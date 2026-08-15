@@ -1,212 +1,237 @@
 # iBalance 改进优化建议
 
-> 基于 2026-08-11 对 `swift/main.swift`（约 1970 行）、`build.sh`、`AGENT.md` 的完整走查整理。
+> 基于 2026-08-15 对全项目的完整走查（`swift/` 下 9 个源文件共约 5700 行 + build.sh/Info.plist/git 状态；忽略 `backups/`）。
+> 上一轮（2026-08-11）的建议大部分已落地，完成情况见文末附录。
 > 优先级标注：🔴 高（建议尽快做）/ 🟡 中（有价值，择机做）/ 🟢 低（锦上添花）
 
 ---
 
-## 一、代码架构
+## 一、安全与凭据 🔴
 
-### 1. 单文件已膨胀到近 2000 行，建议拆分模块 🟡 ✅ 已实施（2026-08-11）
+### 1. `swift/config.json` 模板已含真实凭据，且是 git 跟踪文件 🔴
 
-AGENT.md 记录的还是「~1400 行」，实际已接近 2000 行。AppDelegate 一个类承担了 UI、配置、4 个服务的网络请求、加密解密、OAuth、签到调度全部职责，继续加功能会越来越难维护。
+`.gitignore` 注释还写着「swift/config.json 是空 Key 模板，需要入库」，但实际上该文件现在存有**真实 DeepSeek API Key 和两个 WorkBuddy 账号的完整 token/refresh_token**。它同时被 build.sh 拷进 .app 的 Resources 作为内置 fallback——本地构建出的 .app 内部就带着这些凭据，一旦 `git commit -a` 就会永久进入 git 历史。
 
-建议按现有 MARK 分区拆成独立文件（仍可用 `swiftc` 一次编译多个源文件，build.sh 里把 `$SRC` 换成 `*.swift` 即可）：
+建议：
 
-```
-swift/
-├── main.swift            # 入口 + AppDelegate（UI/菜单/定时器）
-├── Config.swift          # AppConfig / WBAccount / loadConfig / saveConfig
-├── Network.swift         # syncRequest / 重试 / 通用解析辅助
-├── Services/
-│   ├── DeepSeek.swift
-│   ├── WorkBuddy.swift   # 余额 + 签到 + OAuth + token 刷新
-│   ├── Trae.swift        # 积分 + 解密 + 签到
-│   └── Qianwen.swift     # ticket 读取 + 网关查询
-└── Crypto.swift          # sha512 / aesCbcDecrypt / PBKDF2
-```
+- 立刻把 `swift/config.json` 恢复为空凭据模板（真实值只留根目录 `config.json`，已在 .gitignore）；
+- 更新 `.gitignore` 注释；若模板确需入库，打 zip 前的泄漏校验（PACKAGING.md）应同时覆盖它。
 
-### 2. JSON 解析改用 Codable，消除大量手工字典解析 🔴 ✅ 已实施（2026-08-11）
+### 2. 凭据明文落盘且文件权限 644 🔴
 
-全项目用 `JSONSerialization` + `as? [String: Any]` 逐层取值，同一种「Double/Int 双兼容」逻辑重复出现了 **6 处以上**（`expires_at`、`expiresIn`、`CycleCapacityRemain` 等）。典型如：
+`Config.swift:179-187` 保存 config.json、`WorkBuddy.swift:297-299/324` 写 WorkBuddy 认证文件，均为默认权限，同机任何进程可读。涉及 4 类凭据：DeepSeek Key、千问 ticket、WorkBuddy token/refreshToken、TRAE 加密 authInfo。
 
-```swift
-if let ea = d["expiresAt"] as? Double { expiresAt = ea }
-else if let ea = d["expires_at"] as? Double { expiresAt = ea }
-else if let ea = d["expiresAt"] as? Int { expiresAt = TimeInterval(ea) }
-...
-```
+建议（与旧 #12 相同，仍未做）：
 
-改为 `Codable` struct + 自定义 `init(from decoder:)`（或一个 `FlexibleDouble` 包装类型），配置和各 API 响应都能受益：解析错误更早暴露、字段重命名有编译期检查、代码量大约能减少 15–20%。
+- token 类迁移 Keychain（`SecItemAdd` / `kSecClassGenericPassword`），config.json 只留非敏感设置；
+- 迁移前至少 `FileManager.setAttributes([.posixPermissions: 0o600])` 收紧权限。
 
-### 3. 并发模型现代化：semaphore 同步请求 → async/await 🟡 ✅ 已实施（2026-08-11）
+### 3. `/tmp` 日志无条件 dump 签到接口完整响应体 🔴
 
-`syncRequest()` 用 `DispatchSemaphore` 阻塞后台线程，再由调用方手工 `DispatchQueue.global().async` + `DispatchQueue.main.async` 回跳，嵌套层级深、容易漏主线程切换。macOS 12 起已支持 Swift Concurrency，而构建目标正好是 `macos12`，可以：
+`Trae.swift:405-412 / 448-456`：签到成功与失败都把**完整响应体**写进 `/tmp/iBalance_trae_checkin.log`（默认 644，任何本地进程可读，且无轮转、永不清理）。`Trae.swift:318` 与 `WorkBuddy.swift:156` 还各有一份实现写同一个 `/tmp/iBalance_switch.log`（记录 uid/username，同样无锁无上限；`/tmp` 固定文件名在多用户机器上有预创建/symlink 风险）。
 
-- `syncRequest` 改为 `async throws` 版本（`URLSession.data(for:)`）；
-- `doRequest()` 里 4 个服务用 `async let` 并行，UI 更新天然在 `@MainActor` 上；
-- WorkBuddy 的「失败 sleep 2 秒重试」改为 `try? await Task.sleep(nanoseconds:)`，不再阻塞线程。
+建议：
 
-顺带可修掉两个小问题：
-
-- `syncRequest` 超时后 task 没有 `cancel()`，请求会继续在后台跑（轻微泄漏）；
-- `wbOauthCollectAccount` 的轮询用 `Thread.sleep(1.5)`，同样可改为 async 循环。
-
-### 4. 消除重复代码 🟡 ✅ 已实施（2026-08-11）
-
-- `promptForApiKey()` 与 `promptForQianwenTicket()` 两函数 90% 相同（约 100 行重复），可抽一个通用的 `promptForInput(title:info:link:prefill:)`；
-- `getTraeToken()` 与 `fetchTraeCredits()` 前半段（读 storage.json → base64 → 解密）完全重复，`fetchTraeCredits` 直接复用 `getTraeToken()` 即可；
-- `fmtAmount` 与 `fmtAmountCommas` 的前半段类型解析逻辑重复，可共享一个 `toDouble(_ value: Any) -> Double?`。
-
-### 5. 清理死代码与弃用字段 🟢 ✅ 已实施（2026-08-11）
-
-- `onTraeCheckin()` / `showCheckinResult()` 手动签到逻辑保留但菜单已移除，确认不再需要就删掉（约 70 行）；
-- `workbuddy_report_url`、`workbuddy_account`、`cockpit_url` 已弃用（记忆里也确认 report 接口不再使用），但 `loadConfig()`/`saveConfig()` 仍在读写，模板 config.json 里也还在，建议整体移除；
-- `swift/config.json` 模板里 `workbuddy_accounts` 预置了一条 uid/token 全空的占位账号，建议改为空数组 `[]`，避免误导。
-
-### 6. 修复文档与代码不一致 🟢 ✅ 已实施（2026-08-11）
-
-AGENT.md 已有多处过时：
-
-- 「~1400 行」→ 实际 ~1970 行；
-- WorkBuddy 图标写的是 SF Symbol `basketball.fill`、千问 `cup.and.heat.waves.fill`，实际代码已换成 Unicode 字符 🆆 / 🅠；
-- 外部依赖一节仍写「WorkBuddy 数据依赖 Cockpit Tools」，实际已直连 CodeBuddy API。
+- 日志加 debug 开关（默认关）、落盘前脱敏、迁到 `~/Library/Logs/iBalance/` 并加轮转；
+- 两份 appendLog 实现合并为单一日志器。
 
 ---
 
 ## 二、健壮性
 
-### 7. 后台线程直接读写共享状态，存在数据竞争 🔴 ✅ 已实施（2026-08-11）
+### 4. 刷新失败完全静默，「更新于」时间照常刷新 🔴
 
-`config`（含 `workbuddyAccounts` 数组）和 `cacheDs/cacheWb/cacheTrae/cacheQw` 在多个后台队列与主线程间无保护地读写：
+`main.swift:1014-1026`（WorkBuddy）、`1056`（TRAE）、`1096-1104`（千问）：fetch 失败无 else 分支，面板继续显示旧值，而底部「更新于」时间正常更新（`main.swift:998`）——用户无法区分「新数据」和「10 分钟前的旧数据」，直接损害余额工具的可信度。
 
-- `wbAutoCheckinIfNeeded()`（utility 队列）里 `refreshWbAccountToken` 会写 `config.workbuddyAccounts` 并调 `saveConfig()`；
-- `onAddWbAccount`（userInitiated 队列）也在写同一数组；
-- `updateTitle()`（主线程）同时在读各 cache。
+建议：快照增加 per-服务的 error/stale 标记，卡片副标题显示「刷新失败 · HH:mm」；`notifyError`（`main.swift:1010`）从 DeepSeek 专用扩展为通用错误通道。
 
-当前是单写者场景居多所以没爆雷，但 OAuth 采集与整点签到并发时可能互相覆盖 config。建议：所有 config 变更收敛到主线程，或加一个串行 `DispatchQueue(label: "config")` 保护读写（迁 async/await 后用 actor 更自然）。
+### 5. performRefresh 无去重、无取消 🔴
 
-### 8. 网络层缺少统一错误处理与离线感知 🟡 ✅ 已实施（2026-08-11）
+`main.swift:696-699`：定时器、打开面板（489）、网络恢复（309）、手动刷新可并发触发多个 `performRefresh` Task，互不去重也不取消。慢的旧响应会覆盖新缓存，且四服务 `async let`（989-992）不响应取消，重复请求还可能触发签到服务同款风控。
 
-- 只有 WorkBuddy 有一次「sleep 2 秒重试」，DeepSeek / TRAE / 千问失败即静默（仅 DeepSeek 弹通知）；
-- 无网络时每次刷新照样发 4 组请求。可用 `NWPathMonitor` 监听网络状态，断网时暂停定时刷新并在菜单栏显示离线标记，恢复后立即刷一次；
-- 建议统一一个 `fetchWithRetry`：指数退避、最多 2 次、区分「网络错误」与「业务错误」（HTTP 401 说明 token 失效，重试无意义）。
+建议：保存 `refreshTask`，新刷新先 `cancel()` 旧的 + `isRefreshing` 守卫。
 
-### 9. TCC 拦截判断过于粗糙 🟡 ✅ 已实施（2026-08-11）
+### 6. NetworkMonitor 回调不在主线程，直接改 @MainActor 状态 🟡
 
-`edgeQianwenTicket()` 里 `copyItem` 只要抛错就置 `qwTccBlocked = true`，但复制失败也可能是磁盘满、Edge 正在写库等。可以判断 `NSError` 的 domain/code（`NSCocoaErrorDomain` + `NSFileReadNoPermissionError`）再下结论，避免误引导用户去开「完全磁盘访问」。
+`main.swift:306-311`：`onChange` 由 NWPathMonitor 的后台队列触发，闭包内直接写 `self.isOffline` 并调 `onRefresh()`/`updateTitle()`（触 UI）。建议包一层 `Task { @MainActor in ... }`。
 
-### 10. 千问 SEC_TOKEN 用正则抓 HTML，脆弱 🟢
+### 7. 网络层把所有错误压成 `(nil, 0)`，401 与超时不可区分 🔴
 
-`regexFirstGroup("SEC_TOKEN:\\s*\"([^\"]+)\"", in: html)` 依赖页面内联脚本格式，页面改版即失效且无降级提示。建议：失败时在菜单项显示「千问数据获取失败」状态（见功能建议第 3 条），并把解析逻辑集中一处，方便后续修。
+`Network.swift:24`：超时/DNS/连接拒绝/任务取消全部变成 status 0。后果：
 
-### 11. Timer 在 App Nap / 系统睡眠下会漂移 🟢
+- `Trae.swift:94` / `WorkBuddy.swift:362` `guard status == 200` 后返回 nil——多号账号 **token 过期（401）** 与网络抖动在 UI 上都是同一种「获取失败」，无法引导用户重新采集；
+- `Network.swift:40` 重试逻辑对「离线」「已取消」也照样 backoff 重试。
 
-`Timer.scheduledTimer` 依赖 runloop，macOS App Nap 开启后定时器可能被大幅延迟。对「每小时签到轮询」影响不大，但「菜单栏 1 分钟刷新」可能被拉长。可考虑：
+建议：`HTTP.request` 返回 `Result<Data, NetworkError>`（`.timeout / .offline / .http(Int, Data) / .cancelled`），401 单独处理并触发「请重新采集账号」提示；顺带统一默认 timeout 常量（当前 10/15 散传）。
 
-- `checkinTimer` 改用 `DispatchSourceTimer`（不依赖 runloop，可配 `leeway`）；
-- 或加 `NSWorkspace.didWakeNotification` 监听，唤醒后立即补一次刷新/签到检查。
+### 8. 进程切换（TRAE/WorkBuddy 共三处缺陷 + 误杀风险）🔴
 
----
+`Trae.swift:142-160` 与 `WorkBuddy.swift:92-110` 的 `switchAccount` 同构，共同问题：
 
-## 三、安全与隐私
+1. **同步阻塞**：内部 `waitPidsExit` 用 `Thread.sleep` 最多 1.8s+（`Trae.swift:257`），在主线程调用会冻结 UI；
+2. **失败无回滚**：写配置文件失败（`Trae.swift:151-154`）时进程已被杀但不重启，用户停留在「应用被杀未恢复」状态；`restartTrae/restartWorkBuddy`（`Trae.swift:304-309`）`try? task.run()` 吞错，open 失败无反馈；
+3. **双实例风险**：`open -n` 强制新实例，若 SIGKILL 后进程未死透（`waitPidsExit` 结果被 `_ =` 丢弃）会出现双实例竞争写配置文件。
 
-### 12. 敏感凭据全部明文存 config.json 🔴
+另有误杀风险：`Trae.swift:205` 按命令行 `contains("trae")` 匹配进程，任何命令行含 "trae" 的 .app 主进程都可能被误杀；`isPidRunning`（`Trae.swift:262-277`）每次 fork 一个 `/bin/ps`，轮询期间产生大量子进程，且 PID 复用窗口内 `kill` 可能误伤无关进程。
 
-DeepSeek API Key、WorkBuddy 多账号的 token/refreshToken、千问 ticket 全部明文落盘在 `~/.../config.json`。任何进程都能读。建议：
+建议：抽公共 async `AppSwitcher`（见 #15），用 `NSWorkspace.runningApplications` 按 bundle id 精确匹配、`kill(pid, 0)` 判活、等待彻底退出再启动、失败回滚并通知。
 
-- 迁移到 **Keychain**（`SecItemAdd` 存 `kSecClassGenericPassword`），config.json 只留非敏感设置（小数位、刷新间隔、开关）；
-- 做一次性迁移：首次启动检测到 config.json 里有 key/token 就写入 Keychain 后从文件中抹掉；
-- 至少应把根目录 `config.json` 加入 `.gitignore`（项目目前无 git 仓库，若未来初始化 git 这是第一道防线）。
+### 9. Config 解析失败静默回退默认值，随后 save 覆盖用户全部配置 🔴
 
-### 13. Edge Cookie 读取仅支持 Default profile 🟢
+`Config.swift:170-173`：用户手改 config.json 出语法错误时静默回退默认值，下一次 `save` 就用默认值把用户配置整个覆盖。`Config.swift:185-187` 保存失败（磁盘满 / app 放 /Applications 时 bundle 同目录无写权限）也无任何反馈。
 
-硬编码 `Microsoft Edge/Default/Cookies`，多 profile（Profile 1/2…）或其他 Chromium 系浏览器（Chrome/Arc）登录的用户无法自动读取。可以扫描 `Microsoft Edge/*/Cookies` 按修改时间取最新，或配置项指定 profile。
+建议：解析失败时保留原文件改名 `.bak` 并通过 UI 告知；save 返回结果并在失败时提示；长期看配置应迁到 `~/Library/Application Support/iBalance/`（`.app` 旁放可编辑配置不符合 macOS 规范，app 移动/分发后配置「丢失」）。
 
----
+### 10. 零散健壮性问题 🟡
 
-## 四、功能增强
-
-### 14. 菜单栏增加状态可见性 🔴
-
-目前各服务失败完全静默，用户无法区分「没数据」和「获取失败」。建议：
-
-- 菜单顶部加只读状态区：各服务「上次刷新时间 + 成功/失败原因」；
-- 失败的服务在菜单栏标题处给一个弱化标记（如灰色 ⚠︎）；
-- 「刷新余额」菜单项可以加 `Cmd+R` 快捷键。
-
-### 15. 用量历史与消耗趋势 🟡
-
-每次刷新把各服务余额快照追加到本地文件（JSONL 或 SQLite），就能做：
-
-- 菜单项显示「今日已消耗 xxx」「较昨日」；
-- 简单 7 日趋势（菜单里用 NSImage 自绘 sparkline，或点开一个 NSWindow 图表）；
-- 低余额告警：DeepSeek 余额 / 千问周额度低于阈值时主动通知（阈值可配置，如 `alert_threshold`）。
-
-### 16. 千问 5 小时额度已获取但未展示 🟡
-
-`cacheQw` 里已经缓存了 `h5Rem/h5Limit`（5 小时滚动窗口配额），但 `updateTitle()` 只显示周百分比。5 小时窗口往往比周限额更早触顶，建议在菜单里加一行只读项显示「5h 额度剩余 xx%」，触顶时甚至比周额度更有告警价值。
-
-### 17. 开机自启动选项 🟡
-
-菜单栏工具的典型诉求。macOS 13+ 用 `SMAppService.mainApp.register()` 一行搞定；要兼容 macOS 12 则写 LaunchAgent plist。菜单加一个「开机启动」开关即可。
-
-### 18. 设置项收纳到子菜单 🟢
-
-主菜单已 15+ 项，设置类（刷新间隔、小数位×2、隐藏 icon、API Key、Ticket）建议收进「设置 ▸」子菜单，主菜单只留：状态区、刷新、签到开关、打开 Cockpit、关于、退出。
-
-### 19. 刷新间隔档位扩充 🟢
-
-目前只有 1/5 分钟两档硬编码。可以改成 1 / 5 / 15 / 30 分钟四档，或干脆读 config 任意值、菜单只提供常用预设。
-
-### 20. 多 DeepSeek 账号支持 🟢
-
-WorkBuddy 已支持多账号，DeepSeek 只能配一个 API Key。若用户有多个 DeepSeek 账户（个人/团队），可把 `deepseek_api_key` 扩展为数组，菜单栏轮播或加前缀区分。
+- `main.swift:2031-2035`：签到历史 decode 失败返回 `[]`，`appendCheckinHistory` 随即用空数组覆盖旧 key——解码失败即历史全清（虽然该历史目前只写不读，见 #17）；
+- `WorkBuddy.swift:511-518`：refresh 接口的 `expiresAt` 未做毫秒/秒归一化（authInfo 与 collectAccount 路径都归一化了），若服务返回毫秒会被当作秒，token 过期后永远不再刷新；
+- `WorkBuddy.swift:571-593`：OAuth 轮询最长 600s，`try? await Task.sleep` 吞掉 `CancellationError` 后继续发请求（仅靠下一轮 `isCancelled()` 退出）；
+- `main.swift:315-319/737-741/1924-1928`：`Timer.scheduledTimer(target:)` 强引用 target 且 terminate 时不 invalidate；建议 block-based timer（App Nap 漂移问题旧 #11 一并解决，或监听 `didWakeNotification` 唤醒后补刷新）；
+- `main.swift:1876`：`openApplication` completion `{ _, _ in }` 启动失败无提示；各 `UNUserNotificationCenter.add` 回调同样全静默；
+- `main.swift:1496-1500`：手动签到 Task 不可取消，若挂起则 `manualCheckinInProgress` 永久为 true，签到按钮从此失灵且无提示。
 
 ---
 
-## 五、构建与发布
+## 三、代码质量
 
-### 21. build.sh 自动保护用户 config.json，消除「覆盖陷阱」 🔴
+### 11. Trae.swift ↔ WorkBuddy.swift 约 220 行逐字重复 🟡
 
-这是项目记忆里明确记录的坑：`build.sh` 末尾 `cp` 模板覆盖根目录含真实 API Key 的 config.json。建议脚本内建保护，而不是靠人记：
+杀进程/等待退出/重启/日志整条链路双份实现（`switchAccount`、`ms()`、`killXxxProcess`、`collectXxxMainPids`、`isHelperCommandLine`、`sendSIGTERM/KILL`、`waitPidsExit`、`appendSwitchLog`、`restartXxx`），连「readDataToEndOfFile 死锁」注释都只在 WorkBuddy 一侧有。签到部分也重复：`fetchCheckinStatus` 的「尝试 5 种字段名」解析、`claimCheckin` 的 headers/body/解析模式。
 
-```bash
-# 已存在则合并：以用户现有 config 为准，仅补充模板里新增的 key
-if [[ -f "$ROOT_CONFIG" ]]; then
-    /usr/bin/python3 -c '
-import json,sys
-tpl=json.load(open(sys.argv[1])); cur=json.load(open(sys.argv[2]))
-tpl.update(cur)   # 用户字段优先
-json.dump(tpl,open(sys.argv[2],"w"),indent=2,ensure_ascii=False)
-' "$CONFIG" "$ROOT_CONFIG"
-else
-    cp "$CONFIG" "$ROOT_CONFIG"
-fi
-```
+建议：抽 `AppSwitcher`（进程管理）+ `firstInt(in:keys:)` / `postJSON(url:headers:)` 工具，与 #8 一次修完；headers 构造（Trae 3 处、WB 4 处重复）各收口成 `traeHeaders(token:)` / `wbHeaders(token:uid:)`。
 
-顺带把「备份-合并」从人工步骤变成脚本行为后，AGENT.md 里的陷阱 1 也可以删掉。
+### 12. Panel.swift 中 WB/TRAE 卡片约 200 行复制粘贴 🟡
 
-### 22. 版本号自动递增 🟢
+`rebuildWbCards`（1042-1114）与 `rebuildTraeCards`（1140-1206）、`applyWbCardData`（1117-1134）与 `applyTraeCardData`（1209-1227）近乎逐行复制；`WBAccountSnapshot` 与 `TraeAccountSnapshot`（53-78）字段完全同构（注释自认「结构对齐」）。新功能（加载态、失败标记）目前每处都要改两遍。
 
-`Info.plist` 的 `CFBundleVersion` 目前手工维护。build.sh 里可以自动 `agvtool`-style 递增（`PlistBuddy` 读旧值 +1 写回），「关于」弹窗里显示的 Build 号才有意义。
+建议：合并为单一 `AccountSnapshot` + 泛型 `rebuildAccountCards`。main.swift 侧同理：`switchTraeAccount`/`switchWbAccount`（1835-1900）的「后台切换→syncPanel→延时关闭」编排、streak 补全逻辑（3 处重复的 `continuousDays > 0 ? ... : nextStreak 推算`）可各抽 helper。
 
-### 23. 基础验证 / 测试 🟡
+### 13. 性能：Formatter 与图标每次新建 🟡
 
-无测试对解密逻辑（`decryptTraeToken` 硬编码 salt、`edgeQianwenTicket` 的 AES/PBKDF2 参数）风险最大——这些参数一旦 TRAE/Edge 升级就会静默失效。最低成本的做法：
+`fmtAmountCommas`（`main.swift:389-398`）每次调用 new 一个 `NumberFormatter`；`todayString/nowTimeString/latestCheckinTime/nextStreak`（1964-2005）每次 new `DateFormatter`——这条链路每次刷新触发多次，Formatter 创建是 Cocoa 出了名的贵。`refreshStatusItemAppearance`（379-386）每次 `NSImage(contentsOf:)` 读盘，而它被 7 种焦点通知高频触发。
 
-- 把一份已知的 TRAE 密文样本（脱敏后）作为 fixture，写一个小型 `test.swift` 或 Python 脚本验证解密链路端到端可跑通；
-- build.sh 末尾加一步「编译后 smoke test」：`./iBalance.app/Contents/MacOS/iBalance --self-test`（加一个隐藏参数跑配置加载 + 各 URL 构造校验后退出）。
+建议：全部改 `static let` 缓存；状态栏图标加载一次存属性。
+
+### 14. main.swift（2060 行）/ Panel.swift（1906 行）继续拆分 🟡
+
+服务层已拆干净，但入口和面板两个文件又在膨胀。按 MARK 拆（build.sh 自动收集 *.swift，零成本）：
+
+- `AppAccent.swift` ← NSColor swizzle 扩展（main.swift:10-117，自包含 107 行）
+- `CheckinManager.swift` ← 签到域：wb/traeAutoCheckinIfNeeded、traeCheckinStatusFill、签到历史、streak 工具（约 500 行，最大一块）
+- `AccountSwitcher.swift` ← TRAE 采集/切换 + WB 切换 + 切换日志（1777-1917）
+- `Dialogs.swift` ← 全部 NSAlert 弹窗（约 300 行）
+- `Controls.swift` ← Panel.swift:142-824 的自绘控件（约 680 行，占面板文件一半且自包含）
+
+### 15. 硬编码与常量收口 🟢
+
+- URL / bundle id 散落：`platform.deepseek.com/usage`（448）、千问 billing（466）、`cn.trae.solo.app`（451）、`com.workbuddy.workbuddy`（455）等 → 收进 `enum Links` / 配置；
+- UserDefaults key 拼接约 20 处（`"trae_checkin_date_\(uid)"` 等）→ `enum UDKey` 收口；
+- **面板宽度四处矛盾**：头注释「宽 250pt」vs `width: 257`（Panel.swift:640）vs `widthAnchor 260`（1328）vs main.swift:475 注释「320」——当前 viewWillAppear 会把宽度压窄 3pt，统一为单一 `panelWidth` 常量；
+- 魔法数字（0.5s 判同点击、0.05s 弹面板延迟、600/300 退避、90 天历史等）→ 命名常量。
 
 ---
 
-## 六、建议的落地顺序
+## 四、死代码清理（纯减法，约 -300 行）🟢
+
+已全项目 grep 确认零引用：
+
+- `Panel.swift`：`UsageBar`（645-661）、`UsageRing`（665-692）两个控件从未实例化；`animateFillColor`（120-128）、`HoverCard.setInfoHighlighted/applyInfoColor`（397-419）、`kCardBackgroundHover`（105）；
+- `main.swift`：`resetAppAccentToDefault`（63-65）；`onToggleQwDecimals` 回调 + 接线（Panel.swift:836 / main.swift:438，菜单路径的 `toggleQwDecimals` 仍在用，保留本体）；
+- **PanelSnapshot 11 个死字段**（`traeValue/traeUsed/traeLimit/qwH5/traeCheckinTime/traeCheckinDone/traeCheckinFailed/traeCheckinStreak/traeCheckinReward/wbCheckinDesc/qianwenDecimals`）：`Panel.update()` 从不消费，但 `makePanelSnapshot` 每次刷新都计算并读 30+ 次 UserDefaults——删字段既是减代码也是减负担；
+- **签到历史只写不读**（`main.swift:2008-2035`）：每号维护 90 天记录写 UserDefaults，无任何 UI 展示。要么加「查看签到历史」入口（快照里已存 streak/time），要么连 `appendCheckinHistory` 与 5 处调用整体删除。
+
+---
+
+## 五、功能增强
+
+### 16. 手动签到 / 账号采集的进行中反馈 🔴
+
+- `ActionTileButton`（Panel.swift:423-560）无 disabled/loading 态：手动签到（每号 3s 间隔 × N 号可达 10s+）期间磁贴仍可点、无任何指示，结束才弹窗（main.swift:1549）；
+- TRAE 采集进行中只改菜单标题「正在采集…」，面板磁贴无反馈（WB 有「取消添加」文案切换，Panel.swift:1026，TRAE 未对齐）——`traeCollectInProgress` 未暴露进快照。
+
+### 17. 空态与错误态引导 🟡
+
+- TRAE/WB 无任何账号时整个卡片区块消失，没有「先采集账号」的引导卡；
+- 非当前账号首查未回显示 "—"，与「无法获取」不可区分（Panel.swift:1050-1054）。
+
+### 18. 用量历史与低余额告警 🟡（旧 #15，仍未做）
+
+每次刷新把各服务余额快照追加到本地（JSONL/SQLite），即可做「今日已消耗 / 较昨日」、7 日 sparkline、低余额通知（阈值可配置）。签到历史机制（#四）若保留可作为雏形。
+
+### 19. 其余 UI 细节 🟢
+
+- `valueLabel` 固定 60pt 宽 + `byClipping`（Panel.swift:1711-1717）：大额 `¥12,345.67` 会被硬裁（左侧字符直接切掉）→ `.byTruncatingHead` 或放宽约束；
+- 千问无额度时点阵仍全灰渲染，DeepSeek 无 ratio 时隐藏（Panel.swift:999-1004 vs 971-977）→ 统一隐藏；`qwH5` 若要在面板展示 5h 窗口需先接线（当前是死字段，旧 #16 实际未完成）；
+- `switchRow` 整行加 NSClickGestureRecognizer 而 NSSwitch 本身也响应点击（Panel.swift:1848-1849），可能双触发 → 手势识别器忽略落在 switch 上的点击；
+- HoverCard/ActionTileButton 自绘 mouseUp，无 `accessibilityRole = .button` / label，VoiceOver 不可用；
+- `hideWbNickSwitch.state = s.hideWbNickname ? .off : .on` 三重取反（Panel.swift:1037）→ 快照直接存 `showNickname` 正向语义。
+
+### 20. 探测与兼容性 🟢
+
+- `detectTraeStoragePath`（Config.swift:194-205）按目录名前缀 "trae" 模糊匹配取 sorted 第一个：同时装 TRAE 与 TRAE SOLO CN 时静默选错且用户无法干预 → 返回候选列表供选择；
+- Edge Cookie 只读 `Default` profile（Qianwen.swift:30，旧 #13）→ 扫描 `Microsoft Edge/*/Cookies` 按 mtime 取最新；
+- WorkBuddy 认证路径硬编码（WorkBuddy.swift:17）→ 对齐 traeStoragePath 做成可配置 + 自动探测；
+- User-Agent 两处硬编码且与真实浏览器差异大（Qianwen.swift:95/113）→ 提取常量并保持一致；
+- 只构建 arm64（build.sh:34）：Intel Mac（LSMinimumSystemVersion 同样允许 macOS 12）无法运行且无提示 → 至少 README 标注，或双架构。
+
+---
+
+## 六、构建与仓库健康
+
+### 21. build.sh 自动重启不等待旧进程退出；删 bundle 早于杀进程 🔴
+
+- `build.sh:127-131`：`killall` 后固定 `sleep 0.5` 就 `open`（无 `-n`）：旧进程未退时 open 只会激活旧实例，**新二进制根本没运行**，用户误以为已升级 → 循环等 `pgrep` 为空再 open；
+- `build.sh:40`：先 `rm -rf "$APP_DIR"` 后在 127 行才杀进程——正在运行的旧 bundle 先被删掉 → 调整顺序：先停进程再删目录。
+
+### 22. build.sh / Info.plist 零散问题 🟡
+
+- `cp "$CONFIG"`（78）与 `cp icons/*.svg`（81）无容错：文件缺失时脚本中断且报错不友好（对比 png 行有 `|| true`）；
+- `find -maxdepth 2`（22）：Services 下再嵌套子目录会静默漏编 → 放宽或去限制；
+- `.build_state` 读写无并发保护，同时两个构建互相覆盖计数（影响小）；
+- `codesign` 后无 `--verify` 自检；
+- 配置合并用 python3 `tpl.update(cur)` 是**浅合并**，嵌套对象无法逐 key 合并（当前字段都是扁平的所以未爆雷，注明限制或改 jq）；
+- Info.plist 可补：`LSApplicationCategoryType`、`CFBundleDevelopmentRegion`（zh_CN）、`NSHumanReadableCopyright`。
+
+### 23. 仓库卫生 🟡
+
+- **`swift/Panel.swift`（1906 行源码）、`docs/`、`PACKAGING.md`、`AGENT.md` 更新等均未 `git add`**——面板是核心文件，只存在于工作区，误删即丢失；
+- `swift/.build/`（SPM 残留？）未加入 .gitignore；
+- CHANGELOG.md 已删但仍在 git 跟踪中（未提交删除）；
+- 建议：源码与文档尽早提交，敏感的 `swift/config.json` 先做 #1 再提交。
+
+---
+
+## 七、建议的落地顺序
 
 | 顺序 | 事项 | 理由 |
 | --- | --- | --- |
-| 1 | build.sh 保护 config.json（#21） | 一行脚本能消掉最高频的人为事故 |
-| 2 | 凭据迁移 Keychain（#12） | 安全风险最高，越早做迁移成本越低 |
-| 3 | 修数据竞争（#7）+ 状态可见性（#14） | 稳定性 + 可观测性，日常体验提升最明显 |
-| 4 | Codable 重构 + 拆文件（#2、#1） | 为后续所有功能改动铺路 |
-| 5 | 用量历史 + 低余额告警（#15、#16） | 从「看余额」升级为「管余额」 |
-| 6 | 其余按需 | 开机启动、子菜单收纳、趋势图等 |
+| 1 | #1 清空 swift/config.json 模板凭据 + #23 提交源码 | 防止凭据进 git 历史、防核心源码丢失，几分钟的事 |
+| 2 | #3 /tmp 日志脱敏下线 + #2 凭据权限 600 | 安全止损（Keychain 迁移可作二期） |
+| 3 | #4 刷新失败可见 + #7 网络错误分类 | 产品核心价值：数据可信度；#4 依赖 #7 的错误枚举 |
+| 4 | #5 刷新去重 + #8/#11 抽 AppSwitcher 修进程切换 | 一次重构同时消灭 220 行重复和三类切换缺陷 |
+| 5 | #9 Config 失败保护 + #21 build.sh 重启修复 | 都是「出问题才知道疼」的静默失败 |
+| 6 | 死代码清理（#四节）+ #13 Formatter 缓存 | 纯减法，为后续改动铺路 |
+| 7 | #16 签到/采集反馈、#17 空态、#18 用量历史 | 体验增强，按需 |
+
+---
+
+## 附录：上轮（2026-08-11）建议完成情况
+
+| 旧编号 | 事项 | 状态 |
+| --- | --- | --- |
+| #1-#9 | 拆模块、Codable、async/await、去重、死代码清理、文档一致性、数据竞争、网络重试/离线感知、TCC 判断 | ✅ 已实施（2026-08-11） |
+| #10 | 千问 SEC_TOKEN 正则脆弱 | 🟡 部分缓解，解析仍集中一处，无降级提示 |
+| #11 | Timer App Nap 漂移 | ❌ 未做（本轮 #10 收编） |
+| #12 | 凭据迁移 Keychain | ❌ 未做（本轮 #2，升级为 🔴 并补充文件权限问题） |
+| #13 | Edge 多 profile | ❌ 未做（本轮 #20） |
+| #14 | 菜单栏状态可见性 | 🟡 离线标记已做；服务失败可见性未做（本轮 #4） |
+| #15 | 用量历史与趋势 | ❌ 未做（本轮 #18） |
+| #16 | 千问 5h 额度展示 | ❌ 实际未接线：qwH5 是快照死字段（本轮 #19） |
+| #17 | 开机自启动 | ❌ 未做 |
+| #18 | 设置收纳子菜单 | ⏸ 已被面板 UI 取代，主菜单仅剩兜底入口，建议关闭 |
+| #19 | 刷新间隔档位 | ✅ 已做（1/3/5 分钟） |
+| #20 | 多 DeepSeek 账号 | ❌ 未做 |
+| #21 | build.sh 保护 config.json | ✅ 已做（字段级合并） |
+| #22 | 版本号自动递增 | ✅ 已做（日期 + .build_state） |
+| #23 | 基础测试 | ❌ 未做，解密链路 fixture 验证仍值得做 |

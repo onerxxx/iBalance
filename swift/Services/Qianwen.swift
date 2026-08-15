@@ -11,6 +11,8 @@ enum QianwenService {
         let weekLimit: Double
         let h5Rem: Double
         let h5Limit: Double
+        let expireAt: TimeInterval   // 套餐到期时间戳（秒），0 表示未知
+        let remainingDays: Int       // API 返回的剩余自然日（>0=还剩几天，0=今天，负数需本地计算已过期天数）
     }
 
     /// fetchQuota 的复合返回：配额 + TCC 拦截标记（供主线程决定是否弹一次引导授权）
@@ -102,12 +104,11 @@ enum QianwenService {
     }
 
     /// 查询千问 Token Plan 周/5 小时配额剩余。
-    /// 流程：取 ticket（Edge 自动读取优先 → config 手动值）→ 拉控制台页面解析 SEC_TOKEN → 网关三连查。
+    /// ticket 仅来自 config 手动值（可在 ticket 弹窗点「自动获取」按钮从 Edge 登录态采集）。
     static func fetchQuota(manualTicket: String) async -> FetchResult {
-        let (edgeTicket, tccBlocked) = edgeTicket()
-        let ticket = edgeTicket ?? manualTicket
+        let ticket = manualTicket
         guard !ticket.isEmpty else {
-            return FetchResult(quota: nil, tccBlocked: tccBlocked)
+            return FetchResult(quota: nil, tccBlocked: false)
         }
         let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
@@ -145,12 +146,18 @@ enum QianwenService {
         let fiveHour = jsonNum(specQuota["five_hour"])
         let weekPct = (usage["per1WeekPercentage"] as? Double) ?? 0
         let h5Pct = (usage["per5HourPercentage"] as? Double) ?? 0
+        // 套餐到期时间：endTime 单位为毫秒，转秒级时间戳
+        let expireAt = jsonNum(sub["endTime"]) / 1000.0
+        // 直接用 API 返回的 remainingDays（官网同值），避免本地计算偏差
+        let remainingDays = (sub["remainingDays"] as? Int) ?? Int(jsonNum(sub["remainingDays"]))
 
         return FetchResult(quota: Quota(
             weekRem: weekly * (1 - weekPct),
             weekLimit: weekly,
             h5Rem: fiveHour * (1 - h5Pct),
-            h5Limit: fiveHour
+            h5Limit: fiveHour,
+            expireAt: expireAt,
+            remainingDays: remainingDays
         ), tccBlocked: false)
     }
 }

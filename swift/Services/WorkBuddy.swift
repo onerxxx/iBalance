@@ -13,39 +13,328 @@ enum WorkBuddyService {
 
     // MARK: 当前登录账号（auth 文件）
 
+    /// auth 文件路径
+    private static let authPath = NSHomeDirectory() + "/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+
+    /// 内存缓存：mtime 变化才重新读文件并解析，避免 syncPanel 频繁触发时的重复 IO 与 JSON 解析。
+    private static var cachedAuth: (token: String, domain: String, uid: String, nickname: String, refreshToken: String, expiresAt: TimeInterval)?
+    private static var cachedAuthMtime: Date?
+    private static var cachedAuthFetchedAt: Date = .distantPast
+    private static let authCacheLock = NSLock()
+
     /// 读取 WorkBuddy Desktop 当前登录账号：~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
     /// 该文件在账号切换或 token 刷新时由桌面端自动更新。
-    static func authInfo() -> (token: String, domain: String, uid: String, nickname: String)? {
-        let path = NSHomeDirectory() + "/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
-        guard FileManager.default.fileExists(atPath: path),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+    /// 返回的 refreshToken/expiresAt 用于把主账号持久化到 config（多号场景）。
+    /// mtime 变化才重新解析；mtime 未变化但距上次读取 > 30s 也会重读（兜底，防止 mtime 精度丢失）。
+    static func authInfo() -> (token: String, domain: String, uid: String, nickname: String, refreshToken: String, expiresAt: TimeInterval)? {
+        authCacheLock.lock()
+        defer { authCacheLock.unlock() }
+
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: authPath) else {
+            cachedAuth = nil
+            cachedAuthMtime = nil
+            cachedAuthFetchedAt = .distantPast
+            return nil
+        }
+        let attrs = try? fm.attributesOfItem(atPath: authPath)
+        let mtime = (attrs?[.modificationDate] as? Date) ?? .distantPast
+        let now = Date()
+        // mtime 未变且距上次读取 < 30s → 直接用缓存
+        if let cached = cachedAuth,
+           cachedAuthMtime == mtime,
+           now.timeIntervalSince(cachedAuthFetchedAt) < 30 {
+            return cached
+        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
               let file = try? JSONDecoder().decode(AuthFile.self, from: data),
               let token = file.auth?.accessToken, !token.isEmpty,
               let domain = file.auth?.domain, !domain.isEmpty,
-              let uid = file.account?.uid, !uid.isEmpty else { return nil }
+              let uid = file.account?.uid, !uid.isEmpty else {
+            cachedAuth = nil
+            cachedAuthMtime = mtime
+            cachedAuthFetchedAt = now
+            return nil
+        }
         let nickname = file.account?.nickname ?? uid
-        return (token, domain, uid, nickname)
+        let refreshToken = file.auth?.refreshToken ?? ""
+        // auth 文件 expiresAt 单位为毫秒，转成秒级绝对时间戳
+        var expiresAt: TimeInterval = 0
+        if let ms = file.auth?.expiresAt, ms > 0 {
+            expiresAt = TimeInterval(ms) / 1000.0
+        } else if let expIn = file.auth?.expiresIn, expIn > 0 {
+            expiresAt = now.timeIntervalSince1970 + TimeInterval(expIn)
+        }
+        let result = (token, domain, uid, nickname, refreshToken, expiresAt)
+        cachedAuth = result
+        cachedAuthMtime = mtime
+        cachedAuthFetchedAt = now
+        return result
     }
 
     private struct AuthFile: Decodable {
-        struct Auth: Decodable { let accessToken: String?; let domain: String? }
+        struct Auth: Decodable {
+            let accessToken: String?
+            let domain: String?
+            let refreshToken: String?
+            let expiresAt: Int64?      // 毫秒
+            let expiresIn: Int64?      // 秒（fallback）
+        }
         struct Account: Decodable { let uid: String?; let nickname: String? }
         let auth: Auth?
         let account: Account?
     }
 
+    // MARK: 账号切换（写 auth 文件 + 重启 WorkBuddy Desktop）
+
+    /// 将指定账号的凭据写入 workbuddy-desktop.info，然后杀掉并重启 WorkBuddy Desktop。
+    /// 仿 Cockpit Tools 的切号流程：杀进程 → 写认证 → 重启。
+    static func switchAccount(_ account: WBAccount) {
+        let t0 = Date()
+        Logger.log(.switchAccount, "[iBalance] switchAccount start: uid=\(account.uid) nickname=\(account.nickname)")
+        // 1. 杀掉 WorkBuddy Desktop 主进程（SIGTERM，仿 Cockpit 只杀主进程）
+        let tKillStart = Date()
+        killWorkBuddyProcess()
+        Logger.log(.switchAccount, "[iBalance] kill done (\(ms(tKillStart))ms), writing auth file...")
+        // 2. 写入 auth 文件
+        let tWriteStart = Date()
+        guard writeAuthFile(account) else {
+            Logger.log(.switchAccount, "[iBalance] writeAuthFile FAILED")
+            return
+        }
+        Logger.log(.switchAccount, "[iBalance] auth file written (\(ms(tWriteStart))ms), restarting...")
+        // 3. 重启 WorkBuddy Desktop
+        let tRestartStart = Date()
+        restartWorkBuddy()
+        Logger.log(.switchAccount, "[iBalance] restart done (\(ms(tRestartStart))ms), total \(ms(t0))ms")
+    }
+
+    /// 计算从 start 到现在的毫秒数
+    private static func ms(_ start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+    /// 杀掉 WorkBuddy Desktop 主进程
+    /// 仿 Cockpit Tools：用 ps 找主进程 PID（排除 helper/renderer/gpu/crashpad），
+    /// 只对主 PID 发 SIGTERM，靠 Electron 主进程退出自动回收子进程。
+    /// 策略：SIGTERM 等 0.8s，超时立即 SIGKILL（保证最坏 < 1s）。
+    /// 切号场景下旧状态丢弃可接受，auth 文件由 iBalance 覆盖写入。
+    private static func killWorkBuddyProcess() {
+        let tCollect = Date()
+        let pids = collectWorkBuddyMainPids()
+        Logger.log(.switchAccount, "[iBalance] collected pids (\(ms(tCollect))ms): \(pids)")
+        if pids.isEmpty {
+            Logger.log(.switchAccount, "[iBalance] no WorkBuddy pids found, skipping kill")
+            return
+        }
+        // SIGTERM 等 0.8s（正常约 600ms 退出），超时 SIGKILL 强杀
+        let tSig = Date()
+        sendSIGTERM(to: pids)
+        Logger.log(.switchAccount, "[iBalance] SIGTERM sent (\(ms(tSig))ms), waiting up to 0.8s...")
+        let tWait = Date()
+        if waitPidsExit(pids, timeout: 0.8) {
+            Logger.log(.switchAccount, "[iBalance] all pids exited (round 1, \(ms(tWait))ms)")
+            return
+        }
+        // 超时 → 直接 SIGKILL 残留主进程（强制退出，Electron 子进程会自动回收）
+        let remaining = collectWorkBuddyMainPids()
+        Logger.log(.switchAccount, "[iBalance] remaining after round 1 (\(ms(tWait))ms): \(remaining)")
+        if remaining.isEmpty { return }
+        let tKill = Date()
+        sendSIGKILL(to: remaining)
+        _ = waitPidsExit(remaining, timeout: 1.0)
+        Logger.log(.switchAccount, "[iBalance] SIGKILL done (\(ms(tKill))ms)")
+    }
+
+    /// 收集 WorkBuddy 主进程 PID（排除 helper/renderer/gpu/crashpad 等子进程）
+    private static func collectWorkBuddyMainPids() -> [Int] {
+        let task = Process()
+        task.launchPath = "/bin/ps"
+        task.arguments = ["-axo", "pid=,command="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do { try task.run() } catch { return [] }
+        // ⚠️ 必须先读数据再等退出，否则 ps 输出填满 pipe 缓冲区后会死锁
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard let output = String(data: data, encoding: .utf8) else { return [] }
+        var result: [Int] = []
+        for line in output.split(separator: "\n") {
+            let lower = line.lowercased()
+            // 只匹配 WorkBuddy 主进程
+            guard lower.contains("workbuddy.app/contents/macos/") else { continue }
+            // 排除 Electron 子进程（helper/renderer/gpu/crashpad/utility 等）
+            if isHelperCommandLine(lower) { continue }
+            // 解析 PID（行首数字）
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let spaceIdx = trimmed.firstIndex(of: " "),
+               let pid = Int(trimmed[..<spaceIdx].trimmingCharacters(in: .whitespaces)) {
+                result.append(pid)
+            }
+        }
+        return result
+    }
+
+    /// 判断是否为 Electron 子进程（helper/renderer/gpu/crashpad 等）
+    private static func isHelperCommandLine(_ cmd: String) -> Bool {
+        let helperKeywords: [String] = [
+            "--type=", "helper", "renderer", "gpu", "crashpad",
+            "utility", "audio", "sandbox", "--node-ipc",
+            "--clientprocessid=", "resources/app/extensions/",
+        ]
+        for keyword in helperKeywords {
+            if cmd.contains(keyword) { return true }
+        }
+        return false
+    }
+
+    /// 对指定 PID 列表发送 SIGTERM
+    private static func sendSIGTERM(to pids: [Int]) {
+        for pid in pids {
+            let task = Process()
+            task.launchPath = "/bin/kill"
+            task.arguments = ["-15", String(pid)]
+            try? task.run()
+            task.waitUntilExit()
+        }
+    }
+
+    /// 对指定 PID 列表发送 SIGKILL（强制退出）
+    private static func sendSIGKILL(to pids: [Int]) {
+        for pid in pids {
+            let task = Process()
+            task.launchPath = "/bin/kill"
+            task.arguments = ["-9", String(pid)]
+            try? task.run()
+            task.waitUntilExit()
+        }
+    }
+
+    /// 轮询等待 PID 退出，每 120ms 检查一次
+    /// 僵尸态（Z）视为已退出
+    private static func waitPidsExit(_ pids: [Int], timeout: TimeInterval) -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < timeout {
+            var anyAlive = false
+            for pid in pids {
+                if isPidRunning(pid) { anyAlive = true; break }
+            }
+            if !anyAlive { return true }
+            Thread.sleep(forTimeInterval: 0.12)
+        }
+        return false
+    }
+
+    /// 检查 PID 是否存活（ps -p <pid> -o stat=，僵尸态 Z 视为已死）
+    private static func isPidRunning(_ pid: Int) -> Bool {
+        let task = Process()
+        task.launchPath = "/bin/ps"
+        task.arguments = ["-p", String(pid), "-o", "stat="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do { try task.run() } catch { return false }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard let output = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespaces) else { return false }
+        if output.isEmpty { return false }
+        // 僵尸态 Z 视为已退出
+        if output.first == "Z" || output.first == "z" { return false }
+        return true
+    }
+
+    /// 将账号凭据写入 workbuddy-desktop.info（原子写入）
+    /// 仿 Cockpit Tools 的 build_default_client_auth_session 结构
+    private static func writeAuthFile(_ account: WBAccount) -> Bool {
+        let now = Date().timeIntervalSince1970
+        let nowMs = Int64(now * 1000)
+        let expiresAtMs = account.expiresAt > 0 ? Int64(account.expiresAt * 1000) : nowMs + 5184_000_000
+        let refreshExpiresAtMs = expiresAtMs + 2592_000_000 // refresh 比 access 多 30 天
+
+        // 构建 account 对象
+        let accountObj: [String: Any] = [
+            "uid": account.uid,
+            "nickname": account.nickname,
+            "type": "personal",
+            "lastLogin": true,
+            "isCreator": false,
+            "isAdmin": false,
+            "pluginEnabled": true,
+            "accountType": "",
+            "idp": "",
+            "areaInfoComplete": false,
+            "isFirstLogin": false,
+            "isCurrentOneIdEnterprise": false,
+            "isCurrentOneIdPersonal": false,
+            "oneidAccountId": "",
+            "deployStatus": ["statusCode": 0, "statusMsg": "", "detailMsg": ""],
+            "sso": ["domain": "", "domainModifiedTimes": 0],
+        ]
+
+        // 构建 auth 对象
+        let authObj: [String: Any] = [
+            "accessToken": account.token,
+            "refreshToken": account.refreshToken,
+            "tokenType": "Bearer",
+            "domain": account.domain,
+            "expiresAt": expiresAtMs,
+            "expiresIn": 5184_000,            // 60 天（秒）
+            "refreshExpiresAt": refreshExpiresAtMs,
+            "refreshExpiresIn": 7776_000,     // 90 天（秒）
+            "lastRefreshTime": nowMs,
+            "scope": "openid profile offline_access email",
+            "notBeforePolicy": 1724292326,
+            "sessionState": "",
+        ]
+
+        // 完整 auth 文件结构
+        let session: [String: Any] = [
+            "account": accountObj,
+            "auth": authObj,
+            "accounts": [accountObj],
+            "allAccounts": [accountObj],
+        ]
+
+        guard let data = try? JSONSerialization.data(withJSONObject: session, options: [.prettyPrinted]) else {
+            return false
+        }
+        do {
+            try data.write(to: URL(fileURLWithPath: authPath), options: [.atomic])
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 重启 WorkBuddy Desktop
+    /// 仿 Cockpit Tools：open -n -a WorkBuddy --args --new-window
+    /// -n = 强制新实例，--new-window = 新窗口
+    private static func restartWorkBuddy() {
+        let task = Process()
+        task.launchPath = "/usr/bin/open"
+        task.arguments = ["-n", "-a", "WorkBuddy", "--args", "--new-window"]
+        try? task.run()
+    }
+
     // MARK: 积分汇总
 
-    /// 直接调用 CodeBuddy API 获取当前账号的剩余额度。
+    /// 直接调用 CodeBuddy API 获取当前账号的剩余额度与总额度。
     /// POST /v2/billing/meter/get-user-resource，Bearer token + X-User-Id。
-    /// 只累加 Status==0（有效）账户的 CycleCapacityRemainPrecise。
-    static func fetchSummary() async -> Double? {
+    /// 只累加 Status==0（有效）账户的 CycleCapacityRemainPrecise / CycleCapacitySizePrecise。
+    static func fetchSummary() async -> (remain: Double, total: Double)? {
         guard let auth = authInfo() else { return nil }
-        guard let url = URL(string: "https://\(auth.domain)/v2/billing/meter/get-user-resource") else { return nil }
+        return await fetchSummaryForAccount(token: auth.token, uid: auth.uid, domain: auth.domain)
+    }
+
+    /// 查询指定 WorkBuddy 账号的剩余额度与总额度（多号场景）。
+    static func fetchSummaryForAccount(token: String, uid: String, domain: String) async -> (remain: Double, total: Double)? {
+        guard let url = URL(string: "https://\(domain)/v2/billing/meter/get-user-resource") else { return nil }
         let headers = [
-            "Authorization": "Bearer \(auth.token)",
+            "Authorization": "Bearer \(token)",
             "Content-Type": "application/json",
-            "X-User-Id": auth.uid,
+            "X-User-Id": uid,
         ]
         let (data, status) = await HTTP.requestWithRetry(
             url: url, method: "POST", headers: headers, body: Data("{}".utf8), timeout: 10
@@ -53,16 +342,22 @@ enum WorkBuddyService {
         guard status == 200, let data,
               let resp = try? JSONDecoder().decode(ResourceResponse.self, from: data) else { return nil }
 
+        var remain: Double = 0
         var total: Double = 0
         for acc in resp.data?.Response?.Data?.Accounts ?? [] {
             guard acc.Status == 0 else { continue }
             if let precise = acc.CycleCapacityRemainPrecise, let v = Double(precise) {
+                remain += v
+            } else if let r = acc.CycleCapacityRemain {
+                remain += r.value
+            }
+            if let sizePrecise = acc.CycleCapacitySizePrecise, let v = Double(sizePrecise) {
                 total += v
-            } else if let remain = acc.CycleCapacityRemain {
-                total += remain.value
+            } else if let size = acc.CycleCapacitySize {
+                total += size
             }
         }
-        return total
+        return (remain, total)
     }
 
     private struct ResourceResponse: Decodable {
@@ -73,6 +368,8 @@ enum WorkBuddyService {
                         let Status: Int?
                         let CycleCapacityRemainPrecise: String?
                         let CycleCapacityRemain: FlexibleDouble?
+                        let CycleCapacitySizePrecise: String?
+                        let CycleCapacitySize: Double?
                     }
                     let Accounts: [Account]?
                 }
@@ -85,32 +382,50 @@ enum WorkBuddyService {
 
     // MARK: 签到状态 / 领取
 
-    /// 查询签到状态。优先 checkin-activity-status，失败回退 checkin-status。
-    /// 返回 (todayCheckedIn, available)；失败返回 nil。
-    static func fetchCheckinStatus(token: String, uid: String, domain: String) async -> (todayCheckedIn: Bool, available: Bool)? {
+    /// 查询签到状态：直接调用 daily-checkin（幂等，已签时返回非 0 bizCode + 状态信息）。
+    /// 返回 (todayCheckedIn, available, continuousDays, reward)；失败返回 nil。
+    static func fetchCheckinStatus(token: String, uid: String, domain: String) async -> (todayCheckedIn: Bool, available: Bool, continuousDays: Int, reward: Int)? {
+        guard let url = URL(string: "https://\(domain)/v2/billing/meter/daily-checkin") else { return nil }
         let headers = [
             "Authorization": "Bearer \(token)",
             "Content-Type": "application/json",
             "X-User-Id": uid,
         ]
-        for path in ["/v2/billing/meter/checkin-activity-status", "/v2/billing/meter/checkin-status"] {
-            guard let url = URL(string: "https://\(domain)\(path)") else { continue }
-            let (data, status) = await HTTP.request(url: url, method: "GET", headers: headers, timeout: 10)
-            guard status == 200, let data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-            let bizCode: Int
-            if let d = json["data"] as? [String: Any] {
-                bizCode = (d["Code"] as? Int) ?? (d["code"] as? Int) ?? 0
-            } else {
-                bizCode = (json["code"] as? Int) ?? 0
-            }
-            guard bizCode == 0 else { continue }
-            let inner = nestedDict(json, keys: ["data", "Response", "Data"]) ?? nestedDict(json, keys: ["data"]) ?? json
-            let todayCheckedIn = (inner["today_checked_in"] as? Bool) ?? false
-            let available = (inner["available"] as? Bool) ?? !todayCheckedIn
-            return (todayCheckedIn, available)
+        let (data, status) = await HTTP.request(url: url, method: "POST", headers: headers, body: Data("{}".utf8), timeout: 10)
+        // 接受 200（签到成功）和 400（已签到 code=10001）两种情况
+        guard (status == 200 || status == 400), let data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let bizCode = (json["code"] as? Int) ?? (nestedDict(json, keys: ["data"])?["Code"] as? Int) ?? -1
+        let inner = nestedDict(json, keys: ["data", "Response", "Data"]) ?? nestedDict(json, keys: ["data"]) ?? json
+        // bizCode == 0 → 刚刚签到成功；bizCode == 10001 → 今天已签到
+        let todayCheckedIn = bizCode == 0 || bizCode == 10001 || (inner["today_checked_in"] as? Bool ?? false)
+        let available = bizCode == 0
+        // 连续天数：尝试多种字段名
+        let continuousDays = (inner["continuous_days"] as? Int)
+            ?? (inner["streak"] as? Int)
+            ?? (inner["consecutive_days"] as? Int)
+            ?? (inner["days"] as? Int)
+            ?? (inner["checkin_days"] as? Int)
+            ?? 0
+        // reward 可能是 dict { credit: 100 } 也可能是数字
+        var reward = 0
+        if let r = inner["reward"] as? [String: Any] {
+            reward = (r["credit"] as? Int) ?? (r["credits"] as? Int) ?? (r["today_credit"] as? Int) ?? 0
         }
-        return nil
+        if reward == 0 {
+            reward = (inner["credit"] as? Int)
+                ?? (inner["today_credit"] as? Int)
+                ?? (inner["credits"] as? Int)
+                ?? (inner["reward_credit"] as? Int)
+                ?? 0
+        }
+        // 字符串形式的数字
+        if reward == 0 {
+            for k in ["credit", "today_credit", "credits", "reward_credit"] {
+                if let s = inner[k] as? String, let v = Int(s) { reward = v; break }
+            }
+        }
+        return (todayCheckedIn, available, continuousDays, reward)
     }
 
     /// 执行签到。返回 (success, creditDesc, msg)。

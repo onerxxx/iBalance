@@ -5,6 +5,7 @@
 # 构建产物（可由 swift/build.sh 重新生成）
 iBalance.app/
 *.zip
+swift/.build_state
 
 # Python 缓存
 __pycache__/
