@@ -70,13 +70,41 @@ struct TraeAccount: Codable, Equatable {
     }
 }
 
+// MARK: - ZCode 多号账号
+
+/// ZCode（智谱 Coding Plan）账号：导入自 ~/.zcode/v2/config.json 的明文 apiKey（JWT）。
+/// uid 为 JWT payload 中的 user_id；token 用于 billing/balance 余额查询。
+/// nickname 为用户自定义昵称（导入时填写）；平台无昵称 API，留空时显示 uid 尾号。
+struct ZCodeAccount: Codable, Equatable {
+    var uid: String
+    var token: String
+    var nickname: String = ""
+
+    init(uid: String, token: String, nickname: String = "") {
+        self.uid = uid
+        self.token = token
+        self.nickname = nickname
+    }
+
+    /// 展示名：自定义昵称优先，未设置时用 uid 尾 4 位
+    var displayName: String {
+        nickname.isEmpty ? "…" + uid.suffix(4) : nickname
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        uid = try c.decodeIfPresent(String.self, forKey: .uid) ?? ""
+        token = try c.decodeIfPresent(String.self, forKey: .token) ?? ""
+        nickname = try c.decodeIfPresent(String.self, forKey: .nickname) ?? ""
+    }
+}
+
 // MARK: - 应用配置
 
 struct AppConfig: Codable {
     var deepseekApiKey: String = ""
     var deepseekCommonQuota: Double = 0  // DeepSeek 常用充值额度（0=未设置，不显示点阵）
     var refreshInterval: TimeInterval = 300
-    var deepseekDecimals: Int = 2
     var workbuddyDecimals: Int = 2
     var traeStoragePath: String = ""
     var traeDecimals: Int = 0
@@ -84,18 +112,19 @@ struct AppConfig: Codable {
     var traeAutoCheckin: Bool = true
     var hideMainIcon: Bool = true
     var hideWbNickname: Bool = true
+    var debugMode: Bool = false          // 调试模式：余额卡片角标全显 + DeepSeek 金额固定 999.99
     var qianwenTicket: String = ""
     var qianwenDecimals: Int = 1
     var cockpitAppId: String = "com.jlcodes.cockpit-tools"
     var workbuddyAutoCheckin: Bool = true
     var workbuddyAccounts: [WBAccount] = []
     var traeAccounts: [TraeAccount] = []
+    var zcodeAccounts: [ZCodeAccount] = []
 
     enum CodingKeys: String, CodingKey {
         case deepseekApiKey = "deepseek_api_key"
         case deepseekCommonQuota = "deepseek_common_quota"
         case refreshInterval = "refresh_interval"
-        case deepseekDecimals = "deepseek_decimals"
         case workbuddyDecimals = "workbuddy_decimals"
         case traeStoragePath = "trae_storage_path"
         case traeDecimals = "trae_decimals"
@@ -103,12 +132,14 @@ struct AppConfig: Codable {
         case traeAutoCheckin = "trae_auto_checkin"
         case hideMainIcon = "hide_main_icon"
         case hideWbNickname = "hide_wb_nickname"
+        case debugMode = "debug_mode"
         case qianwenTicket = "qianwen_ticket"
         case qianwenDecimals = "qianwen_decimals"
         case cockpitAppId = "cockpit_app_id"
         case workbuddyAutoCheckin = "workbuddy_auto_checkin"
         case workbuddyAccounts = "workbuddy_accounts"
         case traeAccounts = "trae_accounts"
+        case zcodeAccounts = "zcode_accounts"
     }
 
     // 仅解码用的 legacy 字段（旧版统一 "decimals"，新版按服务拆分；读取兼容两者）
@@ -125,7 +156,6 @@ struct AppConfig: Codable {
         deepseekCommonQuota = try c.decodeIfPresent(Double.self, forKey: .deepseekCommonQuota) ?? 0
         // refresh_interval 兼容 Double/Int（TimeInterval 解码数字字面量均 OK）
         refreshInterval = try c.decodeIfPresent(TimeInterval.self, forKey: .refreshInterval) ?? 300
-        deepseekDecimals = try c.decodeIfPresent(Int.self, forKey: .deepseekDecimals) ?? legacy ?? 2
         workbuddyDecimals = try c.decodeIfPresent(Int.self, forKey: .workbuddyDecimals) ?? legacy ?? 2
         traeStoragePath = try c.decodeIfPresent(String.self, forKey: .traeStoragePath) ?? ""
         traeDecimals = try c.decodeIfPresent(Int.self, forKey: .traeDecimals) ?? 0
@@ -133,6 +163,7 @@ struct AppConfig: Codable {
         traeAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .traeAutoCheckin) ?? true
         hideMainIcon = try c.decodeIfPresent(Bool.self, forKey: .hideMainIcon) ?? true
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? true
+        debugMode = try c.decodeIfPresent(Bool.self, forKey: .debugMode) ?? false
         qianwenTicket = try c.decodeIfPresent(String.self, forKey: .qianwenTicket) ?? ""
         qianwenDecimals = try c.decodeIfPresent(Int.self, forKey: .qianwenDecimals) ?? 1
         cockpitAppId = try c.decodeIfPresent(String.self, forKey: .cockpitAppId) ?? "com.jlcodes.cockpit-tools"
@@ -144,6 +175,9 @@ struct AppConfig: Codable {
         // TRAE 多号账号：过滤掉 uid/authInfo 为空的占位项
         traeAccounts = (try c.decodeIfPresent([TraeAccount].self, forKey: .traeAccounts) ?? [])
             .filter { !$0.uid.isEmpty && !$0.encryptedAuthInfo.isEmpty }
+        // ZCode 多号账号：过滤掉 uid/token 为空的占位项
+        zcodeAccounts = (try c.decodeIfPresent([ZCodeAccount].self, forKey: .zcodeAccounts) ?? [])
+            .filter { !$0.uid.isEmpty && !$0.token.isEmpty }
     }
 }
 

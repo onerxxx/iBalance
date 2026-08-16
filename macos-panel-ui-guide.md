@@ -194,7 +194,7 @@ Footer（更新时间 + 退出按钮）
 卡片圆角：      10pt
 卡片边框：      1pt white@10%
 行高：         设置行 ~16pt；磁贴行 48pt；footer 20pt
-行内间距：      icon-文本 8pt；卡片间（同平台）0pt，卡片间（跨平台）8pt
+行内间距：      icon-文本 8pt；卡片间（同平台）0pt，卡片间（跨平台）7pt
 磁贴尺寸：      56×48pt
 hover 高亮：    HoverCard white@5% + 0.8pt white@14% border（0.22s easeInEaseOut）
                HoverIconButton white@20% border（仅 hover 时显示）
@@ -262,7 +262,7 @@ hover 高亮：    HoverCard white@5% + 0.8pt white@14% border（0.22s easeInEas
 ### 4.2 多账号卡片
 
 - TRAE 和 WorkBuddy 各支持多账号，每个账号独立一张 `HoverCard`。
-- 同平台账号卡片之间间距为 0pt（视觉上合并为一组），跨平台间距 8pt。
+- 同平台账号卡片之间间距为 0pt（视觉上合并为一组），跨平台间距 7pt。
 - 当前登录账号（`isCurrent`）使用全尺寸品牌图标和正常前景色；非当前账号 icon 缩至 50% + 前景降为石墨灰。
 - 点击非当前账号卡片触发账号切换（写认证文件 + 杀进程重启）。
 

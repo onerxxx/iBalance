@@ -19,3 +19,15 @@ __pycache__/
 # 编辑器/工具临时文件
 *.swp
 *~
+
+# Cockpit Tools 源码参照（第三方本地副本，不入库）
+cockpit-tools-main/
+
+# 分发给用户的「已损坏」修复说明页，不入库
+iBalance-已损坏说明.html
+
+# SPM/swiftc 构建缓存
+swift/.build/
+
+# demo 编译产物（仅入库源码）
+demo/GlassBackgroundPanelDemo

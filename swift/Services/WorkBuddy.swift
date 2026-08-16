@@ -93,156 +93,15 @@ enum WorkBuddyService {
         let t0 = Date()
         Logger.log(.switchAccount, "[iBalance] switchAccount start: uid=\(account.uid) nickname=\(account.nickname)")
         // 1. 杀掉 WorkBuddy Desktop 主进程（SIGTERM，仿 Cockpit 只杀主进程）
-        let tKillStart = Date()
-        killWorkBuddyProcess()
-        Logger.log(.switchAccount, "[iBalance] kill done (\(ms(tKillStart))ms), writing auth file...")
+        ProcessUtil.killMainProcesses(containingAll: ["workbuddy.app/contents/macos/"], label: "WorkBuddy")
         // 2. 写入 auth 文件
-        let tWriteStart = Date()
         guard writeAuthFile(account) else {
             Logger.log(.switchAccount, "[iBalance] writeAuthFile FAILED")
             return
         }
-        Logger.log(.switchAccount, "[iBalance] auth file written (\(ms(tWriteStart))ms), restarting...")
         // 3. 重启 WorkBuddy Desktop
-        let tRestartStart = Date()
         restartWorkBuddy()
-        Logger.log(.switchAccount, "[iBalance] restart done (\(ms(tRestartStart))ms), total \(ms(t0))ms")
-    }
-
-    /// 计算从 start 到现在的毫秒数
-    private static func ms(_ start: Date) -> Int {
-        Int(Date().timeIntervalSince(start) * 1000)
-    }
-
-    /// 杀掉 WorkBuddy Desktop 主进程
-    /// 仿 Cockpit Tools：用 ps 找主进程 PID（排除 helper/renderer/gpu/crashpad），
-    /// 只对主 PID 发 SIGTERM，靠 Electron 主进程退出自动回收子进程。
-    /// 策略：SIGTERM 等 0.8s，超时立即 SIGKILL（保证最坏 < 1s）。
-    /// 切号场景下旧状态丢弃可接受，auth 文件由 iBalance 覆盖写入。
-    private static func killWorkBuddyProcess() {
-        let tCollect = Date()
-        let pids = collectWorkBuddyMainPids()
-        Logger.log(.switchAccount, "[iBalance] collected pids (\(ms(tCollect))ms): \(pids)")
-        if pids.isEmpty {
-            Logger.log(.switchAccount, "[iBalance] no WorkBuddy pids found, skipping kill")
-            return
-        }
-        // SIGTERM 等 0.8s（正常约 600ms 退出），超时 SIGKILL 强杀
-        let tSig = Date()
-        sendSIGTERM(to: pids)
-        Logger.log(.switchAccount, "[iBalance] SIGTERM sent (\(ms(tSig))ms), waiting up to 0.8s...")
-        let tWait = Date()
-        if waitPidsExit(pids, timeout: 0.8) {
-            Logger.log(.switchAccount, "[iBalance] all pids exited (round 1, \(ms(tWait))ms)")
-            return
-        }
-        // 超时 → 直接 SIGKILL 残留主进程（强制退出，Electron 子进程会自动回收）
-        let remaining = collectWorkBuddyMainPids()
-        Logger.log(.switchAccount, "[iBalance] remaining after round 1 (\(ms(tWait))ms): \(remaining)")
-        if remaining.isEmpty { return }
-        let tKill = Date()
-        sendSIGKILL(to: remaining)
-        _ = waitPidsExit(remaining, timeout: 1.0)
-        Logger.log(.switchAccount, "[iBalance] SIGKILL done (\(ms(tKill))ms)")
-    }
-
-    /// 收集 WorkBuddy 主进程 PID（排除 helper/renderer/gpu/crashpad 等子进程）
-    private static func collectWorkBuddyMainPids() -> [Int] {
-        let task = Process()
-        task.launchPath = "/bin/ps"
-        task.arguments = ["-axo", "pid=,command="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return [] }
-        // ⚠️ 必须先读数据再等退出，否则 ps 输出填满 pipe 缓冲区后会死锁
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-        var result: [Int] = []
-        for line in output.split(separator: "\n") {
-            let lower = line.lowercased()
-            // 只匹配 WorkBuddy 主进程
-            guard lower.contains("workbuddy.app/contents/macos/") else { continue }
-            // 排除 Electron 子进程（helper/renderer/gpu/crashpad/utility 等）
-            if isHelperCommandLine(lower) { continue }
-            // 解析 PID（行首数字）
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if let spaceIdx = trimmed.firstIndex(of: " "),
-               let pid = Int(trimmed[..<spaceIdx].trimmingCharacters(in: .whitespaces)) {
-                result.append(pid)
-            }
-        }
-        return result
-    }
-
-    /// 判断是否为 Electron 子进程（helper/renderer/gpu/crashpad 等）
-    private static func isHelperCommandLine(_ cmd: String) -> Bool {
-        let helperKeywords: [String] = [
-            "--type=", "helper", "renderer", "gpu", "crashpad",
-            "utility", "audio", "sandbox", "--node-ipc",
-            "--clientprocessid=", "resources/app/extensions/",
-        ]
-        for keyword in helperKeywords {
-            if cmd.contains(keyword) { return true }
-        }
-        return false
-    }
-
-    /// 对指定 PID 列表发送 SIGTERM
-    private static func sendSIGTERM(to pids: [Int]) {
-        for pid in pids {
-            let task = Process()
-            task.launchPath = "/bin/kill"
-            task.arguments = ["-15", String(pid)]
-            try? task.run()
-            task.waitUntilExit()
-        }
-    }
-
-    /// 对指定 PID 列表发送 SIGKILL（强制退出）
-    private static func sendSIGKILL(to pids: [Int]) {
-        for pid in pids {
-            let task = Process()
-            task.launchPath = "/bin/kill"
-            task.arguments = ["-9", String(pid)]
-            try? task.run()
-            task.waitUntilExit()
-        }
-    }
-
-    /// 轮询等待 PID 退出，每 120ms 检查一次
-    /// 僵尸态（Z）视为已退出
-    private static func waitPidsExit(_ pids: [Int], timeout: TimeInterval) -> Bool {
-        let start = Date()
-        while Date().timeIntervalSince(start) < timeout {
-            var anyAlive = false
-            for pid in pids {
-                if isPidRunning(pid) { anyAlive = true; break }
-            }
-            if !anyAlive { return true }
-            Thread.sleep(forTimeInterval: 0.12)
-        }
-        return false
-    }
-
-    /// 检查 PID 是否存活（ps -p <pid> -o stat=，僵尸态 Z 视为已死）
-    private static func isPidRunning(_ pid: Int) -> Bool {
-        let task = Process()
-        task.launchPath = "/bin/ps"
-        task.arguments = ["-p", String(pid), "-o", "stat="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return false }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespaces) else { return false }
-        if output.isEmpty { return false }
-        // 僵尸态 Z 视为已退出
-        if output.first == "Z" || output.first == "z" { return false }
-        return true
+        Logger.log(.switchAccount, "[iBalance] switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
     }
 
     /// 将账号凭据写入 workbuddy-desktop.info（原子写入）

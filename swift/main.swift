@@ -21,7 +21,7 @@ enum DialogMetrics {
     /// 输入类弹窗（配置Key/千问）内容宽：说明文字较长，在默认宽基础上加宽一档
     static let inputWidth: CGFloat = 280
     /// accessory 内控件区左右边距（说明/控件距窗口边缘 = 系统 16pt + 此值）
-    static let sidePadding: CGFloat = 4
+    static let sidePadding: CGFloat = 8
     /// accessory 内富文本说明与控件区间距
     static let vSpacing: CGFloat = 8
     /// 苹果 HIG：标准 alert 图标 64×64pt
@@ -150,25 +150,11 @@ final class DialogShell {
         return resp.rawValue >= 1000 ? resp.rawValue - 1000 : -1
     }
 
-    /// 调试日志：居中逻辑执行轨迹（排查不居中问题，写 /tmp/ib_dialog_debug.log）
-    private func debugLog(_ msg: String) {
-        let line = "\(Date().timeIntervalSince1970) \(msg)\n"
-        let url = URL(fileURLWithPath: "/tmp/ib_dialog_debug.log")
-        if let h = FileHandle(forWritingAtPath: url.path) {
-            h.seekToEndOfFile()
-            if let d = line.data(using: .utf8) { h.write(d) }
-            h.closeFile()
-        } else {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
-        }
-    }
-
     /// 模态运行中：把系统图标与标题水平居中（说明文字/按钮/间距保持系统排版）。
     /// ⚠️ v44 原生化后系统标题字段/图标视图的装配晚于 runModal 后的第一个 async tick，
     /// 直接执行会因找不到视图而静默跳过（表现为不居中）——先探测就绪，未就绪则 50ms 重试。
     private func centerIconAndTitle(retries: Int = 8) {
         guard let cv = alert.window.contentView else {
-            debugLog("no contentView, retries=\(retries)")
             return
         }
         cv.layoutSubtreeIfNeeded()
@@ -176,7 +162,6 @@ final class DialogShell {
         let title = alert.messageText
         let iconView = findSubview(named: "_NSAlertImageView", in: cv)
         let titleField = title.isEmpty ? nil : findTextField(withText: title, in: cv)
-        debugLog("title='\(title)' retries=\(retries) icon=\(iconView != nil) field=\(titleField != nil) subviews=\(cv.subviews.count)")
         if iconView == nil || titleField == nil {
             if retries > 0 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
@@ -191,7 +176,6 @@ final class DialogShell {
             iconView.frame.origin.x = (cv.bounds.width - size.width) / 2
             // 图标顶部与窗口顶部的间距 +4pt（整体下移）
             iconView.frame.origin.y -= 4
-            debugLog("icon centered x=\(iconView.frame.origin.x)")
         }
 
         if let tf = titleField {
@@ -205,7 +189,6 @@ final class DialogShell {
             tf.attributedStringValue = attr
             // 标题字段若为固有宽度（标题较短时），frame 也一并居中
             tf.frame.origin.x = (cv.bounds.width - tf.frame.width) / 2
-            debugLog("title centered frame=\(tf.frame) cvW=\(cv.bounds.width)")
         }
     }
 
@@ -249,6 +232,15 @@ private func makeDsBrandIcon() -> NSImage? {
 /// 千问品牌图标（PNG，保持原色非 template），用于千问账号弹窗
 private func makeQwenBrandIcon() -> NSImage? {
     guard let url = Bundle.main.url(forResource: "qwen-color", withExtension: "png"),
+          let img = NSImage(contentsOf: url) else { return nil }
+    img.isTemplate = false
+    img.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
+    return img
+}
+
+/// WorkBuddy 品牌图标（PNG，保持原色非 template），用于添加账号选择弹窗
+private func makeWbBrandIcon() -> NSImage? {
+    guard let url = Bundle.main.url(forResource: "workbuddy", withExtension: "png"),
           let img = NSImage(contentsOf: url) else { return nil }
     img.isTemplate = false
     img.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
@@ -441,7 +433,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var autoCheckinMenuItem: NSMenuItem!
     private var refreshIntervalMenuItem: NSMenuItem!
     private var refreshIntervalOptions: [NSMenuItem] = []
-    private var decimalsDsMenuItem: NSMenuItem!
     private var decimalsQwMenuItem: NSMenuItem!
     private var hideMainIconMenuItem: NSMenuItem!
     private var timer: Timer?
@@ -461,8 +452,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var panelAnchorOrigin: NSPoint?
     /// popover window 的 frame KVO 观察令牌：面板打开期间生效，关闭时移除。
     private var panelFrameObserver: NSKeyValueObservation?
-    // 面板关闭时是否跳过「归还焦点」（打开设置菜单的场景需要保持前台，不能 hide）
-    private var suppressHideOnClose = false
     // 最近一次面板关闭所在事件的时间戳（transient 面板外点击会先关闭面板，
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
@@ -484,12 +473,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// TRAE 多账号额度缓存：uid → (limit, used)
     private var cacheTraeAccounts: [String: (limit: Double, used: Double)] = [:]
     private var cacheQw: QianwenService.Quota?
+    /// ZCode 多账号额度缓存：uid → (remain, total, planEndsAt)，remain/total 为 token 数，planEndsAt 为免费套餐到期戳（0=无）
+    private var cacheZcodeAccounts: [String: (remain: Double, total: Double, planEndsAt: TimeInterval)] = [:]
     // 点阵脉冲状态：仅由真实数据刷新（refreshOne*）更新，面板开关 syncPanel 只读不写
     // 规则：usedRatio 上升（额度被消耗）→ pulsing=true；稳定或回升 → pulsing=false
     private var prevTraeRatio: [String: Double] = [:]
     private var traePulsing: [String: Bool] = [:]
     private var prevWbRatio: [String: Double] = [:]
     private var wbPulsing: [String: Bool] = [:]
+    private var prevZcodeRatio: [String: Double] = [:]
+    private var zcodePulsing: [String: Bool] = [:]
     private var prevQwRatio: Double = -1   // -1 = 未初始化
     private var qwPulsing = false
     private var prevDsRatio: Double = -1   // DeepSeek 已用占比上次值（-1 = 未初始化）
@@ -564,11 +557,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updateRefreshIntervalMenuTitle()
 
         menu.addItem(NSMenuItem.separator())
-
-        decimalsDsMenuItem = NSMenuItem(title: "DeepSeek 显示2位小数", action: #selector(onToggleDecimals(_:)), keyEquivalent: "")
-        decimalsDsMenuItem.target = self
-        decimalsDsMenuItem.state = (config.deepseekDecimals == 2) ? .on : .off
-        menu.addItem(decimalsDsMenuItem)
 
         decimalsQwMenuItem = NSMenuItem(title: "Qwen 显示1位小数", action: #selector(onToggleDecimals(_:)), keyEquivalent: "")
         decimalsQwMenuItem.target = self
@@ -720,6 +708,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return f.string(from: NSNumber(value: dv)) ?? String(format: "%.\(decimals)f", dv)
     }
 
+    /// 按服务器回传的原始小数位格式化（不截断不补零），千分位美化
+    private func fmtAmountRaw(_ raw: String) -> String {
+        let frac = raw.contains(".") ? raw.split(separator: ".", maxSplits: 1)[1].count : 0
+        return fmtAmountCommas(raw, decimals: min(frac, 8))
+    }
+
     // MARK: - 详情面板（NSPopover）
 
     /// 左键点击 → 切换详情面板；右键 → 手动弹出设置菜单。
@@ -755,16 +749,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onOpenCockpit = { [weak self] in self?.onOpenCockpit() }
         panel.onToggleAutoCheckin = { [weak self] in self?.onToggleAutoCheckin() }
         panel.onAddWbAccount = { [weak self] in self?.onAddWbAccount() }
+        panel.onAddZcodeAccount = { [weak self] in self?.onAddZcodeAccount() }
         panel.onSetDsQuota = { [weak self] in self?.onSetDsQuota() }
         panel.onSetInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
-        panel.onToggleDsDecimals = { [weak self] in self?.toggleDsDecimals() }
-        panel.onToggleQwDecimals = { [weak self] in self?.toggleQwDecimals() }
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
         panel.onSetQwTicket = { [weak self] in self?.onSetQianwenTicket() }
         panel.onToggleHideIcon = { [weak self] in self?.onToggleHideMainIcon() }
         panel.onToggleHideWbNickname = { [weak self] in self?.onToggleHideWbNickname() }
+        panel.onToggleDebug = { [weak self] in self?.onToggleDebug() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
+        panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
         panel.onQuit = { [weak self] in self?.onQuit() }
         // 余额卡片点击：DeepSeek / 千问 打开浏览器，TRAE / WorkBuddy 启动应用
         panel.onClickDeepSeek = {
@@ -784,6 +779,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onCollectTraeAccount = { [weak self] in self?.onCollectTraeAccount() }
         panel.onSwitchTraeAccount = { [weak self] uid in
             self?.switchTraeAccount(uid: uid)
+        }
+        panel.onClickZcode = { [weak self] in
+            self?.openApp(bundleId: "dev.zcode.app", missingTitle: "未找到 ZCode 应用",
+                          missingMsg: "未找到 Bundle ID 为 dev.zcode.app 的应用，请确认 ZCode 已安装。")
+        }
+        panel.onSwitchZcodeAccount = { [weak self] uid in
+            self?.switchZcodeAccount(uid: uid)
         }
         panel.onClickQianwen = {
             NSWorkspace.shared.open(URL(string: "https://platform.qianwenai.com/home/billing/subscription/token-plan-individual")!)
@@ -859,7 +861,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// popover 关闭后归还焦点（隐藏 App），让之前活跃的应用恢复前台，
-    /// 避免菜单栏小工具霸占焦点。「打开设置菜单」触发的关闭由 suppressHideOnClose 跳过。
+    /// 避免菜单栏小工具霸占焦点。
     func popoverDidClose(_ notification: Notification) {
         // 移除面板位置锁定：停用 KVO + 清空原始 origin
         panelFrameObserver?.invalidate()
@@ -868,10 +870,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 记录关闭时正在处理的事件时间戳：transient「面板外点击」关闭时，
         // currentEvent 即该 click（onStatusItemClicked 用它识别同一 click，避免抖动重弹）
         lastCloseEventTime = NSApp.currentEvent?.timestamp ?? 0
-        if suppressHideOnClose {
-            suppressHideOnClose = false   // 标志只消费一次，避免残留影响下次关闭
-            return
-        }
         NSApp.hide(nil)
     }
 
@@ -881,20 +879,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.offline = isOffline
         s.updatedAt = lastUpdatedAt
         if let ds = cacheDs {
-            s.ds = "\(ds.symbol)\u{2009}\(fmtAmountCommas(ds.totalRaw, decimals: config.deepseekDecimals))"
+            s.ds = "\(ds.symbol)\u{2009}\(fmtAmountRaw(ds.totalRaw))"
             if config.deepseekCommonQuota > 0 {
                 let used = max(0, config.deepseekCommonQuota - ds.total)
                 s.dsUsedRatio = min(1, used / config.deepseekCommonQuota)
             }
             s.dsPulsing = dsPulsing
         }
+        // 调试模式：DeepSeek 金额固定 999.99（无缓存时也显示，便于查看卡片 UI）
+        if config.debugMode {
+            s.ds = "¥\u{2009}999.99"
+        }
         if config.deepseekCommonQuota > 0 {
             s.dsInfoText = "日常额度 ¥\(Int(config.deepseekCommonQuota))"
-        }
-        if let trae = cacheTrae {
-            s.traeValue = fmtAmountCommas(trae.limit - trae.used, decimals: 0)
-            s.traeUsed = trae.used
-            s.traeLimit = trae.limit
         }
         let today = Self.todayString()
         // TRAE 多账号余额卡片：当前账号排最上
@@ -907,7 +904,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         for ac in traeAccountsList {
             let isCurrent = ac.uid == traeMainUid
             let cached = cacheTraeAccounts[ac.uid]
-            var snap = TraeAccountSnapshot(uid: ac.uid, nickname: ac.username, isCurrent: isCurrent)
+            var snap = AccountCardSnapshot(uid: ac.uid, nickname: ac.username, isCurrent: isCurrent)
             if let c = cached {
                 snap.value = fmtAmountCommas(c.limit - c.used, decimals: 0)
                 if c.limit > 0 {
@@ -915,18 +912,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: "trae_checkin_date_\(ac.uid)") == today
-            snap.checkinFailed = UserDefaults.standard.bool(forKey: "trae_checkin_failed_\(ac.uid)")
-            snap.checkinStreak = UserDefaults.standard.integer(forKey: "trae_checkin_streak_\(ac.uid)")
-            snap.checkinReward = UserDefaults.standard.integer(forKey: "trae_checkin_reward_\(ac.uid)")
+            snap.checkinFailed = UserDefaults.standard.string(forKey: "trae_checkin_failed_date_\(ac.uid)") == today
+            snap.streak = UserDefaults.standard.integer(forKey: "trae_checkin_streak_\(ac.uid)")
+            snap.reward = UserDefaults.standard.integer(forKey: "trae_checkin_reward_\(ac.uid)")
             snap.pulsing = traePulsing[ac.uid] ?? false
             s.traeAccounts.append(snap)
         }
         if let qw = cacheQw, qw.weekLimit > 0 {
             let weekPct = qw.weekRem / qw.weekLimit * 100
             s.qwWeek = fmtAmountCommas(weekPct, decimals: config.qianwenDecimals) + "%"
-            if qw.h5Limit > 0 {
-                s.qwH5 = fmtAmountCommas(qw.h5Rem / qw.h5Limit * 100, decimals: config.qianwenDecimals) + "%"
-            }
             s.qwWeekUsedRatio = 1 - weekPct / 100
             s.qwPulsing = qwPulsing
             // 套餐到期天数：优先用 API 返回的 remainingDays（和官网显示完全一致）
@@ -957,7 +951,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         for ac in accounts {
             let isCurrent = ac.uid == mainUid
             let cached = cacheWbAccounts[ac.uid]
-            var snap = WBAccountSnapshot(uid: ac.uid, nickname: ac.nickname, isCurrent: isCurrent)
+            var snap = AccountCardSnapshot(uid: ac.uid, nickname: ac.nickname, isCurrent: isCurrent)
             if let c = cached {
                 snap.value = fmtAmountCommas(c.remain, decimals: 0)
                 if c.total > 0 {
@@ -965,47 +959,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: "wb_checkin_date_\(ac.uid)") == today
-            snap.checkinFailed = UserDefaults.standard.bool(forKey: "wb_checkin_failed_\(ac.uid)")
+            snap.checkinFailed = UserDefaults.standard.string(forKey: "wb_checkin_failed_date_\(ac.uid)") == today
             snap.streak = UserDefaults.standard.integer(forKey: "wb_checkin_streak_\(ac.uid)")
             snap.reward = UserDefaults.standard.integer(forKey: "wb_checkin_reward_\(ac.uid)")
             snap.pulsing = wbPulsing[ac.uid] ?? false
             s.wbAccounts.append(snap)
         }
+        // ZCode 多账号余额卡片：当前登录账号（config.json token 对应 uid）排最上
+        let zcodeMainUid = ZcodeService.currentUid() ?? ""
+        let zcodeAccountsList = config.zcodeAccounts.sorted { a, b in
+            if a.uid == zcodeMainUid { return true }
+            if b.uid == zcodeMainUid { return false }
+            return false
+        }
+        for ac in zcodeAccountsList {
+            let isCurrent = ac.uid == zcodeMainUid
+            let cached = cacheZcodeAccounts[ac.uid]
+            var snap = AccountCardSnapshot(uid: ac.uid, nickname: ac.displayName, isCurrent: isCurrent)
+            if let c = cached, c.total > 0 {
+                snap.value = fmtAmountCommas(c.remain / c.total * 100, decimals: 1) + "%"
+                snap.usedRatio = (c.total - c.remain) / c.total
+                // 到期副标题：仅当前账号 + 有免费套餐（Start Plan）时显示，剩余时长 HH:mm（小时可超 24）
+                if isCurrent, c.planEndsAt > 0 {
+                    let remainSec = c.planEndsAt - Date().timeIntervalSince1970
+                    if remainSec > 0 {
+                        let h = Int(remainSec) / 3600
+                        let m = (Int(remainSec) % 3600) / 60
+                        snap.expireText = String(format: "\u{2009}%02d:%02d\u{2009}后到期", h, m)
+                    }
+                }
+            }
+            snap.pulsing = zcodePulsing[ac.uid] ?? false
+            s.zcodeAccounts.append(snap)
+        }
         // ── 设置/操作状态 ──
         s.traeAutoCheckin = config.traeAutoCheckin
-        // TRAE 签到状态从当前账号 uid 读取（多账号按 uid 区分存储）
-        s.traeCheckinTime = UserDefaults.standard.string(forKey: "trae_last_checkin_time_\(traeMainUid)")
-        s.traeCheckinDone = UserDefaults.standard.string(forKey: "trae_checkin_date_\(traeMainUid)") == today
-        s.traeCheckinFailed = UserDefaults.standard.bool(forKey: "trae_checkin_failed_\(traeMainUid)")
-        s.traeCheckinStreak = UserDefaults.standard.integer(forKey: "trae_checkin_streak_\(traeMainUid)")
-        s.traeCheckinReward = UserDefaults.standard.integer(forKey: "trae_checkin_reward_\(traeMainUid)")
         s.wbAutoCheckin = config.workbuddyAutoCheckin
-        if !accounts.isEmpty {
-            let done = accounts.filter {
-                UserDefaults.standard.string(forKey: "wb_checkin_date_\($0.uid)") == today
-            }.count
-            var desc = "\(done)/\(accounts.count)"
-            if let t = UserDefaults.standard.string(forKey: "wb_last_checkin_time"), !t.isEmpty {
-                desc += " \(t)"
-            }
-            s.wbCheckinDesc = desc
-        }
-        // 统一签到时间：取 TRAE / WB 最近一次签到的最晚时间（M-d HH:mm）
-        // TRAE 多账号取所有账号中最晚的签到时间
-        var traeTime = ""
+        // 自动签到副标题：今日签到统计「M-d x成功 x失败」（手动一键签到写同一套标记，自然计入；
+        // 失败按 failed_date==today 口径，昨日失败残留不计）
+        var okCount = 0
+        var failCount = 0
         for ac in traeAccountsList {
-            if let t = UserDefaults.standard.string(forKey: "trae_last_checkin_time_\(ac.uid)"), !t.isEmpty {
-                traeTime = Self.latestCheckinTime(trae: traeTime, wb: t) ?? t
-            }
+            if UserDefaults.standard.string(forKey: "trae_checkin_date_\(ac.uid)") == today { okCount += 1 }
+            if UserDefaults.standard.string(forKey: "trae_checkin_failed_date_\(ac.uid)") == today { failCount += 1 }
         }
-        let wbTime = UserDefaults.standard.string(forKey: "wb_last_checkin_time") ?? ""
-        s.lastCheckinTime = Self.latestCheckinTime(trae: traeTime, wb: wbTime)
+        for ac in accounts {
+            if UserDefaults.standard.string(forKey: "wb_checkin_date_\(ac.uid)") == today { okCount += 1 }
+            if UserDefaults.standard.string(forKey: "wb_checkin_failed_date_\(ac.uid)") == today { failCount += 1 }
+        }
+        if okCount + failCount > 0 {
+            let df = DateFormatter()
+            df.dateFormat = "M-d"
+            s.lastCheckinTime = "\(df.string(from: Date())) \(okCount)成功 \(failCount)失败"
+        }
         s.wbOauthInProgress = wbOauthInProgress
         s.refreshIntervalSeconds = Int(config.refreshInterval)
-        s.deepseekDecimals = config.deepseekDecimals
-        s.qianwenDecimals = config.qianwenDecimals
         s.hideMainIcon = config.hideMainIcon
         s.hideWbNickname = config.hideWbNickname
+        s.debugMode = config.debugMode
         return s
     }
 
@@ -1026,19 +1037,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func onToggleDecimals(_ sender: NSMenuItem) {
-        if sender == decimalsDsMenuItem {
-            toggleDsDecimals()
-        } else if sender == decimalsQwMenuItem {
+        if sender == decimalsQwMenuItem {
             toggleQwDecimals()
         }
-    }
-
-    /// DeepSeek 小数位 0/2 切换（菜单与面板共用）
-    private func toggleDsDecimals() {
-        config.deepseekDecimals = (config.deepseekDecimals == 2) ? 0 : 2
-        decimalsDsMenuItem.state = (config.deepseekDecimals == 2) ? .on : .off
-        updateTitle()
-        ConfigStore.save(config)
     }
 
     /// 千问小数位 0/1 切换（菜单与面板共用）
@@ -1091,6 +1092,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
+    /// 调试模式：余额卡片角标全显 + DeepSeek 金额固定 999.99（UI 验证用）
+    @objc private func onToggleDebug() {
+        config.debugMode = !config.debugMode
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
     @objc private func onQuit() {
         NSApp.terminate(nil)
     }
@@ -1100,6 +1108,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let shell = DialogShell()
         shell.addIcon(NSApp.applicationIconImage)
         shell.addTitle("关于 iBalance")
+        // 长文阅读类弹窗：内容宽 +8 抵消 sidePadding 增量，保持正文行宽不变
+        shell.contentWidth = DialogMetrics.width + 8
         shell.addInfo("菜单栏常驻小工具，实时聚合多平台账户余额与积分。\n\n"
             + "• DeepSeek 余额（API Key 查询）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• 千问 Token Plan 周额度（Edge 登录态）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
             + "配置存于同目录 config.json\n版本 v\(build)")
@@ -1147,7 +1157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         var hasContent = false
 
         if let ds = cacheDs {
-            let total = fmtAmountCommas(ds.totalRaw, decimals: config.deepseekDecimals)
+            let total = fmtAmountRaw(ds.totalRaw)
             if !config.hideMainIcon { append(" ") }
             append(ds.symbol)
             append("\u{2009}\(total)", bold: true)
@@ -1211,7 +1221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         async let b: Void = refreshOneWorkBuddy(cfg)
         async let c: Void = refreshOneTrae(cfg)
         async let d: Void = refreshOneQianwen(cfg)
-        _ = await (a, b, c, d)
+        async let e: Void = refreshOneZcode(cfg)
+        _ = await (a, b, c, d, e)
 
         // 已被取消（被更新的刷新取代）→ 不写收尾状态，避免提前停掉新任务的刷新动效
         guard !Task.isCancelled else { return }
@@ -1290,6 +1301,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         wbPulsing[uid] = pulsing
     }
 
+    // MARK: - ZCode（智谱 Coding Plan）余额刷新
+
+    /// 遍历 config 中导入的 ZCode 账号，逐号查询 Coding Plan 用量（本平台无签到）
+    private func refreshOneZcode(_ cfg: AppConfig) async {
+        for ac in cfg.zcodeAccounts {
+            if Task.isCancelled { return }  // 被新刷新取代：不再发后续账号请求
+            // 存量账号自动回填昵称（早期导入无 nickname）：credentials.json 可解出且 uid 匹配时写入一次
+            if ac.nickname.isEmpty, let nick = ZcodeService.autoNickname(forUid: ac.uid),
+               let idx = config.zcodeAccounts.firstIndex(where: { $0.uid == ac.uid }) {
+                config.zcodeAccounts[idx].nickname = nick
+                ConfigStore.save(config)
+            }
+            let r = await ZcodeService.fetchBalance(token: ac.token)
+            guard !Task.isCancelled, r.total > 0 else { continue }
+            cacheZcodeAccounts[ac.uid] = r
+            var prev = prevZcodeRatio[ac.uid] ?? -1
+            var pulsing = zcodePulsing[ac.uid] ?? false
+            updatePulsingState(prevRatio: &prev, pulsing: &pulsing,
+                               newRatio: r.total > 0 ? (r.total - r.remain) / r.total : 0)
+            prevZcodeRatio[ac.uid] = prev
+            zcodePulsing[ac.uid] = pulsing
+        }
+        syncPanel()
+    }
+
     private func refreshOneTrae(_ cfg: AppConfig) async {
         // 主账号（当前登录）：从 storage.json 解密查询
         let mainUid = TraeService.readAuthInfo(storagePath: cfg.traeStoragePath)?.uid ?? ""
@@ -1353,11 +1389,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - WorkBuddy 自动签到
 
-    private func updateWbAutoCheckinMenuTitle() {
-        // 合并开关后不单独更新菜单标题，仅刷新面板
-        syncPanel()
-    }
-
     /// 收集待签到账号：config 预存的其他账号 + 当前登录账号（token 自动刷新，uid 去重）
     /// 主账号不在 config 时自动持久化（含 refreshToken/expiresAt），下次主账号切换后原账号仍可续期签到。
     private func wbCheckinAccounts() -> [WBAccount] {
@@ -1375,7 +1406,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 多号签到核心：遍历账号，每号本地日期守卫（每天最多一次），签到前自动刷新 token。
     /// streak/reward 为 0 时即使今天已签也会查状态补全。
-    private func wbAutoCheckinIfNeeded() async {
+    /// 自动路径走错峰：每账号每天有随机就绪时刻（now+0~10min，wbCheckinReadyTimestamp），
+    /// 未到点的账号本轮跳过（不打任何接口）；force=true（手动一键签到）绕过错峰立即全签。
+    private func wbAutoCheckinIfNeeded(force: Bool = false) async {
         let today = Self.todayString()
         var accounts = wbCheckinAccounts()
         for i in 0..<accounts.count {
@@ -1385,8 +1418,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let rewardKey = "wb_checkin_reward_\(ac.uid)"
             let prevStreak = UserDefaults.standard.integer(forKey: streakKey)
             let prevReward = UserDefaults.standard.integer(forKey: rewardKey)
-            // 今天已签到且 streak/reward 均有值 → 跳过
-            if UserDefaults.standard.string(forKey: dateKey) == today && prevStreak > 0 && prevReward > 0 { continue }
+            // 今天已签到且 streak/reward 均有值且 history 已有今天的记录 → 跳过
+            // （history 缺记录时放行进下方流程查状态补写，补上后恢复零网络跳过）
+            if UserDefaults.standard.string(forKey: dateKey) == today && prevStreak > 0 && prevReward > 0
+               && checkinHistory(key: "wb_checkin_history_\(ac.uid)").contains(where: { $0.date == today }) { continue }
+
+            // 错峰守卫：未到今日就绪时刻的账号本轮跳过（手动一键签到不受限）
+            if !force,
+               Date().timeIntervalSince1970 < Self.checkinReadyTimestamp(keyPrefix: "wb_checkin_ready", uid: ac.uid, today: today) {
+                continue
+            }
 
             // 签到前自动刷新 token（距过期 < 1 小时则用 refreshToken 续期）
             let refreshed = await WorkBuddyService.refreshTokenIfNeeded(account: ac)
@@ -1419,22 +1460,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         if newReward > 0 {
                             UserDefaults.standard.set(newReward, forKey: rewardKey)
                         }
-                        // 状态补全也追加历史记录（仅当今天还没记录过）
-                        if prevStreak == 0 || prevReward == 0 {
-                            let timeStr = UserDefaults.standard.string(forKey: "wb_last_checkin_time") ?? Self.nowTimeString()
-                            appendCheckinHistory(key: "wb_checkin_history_\(ac.uid)",
-                                                 date: today, time: timeStr, reward: newReward, streak: newStreak)
+                        // 状态补全也追加历史记录（今天 history 无记录才补：streak/reward 是跨天
+                        // 持久值，非零不能代表「今天已记录」；补记时刻用当前时间，服务端不返回真实时刻）
+                        let hk = "wb_checkin_history_\(ac.uid)"
+                        if !checkinHistory(key: hk).contains(where: { $0.date == today }) {
+                            appendCheckinHistory(key: hk,
+                                                 date: today, time: Self.nowTimeString(), reward: newReward, streak: newStreak)
                         }
                         // 只有确认今天已签到才写 dateKey=today；
                         // !st.available（活动不可用/token 过期）不写，避免签到流程误判已签
                         UserDefaults.standard.set(today, forKey: dateKey)
                         // 已确认签到成功，清除历史失败残留标记（与 TRAE 侧对齐）
                         UserDefaults.standard.set(false, forKey: "wb_checkin_failed_\(ac.uid)")
+                        UserDefaults.standard.removeObject(forKey: "wb_checkin_failed_date_\(ac.uid)")
                     }
-                    updateWbAutoCheckinMenuTitle()
+                    syncPanel()
                     continue
                 }
             }
+
+            // 已签（dateKey==today）但状态补全未确认成功（如 status 查询失败）→
+            // 不发起 claim，等待下轮补写历史，避免对已签账号误触发签到接口
+            if UserDefaults.standard.string(forKey: dateKey) == today { continue }
 
             // 执行签到
             let r = await WorkBuddyService.claimCheckin(token: ac.token, uid: ac.uid, domain: ac.domain)
@@ -1454,7 +1501,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 // 追加历史记录
                 appendCheckinHistory(key: "wb_checkin_history_\(ac.uid)",
                                      date: today, time: timeStr, reward: credit, streak: newStreak)
-                updateWbAutoCheckinMenuTitle()
+                syncPanel()
                 // 签到后刷新积分显示（仅当前登录号）
                 if config.workbuddyEnabled, WorkBuddyService.authInfo()?.uid == ac.uid {
                     if let wb = await WorkBuddyService.fetchSummary() {
@@ -1466,28 +1513,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 content.title = "WorkBuddy 自动签到（\(ac.nickname)）"
                 content.body = r.creditDesc.isEmpty ? "签到成功 ✓" : "签到成功 ✓ 积分：\(r.creditDesc)"
                 UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_auto_checkin_\(ac.uid)", content: content, trigger: nil)) { _ in }
-                // 签到成功清除失败标记
+                // 签到成功清除失败标记（含日期口径，用于卡片角标/统计）
                 UserDefaults.standard.set(false, forKey: "wb_checkin_failed_\(ac.uid)")
+                UserDefaults.standard.removeObject(forKey: "wb_checkin_failed_date_\(ac.uid)")
             } else {
-                // 签到失败：记录失败标记（用于面板显示 wrongwaysign 未签到）
+                // 签到失败：记录失败标记 + 当日日期（用于卡片角标与「x成功 x失败」统计）
                 UserDefaults.standard.set(true, forKey: "wb_checkin_failed_\(ac.uid)")
+                UserDefaults.standard.set(today, forKey: "wb_checkin_failed_date_\(ac.uid)")
                 syncPanel()
             }
         }
     }
 
-    // MARK: - WorkBuddy OAuth 账号采集
+    // MARK: - WorkBuddy 添加账号（OAuth 采集 / 当前账号 JSON 导入）
 
     @objc private func onAddWbAccount() {
+        // OAuth 采集进行中 → 再点一次 = 取消采集
         guard !wbOauthInProgress else {
             wbOauthCancelled = true
             return
         }
+        // 选择导入方式（同步模态，keepPanelAliveDuring 保持面板不关闭）
+        let shell = DialogShell()
+        shell.addIcon(makeWbBrandIcon())
+        shell.addTitle("添加 WorkBuddy 账号")
+        shell.contentWidth = DialogMetrics.inputWidth
+        shell.addInfo("OAuth 导入：打开浏览器登录新账号，登录成功后自动采集凭据。\n\nJSON 导入：读取 WorkBuddy Desktop 当前登录账号（auth 文件），适合已在 Desktop 登录的账号。")
+        let oauth = shell.addButton("OAuth 导入", keyEquivalent: "\r")
+        let json = shell.addButton("JSON 导入")
+        shell.addButton("取消", keyEquivalent: "\u{1b}")
+        let clicked = keepPanelAliveDuring { shell.present() }
+        if clicked == oauth {
+            startWbOauth()
+        } else if clicked == json {
+            importWbFromAuthFile()
+        }
+    }
+
+    /// 启动 OAuth 采集（浏览器登录 → 轮询 token → 写入 config）
+    private func startWbOauth() {
         wbOauthInProgress = true
         wbOauthCancelled = false
         wbOauthMenuItem.title = "取消添加 WorkBuddy 账号…"
         syncPanel()
         Task { await runOauth() }
+    }
+
+    /// 从 WorkBuddy Desktop 当前登录账号导入：读取 auth 文件（workbuddy-desktop.info，JSON 格式），
+    /// uid 去重后写入 config（已存在则更新凭据），随后拉取余额刷新卡片。
+    private func importWbFromAuthFile() {
+        guard let auth = WorkBuddyService.authInfo() else {
+            let shell = DialogShell()
+            shell.addTitle("导入失败")
+            shell.addInfo("未读取到 WorkBuddy Desktop 的登录信息。\n请先在 WorkBuddy Desktop 中登录账号后重试。")
+            shell.addButton("好的", keyEquivalent: "\r")
+            _ = keepPanelAliveDuring { shell.present() }
+            return
+        }
+        let account = WBAccount(token: auth.token, uid: auth.uid, domain: auth.domain,
+                                nickname: auth.nickname, refreshToken: auth.refreshToken, expiresAt: auth.expiresAt)
+        let existed = config.workbuddyAccounts.contains { $0.uid == account.uid }
+        if let idx = config.workbuddyAccounts.firstIndex(where: { $0.uid == account.uid }) {
+            config.workbuddyAccounts[idx] = account
+        } else {
+            config.workbuddyAccounts.append(account)
+        }
+        ConfigStore.save(config)
+        syncPanel()
+        // 导入后立即拉取余额刷新卡片；自动签到开启时补一次签到（与 OAuth 导入对齐）
+        Task { await refreshOneWorkBuddy(config) }
+        if config.workbuddyAutoCheckin {
+            Task { await wbAutoCheckinIfNeeded() }
+        }
+        let shell = DialogShell()
+        shell.addTitle("导入成功")
+        shell.addInfo(existed
+            ? "已更新账号「\(account.nickname)」的凭据（共 \(config.workbuddyAccounts.count) 个账号）"
+            : "已导入账号「\(account.nickname)」（共 \(config.workbuddyAccounts.count) 个账号）")
+        shell.addButton("好的", keyEquivalent: "\r")
+        _ = keepPanelAliveDuring { shell.present() }
     }
 
     private func runOauth() async {
@@ -1651,9 +1755,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         Task {
-            // 与自动签到完全一致的逻辑链路（每日守卫、token 刷新、退避均生效）
-            async let traeTask = traeAutoCheckinIfNeeded()
-            async let wbTask = wbAutoCheckinIfNeeded()
+            // 与自动签到完全一致的逻辑链路（每日守卫、token 刷新、退避均生效）；
+            // force 绕过两平台错峰就绪时刻：手动一键签到立即全签
+            async let traeTask = traeAutoCheckinIfNeeded(force: true)
+            async let wbTask = wbAutoCheckinIfNeeded(force: true)
             _ = await (traeTask, wbTask)
 
             // ── 汇总各账号签到结果 ──
@@ -1663,7 +1768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
             for ac in traeCheckinAccounts() {
                 let dateKey = UserDefaults.standard.string(forKey: "trae_checkin_date_\(ac.uid)") ?? ""
-                let failed = UserDefaults.standard.bool(forKey: "trae_checkin_failed_\(ac.uid)")
+                let failed = UserDefaults.standard.string(forKey: "trae_checkin_failed_date_\(ac.uid)") == today
                 let streak = UserDefaults.standard.integer(forKey: "trae_checkin_streak_\(ac.uid)")
                 let reward = UserDefaults.standard.integer(forKey: "trae_checkin_reward_\(ac.uid)")
                 if dateKey == today {
@@ -1682,7 +1787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             for ac in wbCheckinAccounts() {
                 let dateKey = UserDefaults.standard.string(forKey: "wb_checkin_date_\(ac.uid)") ?? ""
-                let failed = UserDefaults.standard.bool(forKey: "wb_checkin_failed_\(ac.uid)")
+                let failed = UserDefaults.standard.string(forKey: "wb_checkin_failed_date_\(ac.uid)") == today
                 let streak = UserDefaults.standard.integer(forKey: "wb_checkin_streak_\(ac.uid)")
                 let reward = UserDefaults.standard.integer(forKey: "wb_checkin_reward_\(ac.uid)")
                 if dateKey == today {
@@ -1747,6 +1852,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         _ = shell.present()
     }
 
+    // MARK: - 签到历史
+
+    /// 查看签到历史：汇总 TRAE / WB 各账号的签到记录，按时间倒序展示最近 20 条
+    @objc private func onShowCheckinHistory() {
+        keepPanelAliveDuring { presentCheckinHistory() }
+    }
+
+    /// 签到历史弹窗：沿用 DialogShell 原生模板（图标/标题居中 + 富文本结果列表 + 系统按钮），
+    /// 文字规格与输入类弹窗一致（12pt、与容器等宽）；长文阅读类，内容宽 +38
+    /// （8 抵消 sidePadding 增量 + 30 加宽 info 列表）
+    private func presentCheckinHistory() {
+        // 记录的 date 为 yyyy-MM-dd、time 为 M-d HH:mm（appendCheckinHistory 写入口径）
+        struct Row { let date: String; let time: String; let text: String }
+        var rows: [Row] = []
+        for ac in traeCheckinAccounts() {
+            for r in checkinHistory(key: "trae_checkin_history_\(ac.uid)") {
+                let reward = r.reward > 0 ? " 积分+\(r.reward)" : ""
+                rows.append(Row(date: r.date, time: r.time,
+                                text: "\(r.time) TRAE · \(ac.username)\(reward) 连续\(r.streak)天"))
+            }
+        }
+        for ac in wbCheckinAccounts() {
+            for r in checkinHistory(key: "wb_checkin_history_\(ac.uid)") {
+                let reward = r.reward > 0 ? " 积分+\(r.reward)" : ""
+                rows.append(Row(date: r.date, time: r.time,
+                                text: "\(r.time) WorkBuddy · \(ac.nickname)\(reward) 连续\(r.streak)天"))
+            }
+        }
+        // 仅显示最近两天（今天 + 昨天）；date 为 yyyy-MM-dd，字符串序即日期序
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        let cutoff = Calendar.current.date(byAdding: .day, value: -1, to: Date()).map { df.string(from: $0) } ?? ""
+        let sorted = rows
+            .filter { $0.date >= cutoff }
+            .sorted { $0.date == $1.date ? $0.time > $1.time : $0.date > $1.date }
+
+        let shell = DialogShell()
+        shell.addIcon(NSApp.applicationIconImage)
+        shell.addTitle("签到历史")
+        shell.contentWidth = DialogMetrics.inputWidth + 38
+        let para = NSMutableParagraphStyle()
+        para.lineSpacing = 3
+        let attr = NSMutableAttributedString()
+        func append(_ s: String, color: NSColor) {
+            attr.append(NSAttributedString(string: s, attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: color,
+                .paragraphStyle: para,
+            ]))
+        }
+        if sorted.isEmpty {
+            append("最近两天暂无签到记录", color: .secondaryLabelColor)
+        } else {
+            append("最近两天共 \(sorted.count) 条\n\n", color: .secondaryLabelColor)
+            for r in sorted {
+                append(r.text + "\n", color: .secondaryLabelColor)
+            }
+            // 去掉末行多余的换行
+            if attr.length > 0 { attr.deleteCharacters(in: NSRange(location: attr.length - 1, length: 1)) }
+        }
+        shell.addInfo(attr)
+        shell.addButton("关闭", keyEquivalent: "\r")
+        _ = shell.present()
+    }
+
     /// 补全 TRAE 多账号签到 streak/reward：遍历所有账号，streak 或 reward 为 0 时查状态 API 填充。
     /// 每天最多跑一次（trae_status_fill_date 守卫），避免每次余额刷新都打 status API 触发风控。
     /// auto-checkin 已开启且主账号今日已签到时跳过（签到流程会顺带补全 streak/reward，去重）。
@@ -1794,10 +1964,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 if newReward > 0 {
                     UserDefaults.standard.set(newReward, forKey: rewardKey)
                 }
-                if prevStreak == 0 || prevReward == 0 {
-                    let timeStr = UserDefaults.standard.string(forKey: timeKey) ?? Self.nowTimeString()
+                if !checkinHistory(key: "trae_checkin_history_\(ac.uid)").contains(where: { $0.date == today }) {
                     appendCheckinHistory(key: "trae_checkin_history_\(ac.uid)",
-                                         date: today, time: timeStr, reward: newReward, streak: newStreak)
+                                         date: today, time: Self.nowTimeString(), reward: newReward, streak: newStreak)
                 }
                 UserDefaults.standard.set(today, forKey: dateKey)
             }
@@ -1810,21 +1979,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 多账号签到核心：遍历所有 TRAE 账号，每号本地日期守卫（每天最多一次），
     /// streak/reward 为 0 时即使今天已签也会查状态补全。每号独立退避，避免触发风控。
     /// 文件日志写入 /tmp/iBalance_trae_checkin.log 便于测试观察。
-    private func traeAutoCheckinIfNeeded() async {
+    /// force=true（手动一键签到）绕过错峰就绪时刻立即全签；退避机制始终生效（防风控保护）。
+    private func traeAutoCheckinIfNeeded(force: Bool = false) async {
         let today = Self.todayString()
         let accounts = traeCheckinAccounts()
         let mainUid = TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? ""
-        let logPath = "/tmp/iBalance_trae_checkin.log"
-        func log(_ msg: String) {
-            let line = "\(Self.nowTimeString()) \(msg)\n"
-            if let h = FileHandle(forWritingAtPath: logPath) {
-                h.seekToEndOfFile()
-                if let d = line.data(using: .utf8) { h.write(d) }
-                h.closeFile()
-            } else {
-                try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
-            }
-        }
+        // 与 Logger.Channel.traeCheckin 同一落点（/tmp/iBalance_trae_checkin.log）
+        func log(_ msg: String) { Logger.log(.traeCheckin, msg) }
         log("=== 开始多账号签到，共 \(accounts.count) 个账号（mainUid=\(mainUid)）===")
         for ac in accounts {
             let dateKey = "trae_checkin_date_\(ac.uid)"
@@ -1835,9 +1996,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let timeKey = "trae_last_checkin_time_\(ac.uid)"
             let prevStreak = UserDefaults.standard.integer(forKey: streakKey)
             let prevReward = UserDefaults.standard.integer(forKey: rewardKey)
-            // 今天已签到 → 跳过（强本地守卫，零网络；streak/reward 缺失时由本地推算或下次签到补）
-            if UserDefaults.standard.string(forKey: dateKey) == today {
+            // 今天已签到 → 跳过（强本地守卫，零网络）；history 还没有今天的记录时放行，
+            // 走下方状态查证补写历史（补上后恢复零网络跳过）
+            if UserDefaults.standard.string(forKey: dateKey) == today
+               && checkinHistory(key: "trae_checkin_history_\(ac.uid)").contains(where: { $0.date == today }) {
                 log("[\(ac.uid)] 今日已签到，跳过")
+                continue
+            }
+            // 错峰守卫：未到今日就绪时刻的账号本轮跳过（手动一键签到不受限）
+            if !force,
+               Date().timeIntervalSince1970 < Self.checkinReadyTimestamp(keyPrefix: "trae_checkin_ready", uid: ac.uid, today: today) {
                 continue
             }
             // token：主账号从 storage.json 解密；其他账号从 encryptedAuthInfo 解密
@@ -1857,11 +2025,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             let stOpt = await TraeService.fetchCheckinStatus(token: tk, storagePath: config.traeStoragePath)
             guard let st = stOpt else {
-                // status 查询失败（网络/风控），设 5 分钟退避避免反复打
-                UserDefaults.standard.set(Date().addingTimeInterval(300), forKey: statusRetryKey)
-                log("[\(ac.uid)] status 查询失败，退避 300s")
+                // status 查询失败（网络/风控）：递增退避 5min→10min→…→60min 封顶，
+                // 防止 60s 轮询粒度下失败账号被反复重试（风控场景越打越糟）
+                let failCountKey = "trae_status_fail_count_\(ac.uid)"
+                let fails = UserDefaults.standard.integer(forKey: failCountKey) + 1
+                UserDefaults.standard.set(fails, forKey: failCountKey)
+                let backoff = min(TimeInterval(300) * pow(2, Double(fails - 1)), 3600)
+                UserDefaults.standard.set(Date().addingTimeInterval(backoff), forKey: statusRetryKey)
+                log("[\(ac.uid)] status 查询失败 x\(fails)，退避 \(Int(backoff))s")
                 continue
             }
+            UserDefaults.standard.set(0, forKey: "trae_status_fail_count_\(ac.uid)")
             log("[\(ac.uid)] 状态查询 enable=\(st.enable) checkedIn=\(st.checkedIn) continuousDays=\(st.continuousDays) reward=\(st.reward)")
             if !st.enable || st.checkedIn {
                 if st.checkedIn {
@@ -1879,14 +2053,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     if newReward > 0 {
                         UserDefaults.standard.set(newReward, forKey: rewardKey)
                     }
-                    if prevStreak == 0 || prevReward == 0 {
-                        let timeStr = UserDefaults.standard.string(forKey: timeKey) ?? Self.nowTimeString()
+                    if !checkinHistory(key: "trae_checkin_history_\(ac.uid)").contains(where: { $0.date == today }) {
                         appendCheckinHistory(key: "trae_checkin_history_\(ac.uid)",
-                                             date: today, time: timeStr, reward: newReward, streak: newStreak)
+                                             date: today, time: Self.nowTimeString(), reward: newReward, streak: newStreak)
                     }
                     UserDefaults.standard.set(today, forKey: dateKey)
                     UserDefaults.standard.removeObject(forKey: retryKey)
                     UserDefaults.standard.set(false, forKey: failedKey)
+                    UserDefaults.standard.removeObject(forKey: "trae_checkin_failed_date_\(ac.uid)")
                     log("[\(ac.uid)] 服务端已签到，补全 streak=\(newStreak) reward=\(newReward)")
                 }
                 syncPanel()
@@ -1896,6 +2070,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let retryTime = UserDefaults.standard.object(forKey: retryKey) as? Date,
                Date() < retryTime {
                 log("[\(ac.uid)] 退避期内，跳过（至 \(retryTime)）")
+                continue
+            }
+            // 已签（dateKey==today）但状态补全未确认成功（如 status 查询失败）→
+            // 不发起 claim，等待下轮补写历史，避免对已签账号误触发签到接口
+            if UserDefaults.standard.string(forKey: dateKey) == today {
+                log("[\(ac.uid)] 今日已签但历史待补全，跳过 claim")
                 continue
             }
             log("[\(ac.uid)] 开始执行签到请求…")
@@ -1925,6 +2105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 updateAutoCheckinMenuTitle()
                 UserDefaults.standard.set(false, forKey: failedKey)
                 UserDefaults.standard.removeObject(forKey: retryKey)
+                UserDefaults.standard.removeObject(forKey: "trae_checkin_failed_date_\(ac.uid)")
                 log("[\(ac.uid)] 签到成功 streak=\(newStreak) reward=\(reward)")
                 // 刷新该账号余额：主账号从 storage.json 查询；其他账号用 token 查询
                 if ac.uid == mainUid {
@@ -1942,8 +2123,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 content.body = "账号 \(ac.username) 签到成功 ✓"
                 UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "trae_auto_checkin_\(ac.uid)", content: content, trigger: nil)) { _ in }
             } else {
-                // 签到失败：记录失败标记 + 设置退避避免频繁重试触发风控
+                // 签到失败：记录失败标记 + 当日日期（用于卡片角标与「x成功 x失败」统计）
                 UserDefaults.standard.set(true, forKey: failedKey)
+                UserDefaults.standard.set(today, forKey: "trae_checkin_failed_date_\(ac.uid)")
                 // 9074（操作太过频繁）是服务端对非客户端流量的传输层风控，重试无意义，当天不再尝试；
                 // 其他失败退避 5 分钟
                 let backoff: TimeInterval = (bizCode == 9074) ? Self.secondsUntilTomorrow() : 300
@@ -2011,6 +2193,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    // MARK: - ZCode 添加账号（JSON 导入）
+
+    /// 从 ~/.zcode/v2/config.json 导入当前登录的 ZCode 账号（暂只支持此方式，无 OAuth）。
+    /// 平台无昵称 API（OAuth token 加密不可读），导入后弹输入框让用户自定义昵称（可跳过）。
+    @objc private func onAddZcodeAccount() {
+        var msg: String
+        var success = false
+        var isExisting = false
+        switch ZcodeService.importCurrentAccount() {
+        case .success(let imported):
+            var account = imported
+            // 昵称：优先从 credentials.json 解密 user_info 自动带出（OAuth 登录资料），
+            // 拿不到时弹输入框手填兜底（预填已有昵称）
+            if account.nickname.isEmpty {
+                if let nick = keepPanelAliveDuring({
+                    promptForZcodeNickname(prefill: config.zcodeAccounts.first { $0.uid == account.uid }?.nickname ?? "")
+                }) {
+                    account.nickname = nick
+                }
+            }
+            if let idx = config.zcodeAccounts.firstIndex(where: { $0.uid == account.uid }) {
+                config.zcodeAccounts[idx] = account
+                isExisting = true
+            } else {
+                config.zcodeAccounts.append(account)
+            }
+            ConfigStore.save(config)
+            msg = isExisting
+                ? "账号 \(account.displayName) 已存在，已更新其凭证"
+                : "已添加账号 \(account.displayName)（共 \(config.zcodeAccounts.count) 个 ZCode 账号）"
+            success = true
+        case .failure(let err):
+            msg = err
+        }
+        syncPanel()
+
+        // 弹窗提示（成功/失败/已存在 三种状态）
+        let shell = DialogShell()
+        // 弹窗图标用 ZCode 品牌 logo（PNG，非 template，保持原色）
+        if let url = Bundle.main.url(forResource: "zcode", withExtension: "png"),
+           let icon = NSImage(contentsOf: url) {
+            icon.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
+            shell.addIcon(icon)
+        }
+        shell.addTitle(success ? (isExisting ? "账号已存在" : "添加账号成功") : "添加账号失败")
+        shell.addInfo(msg)
+        shell.addButton("好", keyEquivalent: "\r")
+        _ = keepPanelAliveDuring { shell.present() }
+
+        if success {
+            Task { onRefresh() }
+        }
+    }
+
+    /// ZCode 昵称输入框（平台无昵称 API，由用户自定义用于多账号区分）
+    private func promptForZcodeNickname(prefill: String = "") -> String? {
+        let icon: NSImage? = {
+            guard let url = Bundle.main.url(forResource: "zcode", withExtension: "png"),
+                  let img = NSImage(contentsOf: url) else { return nil }
+            img.isTemplate = false
+            img.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
+            return img
+        }()
+        let dialog = InputDialog(title: "设置 ZCode 账号昵称",
+                                 info: "为该账号设置昵称，用于多账号区分。留空则显示账号尾号。",
+                                 linkText: "", linkURL: URL(string: "about:blank")!,
+                                 prefill: prefill, icon: icon)
+        return dialog.present()
+    }
+
     /// 切换 TRAE 账号：后台执行杀进程 → 写 storage.json → 重启 TRAE。
     /// 不立即关闭面板：让用户看到「切换中」脉冲反馈，切换完成后再关闭。
     private func switchTraeAccount(uid: String) {
@@ -2076,12 +2328,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// 切换 ZCode 账号：杀进程 → 写 credentials/config → 重启 ZCode。
+    /// 在后台线程执行（含等待进程退出），切换完成后再关闭面板（同 WB 流程）。
+    private func switchZcodeAccount(uid: String) {
+        Logger.log(.switchAccount, "[iBalance] switchZcodeAccount called: uid=\(uid)")
+        guard let account = config.zcodeAccounts.first(where: { $0.uid == uid }) else {
+            Logger.log(.switchAccount, "[iBalance] zcode account not found for uid=\(uid)")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            ZcodeService.switchAccount(account)
+            // 切换完成 → 回主线程触发 syncPanel（更新卡片），延迟 0.6s 后关闭面板
+            DispatchQueue.main.async { [weak self] in
+                self?.syncPanel()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    self?.popoverController?.close()
+                }
+            }
+        }
+    }
+
     // MARK: - 签到定时器
 
     private func startCheckinTimer() {
         stopCheckinTimer()
         guard config.traeAutoCheckin || config.workbuddyAutoCheckin else { return }
-        checkinTimer = Timer.scheduledTimer(timeInterval: 3600,
+        // 60s 粒度轮询：为 WB 每账号随机就绪时刻（错峰窗口 10 分钟）提供判定精度；
+        // 未到点/已签账号只做 UserDefaults 比较即跳过，不发网络请求
+        checkinTimer = Timer.scheduledTimer(timeInterval: 60,
                                             target: self,
                                             selector: #selector(onCheckinTimerFired),
                                             userInfo: nil,
@@ -2094,6 +2368,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func onCheckinTimerFired() {
+        // 60s 粒度轮询（两平台均按各自错峰就绪时刻判定）；未到点/已签账号零网络跳过，
+        // 失败重试由各平台退避机制控制（TRAE status 递增退避 / claim 9074 当天熔断）
         if config.traeAutoCheckin { Task { await traeAutoCheckinIfNeeded() } }
         if config.workbuddyAutoCheckin { Task { await wbAutoCheckinIfNeeded() } }
     }
@@ -2125,6 +2401,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd"
         return fmt.string(from: Date())
+    }
+
+    /// 自动签到错峰：返回账号「今日就绪时间戳」（秒）。keyPrefix 区分平台（wb_checkin_ready / trae_checkin_ready）。
+    /// 当天首次遇到该账号时生成 now + 0~600s 随机偏移并持久化（UserDefaults 存 "日期|时间戳"），
+    /// 同一天内恒定返回同一值、跨天自动重生成 → 多号在约 10 分钟窗口内随机错开签到，
+    /// 避免同一轮询点批量请求触发服务端风控（仿 Cockpit Tools 的 per-account schedule）。
+    private static func checkinReadyTimestamp(keyPrefix: String, uid: String, today: String) -> TimeInterval {
+        let key = "\(keyPrefix)_\(uid)"
+        if let saved = UserDefaults.standard.string(forKey: key) {
+            let parts = saved.split(separator: "|")
+            if parts.count == 2, parts[0] == today, let ts = TimeInterval(parts[1]) {
+                return ts
+            }
+        }
+        let ts = Date().timeIntervalSince1970 + Double.random(in: 0...600)
+        UserDefaults.standard.set("\(today)|\(Int(ts))", forKey: key)
+        return ts
     }
 
     private static func nowTimeString() -> String {

@@ -143,137 +143,15 @@ enum TraeService {
         let t0 = Date()
         Logger.log(.switchAccount, "[iBalance] TRAE switchAccount start: uid=\(account.uid) username=\(account.username)")
         // 1. 杀掉 TRAE 主进程
-        let tKillStart = Date()
-        killTraeProcess()
-        Logger.log(.switchAccount, "[iBalance] TRAE kill done (\(ms(tKillStart))ms), writing storage.json...")
+        ProcessUtil.killMainProcesses(containingAll: ["trae", ".app/contents/macos/"], label: "TRAE")
         // 2. 写回 storage.json 的 iCubeAuthInfo 字段
-        let tWriteStart = Date()
         guard writeStorageJson(account: account, storagePath: storagePath) else {
             Logger.log(.switchAccount, "[iBalance] TRAE writeStorageJson FAILED")
             return
         }
-        Logger.log(.switchAccount, "[iBalance] TRAE storage.json written (\(ms(tWriteStart))ms), restarting...")
         // 3. 重启 TRAE
-        let tRestartStart = Date()
         restartTrae()
-        Logger.log(.switchAccount, "[iBalance] TRAE restart done (\(ms(tRestartStart))ms), total \(ms(t0))ms")
-    }
-
-    /// 计算从 start 到现在的毫秒数
-    private static func ms(_ start: Date) -> Int {
-        Int(Date().timeIntervalSince(start) * 1000)
-    }
-
-    /// 杀掉 TRAE SOLO CN 主进程（SIGTERM 0.8s → SIGKILL 兜底）
-    private static func killTraeProcess() {
-        let pids = collectTraeMainPids()
-        Logger.log(.switchAccount, "[iBalance] TRAE collected pids: \(pids)")
-        if pids.isEmpty {
-            Logger.log(.switchAccount, "[iBalance] no TRAE pids found, skipping kill")
-            return
-        }
-        sendSIGTERM(to: pids)
-        Logger.log(.switchAccount, "[iBalance] TRAE SIGTERM sent, waiting up to 0.8s...")
-        if waitPidsExit(pids, timeout: 0.8) {
-            Logger.log(.switchAccount, "[iBalance] TRAE all pids exited (round 1)")
-            return
-        }
-        let remaining = collectTraeMainPids()
-        Logger.log(.switchAccount, "[iBalance] TRAE remaining after round 1: \(remaining)")
-        if remaining.isEmpty { return }
-        sendSIGKILL(to: remaining)
-        _ = waitPidsExit(remaining, timeout: 1.0)
-        Logger.log(.switchAccount, "[iBalance] TRAE SIGKILL done")
-    }
-
-    /// 收集 TRAE SOLO CN 主进程 PID（排除 helper/renderer/gpu/crashpad 等）
-    private static func collectTraeMainPids() -> [Int] {
-        let task = Process()
-        task.launchPath = "/bin/ps"
-        task.arguments = ["-axo", "pid=,command="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
-        var result: [Int] = []
-        for line in output.split(separator: "\n") {
-            let lower = line.lowercased()
-            // 匹配 TRAE SOLO CN 主进程
-            guard lower.contains("trae") && lower.contains(".app/contents/macos/") else { continue }
-            // 排除 Electron 子进程
-            if isHelperCommandLine(lower) { continue }
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if let spaceIdx = trimmed.firstIndex(of: " "),
-               let pid = Int(trimmed[..<spaceIdx].trimmingCharacters(in: .whitespaces)) {
-                result.append(pid)
-            }
-        }
-        return result
-    }
-
-    private static func isHelperCommandLine(_ cmd: String) -> Bool {
-        let helperKeywords: [String] = [
-            "--type=", "helper", "renderer", "gpu", "crashpad",
-            "utility", "audio", "sandbox", "--node-ipc",
-            "--clientprocessid=", "resources/app/extensions/",
-        ]
-        for keyword in helperKeywords {
-            if cmd.contains(keyword) { return true }
-        }
-        return false
-    }
-
-    private static func sendSIGTERM(to pids: [Int]) {
-        for pid in pids {
-            let task = Process()
-            task.launchPath = "/bin/kill"
-            task.arguments = ["-15", String(pid)]
-            try? task.run()
-            task.waitUntilExit()
-        }
-    }
-
-    private static func sendSIGKILL(to pids: [Int]) {
-        for pid in pids {
-            let task = Process()
-            task.launchPath = "/bin/kill"
-            task.arguments = ["-9", String(pid)]
-            try? task.run()
-            task.waitUntilExit()
-        }
-    }
-
-    private static func waitPidsExit(_ pids: [Int], timeout: TimeInterval) -> Bool {
-        let start = Date()
-        while Date().timeIntervalSince(start) < timeout {
-            var anyAlive = false
-            for pid in pids {
-                if isPidRunning(pid) { anyAlive = true; break }
-            }
-            if !anyAlive { return true }
-            Thread.sleep(forTimeInterval: 0.12)
-        }
-        return false
-    }
-
-    private static func isPidRunning(_ pid: Int) -> Bool {
-        let task = Process()
-        task.launchPath = "/bin/ps"
-        task.arguments = ["-p", String(pid), "-o", "stat="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return false }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespaces) else { return false }
-        if output.isEmpty { return false }
-        if output.first == "Z" || output.first == "z" { return false }
-        return true
+        Logger.log(.switchAccount, "[iBalance] TRAE switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
     }
 
     /// 把账号的加密块写回 storage.json 的 iCubeAuthInfo://icube.cloudide 字段（原子写入）
