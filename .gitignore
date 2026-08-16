@@ -1,6 +1,7 @@
-# 用户配置：含真实 API Key / WorkBuddy token / 千问 ticket，严禁入库
-# 注意只排除根目录这份；swift/config.json 是空 Key 模板，需要入库
+# 用户配置：含真实 API Key / WorkBuddy token / 千问 ticket / ZCode JWT，严禁入库
+# 根目录与 swift/ 两份都不跟踪（swift/config.json 是 build.sh 的打包源，仅本地保留）
 /config.json
+/swift/config.json
 
 # 构建产物（可由 swift/build.sh 重新生成）
 iBalance.app/
