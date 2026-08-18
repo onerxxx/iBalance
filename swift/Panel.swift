@@ -25,6 +25,8 @@ struct PanelSnapshot {
     var zcodeAccounts: [AccountCardSnapshot] = []
     /// Codex 多账号余额卡片数据（本机 auth.json 导入）
     var codexAccounts: [AccountCardSnapshot] = []
+    /// 日/周用量行（本地差值，仅当前账号）
+    var usageRows: [UsageRowSnapshot] = []
     var offline = false
     var updatedAt = ""
     /// 刷新失败标记（footer「更新于」后追加，如 "TRAE、ZCode 刷新失败"；nil = 本轮全部成功）
@@ -43,6 +45,14 @@ struct PanelSnapshot {
     var hideWbNickname = true
     /// 面板背景渐变开关（同步自配置，VC 据此决定遮罩渐变/单色）
     var panelGradientEnabled = true
+}
+
+/// 日/周用量行快照：icon + 平台名 + 已格式化的今日/本周用量文本
+struct UsageRowSnapshot {
+    var icon: String
+    var name: String
+    var todayText: String
+    var weekText: String
 }
 
 /// 多号余额卡片统一快照（WorkBuddy / TRAE / ZCode 共用，复用同一套卡片渲染逻辑）。
@@ -1348,6 +1358,11 @@ final class BalancePanelView: NSView {
 
     // MARK: - 设置/操作控件
 
+    /// 日/周用量区块：内容行动态重建（随快照变化）
+    private let usageContentStack = NSStackView()
+    private var usageCardRef: NSView?
+    private var usageTitleRef: NSView?
+
     private let autoCheckinSwitch = MiniSwitch()
     private let autoCheckinSub = NSTextField(labelWithString: "")
     private let wbAddBtn = ActionTileButton(bundleIcon: "workbuddy",
@@ -1390,6 +1405,20 @@ final class BalancePanelView: NSView {
         gradientSwitch.state = s.panelGradientEnabled ? .on : .off
         if gradientChanged { onPanelGradientChanged?() }
         offlineBanner.isHidden = !s.offline
+
+        // 日/周用量行重建（无数据时整个区块隐藏）
+        usageContentStack.arrangedSubviews.forEach {
+            usageContentStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        s.usageRows.forEach { usageContentStack.addArrangedSubview(makeUsageRow($0)) }
+        let hasUsage = !s.usageRows.isEmpty
+        usageTitleRef?.isHidden = !hasUsage
+        if hasUsage {
+            usageCardRef?.isHidden = UserDefaults.standard.bool(forKey: UDKey.usageSectionCollapsed)
+        } else {
+            usageCardRef?.isHidden = true
+        }
 
         dsValueLabel.stringValue = s.ds ?? "—"
         dsInfoLabel.stringValue = s.dsInfoText ?? "打开官网 usage 页面"
@@ -1967,6 +1996,29 @@ final class BalancePanelView: NSView {
         items.forEach { stack.addArrangedSubview($0) }
     }
 
+    /// 日/周用量行：品牌 icon + 平台名 + 右侧「今日 x · 本周 y」
+    private func makeUsageRow(_ row: UsageRowSnapshot) -> NSView {
+        let iconView = NSImageView()
+        iconView.image = bundleIcon(row.icon, size: 14) ?? symbolImage("app.fill", size: 14)
+        iconView.image?.isTemplate = true
+        iconView.contentTintColor = kBalanceForeground
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        let nameLabel = NSTextField(labelWithString: row.name)
+        nameLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        nameLabel.textColor = kBalanceForeground
+        let valueLabel = NSTextField(labelWithString: "今日\u{2009}\(row.todayText)\u{2009}\u{00B7}\u{2009}本周\u{2009}\(row.weekText)")
+        valueLabel.font = .systemFont(ofSize: 10)
+        valueLabel.textColor = .systemGray
+        let rowStack = NSStackView(views: [iconView, nameLabel, stretchSpacer(), valueLabel])
+        rowStack.orientation = .horizontal
+        rowStack.alignment = .centerY
+        rowStack.spacing = 6
+        rowStack.translatesAutoresizingMaskIntoConstraints = false
+        return rowStack
+    }
+
     /// 单项：SF Symbol icon + 文本，中间细空格
     private func makeInfoItem(symbol: String, text: String) -> NSView {
         let iconView = NSImageView()
@@ -2150,8 +2202,30 @@ final class BalancePanelView: NSView {
         // 应用上次拖拽保存的平台顺序；隐藏的账号组仍保留位置，之后重新出现时顺序不跳变。
         applyPlatformOrder(animated: false)
 
-        // 余额区块 → 设置区块（分割线已移除，用区块间距分隔）
+        // 余额区块 → 用量区块（分割线已移除，用区块间距分隔）
         root.setCustomSpacing(10, after: balanceGroupContainer)
+
+        // ── 日/周用量区块（可折叠；行内容随快照重建）──
+        var usageCollapseTargets: [NSView] = []
+        let usageTitle = collapsibleSectionTitle(name: "用量", key: UDKey.usageSectionCollapsed,
+                                                 targets: { usageCollapseTargets })
+        root.addArrangedSubview(usageTitle)
+        pinFullWidth(usageTitle, in: root)
+        root.setCustomSpacing(0, after: usageTitle)
+        usageTitleRef = usageTitle
+        usageContentStack.orientation = .vertical
+        usageContentStack.alignment = .width
+        usageContentStack.distribution = .fill
+        usageContentStack.spacing = 6
+        usageContentStack.translatesAutoresizingMaskIntoConstraints = false
+        let usageCard = addCard(rows: [usageContentStack], to: root, spacing: 6)
+        usageCardRef = usageCard
+        usageCollapseTargets = [usageCard]
+        let usageCollapsed = UserDefaults.standard.bool(forKey: UDKey.usageSectionCollapsed)
+        usageCard.isHidden = usageCollapsed
+        root.setCustomSpacing(usageCollapsed ? 6 : 0, after: usageTitle)
+        // 用量区块 → 设置区块
+        root.setCustomSpacing(10, after: usageCard)
 
         // ── 设置卡片 ──
         autoCheckinSwitch.target = self

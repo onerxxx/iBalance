@@ -237,6 +237,10 @@ enum AppDataStore {
         applicationSupportURL.appendingPathComponent("cache.json")
     }
 
+    static var usageURL: URL {
+        applicationSupportURL.appendingPathComponent("usage.json")
+    }
+
     /// 旧版本把文件放在 .app 同目录；只在新位置没有对应文件时复制一次。
     static func legacyURL(for filename: String) -> URL {
         URL(fileURLWithPath: Bundle.main.bundlePath)
@@ -368,6 +372,7 @@ enum UDKey {
     // 面板区块折叠状态（Bool，设置/操作标题胶囊点击切换）
     static var settingsSectionCollapsed: String { "panel_settings_section_collapsed" }
     static var actionsSectionCollapsed: String { "panel_actions_section_collapsed" }
+    static var usageSectionCollapsed: String { "panel_usage_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
 }
@@ -410,5 +415,80 @@ enum BalanceCacheStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let out = try? encoder.encode(cache) else { return }
         AppDataStore.secureWrite(out, to: AppDataStore.cacheURL)
+    }
+}
+
+// MARK: - 日/周用量基线（本地差值，不依赖平台用量 API）
+
+/// 每平台+账号记录「当日首观 / 当周首观」基线值，用量 = 基线与当前余额的差值。
+/// increasing=false：数值随消耗下降（余额/剩余，如 DeepSeek/WorkBuddy/ZCode）；
+/// increasing=true：数值随消耗上升（已用，如 TRAE used / Codex usedPercent）。
+struct UsageBaselines: Codable {
+    struct Entry: Codable {
+        var dayKey: String
+        var dayBase: Double
+        var weekKey: String
+        var weekBase: Double
+    }
+    var entries: [String: Entry] = [:]
+}
+
+enum UsageStore {
+    private static var memory: UsageBaselines = load()
+
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    /// 周一起始的周 key（与国内习惯一致）
+    private static func weekKey(for date: Date) -> String {
+        var cal = Calendar.current
+        cal.firstWeekday = 2
+        let start = cal.dateInterval(of: .weekOfYear, for: date)?.start ?? date
+        return dayFormatter.string(from: start)
+    }
+
+    private static func load() -> UsageBaselines {
+        guard let data = try? Data(contentsOf: AppDataStore.usageURL),
+              let s = try? JSONDecoder().decode(UsageBaselines.self, from: data) else { return UsageBaselines() }
+        return s
+    }
+
+    private static func save() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let out = try? encoder.encode(memory) else { return }
+        AppDataStore.secureWrite(out, to: AppDataStore.usageURL)
+    }
+
+    /// 记录一次观测：跨天/跨周重置基线为当前值；充值（余额型）或重置（已用型）时校准基线，保证用量 ≥ 0。
+    static func observe(platform: String, uid: String, value: Double, increasing: Bool) {
+        let key = "\(platform):\(uid)"
+        let now = Date()
+        let dk = dayFormatter.string(from: now)
+        let wk = weekKey(for: now)
+        var e = memory.entries[key] ?? UsageBaselines.Entry(dayKey: dk, dayBase: value, weekKey: wk, weekBase: value)
+        var changed = memory.entries[key] == nil
+        if e.dayKey != dk { e.dayKey = dk; e.dayBase = value; changed = true }
+        else if increasing ? value < e.dayBase : value > e.dayBase { e.dayBase = value; changed = true }
+        if e.weekKey != wk { e.weekKey = wk; e.weekBase = value; changed = true }
+        else if increasing ? value < e.weekBase : value > e.weekBase { e.weekBase = value; changed = true }
+        memory.entries[key] = e
+        if changed { save() }
+    }
+
+    /// 当前日/周用量；当日尚无观测基线（今天未刷新过）返回 nil。
+    static func usage(platform: String, uid: String, current: Double, increasing: Bool) -> (today: Double, week: Double)? {
+        guard let e = memory.entries["\(platform):\(uid)"] else { return nil }
+        let now = Date()
+        guard e.dayKey == dayFormatter.string(from: now) else { return nil }
+        let today = increasing ? max(0, current - e.dayBase) : max(0, e.dayBase - current)
+        let week = e.weekKey == weekKey(for: now)
+            ? (increasing ? max(0, current - e.weekBase) : max(0, e.weekBase - current))
+            : 0
+        return (today, week)
     }
 }

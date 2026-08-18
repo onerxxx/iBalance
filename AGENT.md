@@ -16,7 +16,7 @@
 
 > 千问（Qianwen）平台已于 2026-08 下线，相关代码与配置字段已全部移除。
 
-交互方式：**左键**点菜单栏图标弹出详情面板（NSPopover，余额卡片 + 设置 + 操作）；**右键**弹出传统 NSMenu（兜底入口，选项与面板同步）。余额卡片支持**拖拽排序**（平台组顺序持久化，菜单栏条目顺序与面板共用同一份 UserDefaults）。
+交互方式：**左键**点菜单栏图标弹出详情面板（NSPopover，余额卡片 + 日/周用量 + 设置 + 操作）；**右键**弹出传统 NSMenu（兜底入口，选项与面板同步）。余额卡片支持**拖拽排序**（平台组顺序持久化，菜单栏条目顺序与面板共用同一份 UserDefaults）。
 
 应用为纯菜单栏应用（`LSUIElement = true`，无 Dock 图标），最低支持 macOS 12（Apple Silicon, arm64）。
 
@@ -143,7 +143,7 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | ---------------------------------- | ------------------------------------------------------------------ |
 | `main.swift`                       | `@NSApplicationMain` 入口 + `@MainActor AppDelegate`：菜单栏 UI、面板生命周期、菜单构建与回调、刷新/签到定时器、各平台切号编排（统一走 `performAccountSwitch`：后台执行 → 回主线程刷新 → 延迟关面板）、签到历史记录、**App 级 Accent Color**（ObjC runtime swizzle `+[NSColor controlAccentColor]`，UserDefaults 持久化） |
 | `Panel.swift`                      | 详情面板全部 UI：`PanelSnapshot` 数据快照、余额卡片（多账号）、设置/操作卡片、**卡片拖拽排序**（幽灵卡片 + Y 轴位移动画，顺序存 `panel_balance_platform_order`）、自定义控件（`HoverCard` / `HoverRowView` / `ActionTileButton` / `UsageBar` / `UsageRing` / `UsageDots` / `TintedVisualEffectView` / `CenteredSpinButton` 等） |
-| `Config.swift`                     | `AppConfig` / `WBAccount` / `TraeAccount` / `ZCodeAccount` / `CodexAccount`（Codable）+ `AppDataStore`（Application Support 路径 / 0700-0600 权限 / 旧版迁移）+ `ConfigStore` / `BalanceCacheStore` + `UDKey` |
+| `Config.swift`                     | `AppConfig` / `WBAccount` / `TraeAccount` / `ZCodeAccount` / `CodexAccount`（Codable）+ `AppDataStore`（Application Support 路径 / 0700-0600 权限 / 旧版迁移）+ `ConfigStore` / `BalanceCacheStore` / `UsageStore`（日/周用量本地差值基线，usage.json）+ `UDKey` |
 | `Network.swift`                    | `HTTP.request/requestWithRetry`（async）、`NetworkMonitor`（NWPathMonitor 离线感知）、JSON 工具 |
 | `Crypto.swift`                     | SHA-512 / AES-128-CBC / PBKDF2-HMAC-SHA1                              |
 | `Logger.swift`                     | 统一带时间戳日志（分场景 category，后台线程安全）                                        |

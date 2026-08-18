@@ -1122,6 +1122,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             s.codexAccounts.append(snap)
         }
+        // ── 日/周用量（本地差值基线，见 UsageStore；仅当前账号）──
+        func fmtUsage(_ v: Double, percent: Bool, decimals: Int) -> String {
+            percent ? String(format: "%.1f%%", v) : fmtAmountCommas(v, decimals: decimals)
+        }
+        func usageRow(icon: String, name: String, platform: String, uid: String,
+                      current: Double?, increasing: Bool, decimals: Int,
+                      percent: Bool, prefix: String = "") -> UsageRowSnapshot? {
+            guard !uid.isEmpty, let cur = current,
+                  let u = UsageStore.usage(platform: platform, uid: uid, current: cur, increasing: increasing) else { return nil }
+            return UsageRowSnapshot(icon: icon, name: name,
+                                    todayText: prefix + fmtUsage(u.today, percent: percent, decimals: decimals),
+                                    weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals))
+        }
+        if let ds = cacheDs,
+           let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds", uid: "main",
+                              current: ds.total, increasing: false, decimals: 2, percent: false, prefix: ds.symbol) {
+            s.usageRows.append(row)
+        }
+        if let row = usageRow(icon: "workbuddy", name: "WorkBuddy", platform: "wb", uid: mainUid,
+                              current: cacheWbAccounts[mainUid]?.remain, increasing: false,
+                              decimals: config.workbuddyDecimals, percent: false) {
+            s.usageRows.append(row)
+        }
+        if let row = usageRow(icon: "trae-color", name: "TRAE", platform: "trae", uid: traeMainUid,
+                              current: cacheTraeAccounts[traeMainUid]?.used, increasing: true,
+                              decimals: config.traeDecimals, percent: false) {
+            s.usageRows.append(row)
+        }
+        if let zc = cacheZcodeAccounts[zcodeMainUid], zc.total > 0,
+           let row = usageRow(icon: "zhipu", name: "ZCode", platform: "zcode", uid: zcodeMainUid,
+                              current: zc.remain / zc.total * 100, increasing: false,
+                              decimals: 1, percent: true) {
+            s.usageRows.append(row)
+        }
+        if let row = usageRow(icon: "codex", name: "Codex", platform: "codex", uid: codexMainUid,
+                              current: cacheCodexAccounts[codexMainUid]?.usedPercent, increasing: true,
+                              decimals: 1, percent: true) {
+            s.usageRows.append(row)
+        }
         // ── 设置/操作状态 ──
         s.traeAutoCheckin = config.traeAutoCheckin
         s.wbAutoCheckin = config.workbuddyAutoCheckin
@@ -1521,6 +1560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let bal = ds.balance {
             let totalNum = Double(bal.totalRaw) ?? 0
             cacheDs = (bal.symbol, bal.totalRaw, totalNum)
+            UsageStore.observe(platform: "ds", uid: "main", value: totalNum, increasing: false)
             // 脉冲：已用占比（=额度-余额）上升（余额被消耗）→ pulsing；稳定或回升 → 停止
             if config.deepseekCommonQuota > 0 {
                 let used = max(0, config.deepseekCommonQuota - totalNum)
@@ -1550,6 +1590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             cacheWb = wb
             if let uid = WorkBuddyService.authInfo()?.uid {
                 cacheWbAccounts[uid] = wb
+                UsageStore.observe(platform: "wb", uid: uid, value: wb.remain, increasing: false)
                 updatePulsingForWb(uid: uid, remain: wb.remain, total: wb.total)
             }
             updateTitle()
@@ -1571,6 +1612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let r = await WorkBuddyService.fetchSummaryForAccount(token: refreshed.token, uid: refreshed.uid, domain: refreshed.domain) {
                 guard !Task.isCancelled else { return }
                 cacheWbAccounts[refreshed.uid] = r
+                UsageStore.observe(platform: "wb", uid: refreshed.uid, value: r.remain, increasing: false)
                 updatePulsingForWb(uid: refreshed.uid, remain: r.remain, total: r.total)
                 // 非当前账号也要立即同步菜单栏，不能只刷新面板。
                 updateTitle()
@@ -1623,6 +1665,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 continue
             }
             cacheZcodeAccounts[ac.uid] = r
+            if r.total > 0 {
+                UsageStore.observe(platform: "zcode", uid: ac.uid, value: r.remain / r.total * 100, increasing: false)
+            }
             var prev = prevZcodeRatio[ac.uid] ?? -1
             var pulsing = zcodePulsing[ac.uid] ?? false
             updatePulsingState(prevRatio: &prev, pulsing: &pulsing,
@@ -1677,6 +1722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 ConfigStore.save(config)
             }
             cacheCodexAccounts[account.uid] = (usage.usedPercent, usage.resetAt)
+            UsageStore.observe(platform: "codex", uid: account.uid, value: usage.usedPercent, increasing: true)
             updateTitle()
         }
         if failed { failedServices.insert("Codex") }
@@ -1693,6 +1739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             cacheTrae = t
             if !mainUid.isEmpty {
                 cacheTraeAccounts[mainUid] = t
+                UsageStore.observe(platform: "trae", uid: mainUid, value: t.used, increasing: true)
                 updatePulsingForTrae(uid: mainUid, limit: t.limit, used: t.used)
             }
             updateTitle()
@@ -1706,6 +1753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                let r = await TraeService.fetchCreditsForToken(token) {
                 guard !Task.isCancelled else { return }
                 cacheTraeAccounts[ac.uid] = r
+                UsageStore.observe(platform: "trae", uid: ac.uid, value: r.used, increasing: true)
                 updatePulsingForTrae(uid: ac.uid, limit: r.limit, used: r.used)
                 // 非当前账号也要立即同步菜单栏，不能只刷新面板。
                 updateTitle()
