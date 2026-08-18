@@ -89,19 +89,22 @@ enum WorkBuddyService {
 
     /// 将指定账号的凭据写入 workbuddy-desktop.info，然后杀掉并重启 WorkBuddy Desktop。
     /// 仿 Cockpit Tools 的切号流程：杀进程 → 写认证 → 重启。
-    static func switchAccount(_ account: WBAccount) {
+    /// 返回 false = 写入失败已回滚（auth 文件未被改动，重启恢复原账号，应用不会停留在「被杀」状态）。
+    static func switchAccount(_ account: WBAccount) -> Bool {
         let t0 = Date()
         Logger.log(.switchAccount, "[iBalance] switchAccount start: uid=\(account.uid) nickname=\(account.nickname)")
-        // 1. 杀掉 WorkBuddy Desktop 主进程（SIGTERM，仿 Cockpit 只杀主进程）
-        ProcessUtil.killMainProcesses(containingAll: ["workbuddy.app/contents/macos/"], label: "WorkBuddy")
+        // 1. 杀掉 WorkBuddy Desktop 主进程（按 bundle id 精确定位，仿 Cockpit 只杀主进程）
+        ProcessUtil.killMainProcesses(bundleId: "com.workbuddy.workbuddy", label: "WorkBuddy")
         // 2. 写入 auth 文件
         guard writeAuthFile(account) else {
-            Logger.log(.switchAccount, "[iBalance] writeAuthFile FAILED")
-            return
+            Logger.log(.switchAccount, "[iBalance] writeAuthFile FAILED, rollback: restart with original account")
+            restartWorkBuddy()
+            return false
         }
         // 3. 重启 WorkBuddy Desktop
         restartWorkBuddy()
         Logger.log(.switchAccount, "[iBalance] switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
+        return true
     }
 
     /// 将账号凭据写入 workbuddy-desktop.info（原子写入）
@@ -174,7 +177,9 @@ enum WorkBuddyService {
         let task = Process()
         task.launchPath = "/usr/bin/open"
         task.arguments = ["-n", "-a", "WorkBuddy", "--args", "--new-window"]
-        try? task.run()
+        do { try task.run() } catch {
+            Logger.log(.switchAccount, "[iBalance] restart WorkBuddy failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: 积分汇总

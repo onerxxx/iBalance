@@ -116,27 +116,23 @@ enum ZcodeService {
     /// config.json（start-plan apiKey，让「当前账号」判定立即生效）→ 重启 ZCode。
     /// 仿 WorkBuddy 切号流程；写入键集逆向自 ZCode 客户端 restoreCachedSession：
     /// zai 渠道凭 zcodejwttoken + user_info 即恢复 authenticated，无需 access_token。
-    static func switchAccount(_ account: ZCodeAccount) {
+    /// 返回 false = 写入失败已回滚（凭据文件未被改动，重启恢复原账号）。
+    static func switchAccount(_ account: ZCodeAccount) -> Bool {
         let t0 = Date()
         Logger.log(.switchAccount, "[iBalance] zcode switchAccount start: uid=\(account.uid)")
-        // 1. 杀 ZCode 主进程：主进程命令行为裸二进制名（ps 无 .app 路径可匹配），
-        //    改按 bundleId 定位主进程 PID（NSRunningApplication），Electron 主进程退出自动回收子进程
-        if let pid = NSRunningApplication.runningApplications(withBundleIdentifier: "dev.zcode.app").first?.processIdentifier,
-           pid > 0 {
-            ProcessUtil.killMainProcess(pid: Int(pid), label: "ZCode")
-        } else {
-            Logger.log(.switchAccount, "[iBalance] ZCode not running, skip kill")
-        }
+        // 1. 杀 ZCode 主进程（按 bundle id 精确定位，Electron 主进程退出自动回收子进程）
+        ProcessUtil.killMainProcesses(bundleId: "dev.zcode.app", label: "ZCode")
         // 2. 写凭据文件（失败也要重启 ZCode：进程已杀，不重启 app 会凭空消失）
         guard writeCredentials(account) else {
-            Logger.log(.switchAccount, "[iBalance] zcode writeCredentials FAILED")
+            Logger.log(.switchAccount, "[iBalance] zcode writeCredentials FAILED, rollback: restart with original account")
             restartZcode()
-            return
+            return false
         }
         syncConfigApiKey(account.token)
         // 3. 重启 ZCode
         restartZcode()
         Logger.log(.switchAccount, "[iBalance] zcode switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
+        return true
     }
 
     /// 写入 credentials.json：清两渠道旧 OAuth 键（防旧号串扰），写 active_provider /
@@ -202,7 +198,9 @@ enum ZcodeService {
         let task = Process()
         task.launchPath = "/usr/bin/open"
         task.arguments = ["-n", "-a", "ZCode"]
-        try? task.run()
+        do { try task.run() } catch {
+            Logger.log(.switchAccount, "[iBalance] restart ZCode failed: \(error.localizedDescription)")
+        }
     }
 
     /// 从 credentials.json 解密当前登录账号的 (uid, 昵称)。

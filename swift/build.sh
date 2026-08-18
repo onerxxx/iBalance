@@ -91,6 +91,8 @@ cp "$CONFIG" "$RESOURCES_DIR/config.json"
 cp "$SCRIPT_DIR/icons/"*.svg "$RESOURCES_DIR/"
 # 拷贝 PNG 图标（如「关于」弹窗使用的 deepseek.png）
 cp "$SCRIPT_DIR/icons/"*.png "$RESOURCES_DIR/" 2>/dev/null || true
+# 拷贝 PDF 图标（菜单栏平台图标矢量版，优先于同名 SVG 加载）
+cp "$SCRIPT_DIR/icons/"*.pdf "$RESOURCES_DIR/" 2>/dev/null || true
 
 # 代码签名（保持固定签名身份）：
 # ad-hoc 签名每次编译都会生成新哈希，macOS TCC 按签名识别应用，

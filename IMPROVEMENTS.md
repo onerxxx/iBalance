@@ -19,7 +19,7 @@
 
 ### 2. 凭据明文落盘且文件权限 644 🔴 ❌（与旧 #12 相同，仍未做）
 
-`Config.swift:213-222` 保存 config.json、`WorkBuddy.swift` 写 auth 文件均为默认权限，同机任何进程可读。涉及 5 类凭据：DeepSeek Key、千问 ticket、WorkBuddy token/refreshToken、TRAE 加密 authInfo、**ZCode 明文 JWT（新增，随 zcodeAccounts 存 config，切号时还要写 credentials.json 三键）**。
+`Config.swift:213-222` 保存 config.json、`WorkBuddy.swift` 写 auth 文件均为默认权限，同机任何进程可读。涉及 4 类凭据：DeepSeek Key、WorkBuddy token/refreshToken、TRAE 加密 authInfo、ZCode 明文 JWT（随 zcodeAccounts 存 config，切号时还要写 credentials.json 三键）。千问平台已于 2026-08-17 整体下线（v2026.8.17.25）。
 
 建议：
 
@@ -37,9 +37,9 @@
 
 ### 4. 刷新失败完全静默，「更新于」时间照常刷新 🔴 ✅ 已完成（2026-08-17，v2026.8.17.19）
 
-采用 **footer 方案**（用户拍板，未做卡片副标题）：`main.swift` 新增 `failedServices: Set<String>`，五个 `refreshOne*` 在各自失败分支记录、成功分支清除；`makePanelSnapshot` 按固定顺序拼出 `failedText`，footer「更新于 HH:mm:ss」后追加显示（如「更新于 12:30:15 · 千问、TRAE 刷新失败」）。关键口径：
+采用 **footer 方案**（用户拍板，未做卡片副标题）：`main.swift` 新增 `failedServices: Set<String>`，各 `refreshOne*` 在各自失败分支记录、成功分支清除；`makePanelSnapshot` 按固定顺序拼出 `failedText`，footer「更新于 HH:mm:ss」后追加显示（如「更新于 12:30:15 · TRAE、ZCode 刷新失败」）。关键口径：
 
-- **未配置不计失败**（DeepSeek 空 key / 千问空 ticket / WB·TRAE 未登录且无账号），避免没配某服务的用户永远看到失败标记；
+- **未配置不计失败**（DeepSeek 空 key / WB·TRAE 未登录且无账号），避免没配某服务的用户永远看到失败标记；
 - 多号服务任一账号获取失败即标记整服务（footer 是服务级粒度）；
 - 取消导致的提前 return 不写状态（沿用 #5 的协作式取消守卫，被取代的旧刷新不污染标记）；
 - `notifyError` 已参数化为通用错误通道（`service` 参数生成标题与标识），仍仅 DeepSeek 调用——其余服务每轮刷新都会失败，发通知会刷屏，走 footer 即可。
@@ -121,7 +121,7 @@
 
 - ✅ **UDKey 收口（2026-08-17）**：main.swift 全部 UserDefaults key 字面量（约 64 处调用、17 个 key）收敛到 `Config.swift` 的 `enum UDKey`（per-uid 函数 + 静态属性），`forKey: "..."` 字面量清零；字符串格式与历史版本逐字一致，已落盘的签到数据不受影响；`checkinReadyTimestamp` 顺带由 keyPrefix 拼接改为直接收 key；
 - ❌ URL / bundle id 仍散落（`platform.deepseek.com/usage` 等）→ 收进 `enum Links` / 配置；
-- ❌ **面板宽度仍三处矛盾**：头注释「宽 250pt」（`Panel.swift:3`）vs `width: 257`（`Panel.swift:681`）vs `widthAnchor 260`（`Panel.swift:1357`，root 内容宽 246）——统一为单一 `panelWidth` 常量；
+- 🟡 **面板宽度**：2026-08-17 已整体缩窄 10pt 并四处同步（头注释 240 / preferredContentSize 247 / 视图内在宽 250 / root 内容宽 236，v2026.8.17.34），但仍是散落字面量而非单一 `panelWidth` 常量 → 收口；
 - ❌ 魔法数字（0.6s 延时关面板、0.8s/1.0s 杀进程超时、600s OAuth、90 天历史等）→ 命名常量。
 
 ---
@@ -137,10 +137,11 @@
 
 ## 五、功能增强
 
-### 16. 手动签到 / 账号采集的进行中反馈 🔴 ❌
+### 16. 手动签到 / 账号采集的进行中反馈 🔴 ✅ 已完成（2026-08-17，v2026.8.17.24）
 
-- `ActionTileButton` 仍无 disabled/loading 态：手动签到（每号 3s 间隔 × N 号可达 10s+）期间磁贴仍可点、无任何指示，结束才弹窗；
-- TRAE 采集进行中仍只改菜单标题「正在采集…」（`main.swift:2150`），`traeCollectInProgress` 未暴露进面板快照，磁贴无反馈（WB 有文案切换，TRAE 未对齐）。
+- `ActionTileButton` 新增进行中态 `setInProgress(_:)`：背景呼吸脉冲（白 5%↔14%、0.55s 往复，CABasicAnimation 同卡片切号脉冲的视觉语言）+ `mouseUp` 禁点（主流程状态守卫之外的视觉层拦截）；
+- **手动签到**：磁提升为 `checkinBtn` 属性，快照新增 `checkinInProgress`；`onManualCheckin` 起止各调一次 `syncPanel()`——点击瞬间磁贴开始脉冲禁点，签到结束（弹结果窗前）恢复；
+- **TRAE 采集**：`traeCollectInProgress` 暴露进快照，磁贴对齐 WB 的文案切换（「采集中…」）+ 同款脉冲；起止的 `syncPanel()` 原本就有，直接生效。
 
 ### 17. 空态与错误态引导 🟡 ❌
 
@@ -162,9 +163,7 @@
 ### 20. 探测与兼容性 🟢 ❌
 
 - `detectTraeStoragePath`（`Config.swift:222-235`）仍按目录名前缀 "trae" 模糊匹配取 sorted 第一个：同时装 TRAE 与 TRAE SOLO CN 时静默选错且用户无法干预 → 返回候选列表供选择；
-- Edge Cookie 仍只读 `Default` profile（`Qianwen.swift:30`，旧 #13）→ 扫描 `Microsoft Edge/*/Cookies` 按 mtime 取最新；
 - WorkBuddy 认证路径仍硬编码（`WorkBuddy.swift:17`，现为 CodeBuddyExtension 路径）→ 对齐 traeStoragePath 做成可配置 + 自动探测；
-- User-Agent 仍两处硬编码（`Qianwen.swift:95/120`）→ 提取常量并保持一致；
 - 仍只构建 arm64（`build.sh:44`）：Intel Mac 无法运行且无提示 → 至少 README 标注，或双架构。
 
 ---
@@ -202,7 +201,7 @@
 | 3 | #7 网络错误分类 | 产品核心价值：数据可信度的另一半（#4 已完成，401 引导重新采集依赖此项） |
 | 4 | #9 Config 失败保护 + #21 build.sh 重启修复 | 都是「出问题才知道疼」的静默失败 |
 | 5 | #10 签到历史 decode 防覆盖 + 手动签到可取消 | 历史已有 UI，数据丢失从隐患变可见事故 |
-| 6 | #16 签到/采集反馈、#17 空态、#18 用量历史 | 体验增强，按需 |
+| 6 | #17 空态、#18 用量历史 | 体验增强，按需 |
 | 7 | #15 剩余（Links 收口 + panelWidth 常量 + 魔法数字） | 纯整洁度，择机 |
 
 ---
@@ -212,13 +211,13 @@
 | 旧编号 | 事项 | 状态 |
 | --- | --- | --- |
 | #1-#9 | 拆模块、Codable、async/await、去重、死代码清理、文档一致性、数据竞争、网络重试/离线感知、TCC 判断 | ✅ 已实施（2026-08-11） |
-| #10 | 千问 SEC_TOKEN 正则脆弱 | 🟡 部分缓解，解析仍集中一处，无降级提示 |
+| #10 | 千问 SEC_TOKEN 正则脆弱 | ✅ 已随千问平台下线失效（2026-08-17） |
 | #11 | Timer App Nap 漂移 | ❌ 未做（本轮 #10 收编） |
 | #12 | 凭据迁移 Keychain | ❌ 未做（本轮 #2，升级为 🔴 并补充文件权限问题） |
-| #13 | Edge 多 profile | ❌ 未做（本轮 #20） |
+| #13 | Edge 多 profile | ✅ 已随千问平台下线失效（2026-08-17） |
 | #14 | 菜单栏状态可见性 | 🟡 离线标记已做；服务失败可见性未做（本轮 #4） |
 | #15 | 用量历史与趋势 | ❌ 未做（本轮 #18） |
-| #16 | 千问 5h 额度展示 | ✅ 已关闭：qwH5 随死字段删除（2026-08-16） |
+| #16 | 千问 5h 额度展示 | ✅ 已关闭：千问平台已整体下线（2026-08-17） |
 | #17 | 开机自启动 | ❌ 未做 |
 | #18 | 设置收纳子菜单 | ⏸ 已被面板 UI 取代，主菜单仅剩兜底入口，建议关闭 |
 | #19 | 刷新间隔档位 | ✅ 已做（1/3/5 分钟） |
@@ -237,6 +236,7 @@
 | #8 | 进程切号链路 | ✅ 第二批补齐：bundle id 精确匹配 + kill(pid,0) 判活 + 失败回滚通知（v2026.8.17.19-22） |
 | #13 | Formatter/图标每次新建 | ✅ static 缓存全套（NumberFormatter / 5 个 DateFormatter / Logger 时间戳 / 状态栏图标） |
 | #15 | UDKey 收口 | ✅ 17 个 key / 约 64 处调用收敛进 enum UDKey；Links、panelWidth、魔法数字仍待做 |
+| #16 | 签到/采集进行中反馈 | ✅ ActionTileButton 脉冲 + 禁点；签到/TRAE 采集磁贴接入（v2026.8.17.24） |
 | #6 | NetworkMonitor 主线程 | ✅ @MainActor + Task hop |
 | #8 | 进程切号三缺陷 | 🟡 主线程冻结 / fork 风暴 / 匹配过宽已修；回滚与 bundle id 精确匹配待做 |
 | #10 | OAuth 轮询取消 | ✅ isCancelled 主动检查 |

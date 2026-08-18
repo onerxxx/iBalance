@@ -21,37 +21,41 @@
 | 副本内路径 | 说明 |
 |-----------|------|
 | `config.json` | 根目录用户配置（用户编辑这份） |
-| `swift/config.json` | 编译模板（`build.sh` 会用它覆盖根目录） |
+| `swift/config.json` | 编译模板（`build.sh` 会用它做字段级合并） |
 | `iBalance.app/Contents/Resources/config.json` | App bundle 内运行时配置 |
 
 ```json
 {
   "cockpit_app_id" : "com.jlcodes.cockpit-tools",
+  "debug_mode" : false,
   "deepseek_api_key" : "",
-  "deepseek_decimals" : 2,
+  "deepseek_common_quota" : 10,
   "hide_main_icon" : true,
-  "qianwen_decimals" : 1,
-  "qianwen_ticket" : "",
+  "hide_wb_nickname" : false,
+  "menubar_visible" : {},
   "refresh_interval" : 300,
+  "trae_accounts" : [],
   "trae_auto_checkin" : false,
   "trae_decimals" : 0,
   "trae_storage_path" : "",
   "workbuddy_accounts" : [],
   "workbuddy_auto_checkin" : false,
   "workbuddy_decimals" : 0,
-  "workbuddy_enabled" : true
+  "workbuddy_enabled" : true,
+  "zcode_accounts" : [],
+  "codex_accounts" : []
 }
 ```
 
 要点：
 - `deepseek_api_key` 清空
-- `qianwen_ticket` 清空
 - `trae_storage_path` 清空
-- `workbuddy_accounts` 清空数组（删除所有 token / refresh_token / uid）
+- `workbuddy_accounts` / `trae_accounts` / `zcode_accounts` / `codex_accounts` 清空数组（删除所有 token / refresh_token / auth_info / uid）
 - `trae_auto_checkin` / `workbuddy_auto_checkin` 关闭
+- `debug_mode` 关闭
 - `refresh_interval` 恢复默认 300 秒
 
-> ⚠️ 本模板与第三节脚本中的 `INIT_CONFIG` 是同一份内容的两处拷贝。**新增/删除配置字段时必须两处同步修改**，且字段集合要与真实 `config.json` 对齐（可用 `python3 -c "import json;print(sorted(json.load(open('config.json'))))"` 对比）。
+> ⚠️ 本模板与第三节脚本中的 `INIT_CONFIG` 是同一份内容的两处拷贝。**新增/删除配置字段时必须两处同步修改**，且字段集合要与真实 `config.json` 对齐（可用 `python3 -c "import json;print(sorted(json.load(open('config.json'))))"` 对比，权威字段定义见 `swift/Config.swift` 的 `CodingKeys`）。
 
 ## 二、打包排除清单
 
@@ -60,6 +64,12 @@
 | 排除路径 | 原因 |
 |---------|------|
 | `backups/` | 项目历史备份，与发行版无关 |
+| `cockpit-tools-main/` | Cockpit Tools 参考源码（约 52MB），与发行版无关 |
+| `demo/` | UI 开发 demo，与发行版无关 |
+| `docs/` | 开发文档（segmented control 指南等），与发行版无关 |
+| `cache.json` | 运行时缓存（含账号用量数据），属用户隐私 |
+| `click_ibalance.lua` | Hammerspoon 调试脚本，仅开发用 |
+| `iBalance-已损坏说明.html` | 本机说明页，不进分发包 |
 | `iBalance*.zip`（含 `iBalance.zip`、`iBalance-v*.zip`、`iBalance 1.0.zip` 等） | 已存在的 zip 文件，避免套娃。**注意排除模式必须覆盖带空格/带版本号的文件名**，只写 `iBalance.zip` + `iBalance-v*.zip` 会漏掉 `iBalance 1.0.zip`（历史上已踩过坑，2MB 的旧包被套进了新包） |
 | `.git/` | 版本控制元数据 |
 | `.reasonix/` | IDE / 工具临时数据 |
@@ -72,14 +82,14 @@
 
 ## 三、打包命令
 
-> 版本号取自 `swift/Info.plist` 的 `CFBundleShortVersionString`（唯一权威来源，格式如 `2026.8.13`），
-> 产物命名为 `iBalance-v<版本>.zip`。**发版前若 bump 了版本号，先跑 `swift/build.sh` 重建 App**，
-> 否则 zip 里的 `iBalance.app` 还是旧版本。
+> 版本号取自已编译 `iBalance.app/Contents/Info.plist` 的 `CFBundleVersion`（唯一权威来源，格式如 `2026.8.17.1`，末尾 `.1` 为当日构建序号，同日多次打包自动递增），
+> 产物命名为 `iBalance-v<完整版本>.zip`。**发版前必须先跑 `swift/build.sh` 重建 App**，
+> 因为构建序号在编译时才写入 App bundle，`swift/Info.plist` 里的版本号是占位值不可用。
 
 ```bash
 SRC=/Volumes/850Pro_256G/htmls/iBalance
 PKG_DIR=/tmp/iBalance_pkg
-VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$SRC/swift/Info.plist")
+VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$SRC/iBalance.app/Contents/Info.plist")
 ZIP_OUT=$SRC/iBalance-v$VER.zip
 echo "打包版本: v$VER -> $ZIP_OUT"
 
@@ -90,6 +100,12 @@ mkdir -p "$PKG_DIR"
 # 2. 复制项目到副本，排除清单见第二节（原项目零修改）
 rsync -a \
   --exclude 'backups/' \
+  --exclude 'cockpit-tools-main/' \
+  --exclude 'demo/' \
+  --exclude 'docs/' \
+  --exclude 'cache.json' \
+  --exclude 'click_ibalance.lua' \
+  --exclude 'iBalance-已损坏说明.html' \
   --exclude '.reasonix/' \
   --exclude '.git/' \
   --exclude '.workbuddy/' \
@@ -105,19 +121,23 @@ rsync -a \
 # 3. 在副本里把三处 config.json 替换为初始化模板（内容见第一节）
 INIT_CONFIG='{
   "cockpit_app_id" : "com.jlcodes.cockpit-tools",
+  "debug_mode" : false,
   "deepseek_api_key" : "",
-  "deepseek_decimals" : 2,
+  "deepseek_common_quota" : 10,
   "hide_main_icon" : true,
-  "qianwen_decimals" : 1,
-  "qianwen_ticket" : "",
+  "hide_wb_nickname" : false,
+  "menubar_visible" : {},
   "refresh_interval" : 300,
+  "trae_accounts" : [],
   "trae_auto_checkin" : false,
   "trae_decimals" : 0,
   "trae_storage_path" : "",
   "workbuddy_accounts" : [],
   "workbuddy_auto_checkin" : false,
   "workbuddy_decimals" : 0,
-  "workbuddy_enabled" : true
+  "workbuddy_enabled" : true,
+  "zcode_accounts" : [],
+  "codex_accounts" : []
 }'
 
 echo "$INIT_CONFIG" > "$PKG_DIR/iBalance/config.json"
@@ -141,9 +161,9 @@ rm -rf "$PKG_DIR"
 > `ZIP` 指向刚打出的包（按实际版本号调整，或先 `ZIP=$(ls -t iBalance/iBalance-v*.zip | head -1)` 自动取最新）。
 
 ```bash
-ZIP=iBalance/iBalance-v2026.8.13.zip
+ZIP=iBalance/iBalance-v2026.8.17.1.zip
 
-# 1. config.json 体积应均为 418B（初始化版），不应出现 4974B（含真实 token）
+# 1. config.json 体积应均为 475B（初始化版），不应出现 13034B（含真实 token）
 unzip -l "$ZIP" | grep config.json
 
 # 2. 内容级防泄漏校验（比体积更可靠）：三处 config 的敏感字段必须为空
@@ -151,18 +171,19 @@ for f in config.json swift/config.json iBalance.app/Contents/Resources/config.js
   unzip -p "$ZIP" "iBalance/$f" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
-leaks = [k for k in ('deepseek_api_key','qianwen_ticket','trae_storage_path') if d.get(k)]
-if d.get('workbuddy_accounts'): leaks.append('workbuddy_accounts')
+leaks = [k for k in ('deepseek_api_key','trae_storage_path') if d.get(k)]
+for k in ('workbuddy_accounts','trae_accounts','zcode_accounts','codex_accounts'):
+    if d.get(k): leaks.append(k)
 print('$f', 'LEAK:' if leaks else 'OK', leaks)"
 done
 
 # 3. 应排除项应为空（含任何形式的嵌套 zip）
-unzip -l "$ZIP" | grep -E 'backups/|\.reasonix/|\.git/|\.workbuddy/|__pycache__/|\.build/|\.build_state|/click$|/presskey$|iBalance[^/]*\.zip'
+unzip -l "$ZIP" | grep -E 'backups/|cockpit-tools-main/|demo/|docs/|cache\.json|click_ibalance\.lua|已损坏说明|\.reasonix/|\.git/|\.workbuddy/|__pycache__/|\.build/|\.build_state|/click$|/presskey$|iBalance[^/]*\.zip'
 
-# 4. zip 内 App 的版本号应与文件名一致（plutil 不支持读 stdin，需经临时文件）
+# 4. zip 内 App 的完整版本号应与文件名一致（plutil 不支持读 stdin，需经临时文件）
 TMP_PLIST=$(mktemp)
 unzip -p "$ZIP" iBalance/iBalance.app/Contents/Info.plist > "$TMP_PLIST"
-/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$TMP_PLIST"
+/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$TMP_PLIST"
 rm -f "$TMP_PLIST"
 
 # 5. 顶层条目
@@ -177,24 +198,30 @@ grep deepseek_api_key iBalance/config.json
 ```
 iBalance/
 ├── AGENT.md
-├── CHANGELOG.md
 ├── IMPROVEMENTS.md
 ├── PACKAGING.md
+├── macos-panel-ui-guide.md
 ├── reasonix.toml
 ├── .gitignore
-├── config.json                  ← 初始化版（418B）
+├── config.json                  ← 初始化版（475B）
 ├── iBalance.app/                ← 可执行 App（含初始化 config）
 ├── swift/                       ← 源码
 │   ├── Services/
+│   │   ├── DeepSeek.swift
+│   │   ├── Trae.swift
+│   │   ├── WorkBuddy.swift
+│   │   └── Zcode.swift
 │   ├── icons/
 │   ├── AppIcon.icns
 │   ├── Config.swift
 │   ├── Crypto.swift
 │   ├── Info.plist
+│   ├── Logger.swift
 │   ├── Network.swift
 │   ├── Panel.swift
+│   ├── ProcessUtil.swift
 │   ├── build.sh
-│   ├── config.json              ← 初始化版（418B）
+│   ├── config.json              ← 初始化版（475B）
 │   └── main.swift
 └── swift-tools/                 ← 辅助工具源码
     ├── click.swift

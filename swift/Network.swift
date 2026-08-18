@@ -118,19 +118,3 @@ func jsonNum(_ v: Any?) -> Double {
     if let i = v as? Int { return Double(i) }
     return 0
 }
-
-/// 表单百分号编码（application/x-www-form-urlencoded 安全字符集）
-func formEncode(_ s: String) -> String {
-    var allowed = CharacterSet.alphanumerics
-    allowed.insert(charactersIn: "-._~")
-    return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
-}
-
-/// 正则提取首个捕获组
-func regexFirstGroup(_ pattern: String, in text: String) -> String? {
-    guard let re = try? NSRegularExpression(pattern: pattern),
-          let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-          m.numberOfRanges > 1,
-          let r = Range(m.range(at: 1), in: text) else { return nil }
-    return String(text[r])
-}

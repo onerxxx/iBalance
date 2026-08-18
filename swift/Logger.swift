@@ -2,6 +2,13 @@
 import Foundation
 
 enum Logger {
+    /// 日志时间戳格式化器（缓存复用；Logger 会在后台线程调用，DateFormatter 10.9+ 线程安全）
+    private static let tsFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss.SSS"
+        return df
+    }()
+
     /// 预定义日志通道
     enum Channel: String {
         case switchAccount = "iBalance_switch"
@@ -10,9 +17,7 @@ enum Logger {
 
     /// 追加一行日志到 /tmp/<channel>.log（带时间戳 HH:mm:ss.SSS）
     static func log(_ channel: Channel, _ msg: String) {
-        let df = DateFormatter()
-        df.dateFormat = "HH:mm:ss.SSS"
-        let ts = df.string(from: Date())
+        let ts = tsFormatter.string(from: Date())
         let line = "[\(ts)] \(msg)\n"
         if let data = line.data(using: .utf8) {
             let url = URL(fileURLWithPath: "/tmp/\(channel.rawValue).log")

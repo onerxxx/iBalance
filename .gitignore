@@ -5,6 +5,9 @@
 /swift/config.json
 backups/*/config.json
 
+# 余额数值磁盘缓存（cache-then-refresh 启动秒显，运行时状态不入库）
+/cache.json
+
 # 构建产物（可由 swift/build.sh 重新生成）
 iBalance.app/
 *.zip

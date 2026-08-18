@@ -138,20 +138,23 @@ enum TraeService {
     // MARK: - 多账号切换（写 storage.json + 重启 TRAE）
 
     /// 将指定账号的加密块写回 storage.json，然后杀掉并重启 TRAE SOLO CN。
-    /// 流程：杀进程 → 写 storage.json → 重启
-    static func switchAccount(account: TraeAccountInfo, storagePath: String) {
+    /// 流程：杀进程 → 写 storage.json → 重启。
+    /// 返回 false = 写入失败已回滚（storage.json 未被改动，重启恢复原账号，应用不会停留在「被杀」状态）。
+    static func switchAccount(account: TraeAccountInfo, storagePath: String) -> Bool {
         let t0 = Date()
         Logger.log(.switchAccount, "[iBalance] TRAE switchAccount start: uid=\(account.uid) username=\(account.username)")
-        // 1. 杀掉 TRAE 主进程
-        ProcessUtil.killMainProcesses(containingAll: ["trae", ".app/contents/macos/"], label: "TRAE")
+        // 1. 杀掉 TRAE 主进程（按 bundle id 精确定位，Electron 主进程退出自动回收子进程）
+        ProcessUtil.killMainProcesses(bundleId: "cn.trae.solo.app", label: "TRAE")
         // 2. 写回 storage.json 的 iCubeAuthInfo 字段
         guard writeStorageJson(account: account, storagePath: storagePath) else {
-            Logger.log(.switchAccount, "[iBalance] TRAE writeStorageJson FAILED")
-            return
+            Logger.log(.switchAccount, "[iBalance] TRAE writeStorageJson FAILED, rollback: restart with original account")
+            restartTrae()
+            return false
         }
         // 3. 重启 TRAE
         restartTrae()
         Logger.log(.switchAccount, "[iBalance] TRAE switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
+        return true
     }
 
     /// 把账号的加密块写回 storage.json 的 iCubeAuthInfo://icube.cloudide 字段（原子写入）
@@ -183,7 +186,9 @@ enum TraeService {
         let task = Process()
         task.launchPath = "/usr/bin/open"
         task.arguments = ["-n", "-a", "TRAE SOLO CN"]
-        try? task.run()
+        do { try task.run() } catch {
+            Logger.log(.switchAccount, "[iBalance] restart TRAE failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: 签到

@@ -1,11 +1,11 @@
 // Panel.swift — NSPopover 详情面板（左键点击菜单栏图标弹出）
 //
-// 布局（宽 250pt）：
+// 布局（宽 240pt）：
 //   头部    iBalance + 刷新按钮
 //   横幅    离线提示（条件显示）
-//   卡片 ×5 DeepSeek / ZCode / TRAE（含用量进度条）/ 千问（周%+5h 明细）/ WorkBuddy
-//   设置卡片  自动签到开关 / 刷新间隔 / 隐藏主icon
-//   操作卡片  Cockpit / 添加 WB 账号 / API Key / 千问 Ticket / 关于
+//   卡片 ×4 DeepSeek / ZCode / TRAE（含用量进度条）/ WorkBuddy
+//   设置卡片  自动签到开关 / 刷新间隔 / 昵称开关 / 调试
+//   操作卡片  Cockpit / 添加 WB 账号 / API Key / 关于
 //   底部    更新于 HH:mm:ss + 退出按钮
 //
 // v1.1：原右键菜单的全部选项搬入弹窗；右键菜单保留作为兜底。
@@ -19,31 +19,34 @@ struct PanelSnapshot {
     var dsInfoText: String?         // DeepSeek 副标题文字（nil 显示默认提示）
     /// TRAE 多账号余额卡片数据（每号一条，当前账号排首位）
     var traeAccounts: [AccountCardSnapshot] = []
-    var qwWeek: String?             // 千问周剩余百分比（如 "63%"）
-    var qwWeekUsedRatio: Double = 0 // 周已用占比（进度条用）
-    var qwPulsing: Bool = false     // 周额度被消耗 → 点阵脉冲
-    var qwExpireText: String?       // 套餐到期时间（格式：到期日: 00-00 00:00）
     /// WorkBuddy 多账号余额卡片数据（每号一条）
     var wbAccounts: [AccountCardSnapshot] = []
     /// ZCode 多账号余额卡片数据（每号一条，当前账号排首位）
     var zcodeAccounts: [AccountCardSnapshot] = []
+    /// Codex 多账号余额卡片数据（本机 auth.json 导入）
+    var codexAccounts: [AccountCardSnapshot] = []
     var offline = false
     var updatedAt = ""
+    /// 刷新失败标记（footer「更新于」后追加，如 "TRAE、ZCode 刷新失败"；nil = 本轮全部成功）
+    var failedText: String?
     // ── 设置/操作状态 ──
     var traeAutoCheckin = false
     var wbAutoCheckin = false
     /// 今日签到统计文案（如 "8-16 3成功 1失败"，手动签到计入；空 = 今天尚未产生任何签到结果）
     var lastCheckinTime: String?
     var wbOauthInProgress = false   // 添加账号进行中 → 按钮变「取消添加…」
+    /// TRAE 采集进行中 → 按钮变「采集中…」+ 脉冲禁点（对齐 WB 反馈）
+    var traeCollectInProgress = false
+    /// 手动签到进行中 → 签到磁贴脉冲禁点
+    var checkinInProgress = false
     var refreshIntervalSeconds: Int = 300
-    var hideMainIcon = true
     var hideWbNickname = true
-    /// 调试模式：所有余额卡片 icon 显示角标 + DeepSeek 金额固定 999.99
-    var debugMode = false
+    /// 面板背景渐变开关（同步自配置，VC 据此决定遮罩渐变/单色）
+    var panelGradientEnabled = true
 }
 
 /// 多号余额卡片统一快照（WorkBuddy / TRAE / ZCode 共用，复用同一套卡片渲染逻辑）。
-/// 无签到平台（ZCode）的 checkin 字段保持默认；expireText 仅 ZCode 当前账号有值。
+/// 无签到平台（ZCode / Codex）的 checkin 字段保持默认；expireText 为当前账号重置/到期副标题。
 struct AccountCardSnapshot {
     var uid: String
     var nickname: String
@@ -51,7 +54,8 @@ struct AccountCardSnapshot {
     var usedRatio: Double = 0       // 已用占比（0~1），用于点阵进度
     var isCurrent: Bool = false     // 是否为当前登录账号（主账号 icon 全尺寸，其余缩小）
     var pulsing: Bool = false       // 额度被消耗（usedRatio 上升）→ 最右亮点阵脉冲
-    var expireText: String?         // 免费套餐到期倒计时（仅 ZCode 当前账号，如 " 19:55 后到期"）
+    var expireText: String?         // 重置/套餐到期倒计时（Codex / ZCode 当前账号）
+    var expired: Bool = false       // Start Plan 已到期（expireText 显示"套餐已到期"红色警告）
     var checkinDone: Bool = false   // 今日已签到
     var checkinFailed: Bool = false // 签到失败（按 failed_date==today 口径）
     var streak: Int = 0             // 连续签到天数
@@ -70,12 +74,12 @@ private enum Palette {
     static let cardBackgroundHover = NSColor(calibratedWhite: 51.0 / 255.0, alpha: 0.3)
     /// 容器玻璃遮罩色（近黑半透明，加深毛玻璃底色）
     static let containerTint = NSColor(calibratedWhite: 0.02, alpha: 0.30)
+    /// 容器玻璃渐变底色（中灰半透明）：与 containerTint 组成纵向渐变，顶部近黑 → 底部中灰
+    static let containerTintBottom = NSColor(calibratedWhite: 0.35, alpha: 0.30)
     /// 卡片圆角 10pt（对齐 macOS Big Sur+ NSPopover 窗口系统圆角）
     static let cardCornerRadius: CGFloat = 10
     /// 卡片边框色/分割线色（暗主题：浅灰半透明，1px 描边，统一白@10%）
     static let cardBorderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10)
-    /// 区块分割线色（与卡片边框统一）
-    static let dividerColor = NSColor(calibratedWhite: 1.0, alpha: 0.10)
     /// 卡片边框宽度 1pt
     static let cardBorderWidth: CGFloat = 1
 }
@@ -84,18 +88,6 @@ private enum Palette {
 private let kBalanceForeground = Palette.cardForeground
 private let kCardBackground = Palette.cardBackground
 private let kCardBackgroundHover = Palette.cardBackgroundHover
-
-/// 给 layer.backgroundColor 加 0.22s 过渡动画（hover 背景提亮/恢复）
-private func animateLayerBg(_ layer: CALayer?, to color: CGColor) {
-    guard let l = layer else { return }
-    let anim = CABasicAnimation(keyPath: "backgroundColor")
-    anim.duration = 0.22
-    anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-    anim.fromValue = l.backgroundColor
-    anim.toValue = color
-    l.add(anim, forKey: "backgroundColorTransition")
-    l.backgroundColor = color
-}
 
 /// 通用 layer keypath 过渡（borderWidth / shadowOpacity 等），0.22s easeInEaseOut
 private func animateLayerKey(_ layer: CALayer?, keyPath: String, to value: Any?, duration: Double = 0.22) {
@@ -162,6 +154,33 @@ final class MiniSwitch: NSSwitch {
 /// 紧凑分段控件：纯使用 AppKit 原生 controlSize/font/segmentWidth 控制尺寸，
 /// 不使用任何 layer transform（AppKit 复杂控件会在首次显示时重置 layer 属性导致缩放失效）。
 /// 选中段高亮色固定为 #7F7F7F。
+/// NSSegmentedControl 的自定义 cell：收窄每段标题的水平内边距。
+/// 系统 .mini 分段控件每段内边距约 7pt/侧，「3分钟」@9pt 宽约 25pt，38pt 段下
+/// 25 + 14 ≈ 39pt 仍会溢出被省略号截断。这里改由 cell 自绘标题：
+/// 水平余量均分居中（约 6.5pt/侧，等价于收窄内边距），38pt 段即可稳定容纳。
+final class CompactSegmentedCell: NSSegmentedCell {
+    override func drawSegment(_ segment: Int, inFrame frame: NSRect, with view: NSView) {
+        // 临时清空标题让 super 只画背景/选中 bezel（选中态由 isSelected(forSegment:)
+        // 驱动，与标题内容无关），随后按收窄内边距自绘标题，避免双层文字。
+        let originalLabel = self.label(forSegment: segment)
+        setLabel("", forSegment: segment)
+        super.drawSegment(segment, inFrame: frame, with: view)
+        setLabel(originalLabel ?? "", forSegment: segment)
+        guard let label = originalLabel, !label.isEmpty else { return }
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: 9),
+            .foregroundColor: NSColor.controlTextColor,
+        ]
+        let size = (label as NSString).size(withAttributes: attrs)
+        // 水平：段内余量均分居中；垂直：draw(in:) 实测不垂直居中（偏上约 3pt），
+        // 需手动以 (midY - 文本高/2) 定位用 draw(at:)。
+        let origin = NSPoint(x: frame.midX - size.width / 2,
+                             y: frame.midY - size.height / 2)
+        (label as NSString).draw(at: origin, withAttributes: attrs)
+    }
+}
+
 final class MiniSegmentedControl: NSSegmentedControl {
 
     override init(frame frameRect: NSRect) {
@@ -189,11 +208,27 @@ final class MiniSegmentedControl: NSSegmentedControl {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        // 首次进窗口时换成 CompactSegmentedCell（收窄内边距）。此刻 segment 已由
+        // init(labels:...) 配置完毕，直接复制配置；target/action/segmentStyle 等状态
+        // 在 NSControl/NSSegmentedControl 层，换 cell 不受影响。
+        if !(cell is CompactSegmentedCell), let old = cell as? NSSegmentedCell {
+            let compact = CompactSegmentedCell()
+            compact.segmentCount = old.segmentCount
+            compact.trackingMode = old.trackingMode
+            compact.controlSize = .mini
+            for i in 0..<old.segmentCount {
+                compact.setLabel(old.label(forSegment: i) ?? "", forSegment: i)
+            }
+            // selectedSegment 状态存储在 cell 上，换 cell 会丢失（新 cell 默认 -1 无选中），
+            // 首次打开会视觉上"没选中任何段"，必须显式迁移。
+            compact.selectedSegment = old.selectedSegment
+            cell = compact
+        }
         let miniFont = NSFont.systemFont(ofSize: 9, weight: .medium)
         font = miniFont
         cell?.font = miniFont
         for i in 0..<segmentCount {
-            setWidth(36, forSegment: i)
+            setWidth(38, forSegment: i)
         }
         needsLayout = true
     }
@@ -204,6 +239,10 @@ final class MiniSegmentedControl: NSSegmentedControl {
 final class HoverRowView: NSView {
     private var trackingArea: NSTrackingArea?
     private var labels: [NSTextField] = []
+    /// 需要 hover 提亮的 tint 控件 setter：contentTintColor 为 systemGray 的 NSImageView / NSButton
+    /// 跟随整行 hover 提亮为 labelColor，行为与下方选项小字（systemGray 文字）一致。
+    /// 用闭包捕获具体类型，使 animator().contentTintColor 能正确解析（NSControl 父类不暴露该属性）。
+    private var tintables: [(NSColor) -> Void] = []
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -216,8 +255,15 @@ final class HoverRowView: NSView {
 
     private func collectLabels() {
         labels = []
+        tintables = []
         func scan(_ v: NSView) {
             if let tf = v as? NSTextField { labels.append(tf) }
+            else if let iv = v as? NSImageView, iv.contentTintColor == NSColor.systemGray {
+                tintables.append({ [weak iv] c in iv?.animator().contentTintColor = c })
+            }
+            else if let btn = v as? NSButton, btn.contentTintColor == NSColor.systemGray {
+                tintables.append({ [weak btn] c in btn?.animator().contentTintColor = c })
+            }
             for sub in v.subviews { scan(sub) }
         }
         scan(self)
@@ -234,6 +280,7 @@ final class HoverRowView: NSView {
                     l.animator().textColor = NSColor.labelColor
                 }
             }
+            for setter in tintables { setter(NSColor.labelColor) }
         }, completionHandler: nil)
     }
 
@@ -247,17 +294,44 @@ final class HoverRowView: NSView {
                     l.animator().textColor = NSColor.systemGray
                 }
             }
+            for setter in tintables { setter(NSColor.systemGray) }
         }, completionHandler: nil)
     }
+}
 
-    /// hover 时光标变为 pointingHand（手指指针），提示可点击
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
+/// 刷新时间行容器：点击整行（排除分段控件区域）触发刷新按钮，等价于点按钮（含旋转动画）。
+/// hitTest 把分段控件放行给自身处理选择，其余区域（label/按钮/spacer/空白）拦截到 self，
+/// mouseDown 转发 triggerButton.performClick → 触发 RefreshIconButton 的 sendAction（旋转 + 刷新）。
+final class RefreshRow: NSStackView {
+    /// 排除的控件：点击其区域不触发刷新，交给分段控件处理选择
+    var segmentView: NSView?
+    /// 触发目标：performClick 等价于点按钮
+    var triggerButton: NSButton?
+
+    override init(frame frameRect: NSRect) { super.init(frame: frameRect) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let candidate = super.hitTest(point) else { return nil }
+        // 命中分段控件（或其子树）→ 放行，交给分段控件处理选择
+        if let seg = segmentView, candidate === seg || candidate.isDescendant(of: seg) {
+            return candidate
+        }
+        // 命中刷新按钮本身 → 交给按钮（保留原生高亮反馈）
+        if let btn = triggerButton, candidate === btn || candidate.isDescendant(of: btn) {
+            return candidate
+        }
+        // 其余区域（label/spacer/空白）→ 拦截到 self，mouseDown 时触发刷新
+        return self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        triggerButton?.performClick(nil)
     }
 }
 
 /// 无边框图标按钮：使用 macOS 原生 bezelStyle 实现 hover 时自动显示圆角背景，
-/// 系统自动处理背景绘制，仅用 tracking area 管理图标颜色变化和手指光标。
+/// 系统自动处理背景绘制，仅用 tracking area 管理图标颜色变化。
 /// hover 时系统渲染浅色圆角背景（略大于图标），图标同步提亮为 labelColor。
 final class HoverIconButton: NSButton {
     /// 按钮容器尺寸（正方形）
@@ -266,14 +340,17 @@ final class HoverIconButton: NSButton {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        bezelStyle = .recessed                  // macOS 原生凹槽按钮：hover 时自动显示圆角背景
-        isBordered = true
-        showsBorderOnlyWhileMouseInside = true  // 仅鼠标悬停时显示边框/背景
-        imagePosition = .imageOnly              // 仅显示图标，不显示标题
-        title = ""
+        // 无边框按钮：hover 背景自绘（大圆角容器，替代系统 recessed 的小圆角底）
+        isBordered = false
         setButtonType(.momentaryPushIn)         // 点击时有按下效果
+        imagePosition = .imageOnly
+        title = ""
         imageScaling = .scaleProportionallyDown
         contentTintColor = .systemGray
+        wantsLayer = true
+        layer?.cornerRadius = Self.buttonSize / 2  // 圆角拉满：22×22 容器 → 11pt 正圆
+        layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -290,25 +367,104 @@ final class HoverIconButton: NSButton {
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
         contentTintColor = .labelColor
+        // hover 背景：极淡白底淡入（0.22s，同全项目过渡节奏）
+        animateLayerKey(layer, keyPath: "backgroundColor",
+                        to: NSColor.white.withAlphaComponent(0.08).cgColor)
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
         contentTintColor = .systemGray
+        animateLayerKey(layer, keyPath: "backgroundColor", to: NSColor.clear.cgColor)
+    }
+}
+
+/// 手动刷新按钮：点击时图标顺时针旋转一圈。
+/// AppKit layer-backed 视图经 Auto Layout 同步会把 anchorPoint 重置为 (0,0)，
+/// 直接旋转会绕左下角转；需在 layout() 里恢复中心锚点 + 补偿 position（同 MiniSwitch 思路）。
+/// hover 提亮交由外层 HoverRowView 统一驱动（contentTintColor==systemGray 时跟随提亮）。
+final class RefreshIconButton: NSButton {
+    private var isSpinning = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBordered = false
+        setButtonType(.momentaryPushIn)
+        imagePosition = .imageOnly
+        title = ""
+        imageScaling = .scaleProportionallyDown
+        contentTintColor = .systemGray
+        wantsLayer = true
     }
 
-    /// hover 时光标变为 pointingHand（手指指针），提示可点击
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        restoreCenterAnchor()
+    }
+
+    override func layout() {
+        super.layout()
+        restoreCenterAnchor()
+        // AppKit 可能在 layout 同步后重置 layer 属性，下一帧再修一次
+        DispatchQueue.main.async { [weak self] in self?.restoreCenterAnchor() }
+    }
+
+    /// 恢复 layer 锚点 + 补偿 position，使旋转绕图标视觉圆心。
+    /// y=0.41（低于几何中心 0.5）：arrow.clockwise 圆环视觉圆心偏下，
+    /// 绕几何中心旋转会偏高，向下偏移对齐视觉圆心。
+    private func restoreCenterAnchor() {
+        guard let l = layer, l.bounds.width > 0 else { return }
+        let center = CGPoint(x: 0.5, y: 0.41)
+        guard l.anchorPoint != center else { return }
+        var p = l.position
+        p.x += l.bounds.width * (center.x - l.anchorPoint.x)
+        p.y += l.bounds.height * (center.y - l.anchorPoint.y)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        l.anchorPoint = center
+        l.position = p
+        CATransaction.commit()
+    }
+
+    /// 点击发送 action 时顺时针旋转一圈（-2π，0.45s ease-in-out）
+    override func sendAction(_ action: Selector?, to target: Any?) -> Bool {
+        spinOnce()
+        return super.sendAction(action, to: target)
+    }
+
+    private func spinOnce() {
+        guard let l = layer, !isSpinning else { return }
+        restoreCenterAnchor()
+        isSpinning = true
+        // macOS NSView（isFlipped=false）layer 坐标系 y 向上，rotation.z 正值=屏幕逆时针；
+        // arrow.clockwise 箭头朝顺时针，故用负角 -2π 让屏幕上呈顺时针旋转。
+        let anim = CABasicAnimation(keyPath: "transform.rotation.z")
+        anim.fromValue = 0
+        anim.toValue = -CGFloat.pi * 2
+        anim.duration = 0.45
+        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        anim.isRemovedOnCompletion = true
+        anim.delegate = self
+        l.add(anim, forKey: "spinOnce")
+    }
+}
+
+extension RefreshIconButton: CAAnimationDelegate {
+    func animationDidStop(_ anim: CAAnimation, finished flag: Bool) {
+        isSpinning = false
     }
 }
 
 /// 余额卡片容器：hover 时显示 8% 背景圆角，并切换签到信息子视图颜色。
 /// 点击卡片触发 onClick 回调（如打开对应平台主页或应用）。
-final class HoverCard: NSView {
+class HoverCard: NSView {
     private var trackingArea: NSTrackingArea?
     /// 点击回调：由外部设置，mouseUp 时触发
     var onClick: (() -> Void)?
+    /// 右键点击回调：由外部设置，rightMouseDown 时触发（参数为事件，可用于弹出菜单定位）
+    var onRightClick: ((NSEvent) -> Void)?
     /// hover 状态回调：true=进入，false=离开（如「悬停显示昵称」）
     var onHover: ((Bool) -> Void)?
     /// hover 效果容器：渐变 + 噪点统一淡入淡出
@@ -438,40 +594,49 @@ final class HoverCard: NSView {
         // 不调用 super：避免被当作无意义点击传给父视图
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        // 不调用 super：由 onRightClick 接管，弹出上下文菜单
+        onRightClick?(event)
+    }
+
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         if bounds.contains(p) {
             onClick?()
         }
     }
-
-    /// hover 时光标变为 pointingHand（手指指针），提示可点击
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
-    }
 }
 
-/// 操作磁贴按钮：纵向 icon + 多行文本（最多两行），矩形带 hover 背景
-final class ActionTileButton: NSView {
-    private var trackingArea: NSTrackingArea?
+/// 操作磁贴按钮：纵向 icon + 多行文本（最多两行）。
+/// 继承 HoverCard：hover 效果与余额卡片完全统一（渐变+噪点背景、0.8pt white@20% 发丝边框、
+/// bounds 内 mouseUp 触发），额外叠加磁贴特有的 icon 软光晕与标题提亮。
+final class ActionTileButton: HoverCard {
     private var _titleText: String = ""
     private let iconView = NSImageView()
     private let label = NSTextField(labelWithString: "")
     /// 目标-动作（与 NSButton 兼容，支持后续赋值）
     var target: AnyObject?
     var action: Selector?
+    /// 进行中（脉冲 + 禁点）状态标记
+    private var isInProgress = false
     /// icon 固定尺寸
-    private let iconSize: CGFloat = 18
+    private let iconSize: CGFloat
 
-    init(symbol: String? = nil, bundleIcon iconName: String? = nil, title: String, target: AnyObject?, action: Selector?) {
+    init(symbol: String? = nil, bundleIcon iconName: String? = nil, title: String, target: AnyObject?, action: Selector?, iconSize: CGFloat = 18) {
+        self.iconSize = iconSize
         super.init(frame: .zero)
         self.target = target
         self.action = action
-        wantsLayer = true
-        layer?.cornerRadius = 8
+        // 点击经 HoverCard.onClick 触发（target/action 可在 init 后再赋值，闭包点击时取最新值）
+        onClick = { [weak self] in
+            guard let self, let action = self.action else { return }
+            _ = self.target?.perform(action, with: self)
+        }
+        layer?.cornerRadius = 10
+        layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
-        // hover 时淡入的发丝边框（颜色预设，width 默认 0，hover 时动画到 0.5pt）
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
+        // 边框色与卡片统一 white@20%（hover 时由 HoverCard 动画 borderWidth 到 0.8）
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
         layer?.borderWidth = 0
 
         iconView.imageScaling = .scaleProportionallyUpOrDown
@@ -546,59 +711,84 @@ final class ActionTileButton: NSView {
         }, completionHandler: nil)
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let ta = trackingArea { removeTrackingArea(ta) }
-        let ta = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                owner: self, userInfo: nil)
-        addTrackingArea(ta)
-        trackingArea = ta
-    }
-
     override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        // 背景：极淡白底（更轻，留给发丝边框定义边缘层次）
-        animateLayerBg(layer, to: NSColor.white.withAlphaComponent(0.05).cgColor)
-        // 发丝边框淡入
-        animateLayerKey(layer, keyPath: "borderWidth", to: 0.8, duration: 0.22)
-        // icon 软光晕淡入
+        super.mouseEntered(with: event)  // 卡片同款：渐变+噪点背景、发丝边框
+        // 磁贴特有：icon 软光晕 + 标题提亮
         animateLayerKey(iconView.layer, keyPath: "shadowOpacity", to: 0.45, duration: 0.22)
         setTitle(_titleText, highlighted: true)
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
-        animateLayerBg(layer, to: NSColor.clear.cgColor)
-        animateLayerKey(layer, keyPath: "borderWidth", to: 0, duration: 0.22)
         animateLayerKey(iconView.layer, keyPath: "shadowOpacity", to: 0.0, duration: 0.22)
         setTitle(_titleText, highlighted: false)
     }
 
-    override func mouseDown(with event: NSEvent) {
-        // 不调用 super：避免被当作无意义点击传给父视图
-    }
-
     override func mouseUp(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        if bounds.contains(p) {
-            _ = target?.perform(action, with: self)
-        }
+        // 进行中不可重复触发（主流程侧另有状态守卫，这里拦掉视觉层点击）
+        guard !isInProgress else { return }
+        super.mouseUp(with: event)  // HoverCard：bounds 内触发 onClick
     }
 
-    /// hover 时光标变为 pointingHand（手指指针），提示可点击
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
+    /// 进行中状态：true 时禁点 + 背景呼吸脉冲（手动签到/账号采集等长任务的通用反馈）
+    func setInProgress(_ on: Bool) {
+        guard on != isInProgress else { return }
+        isInProgress = on
+        if on {
+            // 背景在白 5%↔14% 间呼吸（与 hover 底色同族，避免视觉突兀），
+            // autoreverses + infinity 持续到任务结束；模型值先落 5% 保证动画移除后不闪清
+            let pulse = CABasicAnimation(keyPath: "backgroundColor")
+            pulse.fromValue = NSColor.white.withAlphaComponent(0.05).cgColor
+            pulse.toValue = NSColor.white.withAlphaComponent(0.14).cgColor
+            pulse.duration = 0.55
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
+            layer?.add(pulse, forKey: "progressPulse")
+        } else {
+            layer?.removeAnimation(forKey: "progressPulse")
+            // 恢复常态底色（若此刻正悬停，hover 渐变层照常覆盖在上）
+            layer?.backgroundColor = NSColor.clear.cgColor
+        }
     }
 }
 
 /// 半透明遮罩视图：用 draw(_:) 而非 layer.backgroundColor 渲染色块。
 /// NSView 的 backing layer 在加入 window 前可能为 nil，直接 set backgroundColor 会失效；
 /// draw 由 AppKit 在确定进入渲染层级后调用，能可靠地呈现颜色。
+/// 设置 bottomColor 后改为纵向渐变绘制：顶部 color（暗）→ 底部 bottomColor（中灰），
+/// gradientStartY 指定渐变起点（距顶部 pt，起点以上保持纯暗色，与渐变起点无缝衔接）。
 final class TintOverlayView: NSView {
     var color: NSColor? { didSet { needsDisplay = true } }
+    var bottomColor: NSColor? { didSet { needsDisplay = true } }
+    /// 渐变起始位置（距视觉顶部的 pt 数，isFlipped 语义：顶部为 0）；默认 0 = 从顶部渐变
+    var gradientStartY: CGFloat = 0 { didSet { needsDisplay = true } }
     override var isFlipped: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
-        if let c = color { c.setFill(); NSBezierPath(rect: bounds).fill() }
+        guard let c = color else { return }
+        if let b = bottomColor {
+            let startY = min(max(bounds.minY + gradientStartY, bounds.minY), bounds.maxY)
+
+            // 固定区域只绘制到渐变起点。不能先填满整个 bounds 再绘制渐变，
+            // 否则渐变起点的半透明 c 会叠加在已有的 c 上，导致起点比上方固定区域更深。
+            if startY > bounds.minY {
+                c.setFill()
+                NSBezierPath(rect: NSRect(x: bounds.minX,
+                                           y: bounds.minY,
+                                           width: bounds.width,
+                                           height: startY - bounds.minY)).fill()
+            }
+
+            guard startY < bounds.maxY else { return }
+            // isFlipped=true 时 minY 在顶部：colors[0]（暗）→ 渐变起点，colors[1]（中灰）→ 底部
+            NSGradient(colors: [c, b])?.draw(from: NSPoint(x: bounds.midX, y: startY),
+                                             to: NSPoint(x: bounds.midX, y: bounds.maxY),
+                                             options: [])
+        } else {
+            c.setFill()
+            NSBezierPath(rect: bounds).fill()
+        }
     }
 }
 
@@ -609,6 +799,19 @@ final class TintedVisualEffectView: NSVisualEffectView {
 
     var tintColor: NSColor? {
         didSet { tintView.color = tintColor }
+    }
+
+    /// 渐变底部色：设置后遮罩从 tintColor（顶部，暗）纵向渐变到此色（底部，中灰）
+    var tintBottomColor: NSColor? {
+        didSet { tintView.bottomColor = tintBottomColor }
+    }
+
+    /// 渐变起始位置（距容器顶部的 pt 数，0 = 从顶部渐变；起点以上保持纯暗色）
+    var tintGradientStartY: CGFloat = 0 {
+        didSet {
+            guard abs(oldValue - tintGradientStartY) > 0.5 else { return }
+            tintView.gradientStartY = tintGradientStartY
+        }
     }
 
     override init(frame frameRect: NSRect) {
@@ -664,6 +867,13 @@ final class BalancePanelViewController: NSViewController {
         container.appearance = NSAppearance(named: .darkAqua)  // 强制深色外观加深底色
         // 叠加近黑半透明遮罩：降低 alpha 让玻璃质感更通透（底色更浅），不引入色相
         container.tintColor = Palette.containerTint
+        // 背景纵向渐变（默认开启）：顶部保持近黑（暗）→ 底部中灰；开关关闭时恢复单色近黑
+        container.tintBottomColor = panel.panelGradientEnabled ? Palette.containerTintBottom : nil
+        // 容器圆角与系统 popover 窗口对齐（10pt 连续曲率），裁掉遮罩层直角边缘
+        container.wantsLayer = true
+        container.layer?.cornerRadius = Palette.cardCornerRadius
+        container.layer?.cornerCurve = .continuous
+        container.layer?.masksToBounds = true
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(panel)
         NSLayoutConstraint.activate([
@@ -673,12 +883,36 @@ final class BalancePanelViewController: NSViewController {
             panel.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
         view = container
+        // 渐变开关状态变化（update 同步时触发）：立即刷新遮罩绘制
+        panel.onPanelGradientChanged = { [weak self] in
+            self?.applyGradient()
+        }
+        // 区块折叠/展开后按新内容高度收缩 popover（与 viewWillAppear 同一套口径），
+        // 避免 preferredContentSize 固定不变时根布局把其余区块拉伸填高
+        panel.onContentChanged = { [weak self] in
+            guard let self else { return }
+            self.panel.layoutSubtreeIfNeeded()
+            self.preferredContentSize = NSSize(width: 247, height: self.panel.fittingSize.height + 24)
+        }
+    }
+
+    /// 按当前开关状态刷新背景遮罩：渐变（起点=余额卡片底部）或单色近黑
+    private func applyGradient() {
+        guard let container = view as? TintedVisualEffectView else { return }
+        container.tintBottomColor = panel.panelGradientEnabled ? Palette.containerTintBottom : nil
+        container.tintGradientStartY = panel.balanceSectionBottomY
     }
 
     override func viewWillAppear() {
         super.viewWillAppear()
         // 让 popover 按内容实际高度撑开
-        preferredContentSize = NSSize(width: 257, height: panel.fittingSize.height + 24)
+        preferredContentSize = NSSize(width: 247, height: panel.fittingSize.height + 24)
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        // 背景渐变从余额卡片底部开始：布局变化（折叠/展开/账号增删）后同步起点
+        applyGradient()
     }
 }
 
@@ -823,22 +1057,23 @@ final class BalancePanelView: NSView {
     var onAddWbAccount: (() -> Void)?
     var onSetDsQuota: (() -> Void)?           // 设置 DeepSeek 常用充值额度
     var onSetInterval: ((Int) -> Void)?          // 秒数：60 / 180 / 300
+    /// 手动刷新（刷新时间行内的刷新按钮触发）
+    var onManualRefresh: (() -> Void)?
     var onSetApiKey: (() -> Void)?
-    var onSetQwTicket: (() -> Void)?
-    var onToggleHideIcon: (() -> Void)?
     var onToggleHideWbNickname: (() -> Void)?
-    /// 调试模式开关（角标全显 + DeepSeek 假金额）
-    var onToggleDebug: (() -> Void)?
+    /// 面板渐变背景开关（设置卡片开关触发）
+    var onTogglePanelGradient: (() -> Void)?
+    /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
+    var onPanelGradientChanged: (() -> Void)?
     var onAbout: (() -> Void)?
     var onManualCheckin: (() -> Void)?
     /// 查看签到历史（各账号签到记录列表）
     var onShowCheckinHistory: (() -> Void)?
     var onQuit: (() -> Void)?
-    // 余额卡片点击回调：DeepSeek / TRAE / WorkBuddy / 千问
+    // 余额卡片点击回调：DeepSeek 打开网页，TRAE / WorkBuddy / ZCode 启动应用
     var onClickDeepSeek: (() -> Void)?
     var onClickTrae: (() -> Void)?
     var onClickWorkBuddy: (() -> Void)?
-    var onClickQianwen: (() -> Void)?
     /// WorkBuddy 非当前账号卡片点击：传入 uid，触发切号重启
     var onSwitchWbAccount: ((String) -> Void)?
     /// TRAE 账号采集（菜单按钮触发）
@@ -847,10 +1082,16 @@ final class BalancePanelView: NSView {
     var onSwitchTraeAccount: ((String) -> Void)?
     /// ZCode 添加账号（JSON 导入 ~/.zcode/v2/config.json）
     var onAddZcodeAccount: (() -> Void)?
+    /// Codex 添加账号（JSON 导入 ~/.codex/auth.json）
+    var onAddCodexAccount: (() -> Void)?
     /// ZCode 卡片点击：打开 ZCode 应用
     var onClickZcode: (() -> Void)?
+    /// Codex 卡片点击：打开 Codex 应用
+    var onClickCodex: (() -> Void)?
     /// ZCode 非当前账号卡片点击：传入 uid，触发切号重启
     var onSwitchZcodeAccount: ((String) -> Void)?
+    /// 右键点击余额卡片：传入卡片 menuBarId 和事件（用于弹出「在菜单栏显示」上下文菜单）
+    var onRightClickCard: ((String, NSEvent) -> Void)?
 
     // MARK: - 余额展示控件
 
@@ -872,34 +1113,6 @@ final class BalancePanelView: NSView {
         stack.heightAnchor.constraint(equalToConstant: 12).isActive = true
         return stack
     }()
-    private let qwValueLabel = NSTextField(labelWithString: "—")
-    private let qwDots = UsageDots()
-    /// 千问卡片副标题标签（显示「x天后到期」，字符串前自带细空格用于与 timer icon 对齐）
-    private let qwInfoLabel = NSTextField(labelWithString: "")
-    private lazy var qwInfoIcon: NSImageView = {
-        let v = NSImageView()
-        v.image = symbolImage("timer", size: 9)
-        v.contentTintColor = .systemGray
-        v.imageScaling = .scaleProportionallyUpOrDown
-        v.translatesAutoresizingMaskIntoConstraints = false
-        return v
-    }()
-    private lazy var qwInfo: NSStackView = {
-        qwInfoLabel.font = .systemFont(ofSize: 9)
-        qwInfoLabel.textColor = .systemGray
-        qwInfoLabel.setContentHuggingPriority(.defaultLow, for: .vertical)
-        qwInfoLabel.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        qwInfoLabel.setContentHuggingPriority(.required, for: .horizontal)
-        qwInfoLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let stack = NSStackView(views: [qwInfoIcon, qwInfoLabel])
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 0
-        stack.heightAnchor.constraint(equalToConstant: 12).isActive = true
-        stack.setContentHuggingPriority(.required, for: .horizontal)
-        stack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return stack
-    }()
     // WorkBuddy 多账号卡片容器（动态重建，账号列表变化时刷新）
     private var wbCardsContainer: NSStackView!
     private var wbCardEntries: [CardEntry] = []
@@ -916,8 +1129,9 @@ final class BalancePanelView: NSView {
         let checkinInfo: NSStackView   // 签到信息行（每张当前账号卡片独立持有，避免跨重建复用导致布局错位）
         let nickLabel: NSTextField
         let infoLabel: NSTextField?    // 到期倒计时副标题（仅 ZCode 当前账号卡片有）
+        let expireIcon: NSImageView?   // 到期行 timer 图标（随 expired 状态变色）
         var checkinKey: String = ""
-        let badgeView: NSView          // 签到失败角标（icon 右上角，无签到平台仅调试模式显示）
+        let badgeView: NSView          // 签到失败角标（icon 右上角，无签到平台恒隐藏）
     }
 
     /// 各平台卡片差异配置（icon / 标题 / 签到行 / 到期行 / reward 兜底）
@@ -926,11 +1140,13 @@ final class BalancePanelView: NSView {
         let name: String
         let iconSize: CGFloat          // 当前账号 icon 尺寸（非当前固定 12.65）
         let checkin: Bool              // 是否显示签到信息行（WB / TRAE）
-        let showsExpire: Bool          // 是否显示到期倒计时行（ZCode）
+        let showsExpire: Bool          // 是否显示重置/到期倒计时行（ZCode / Codex）
         let fallbackReward: Int        // reward 为 0 时的兜底值（WB 固定 +100，TRAE 显示 +???）
-        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", iconSize: 20.47, checkin: true, showsExpire: false, fallbackReward: 100)
-        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", iconSize: 20.47, checkin: true, showsExpire: false, fallbackReward: 0)
-        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", iconSize: 18.47, checkin: false, showsExpire: true, fallbackReward: 0)
+        let menuBarIdPrefix: String    // 菜单栏 item id 前缀："trae:" / "wb:" / "zcode:"
+        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", iconSize: 20.47, checkin: true, showsExpire: false, fallbackReward: 100, menuBarIdPrefix: "wb:")
+        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", iconSize: 20.47, checkin: true, showsExpire: false, fallbackReward: 0, menuBarIdPrefix: "trae:")
+        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", iconSize: 18.47, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "zcode:")
+        static let codex = CardStyle(icon: "codex", name: "Codex", iconSize: 20.47, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "codex:")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -938,10 +1154,21 @@ final class BalancePanelView: NSView {
     private var traeCardEntries: [CardEntry] = []
     private var traeCardUids: [String] = []  // 当前已渲染卡片的 uid 列表（检测变化）
 
+    // 余额卡片组容器（统一背景 + 圆角，子卡片透明）；背景渐变起点定位依据
+    private var balanceGroupContainer: NSStackView!
+    /// 余额卡片组视觉底边距面板顶部的距离（背景渐变从此处开始；panel 非 flipped，
+    /// 视觉底部 = frame.minY，故 = bounds.height - minY；布局前为 0 = 渐变暂从顶部开始）
+    var balanceSectionBottomY: CGFloat {
+        bounds.height - balanceGroupContainer.frame.minY
+    }
+
     // ZCode 多账号卡片容器（动态重建，账号列表变化时刷新）
     private var zcodeCardsContainer: NSStackView!
     private var zcodeCardEntries: [CardEntry] = []
     private var zcodeCardUids: [String] = []  // 当前已渲染卡片的 uid 列表（检测变化）
+    private var codexCardsContainer: NSStackView!
+    private var codexCardEntries: [CardEntry] = []
+    private var codexCardUids: [String] = []
     private let updatedLabel = NSTextField(labelWithString: "")
     /// 刷新动效状态：true 时「更新于」区域脉冲显示「刷新中…」
     private var isRefreshing = false
@@ -954,22 +1181,23 @@ final class BalancePanelView: NSView {
                                            title: "添加账号", target: nil, action: nil)
     private let traeAddBtn = ActionTileButton(bundleIcon: "trae-color",
                                              title: "添加账号", target: nil, action: nil)
+    /// 手动签到磁贴：进行中由 update() 驱动脉冲 + 禁点
+    private let checkinBtn = ActionTileButton(symbol: "checkmark.seal",
+                                              title: "手动签到", target: nil, action: nil)
     private let zcodeAddBtn = ActionTileButton(bundleIcon: "zhipu",
-                                               title: "添加账号", target: nil, action: nil)
+                                               title: "添加账号", target: nil, action: nil,
+                                               iconSize: 17.1)  // 18 × 0.95，容器不变
     // 刷新间隔：MiniSegmentedControl（原生 .mini 尺寸，紧凑稳定）
     private let intervalSegment: MiniSegmentedControl = {
         let seg = MiniSegmentedControl(labels: ["1分钟", "3分钟", "5分钟"], trackingMode: .selectOne, target: nil, action: nil)
         seg.selectedSegment = 2
         return seg
     }()
-    private let hideIconSwitch = MiniSwitch()
     private let hideWbNickSwitch = MiniSwitch()
-    private let debugSwitch = MiniSwitch()
-    /// 调试模式（update 时随快照同步，角标显隐与 DeepSeek 假金额由此驱动）
-    private var debugMode = false
-    /// DeepSeek / 千问卡片失败角标（静态卡片，build 时创建，调试模式强制显示）
-    private var dsBadge: NSView?
-    private var qwBadge: NSView?
+    /// 面板渐变背景开关（update 时随快照同步状态）
+    private let gradientSwitch = MiniSwitch()
+    /// 渐变开关状态（update 同步；VC 读取决定遮罩渐变/单色）
+    private(set) var panelGradientEnabled = true
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -981,9 +1209,11 @@ final class BalancePanelView: NSView {
     // MARK: - 数据更新
 
     func update(_ s: PanelSnapshot) {
-        // 调试模式必须先于下方卡片 apply 同步：apply*CardData 读取它决定角标显隐，
-        // 放在末尾会导致本轮用旧值、下一轮才生效（开关不实时）
-        debugMode = s.debugMode
+        // 渐变开关状态同步（VC 通过 onPanelGradientChanged 即时刷新遮罩绘制）
+        let gradientChanged = s.panelGradientEnabled != panelGradientEnabled
+        panelGradientEnabled = s.panelGradientEnabled
+        gradientSwitch.state = s.panelGradientEnabled ? .on : .off
+        if gradientChanged { onPanelGradientChanged?() }
         offlineBanner.isHidden = !s.offline
 
         dsValueLabel.stringValue = s.ds ?? "—"
@@ -992,15 +1222,11 @@ final class BalancePanelView: NSView {
             let remainRatio = CGFloat(min(1, max(0, 1 - s.dsUsedRatio)))
             dsDots.ratio = remainRatio
             dsDots.isHidden = false
-        } else if debugMode {
-            // 调试模式：未设日常额度也给定可见进度，便于展示点阵脉冲效果
-            dsDots.ratio = 0.6
-            dsDots.isHidden = false
         } else {
             dsDots.ratio = 0
             dsDots.isHidden = true
         }
-        dsDots.pulsing = s.dsPulsing || debugMode
+        dsDots.pulsing = s.dsPulsing
 
         // 昵称开关变化：昵称仅 hover 时显示，平时恒隐藏（不 rebuild 卡片，避免点阵脉冲动画被打断）；
         // 切换时把 alpha 复位为 0（可能正悬停中）
@@ -1020,6 +1246,14 @@ final class BalancePanelView: NSView {
             applyZcodeCardData(s.zcodeAccounts)
         }
 
+        // Codex 多账号卡片：uid 列表变化时重建，否则就地更新
+        let newCodexUids = s.codexAccounts.map(\.uid)
+        if newCodexUids != codexCardUids {
+            rebuildCodexCards(s.codexAccounts)
+        } else {
+            applyCodexCardData(s.codexAccounts)
+        }
+
         // TRAE 多账号卡片：uid 列表变化 时重建，否则就地更新数据
         let newTraeUids = s.traeAccounts.map(\.uid)
         if newTraeUids != traeCardUids {
@@ -1027,16 +1261,6 @@ final class BalancePanelView: NSView {
         } else {
             applyTraeCardData(s.traeAccounts)
         }
-
-        qwValueLabel.stringValue = s.qwWeek ?? "—"
-        qwInfoLabel.stringValue = s.qwExpireText ?? ""
-        if s.qwWeekUsedRatio > 0 {
-            let qwRatio = CGFloat(min(1, max(0, 1 - s.qwWeekUsedRatio)))
-            qwDots.ratio = qwRatio
-        } else {
-            qwDots.ratio = 0
-        }
-        qwDots.pulsing = s.qwPulsing
 
         // WorkBuddy 多账号卡片：uid 列表变化 时重建，否则就地更新数据
         let newUids = s.wbAccounts.map(\.uid)
@@ -1046,9 +1270,11 @@ final class BalancePanelView: NSView {
             applyWbCardData(s.wbAccounts)
         }
 
-        // 刷新中时底部显示「刷新中…」并保持脉冲，刷新完成后恢复更新时间
+        // 刷新中时底部显示「刷新中…」并保持脉冲，刷新完成后恢复更新时间；
+        // 有服务获取失败时追加标记，让「旧数据」可被识别（失败时间即本轮更新时间）
         updatedLabel.stringValue = isRefreshing ? "刷新中…"
-            : (s.updatedAt.isEmpty ? "尚未更新" : "更新于 \(s.updatedAt)")
+            : (s.updatedAt.isEmpty ? "尚未更新"
+               : "更新于 \(s.updatedAt)" + (s.failedText.map { " · \($0)" } ?? ""))
 
         // ── 设置/操作状态（代码设置 state 不会触发 action，安全）──
         let autoOn = s.traeAutoCheckin || s.wbAutoCheckin
@@ -1059,6 +1285,11 @@ final class BalancePanelView: NSView {
 
         wbAddBtn.setTitle(s.wbOauthInProgress ? "取消添加" : "添加账号",
                           highlighted: false)
+        // 进行中反馈：签到磁贴背景脉冲 + 禁点；TRAE 采集对齐 WB 的文案切换 + 同款脉冲
+        checkinBtn.setInProgress(s.checkinInProgress)
+        traeAddBtn.setTitle(s.traeCollectInProgress ? "采集中…" : "添加账号",
+                            highlighted: false)
+        traeAddBtn.setInProgress(s.traeCollectInProgress)
 
         switch s.refreshIntervalSeconds {
         case 60: intervalSegment.selectedSegment = 0
@@ -1066,13 +1297,7 @@ final class BalancePanelView: NSView {
         default: intervalSegment.selectedSegment = 2
         }
 
-        hideIconSwitch.state = s.hideMainIcon ? .off : .on
         hideWbNickSwitch.state = s.hideWbNickname ? .off : .on
-        // 调试模式：同步开关状态 + 静态卡片（DeepSeek/千问）角标强制显示；
-        // 动态卡片（TRAE/WB）角标在各自 apply 中结合 checkinFailed 判定（debugMode 已在开头同步）
-        debugSwitch.state = s.debugMode ? .on : .off
-        dsBadge?.isHidden = !s.debugMode
-        qwBadge?.isHidden = !s.debugMode
     }
 
     // MARK: - 多号卡片通用实现（WB / TRAE / ZCode）
@@ -1103,9 +1328,10 @@ final class BalancePanelView: NSView {
             let isCurrent = ac.isCurrent
             let dots: UsageDots? = isCurrent ? UsageDots() : nil
             let checkinInfo = NSStackView()
-            // 第二行信息：ZCode 当前账号为到期倒计时（timer 图标 + 文本，同千问卡片规格 9pt systemGray 行高 12），
+            // 第二行信息：ZCode 当前账号为到期倒计时（timer 图标 + 文本，9pt systemGray 行高 12），
             // WB/TRAE 当前账号为签到信息行（空容器，由 updateCheckinInfo 填充）；非当前账号无第二行
             var expireLabel: NSTextField? = nil
+            var expireIcon: NSImageView? = nil
             let info: NSStackView?
             if isCurrent && style.showsExpire {
                 let label = NSTextField(labelWithString: "")
@@ -1123,6 +1349,7 @@ final class BalancePanelView: NSView {
                 stack.spacing = 0
                 stack.heightAnchor.constraint(equalToConstant: 12).isActive = true
                 expireLabel = label
+                expireIcon = icon
                 info = stack
             } else if isCurrent && style.checkin {
                 info = checkinInfo
@@ -1133,7 +1360,7 @@ final class BalancePanelView: NSView {
             // 复用 hideWbNickname 开关（语义为「显示平台昵称」，同时控制三个平台）：
             // 开启后仅在该卡片 hover 时淡入显示，关闭则完全不显示
             let nickLabel: NSTextField = {
-                let nl = NSTextField(labelWithString: Self.displayNickname(ac.nickname))
+                let nl = NSTextField(labelWithString: ac.nickname)
                 nl.textColor = isCurrent ? .systemGray : Palette.cardForegroundDimmed
                 nl.alphaValue = 0
                 return nl
@@ -1141,8 +1368,9 @@ final class BalancePanelView: NSView {
             // 非当前账号 icon 缩小至 12.65pt（约为大 icon 的 1/1.618），列宽不变；内边距加大增加卡片高度
             let imgSize: CGFloat = isCurrent ? style.iconSize : 12.65
             let fgColor: NSColor = isCurrent ? kBalanceForeground : Palette.cardForegroundDimmed
-            let cardPadTop: CGFloat = isCurrent ? 4 : 6
-            let cardPadBottom: CGFloat = isCurrent ? 4 : 6
+            // 上下内边距大小卡统一 4pt
+            let cardPadTop: CGFloat = 4
+            let cardPadBottom: CGFloat = 4
             let uid = ac.uid
             weak var cardRef: NSView?
             // 签到失败角标（当日失败时显示；无签到平台仅调试模式，apply 阶段控制显隐）
@@ -1171,6 +1399,8 @@ final class BalancePanelView: NSView {
                     }
                     onSwitch?(uid)
                 }
+            }, onRightClick: { [weak self] event in
+                self?.onRightClickCard?(style.menuBarIdPrefix + uid, event)
             }, topPadding: cardPadTop, bottomPadding: cardPadBottom, cardBackground: nil)
             cardRef = card
             // 悬停卡片时昵称淡入、离开淡出（设置关闭时完全不显示）
@@ -1187,7 +1417,8 @@ final class BalancePanelView: NSView {
             // 非当前账号无 dots/checkinInfo（未加入视图层级），用占位保持 entry 结构一致
             entries.append(CardEntry(uid: ac.uid, valueLabel: valueLabel,
                                      dots: dots ?? UsageDots(), checkinInfo: checkinInfo,
-                                     nickLabel: nickLabel, infoLabel: expireLabel, badgeView: badge))
+                                     nickLabel: nickLabel, infoLabel: expireLabel,
+                                     expireIcon: expireIcon, badgeView: badge))
         }
         uids = accounts.map(\.uid)
         applyAccountCardData(accounts, entries: &entries, style: style)
@@ -1201,14 +1432,19 @@ final class BalancePanelView: NSView {
             let e = entries[i]
             e.valueLabel.stringValue = ac.value ?? "—"
             // 就地更新昵称显示（用户在平台内改昵称后无需 rebuild 卡片）
-            e.nickLabel.stringValue = Self.displayNickname(ac.nickname)
+            e.nickLabel.stringValue = ac.nickname
             // 当日签到失败或调试模式 → icon 右上角显示失败角标（ZCode 无签到，仅调试模式）
-            e.badgeView.isHidden = !(ac.checkinFailed || debugMode)
-            // 到期倒计时（无值时清空文本，占位保持行高稳定）
+            e.badgeView.isHidden = !ac.checkinFailed
+            // 到期倒计时（无值时清空文本，占位保持行高稳定）；套餐已到期 → 文本与图标转红警告
             e.infoLabel?.stringValue = ac.expireText ?? ""
+            let expireColor: NSColor = ac.expired ? .systemRed : .systemGray
+            e.infoLabel?.textColor = expireColor
+            e.expireIcon?.contentTintColor = expireColor
             // 非当前账号卡片无 dots/签到信息（未加入视图层级），跳过更新
             guard ac.isCurrent else { continue }
-            if ac.usedRatio > 0 {
+            // 有余额数据（value 非空）→ 按剩余比例点亮（100% 未用时 usedRatio=0 → 满格绿）；
+            // 无数据（value 为空）→ 全灰，避免误显满格
+            if ac.value != nil {
                 e.dots.ratio = CGFloat(min(1, max(0, 1 - ac.usedRatio)))
             } else {
                 e.dots.ratio = 0
@@ -1233,6 +1469,16 @@ final class BalancePanelView: NSView {
     }
     private func applyZcodeCardData(_ accounts: [AccountCardSnapshot]) {
         applyAccountCardData(accounts, entries: &zcodeCardEntries, style: .zcode)
+    }
+
+    private func rebuildCodexCards(_ accounts: [AccountCardSnapshot]) {
+        rebuildAccountCards(accounts, style: .codex, container: codexCardsContainer,
+                            entries: &codexCardEntries, uids: &codexCardUids,
+                            onCurrentClick: { [weak self] in self?.onClickCodex?() },
+                            onSwitch: nil)
+    }
+    private func applyCodexCardData(_ accounts: [AccountCardSnapshot]) {
+        applyAccountCardData(accounts, entries: &codexCardEntries, style: .codex)
     }
 
     private func rebuildTraeCards(_ accounts: [AccountCardSnapshot]) {
@@ -1340,21 +1586,12 @@ final class BalancePanelView: NSView {
         updatedLabel.layer?.opacity = 1.0
     }
 
-    /// 昵称显示规则：中文只取第一个汉字（避免过长），非中文保留原值。
-    /// rebuild 和 apply 均复用，确保改昵称后就地刷新也能正确更新显示文本。
-    private static func displayNickname(_ nick: String) -> String {
-        for ch in nick.unicodeScalars {
-            if 0x4E00...0x9FFF ~= ch.value { return String(ch) }
-        }
-        return nick
-    }
-
     // MARK: - 布局构建
 
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        // 内在宽度 260：独立（未挂到窗口）时 fittingSize 也能解出正确高度
-        widthAnchor.constraint(equalToConstant: 260).isActive = true
+        // 内在宽度 250：独立（未挂到窗口）时 fittingSize 也能解出正确高度
+        widthAnchor.constraint(equalToConstant: 250).isActive = true
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -1368,7 +1605,7 @@ final class BalancePanelView: NSView {
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             root.topAnchor.constraint(equalTo: topAnchor, constant: 14),
             root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
-            root.widthAnchor.constraint(equalToConstant: 260 - 14),
+            root.widthAnchor.constraint(equalToConstant: 250 - 14),
         ])
 
         // 底部更新时间标签启用 layer 供脉冲动效使用
@@ -1400,16 +1637,19 @@ final class BalancePanelView: NSView {
         balanceGroupContainer.translatesAutoresizingMaskIntoConstraints = false
         balanceGroupContainer.wantsLayer = true
         balanceGroupContainer.layer?.cornerRadius = Palette.cardCornerRadius
+        balanceGroupContainer.layer?.cornerCurve = .continuous
         balanceGroupContainer.layer?.masksToBounds = true
         balanceGroupContainer.layer?.backgroundColor = kCardBackground.cgColor
+        self.balanceGroupContainer = balanceGroupContainer
         root.addArrangedSubview(balanceGroupContainer)
         balanceGroupContainer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
         // ── DeepSeek 卡片（中间仅标题）──
-        dsBadge = makeFailureBadge()
         let dsCard = addCard(rows: [
-            balanceContentRow(icon: "deepseek", name: "DeepSeek", valueLabel: dsValueLabel, info: dsInfo, dots: dsDots, failureBadge: dsBadge)
-        ], to: balanceGroupContainer, onClick: { [weak self] in self?.onClickDeepSeek?() }, topPadding: 4, bottomPadding: 4, cardBackground: nil)
+            balanceContentRow(icon: "deepseek", name: "DeepSeek", valueLabel: dsValueLabel, info: dsInfo, dots: dsDots)
+        ], to: balanceGroupContainer, onClick: { [weak self] in self?.onClickDeepSeek?() }, onRightClick: { [weak self] event in
+            self?.onRightClickCard?("ds", event)
+        }, topPadding: 4, bottomPadding: 4, cardBackground: nil)
         dsCardRef = dsCard
         // 平台间间隔 7pt（同平台内 trae/wb 容器内部 spacing=0 不加间隔）
         balanceGroupContainer.setCustomSpacing(7, after: dsCard)
@@ -1427,6 +1667,18 @@ final class BalancePanelView: NSView {
         balanceGroupContainer.addArrangedSubview(zcodeCardsContainer)
         zcodeCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
         balanceGroupContainer.setCustomSpacing(7, after: zcodeCardsContainer)
+
+        // ── Codex 多账号卡片容器（本机 auth.json 导入）──
+        codexCardsContainer = NSStackView(views: [])
+        codexCardsContainer.orientation = .vertical
+        codexCardsContainer.alignment = .leading
+        codexCardsContainer.distribution = .fill
+        codexCardsContainer.spacing = 0
+        codexCardsContainer.translatesAutoresizingMaskIntoConstraints = false
+        codexCardsContainer.isHidden = true
+        balanceGroupContainer.addArrangedSubview(codexCardsContainer)
+        codexCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
+        balanceGroupContainer.setCustomSpacing(7, after: codexCardsContainer)
 
         // ── TRAE 多账号卡片容器（动态创建，账号列表变化时重建）──
         // 单账号时也走容器：保证布局与 WB 多账号卡片一致
@@ -1453,56 +1705,70 @@ final class BalancePanelView: NSView {
         wbCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
         balanceGroupContainer.setCustomSpacing(7, after: wbCardsContainer)
 
-        // ── 千问卡片（标题 + 到期时间 + 点阵进度）──
-        qwBadge = makeFailureBadge()
-        let qwCard = addCard(rows: [
-            balanceContentRow(icon: "qwen-color", name: "千问 Token Plan", valueLabel: qwValueLabel, info: qwInfo, dots: qwDots, iconTint: .white, failureBadge: qwBadge)
-        ], to: balanceGroupContainer, onClick: { [weak self] in self?.onClickQianwen?() }, topPadding: 4, bottomPadding: 4, cardBackground: nil)
-
-        // 千问卡片等高于 DeepSeek（TRAE / WB 卡片动态等高，在 rebuildTraeCards / rebuildWbCards 中设置）
-        qwCard.heightAnchor.constraint(equalTo: dsCard.heightAnchor).isActive = true
-        // 分割线①：余额区块 → 设置区块
-        root.setCustomSpacing(8, after: balanceGroupContainer)
-        let divider1 = sectionDivider(in: root)
-        root.setCustomSpacing(8, after: divider1)
+        // 余额区块 → 设置区块（分割线已移除，用区块间距分隔）
+        root.setCustomSpacing(10, after: balanceGroupContainer)
 
         // ── 设置卡片 ──
         autoCheckinSwitch.target = self
         autoCheckinSwitch.action = #selector(autoCheckinToggled)
-        hideIconSwitch.target = self
-        hideIconSwitch.action = #selector(hideIconToggled)
         hideWbNickSwitch.target = self
         hideWbNickSwitch.action = #selector(hideWbNicknameToggled)
-        debugSwitch.target = self
-        debugSwitch.action = #selector(debugToggled)
-        // 刷新间隔行：标题 + spacer + NSSegmentedControl
+        gradientSwitch.target = self
+        gradientSwitch.action = #selector(panelGradientToggled)
+        // 刷新间隔行：标题 + 手动刷新按钮 + spacer + NSSegmentedControl
         intervalSegment.target = self
         intervalSegment.action = #selector(intervalChanged)
         intervalSegment.setContentHuggingPriority(.required, for: .horizontal)
         intervalSegment.setContentHuggingPriority(.defaultLow, for: .vertical)
         intervalSegment.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        // 钉死分段控件宽度（3 × 38，与 viewDidMoveToWindow 中 setWidth 一致）：
+        // NSSegmentedControl 的 intrinsic 尺寸由 cell 按系统版本计算，setWidth 在
+        // viewDidMoveToWindow 才生效、且未必被 intrinsic 采纳，行内余量会被它吃掉，
+        // 导致低压缩阻力的 label 先被压窄、文字被裁剪。显式约束不受版本/时序影响。
+        // 内边距已由 CompactSegmentedCell 收窄，38pt/段足以容纳「3分钟」@9pt（约 25pt）。
+        intervalSegment.widthAnchor.constraint(equalToConstant: 114).isActive = true
         let intervalLabel = NSTextField(labelWithString: "刷新时间")
         intervalLabel.font = .systemFont(ofSize: 12)
         intervalLabel.textColor = kBalanceForeground
-        let intervalRow = NSStackView(views: [
-            intervalLabel, stretchSpacer(), intervalSegment
-        ])
+        // label 压缩阻力提到 required：行空间不足时优先让其它视图让步，label 永远不被压窄
+        intervalLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        // 手动刷新按钮：arrow.clockwise 图标，石墨灰（systemGray），size 10（小于选项文本 12pt，更紧凑）。
+        // 点击时图标顺时针旋转一圈（RefreshIconButton 内部 sendAction 触发）。
+        // 无独立 hover 背景——整行被 HoverRowView 包裹，hover 时图标 contentTintColor 跟随
+        // 下方选项小字一起提亮为 labelColor（systemGray→labelColor），样式一致。
+        let manualRefreshBtn = RefreshIconButton()
+        manualRefreshBtn.image = symbolImage("arrow.clockwise", size: 10)
+        manualRefreshBtn.target = self
+        manualRefreshBtn.action = #selector(manualRefreshTapped)
+        manualRefreshBtn.setContentHuggingPriority(.required, for: .horizontal)
+        manualRefreshBtn.setContentHuggingPriority(.defaultLow, for: .vertical)
+        manualRefreshBtn.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        let intervalRow = RefreshRow()
         intervalRow.orientation = .horizontal
         intervalRow.spacing = 6
+        intervalRow.setViews([intervalLabel, manualRefreshBtn, stretchSpacer(), intervalSegment], in: .leading)
+        intervalRow.segmentView = intervalSegment
+        intervalRow.triggerButton = manualRefreshBtn
 
         let settingRows = [
             intervalRow,
             switchRow(title: "自动签到", sub: autoCheckinSub, sw: autoCheckinSwitch),
             switchRow(title: "悬停卡片时显示昵称", sub: nil, sw: hideWbNickSwitch),
-            switchRow(title: "显示菜单栏主图标", sub: nil, sw: hideIconSwitch),
-            switchRow(title: "调试", sub: nil, sw: debugSwitch),
+            switchRow(title: "面板渐变背景", sub: nil, sw: gradientSwitch),
         ].map { wrapHoverRow($0) }
-        // 「设置」标题独立置于卡片上方，左对齐到卡片内标题边界（root.leading + 8）
-        let settingTitle = sectionTitleRow(name: "设置")
+        // 「设置」标题：可折叠标题条（hover 余额卡片样式，点击折叠整个设置卡片）
+        var settingCollapseTargets: [NSView] = []
+        let settingTitle = collapsibleSectionTitle(name: "设置", key: UDKey.settingsSectionCollapsed,
+                                                    targets: { settingCollapseTargets })
         root.addArrangedSubview(settingTitle)
-        settingTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8).isActive = true
+        pinFullWidth(settingTitle, in: root)
         root.setCustomSpacing(0, after: settingTitle)
         let settingCard = addCard(rows: settingRows, to: root, spacing: 8)
+        // 折叠目标接线 + 初始态（内容隐藏与标题下间距，展开时间距 0 贴卡片）
+        settingCollapseTargets = [settingCard]
+        let settingsCollapsed = UserDefaults.standard.bool(forKey: UDKey.settingsSectionCollapsed)
+        settingCard.isHidden = settingsCollapsed
+        root.setCustomSpacing(settingsCollapsed ? 6 : 0, after: settingTitle)
 
         // ── 操作卡片：磁贴按钮（每行 4 个，超出换行）──
         wbAddBtn.target = self
@@ -1511,28 +1777,35 @@ final class BalancePanelView: NSView {
         traeAddBtn.action = #selector(addTraeAccountTapped)
         zcodeAddBtn.target = self
         zcodeAddBtn.action = #selector(addZcodeAccountTapped)
+        let codexAddBtn = ActionTileButton(bundleIcon: "codex", title: "添加账号", target: self, action: #selector(addCodexAccountTapped), iconSize: 19)
+        checkinBtn.target = self
+        checkinBtn.action = #selector(manualCheckinTapped)
 
         let cockpitBtn = ActionTileButton(symbol: "gauge.with.needle", title: "Cockpit", target: self, action: #selector(openCockpitTapped))
         let apiKeyBtn = ActionTileButton(bundleIcon: "deepseek", title: "配置Key", target: self, action: #selector(setApiKeyTapped))
+        let aboutBtn = ActionTileButton(symbol: "info.circle", title: "关于", target: self, action: #selector(aboutTapped))
         let actionTiles = [
             cockpitBtn,
             wbAddBtn,
             traeAddBtn,
             zcodeAddBtn,
+            codexAddBtn,
             apiKeyBtn,
             ActionTileButton(bundleIcon: "deepseek", title: "日常额度", target: self, action: #selector(setDsQuotaTapped)),
-            ActionTileButton(bundleIcon: "qwen-color", title: "千问账号", target: self, action: #selector(setQwTicketTapped)),
-            ActionTileButton(symbol: "checkmark.seal", title: "手动签到", target: self, action: #selector(manualCheckinTapped)),
-            ActionTileButton(symbol: "clock.arrow.circlepath", title: "签到历史", target: self, action: #selector(checkinHistoryTapped)),
-            ActionTileButton(symbol: "info.circle", title: "关于", target: self, action: #selector(aboutTapped)),
+            checkinBtn,
+            ActionTileButton(symbol: "list.bullet.rectangle", title: "签到历史", target: self, action: #selector(checkinHistoryTapped)),
+            aboutBtn,
         ]
         // 各按钮悬停提示（HIG：图标类控件应有 tooltip）
         cockpitBtn.toolTip = "打开 Cockpit"
         wbAddBtn.toolTip = "添加 WorkBuddy 账号"
         traeAddBtn.toolTip = "添加 TRAE 账号"
         zcodeAddBtn.toolTip = "添加 ZCode 账号（JSON 导入）"
+        codexAddBtn.toolTip = "添加 Codex 账号（JSON 导入 ~/.codex/auth.json）"
         apiKeyBtn.toolTip = "配置 API Key"
-        // 按钮间固定间距 2pt（(230 - 4×56) / 3：满行恰好撑满卡片宽度）
+        let buildVer = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        aboutBtn.toolTip = "关于 iBalance（v\(buildVer)）"
+        // 按钮间固定间距 2pt（4×56 + 3×2 = 230：满行恰好撑满卡片内容宽度）
         let tileSpacing: CGFloat = 2
         for tile in actionTiles {
             tile.widthAnchor.constraint(equalToConstant: 56).isActive = true
@@ -1555,22 +1828,26 @@ final class BalancePanelView: NSView {
             row.heightAnchor.constraint(equalToConstant: 48).isActive = true
             return row
         }
-        // 分割线②：设置区块 → 操作区块
-        root.setCustomSpacing(8, after: settingCard)
-        let divider2 = sectionDivider(in: root)
-        root.setCustomSpacing(8, after: divider2)
-        // 「操作」标题独立置于卡片上方，左对齐到卡片内标题边界（root.leading + 8）
-        let actionTitle = sectionTitleRow(name: "操作")
+        // 设置区块 → 操作区块（分割线已移除，用区块间距分隔）
+        root.setCustomSpacing(10, after: settingCard)
+        // 「操作」标题：可折叠标题条（折叠时内容整体隐藏）
+        var actionCollapseTargets: [NSView] = []
+        let actionTitle = collapsibleSectionTitle(name: "操作", key: UDKey.actionsSectionCollapsed,
+                                                  targets: { actionCollapseTargets })
         root.addArrangedSubview(actionTitle)
-        actionTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8).isActive = true
+        pinFullWidth(actionTitle, in: root)
         root.setCustomSpacing(0, after: actionTitle)
-        // 磁贴行按内容宽靠左排（每行磁贴固定等宽，不满一行不被拉伸）
-        let actionCard = addCard(rows: tileRows, to: root, spacing: 0, bottomPadding: 7, stretchRows: false)
+        // 磁贴行按内容宽靠左排（每行磁贴固定等宽，不满一行不被拉伸）；
+        // 左右内边距 0（磁贴行 230 ≤ 内容宽 236，余量留右侧）
+        let actionCard = addCard(rows: tileRows, to: root, spacing: 0, bottomPadding: 7, horizontalPadding: 0, stretchRows: false)
 
-        // 分割线③：操作区块 → footer
-        root.setCustomSpacing(8, after: actionCard)
-        let divider3 = sectionDivider(in: root)
-        root.setCustomSpacing(8, after: divider3)
+        // 操作区块 → footer（分割线已移除，用区块间距分隔）
+        root.setCustomSpacing(10, after: actionCard)
+        // 折叠目标接线 + 初始态
+        actionCollapseTargets = [actionCard]
+        let actionsCollapsed = UserDefaults.standard.bool(forKey: UDKey.actionsSectionCollapsed)
+        actionCard.isHidden = actionsCollapsed
+        root.setCustomSpacing(actionsCollapsed ? 6 : 0, after: actionTitle)
 
         // ── 底部：更新时间（严格水平居中）+ 退出按钮（贴右）──
         updatedLabel.font = .systemFont(ofSize: 9, weight: .regular)
@@ -1598,10 +1875,10 @@ final class BalancePanelView: NSView {
             updatedLabel.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
             updatedLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: footerHeight),
-            quitBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -4),
+            quitBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
             quitBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
-            // 容器固定 22×22（HoverIconButton.buttonSize）；使用 macOS 原生 recessed 按钮，
-            // hover 时系统自动绘制圆角背景（略大于图标），符合 macOS 设计规范
+            // 容器固定 22×22（HoverIconButton.buttonSize）；无边框按钮，
+            // hover 时自绘大圆角淡白背景（圆角与卡片统一）
             quitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             quitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
         ])
@@ -1612,7 +1889,7 @@ final class BalancePanelView: NSView {
     /// onClick 非空时卡片使用 HoverCard（hover 高亮 + 点击回调）；设置/操作卡片用普通 NSView。
     /// bottomPadding: 卡片底部内边距（默认 7，操作卡片可减小以消除与 footer 间的空白）
     @discardableResult
-    private func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true) -> NSView {
+    private func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true) -> NSView {
         var all = rows
         if let t = title {
             all.insert(sectionTitleRow(name: t, color: titleColor), at: 0)
@@ -1633,15 +1910,17 @@ final class BalancePanelView: NSView {
         // 卡片透明背景（露出 popover 原生玻璃），仅保留圆角 + 细边框区分
         // 余额卡片使用 HoverCard 获得 hover 高亮 + 点击回调；设置/操作卡片用普通 NSView
         let card: NSView
-        if onClick != nil {
+        if onClick != nil || onRightClick != nil {
             let hc = HoverCard()
             hc.onClick = onClick
+            hc.onRightClick = onRightClick
             card = hc
         } else {
             card = NSView()
         }
         card.wantsLayer = true
         card.layer?.cornerRadius = Palette.cardCornerRadius
+        card.layer?.cornerCurve = .continuous
         card.layer?.masksToBounds = true
         // 预设边框色（hover 时由 HoverCard/ActionTileButton 动画 borderWidth 显示）
         card.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
@@ -1665,24 +1944,6 @@ final class BalancePanelView: NSView {
         return card
     }
 
-    /// 区块分割线：1pt 高，撑满 root 宽度，使用暗主题分割色
-    private func sectionDivider(in root: NSStackView) -> NSView {
-        let line = NSView()
-        line.translatesAutoresizingMaskIntoConstraints = false
-        line.wantsLayer = true
-        line.layer?.backgroundColor = Palette.dividerColor.cgColor
-        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(line)
-        // 撑满父级容器宽度（忽略 root 的左右内边距）：锚到 panel 的 leading/trailing
-        if let panel = root.superview {
-            line.leadingAnchor.constraint(equalTo: panel.leadingAnchor).isActive = true
-            line.trailingAnchor.constraint(equalTo: panel.trailingAnchor).isActive = true
-        } else {
-            pinFullWidth(line, in: root)
-        }
-        return line
-    }
-
     /// 分组标题行：标题，12pt bold + systemGray（石墨灰），左对齐，固定行高 24pt
     private func sectionTitleRow(name: String, color: NSColor = .systemGray) -> NSView {
         let label = NSTextField(labelWithString: name)
@@ -1694,6 +1955,66 @@ final class BalancePanelView: NSView {
         row.spacing = 6
         row.heightAnchor.constraint(equalToConstant: 24).isActive = true
         return row
+    }
+
+    /// 内容高度变化回调（区块折叠/展开后由面板调用）：VC 据此重算 preferredContentSize，
+    /// 让 popover 高度随内容收缩，其余区块保持自然高度不被拉伸
+    var onContentChanged: (() -> Void)?
+
+    /// 可折叠区块标题条：hover 复用余额卡片样式（HoverCard 渐变+噪点+0.8pt 发丝边框），
+    /// 点击切换折叠并持久化（UserDefaults，key 走 UDKey）。整条撑满 root 宽：
+    /// 标题文字左对齐余额标题（内边距 8），箭头（▸ 折叠 / ▾ 展开）靠右贴卡片内边界。
+    /// targets 闭包返回随折叠一起隐藏的视图（build 在区块内容创建后才会填充，闭包按引用取最新值）；
+    /// 初始折叠态由 build 在填完 targets 后自行应用（isHidden + 间距）。
+    private func collapsibleSectionTitle(name: String, key: String, targets: @escaping () -> [NSView]) -> HoverCard {
+        let label = NSTextField(labelWithString: name)
+        label.font = .systemFont(ofSize: 12, weight: .bold)
+        label.textColor = .systemGray
+        let chevron = NSImageView()
+        chevron.contentTintColor = .systemGray
+        chevron.imageScaling = .scaleProportionallyUpOrDown
+
+        func apply(_ collapsed: Bool) {
+            targets().forEach { $0.isHidden = collapsed }
+            chevron.image = symbolImage(collapsed ? "chevron.right" : "chevron.down", size: 8)
+            // 折叠后标题下方无卡片可贴（间距 0 会贴住下一元素），补 6pt；展开恢复 0 贴卡片
+            (hc.superview as? NSStackView)?.setCustomSpacing(collapsed ? 6 : 0, after: hc)
+            // 通知 VC 按新内容高度收缩 popover，避免固定高度把其余区块拉伸
+            onContentChanged?()
+        }
+
+        let hc = HoverCard()
+        hc.onClick = {
+            let collapsed = !UserDefaults.standard.bool(forKey: key)
+            UserDefaults.standard.set(collapsed, forKey: key)
+            apply(collapsed)
+        }
+        hc.wantsLayer = true
+        // 圆角与余额卡片统一（Palette.cardCornerRadius = 10pt）
+        hc.layer?.cornerRadius = Palette.cardCornerRadius
+        hc.layer?.cornerCurve = .continuous
+        hc.layer?.masksToBounds = true
+        // 边框色预设（HoverCard mouseEntered 只动画 borderWidth，色值由此处提供）
+        hc.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        hc.layer?.borderWidth = 0
+        // label 与箭头直接锚到标题条两端——不经 NSStackView（默认 .gravityAreas
+        // 会把子视图全堆在 leading 重力区，行撑满也没法把箭头推到最右）
+        hc.addSubview(label)
+        hc.addSubview(chevron)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            hc.heightAnchor.constraint(equalToConstant: 24),
+            // 标题文字距左 8（与余额标题对齐），垂直居中
+            label.leadingAnchor.constraint(equalTo: hc.leadingAnchor, constant: 8),
+            label.centerYAnchor.constraint(equalTo: hc.centerYAnchor),
+            // 箭头钉在最右（距右 8，与卡片右内边界对齐），垂直居中
+            chevron.trailingAnchor.constraint(equalTo: hc.trailingAnchor, constant: -8),
+            chevron.centerYAnchor.constraint(equalTo: hc.centerYAnchor),
+        ])
+        // 初始箭头方向（内容显隐由 build 在 targets 就绪后应用）
+        chevron.image = symbolImage(UserDefaults.standard.bool(forKey: key) ? "chevron.right" : "chevron.down", size: 8)
+        return hc
     }
 
     /// 余额卡片内容行：左大 icon + 中间纵向（标题/签到信息）+ 右纵向（额度值/点阵）
@@ -1734,10 +2055,10 @@ final class BalancePanelView: NSView {
             badge.isHidden = true
             iconContainer.addSubview(badge)
             NSLayoutConstraint.activate([
-                badge.widthAnchor.constraint(equalToConstant: 10),
-                badge.heightAnchor.constraint(equalToConstant: 10),
+                badge.widthAnchor.constraint(equalToConstant: 11),
+                badge.heightAnchor.constraint(equalToConstant: 11),
                 badge.centerXAnchor.constraint(equalTo: iconView.centerXAnchor, constant: imgSize / 2 - 1),
-                badge.centerYAnchor.constraint(equalTo: iconView.centerYAnchor, constant: -imgSize / 2 + 1),
+                badge.centerYAnchor.constraint(equalTo: iconView.centerYAnchor, constant: -imgSize / 2),
             ])
         }
 
@@ -1934,7 +2255,7 @@ final class BalancePanelView: NSView {
 
     /// 从 App bundle Resources 加载品牌 SVG 图标。
     /// ⚠️ 保持文件原始颜色：不设 isTemplate、不加 contentTintColor，
-    ///    否则品牌色（如千问渐变）会被单色化。
+    ///    否则品牌色（如 TRAE 渐变）会被单色化。
     private func bundleIcon(_ name: String, size: CGFloat) -> NSImage? {
         guard let url = Bundle.main.url(forResource: name, withExtension: "svg"),
               let img = NSImage(contentsOf: url) else { return nil }
@@ -1947,7 +2268,7 @@ final class BalancePanelView: NSView {
     /// 默认隐藏，由 apply*CardData 按当日签到失败状态显隐。
     private func makeFailureBadge() -> NSView {
         let img = NSImageView()
-        img.image = symbolImage("exclamationmark.message.fill", size: 10)
+        img.image = symbolImage("exclamationmark.message.fill", size: 11)
         img.contentTintColor = .systemRed
         img.imageScaling = .scaleProportionallyUpOrDown
         return img
@@ -1959,13 +2280,13 @@ final class BalancePanelView: NSView {
     @objc private func autoCheckinToggled() { onToggleAutoCheckin?() }
     @objc private func addWbAccountTapped() { onAddWbAccount?() }
     @objc private func addZcodeAccountTapped() { onAddZcodeAccount?() }
-    @objc private func debugToggled() { onToggleDebug?() }
+    @objc private func addCodexAccountTapped() { onAddCodexAccount?() }
     @objc private func addTraeAccountTapped() { onCollectTraeAccount?() }
-    @objc private func hideIconToggled() { onToggleHideIcon?() }
     @objc private func hideWbNicknameToggled() { onToggleHideWbNickname?() }
+    @objc private func panelGradientToggled() { onTogglePanelGradient?() }
     @objc private func setApiKeyTapped() { onSetApiKey?() }
     @objc private func setDsQuotaTapped() { onSetDsQuota?() }
-    @objc private func setQwTicketTapped() { onSetQwTicket?() }
+
     @objc private func aboutTapped() { onAbout?() }
     @objc private func manualCheckinTapped() { onManualCheckin?() }
     @objc private func checkinHistoryTapped() { onShowCheckinHistory?() }
@@ -1979,4 +2300,5 @@ final class BalancePanelView: NSView {
         }
         onSetInterval?(seconds)
     }
+    @objc private func manualRefreshTapped() { onManualRefresh?() }
 }
