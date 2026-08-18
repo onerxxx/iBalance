@@ -1,7 +1,7 @@
 // main.swift — iBalance 入口 + AppDelegate（菜单栏 UI / 定时器 / 编排）
 // macOS 菜单栏常驻应用（NSStatusItem），实时汇总多平台余额/积分。
 // 不依赖 Python/rumps，编译为单个 .app，内存占用 ~10MB。
-// 配置从 .app 同目录 config.json 读取，改配置无需重新编译。
+// 配置和缓存存放在 ~/Library/Application Support/com.local.ibalance，App 可自由移动或更新。
 
 import Cocoa
 import UserNotifications
@@ -238,9 +238,10 @@ private func makeWbBrandIcon() -> NSImage? {
     return img
 }
 
-/// DeepSeek 日常额度弹窗控制器（MVC：NSAlert = View，本类 = Controller）。
+/// DeepSeek 设置弹窗：一次性配置 API Key 和日常充值额度。
 @MainActor
-final class DsQuotaDialog: NSObject {
+final class DeepSeekSettingsDialog: NSObject {
+    private let apiKeyField = NSTextField()
     private let popup = NSPopUpButton()
     private let customField = NSTextField()
     private let presets: [(label: String, value: Double)] = [
@@ -251,9 +252,21 @@ final class DsQuotaDialog: NSObject {
         ("¥100", 100),
     ]
 
-    /// - Parameter quota: 当前已设置的额度（0 = 未设置），用于弹窗初值
-    init(quota: Double) {
+    /// - Parameters:
+    ///   - apiKey: 当前 DeepSeek API Key
+    ///   - quota: 当前已设置的日常充值额度（0 = 未设置）
+    init(apiKey: String, quota: Double) {
         super.init()
+        apiKeyField.isBezeled = true
+        apiKeyField.bezelStyle = .roundedBezel
+        apiKeyField.isEditable = true
+        apiKeyField.isSelectable = true
+        apiKeyField.font = NSFont.systemFont(ofSize: 12)
+        apiKeyField.stringValue = apiKey
+        apiKeyField.cell?.isScrollable = true
+        apiKeyField.cell?.wraps = false
+        apiKeyField.lineBreakMode = .byTruncatingTail
+
         for opt in presets { popup.addItem(withTitle: opt.label) }
         popup.menu?.addItem(withTitle: "自定义", action: nil, keyEquivalent: "")
         customField.placeholderString = "自定义额度"
@@ -281,29 +294,60 @@ final class DsQuotaDialog: NSObject {
         }
     }
 
-    func present() -> Double? {
+    func present() -> (apiKey: String?, quota: Double)? {
         let shell = DialogShell()
         shell.addIcon(makeDsBrandIcon())
-        shell.addTitle("日常充值额度")
-        // 说明文字与金额控件同容器等宽（富文本路径放 accessoryView，宽度对齐控件行）；
-        // 颜色对齐系统次级标签色，字号 12pt
-        shell.addInfo(NSAttributedString(
-            string: "设置日常充值额度，用于显示余额进度。",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 12),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ]))
+        shell.addTitle("DeepSeek 设置")
+        let infoAttr = NSMutableAttributedString(
+            string: "配置 API Key 和日常充值额度。获取 API Key：",
+            attributes: [.font: NSFont.systemFont(ofSize: 12),
+                         .foregroundColor: NSColor.secondaryLabelColor])
+        infoAttr.append(NSAttributedString(
+            string: "platform.deepseek.com/api_keys",
+            attributes: [.link: URL(string: "https://platform.deepseek.com/api_keys")!,
+                         .foregroundColor: NSColor.linkColor,
+                         .underlineStyle: NSUnderlineStyle.single.rawValue,
+                         .font: NSFont.systemFont(ofSize: 12)]))
+        shell.addInfo(infoAttr)
+        shell.contentWidth = DialogMetrics.inputWidth
 
-        // 控件区：下拉(110pt) + 间距(8pt) + 输入框(撑满)，纯 frame 布局
-        let rowWidth = DialogMetrics.width - DialogMetrics.sidePadding * 2
+        // 两行设置共用一个 accessory 容器：文本在上、控件在下，统一左对齐。
+        let rowWidth = shell.contentWidth - DialogMetrics.sidePadding * 2
+        let labelHeight: CGFloat = 18
+        let controlHeight: CGFloat = 28
+        let labelControlGap: CGFloat = 4
+        let rowHeight = labelHeight + labelControlGap + controlHeight
+        let rowGap: CGFloat = 10
+        let content = NSView(frame: NSRect(x: 0, y: 0,
+                                           width: rowWidth,
+                                           height: rowHeight * 2 + rowGap))
+        let keyLabel = NSTextField(labelWithString: "API Key")
+        keyLabel.font = NSFont.systemFont(ofSize: 12)
+        keyLabel.textColor = NSColor.labelColor
+        keyLabel.alignment = .left
+        keyLabel.frame = NSRect(x: 0, y: rowHeight + rowGap + controlHeight + labelControlGap,
+                                width: rowWidth, height: labelHeight)
+        apiKeyField.frame = NSRect(x: 0, y: rowHeight + rowGap,
+                                   width: rowWidth, height: controlHeight)
+        content.addSubview(keyLabel)
+        content.addSubview(apiKeyField)
+
+        let quotaLabel = NSTextField(labelWithString: "日常额度")
+        quotaLabel.font = NSFont.systemFont(ofSize: 12)
+        quotaLabel.textColor = NSColor.labelColor
+        quotaLabel.alignment = .left
+        quotaLabel.frame = NSRect(x: 0, y: controlHeight + labelControlGap,
+                                  width: rowWidth, height: labelHeight)
         let popupWidth: CGFloat = 110
-        let fieldWidth = rowWidth - popupWidth - 8
-        let row = NSView(frame: NSRect(x: 0, y: 0, width: rowWidth, height: 28))
-        popup.frame = NSRect(x: 0, y: 1, width: popupWidth, height: 26)
-        customField.frame = NSRect(x: popupWidth + 8, y: 2, width: fieldWidth, height: 24)
-        row.addSubview(popup)
-        row.addSubview(customField)
-        shell.addContent(row, height: 28)
+        popup.frame = NSRect(x: 0, y: 0, width: popupWidth, height: controlHeight)
+        customField.frame = NSRect(x: popupWidth + 8, y: 2,
+                                   width: rowWidth - popupWidth - 8,
+                                   height: 24)
+        content.addSubview(quotaLabel)
+        content.addSubview(popup)
+        content.addSubview(customField)
+        shell.addContent(content, height: content.frame.height)
+        shell.firstResponder = apiKeyField
 
         // NSAlert 按钮顺序：先添加的在右边（默认按钮）
         let save = shell.addButton("保存", keyEquivalent: "\r")
@@ -311,11 +355,13 @@ final class DsQuotaDialog: NSObject {
         let clicked = shell.present()
         guard clicked == save else { return nil }
 
+        let apiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if let customVal = Double(customField.stringValue.trimmingCharacters(in: .whitespaces)), customVal > 0 {
-            return customVal
+            return (apiKey.isEmpty ? nil : apiKey, customVal)
         }
         let idx = popup.indexOfSelectedItem
-        return idx < presets.count ? presets[idx].value : 0
+        let quota = idx < presets.count ? presets[idx].value : 0
+        return (apiKey.isEmpty ? nil : apiKey, quota)
     }
 }
 
@@ -430,6 +476,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
     private var settingsMenu: NSMenu!
+    /// 面板最近一次释放拖拽后的平台顺序；面板未拖拽前回退到 UserDefaults。
+    private var menuBarPlatformOrder: [String]?
     private var lastUpdatedAt = ""
     /// 上次余额刷新完成时间：打开面板时若距此 <1分钟则跳过自动刷新，避免频繁请求
     private var lastRefreshTime = Date.distantPast
@@ -541,7 +589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let apiKeyMenuItem = NSMenuItem(title: "设置 API Key…", action: #selector(onSetApiKey), keyEquivalent: "")
+        let apiKeyMenuItem = NSMenuItem(title: "DeepSeek 设置…", action: #selector(onSetApiKey), keyEquivalent: "")
         apiKeyMenuItem.target = self
         menu.addItem(apiKeyMenuItem)
 
@@ -796,7 +844,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onAddWbAccount = { [weak self] in self?.onAddWbAccount() }
         panel.onAddZcodeAccount = { [weak self] in self?.onAddZcodeAccount() }
         panel.onAddCodexAccount = { [weak self] in self?.onAddCodexAccount() }
-        panel.onSetDsQuota = { [weak self] in self?.onSetDsQuota() }
         panel.onSetInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
         panel.onManualRefresh = { [weak self] in self?.onRefresh() }
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
@@ -829,18 +876,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.openApp(bundleId: "dev.zcode.app", missingTitle: "未找到 ZCode 应用",
                           missingMsg: "未找到 Bundle ID 为 dev.zcode.app 的应用，请确认 ZCode 已安装。")
         }
-        panel.onClickCodex = {
-            if let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
-                NSWorkspace.shared.open(app)
-            } else {
-                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Codex.app"))
-            }
+        panel.onClickCodex = { [weak self] in
+            self?.openApp(bundleId: "com.openai.codex", missingTitle: "未找到 Codex 应用",
+                          missingMsg: "未找到 Codex 应用，请确认 ChatGPT/Codex 已安装。")
+        }
+        panel.onSwitchCodexAccount = { [weak self] uid in
+            self?.switchCodexAccount(uid: uid)
         }
         panel.onSwitchZcodeAccount = { [weak self] uid in
             self?.switchZcodeAccount(uid: uid)
         }
         panel.onRightClickCard = { [weak self] itemId, event in
             self?.toggleMenuBarVisibility(itemId: itemId, event: event)
+        }
+        panel.onPlatformOrderChanged = { [weak self] order in
+            self?.menuBarPlatformOrder = order
+            self?.updateTitle()
         }
         let popover = NSPopover()
         popover.delegate = self
@@ -1167,24 +1218,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         shell.contentWidth = DialogMetrics.width + 8 + 20
         shell.addInfo("菜单栏常驻小工具，实时聚合多平台账户余额与积分。\n\n"
             + "• DeepSeek 余额（API Key 查询）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（JSON 导入，多号切换）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
-            + "配置存于同目录 config.json\n版本 v\(build)")
+            + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }
     }
 
     @objc private func onSetApiKey() {
-        guard let key = keepPanelAliveDuring({ promptForApiKey(prefill: config.deepseekApiKey) }) else { return }
-        config.deepseekApiKey = key
+        guard let result = keepPanelAliveDuring({
+            DeepSeekSettingsDialog(apiKey: config.deepseekApiKey,
+                                   quota: config.deepseekCommonQuota).present()
+        }) else { return }
+        if let apiKey = result.apiKey { config.deepseekApiKey = apiKey }
+        config.deepseekCommonQuota = max(0, result.quota)
         ConfigStore.save(config)
         onRefresh()
-    }
-
-    @objc private func onSetDsQuota() {
-        let quota = keepPanelAliveDuring { DsQuotaDialog(quota: config.deepseekCommonQuota).present() }
-        guard let quota else { return }  // 取消
-        config.deepseekCommonQuota = max(0, quota)
-        ConfigStore.save(config)
-        syncPanel()
     }
 
     // MARK: - 菜单栏条目显示控制
@@ -1236,8 +1283,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// 按面板余额卡片顺序构建要显示在菜单栏的条目（id, symbol, value, icon）
-    /// 顺序：DS → ZCode → Codex → TRAE → WB（均主→其他），与 UI 卡片顺序严格一致
+    /// 读取面板保存的平台顺序；未知/新增平台自动追加到末尾。
+    private func balancePlatformOrder() -> [String] {
+        let saved = menuBarPlatformOrder
+            ?? UserDefaults.standard.stringArray(forKey: UDKey.balancePlatformOrder)
+            ?? []
+        return BalancePlatform.normalizedOrder(from: saved)
+    }
+
+    /// 按面板余额卡片顺序构建要显示在菜单栏的条目（id, symbol, value, icon）。
+    /// 平台组顺序与余额面板共用 UserDefaults，组内仍保持当前账号优先。
     private func orderedMenuBarEntries() -> [(id: String, symbol: String, value: String, isCurrent: Bool, icon: String)] {
         var entries: [(id: String, symbol: String, value: String, isCurrent: Bool, icon: String)] = []
 
@@ -1298,7 +1353,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             entries.append((id: MenuBarPrefix.wb + ac.uid, symbol: "", value: fmtAmountCommas(c.remain, decimals: 0), isCurrent: ac.uid == wbMainUid, icon: "workbuddy"))
         }
 
-        return entries
+        // 余额面板拖拽只改变平台组顺序；这里按平台前缀重排，保持每组内部账号顺序不变。
+        return balancePlatformOrder().flatMap { platformID in
+            switch platformID {
+            case "ds":
+                return entries.filter { $0.id == MenuBarPrefix.ds }
+            case "zcode":
+                return entries.filter { $0.id.hasPrefix(MenuBarPrefix.zcode) }
+            case "codex":
+                return entries.filter { $0.id.hasPrefix(MenuBarPrefix.codex) }
+            case "trae":
+                return entries.filter { $0.id.hasPrefix(MenuBarPrefix.trae) }
+            case "wb":
+                return entries.filter { $0.id.hasPrefix(MenuBarPrefix.wb) }
+            default:
+                return []
+            }
+        }
     }
 
     // MARK: - 统一格式化标题（用缓存 + 当前小数位）
@@ -1354,6 +1425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             switch entry.icon {
             case "trae-color": iconScale = 0.94
             case "zhipu": iconScale = 0.87
+            case "codex": iconScale = 0.90
             default: iconScale = 1.0
             }
             // DeepSeek 图标后用细空格（后面紧跟 ¥ 符号），其余平台保持普通空格
@@ -1408,6 +1480,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastUpdatedAt = Self.dfClock.string(from: Date())
         lastRefreshTime = Date()  // 记录本次刷新完成时间，用于面板打开时节流
         saveBalanceCache()  // 数值快照落盘，供下次启动秒显
+        // 各服务并行返回时已先行刷新菜单栏；这里再统一补一次，确保本轮所有账号最终一致。
+        updateTitle()
         panelView?.setRefreshing(false)  // 先停动效，syncPanel 再写入真实更新时间
         syncPanel()
     }
@@ -1498,6 +1572,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 guard !Task.isCancelled else { return }
                 cacheWbAccounts[refreshed.uid] = r
                 updatePulsingForWb(uid: refreshed.uid, remain: r.remain, total: r.total)
+                // 非当前账号也要立即同步菜单栏，不能只刷新面板。
+                updateTitle()
             } else if !Task.isCancelled {
                 wbFailed = true  // 该号 token 刷新或查询失败
             }
@@ -1553,6 +1629,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                newRatio: r.total > 0 ? (r.total - r.remain) / r.total : 0)
             prevZcodeRatio[ac.uid] = prev
             zcodePulsing[ac.uid] = pulsing
+            // ZCode 没有主账号单独刷新路径，每个账号写入后立即更新菜单栏。
+            updateTitle()
         }
         if zcodeFailed { failedServices.insert("ZCode") }
         else { failedServices.remove("ZCode") }
@@ -1629,6 +1707,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 guard !Task.isCancelled else { return }
                 cacheTraeAccounts[ac.uid] = r
                 updatePulsingForTrae(uid: ac.uid, limit: r.limit, used: r.used)
+                // 非当前账号也要立即同步菜单栏，不能只刷新面板。
+                updateTitle()
             } else if !Task.isCancelled {
                 traeFailed = true  // 该号解密或获取失败
             }
@@ -2040,6 +2120,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - 手动签到（全部账号，链路与自动签到一致）
 
+    /// 签到成功行的 SF Symbol 信息项：状态 + 连续天数 + 奖励积分（0 值项省略）。
+    private func checkinInfoItems(alreadyCheckedIn: Bool, streak: Int, reward: Int) -> [CheckinInfoItem] {
+        var items = [CheckinInfoItem(symbol: "checkmark.seal", text: alreadyCheckedIn ? "已签到" : "签到成功")]
+        if streak > 0 { items.append(CheckinInfoItem(symbol: "flame", text: "\(streak)\u{2009}天")) }
+        if reward > 0 { items.append(CheckinInfoItem(symbol: "gift", text: "+\(reward)")) }
+        return items
+    }
+
     /// 手动触发全部账号签到：复用 traeAutoCheckinIfNeeded / wbAutoCheckinIfNeeded
     /// （含每日守卫、token 刷新、退避），完成后弹窗汇总各账号签到情况。
     @objc private func onManualCheckin() {
@@ -2076,11 +2164,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
                 let reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
                 if dateKey == today {
-                    let tag = (traeBefore[ac.uid] ?? "") == today ? "今日已签到" : "签到成功"
-                    var detail = ""
-                    if streak > 0 { detail += " 连续\(streak)\u{2009}天" }
-                    if reward > 0 { detail += " 积分+\(reward)" }
-                    rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：\(tag)\(detail)", state: .ok))
+                    let infoItems = checkinInfoItems(alreadyCheckedIn: (traeBefore[ac.uid] ?? "") == today,
+                                                     streak: streak, reward: reward)
+                    rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：", state: .ok, infoItems: infoItems))
                     okCount += 1
                 } else if failed {
                     rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：签到失败", state: .fail))
@@ -2095,11 +2181,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
                 let reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
                 if dateKey == today {
-                    let tag = (wbBefore[ac.uid] ?? "") == today ? "今日已签到" : "签到成功"
-                    var detail = ""
-                    if streak > 0 { detail += " 连续\(streak)\u{2009}天" }
-                    if reward > 0 { detail += " 积分+\(reward)" }
-                    rows.append(CheckinResultRow(text: "WorkBuddy · \(ac.nickname)：\(tag)\(detail)", state: .ok))
+                    let infoItems = checkinInfoItems(alreadyCheckedIn: (wbBefore[ac.uid] ?? "") == today,
+                                                     streak: streak, reward: reward)
+                    rows.append(CheckinResultRow(text: "WorkBuddy · \(ac.nickname)：", state: .ok, infoItems: infoItems))
                     okCount += 1
                 } else if failed {
                     rows.append(CheckinResultRow(text: "WorkBuddy · \(ac.nickname)：签到失败", state: .fail))
@@ -2125,7 +2209,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let shell = DialogShell()
         shell.addIcon(NSApp.applicationIconImage)
         shell.addTitle("手动签到完成")
-        shell.contentWidth = DialogMetrics.inputWidth
+        // 手动签到结果较长，info 容器在输入类弹窗基准上加宽 25pt，减少账号名称换行。
+        shell.contentWidth = DialogMetrics.inputWidth + 25
 
         let para = NSMutableParagraphStyle()
         para.lineSpacing = 3
@@ -2137,17 +2222,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 .paragraphStyle: para,
             ]))
         }
+        func appendSymbol(_ name: String, color: NSColor) {
+            let symbolSize: CGFloat = 11.5
+            guard let source = NSImage(systemSymbolName: name, accessibilityDescription: nil),
+                  let configured = source.withSymbolConfiguration(.init(pointSize: symbolSize, weight: .medium)) else { return }
+            // NSTextAttachment 不会稳定继承 surrounding foregroundColor，先把 SF Symbol
+            // 显式渲染成与卡片副标题一致的灰色，避免图标在弹窗中出现不同色相/亮度。
+            let imageSize = NSSize(width: symbolSize, height: symbolSize)
+            let image = NSImage(size: imageSize)
+            image.lockFocus()
+            color.setFill()
+            NSBezierPath(rect: NSRect(origin: .zero, size: imageSize)).fill()
+            configured.draw(in: NSRect(origin: .zero, size: imageSize),
+                            from: .zero, operation: .destinationIn, fraction: 1)
+            image.unlockFocus()
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            // 让图标与 12pt 正文同高并保持基线视觉居中。
+            attachment.bounds = NSRect(x: 0, y: -1.5, width: symbolSize, height: symbolSize)
+            attr.append(NSAttributedString(attachment: attachment))
+        }
         append("成功\u{2009}\(okCount) · 失败\u{2009}\(failCount)\n\n",
                color: failCount > 0 ? .systemOrange : .secondaryLabelColor)
         for row in rows {
-            let (symbol, color): (String, NSColor)
-            switch row.state {
-            case .ok: (symbol, color) = ("✓  ", .systemGreen)
-            case .fail: (symbol, color) = ("✗  ", .systemOrange)
-            case .skipped: (symbol, color) = ("–  ", .systemGray)
+            if !row.infoItems.isEmpty {
+                let infoColor = NSColor.systemGray
+                append(row.text, color: infoColor)
+                for (index, item) in row.infoItems.enumerated() {
+                    append(index == 0 ? "\u{2009}" : "\u{2003}", color: infoColor)
+                    appendSymbol(item.symbol, color: infoColor)
+                    append("\u{2009}\(item.text)", color: infoColor)
+                }
+                append("\n", color: infoColor)
+            } else {
+                let (symbol, color): (String, NSColor)
+                switch row.state {
+                case .ok: (symbol, color) = ("✓  ", .systemGreen)
+                case .fail: (symbol, color) = ("✗  ", .systemOrange)
+                case .skipped: (symbol, color) = ("–  ", .systemGray)
+                }
+                append(symbol, color: color)
+                append(row.text + "\n", color: row.state == .fail ? .systemOrange : .secondaryLabelColor)
             }
-            append(symbol, color: color)
-            append(row.text + "\n", color: row.state == .fail ? .systemOrange : .secondaryLabelColor)
         }
         // 去掉末行多余的换行
         if attr.length > 0 { attr.deleteCharacters(in: NSRange(location: attr.length - 1, length: 1)) }
@@ -2303,7 +2419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 走下方状态查证补写历史（补上后恢复零网络跳过）
             if UserDefaults.standard.string(forKey: dateKey) == today
                && checkinHistory(key: UDKey.traeCheckinHistory(ac.uid)).contains(where: { $0.date == today }) {
-                log("[\(ac.uid)] 今日已签到，跳过")
+                log("[\(ac.uid)] 已签到，跳过")
                 continue
             }
             // 错峰守卫：未到今日就绪时刻的账号本轮跳过（手动一键签到不受限）
@@ -2609,28 +2725,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 不立即关闭面板：让用户看到「切换中」脉冲反馈，切换完成后再关闭。
     private func switchTraeAccount(uid: String) {
         guard let account = config.traeAccounts.first(where: { $0.uid == uid }) else { return }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            let ok = TraeService.switchAccount(account: TraeAccountInfo(
+        let storagePath = config.traeStoragePath
+        performAccountSwitch(serviceName: "TRAE",
+                             failureMessage: "写入 storage.json 未成功，已重启恢复原账号") {
+            TraeService.switchAccount(account: TraeAccountInfo(
                 uid: account.uid,
                 username: account.username,
                 avatarUrl: "",
                 encryptedAuthInfo: account.encryptedAuthInfo,
                 token: TraeService.getTokenFromEncrypted(account.encryptedAuthInfo) ?? ""
-            ), storagePath: self.config.traeStoragePath)
-            // 切换完成 → 回主线程：重排卡片 + 触发刷新拉新账号余额（菜单栏/面板同步），失败发通知，0.6s 后关面板
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                if !ok {
-                    self.notify("TRAE 切号失败", "写入 storage.json 未成功，已重启恢复原账号")
-                } else {
-                    self.syncPanel()
-                    self.onRefresh()
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                    self?.popoverController?.close()
-                }
-            }
+            ), storagePath: storagePath)
         }
     }
 
@@ -2654,25 +2758,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
     }
 
-    /// 切换 WorkBuddy 账号：杀进程 → 写 auth 文件 → 重启 WorkBuddy Desktop。
-    /// 在后台线程执行（含 Thread.sleep），避免阻塞 UI。
-    /// 不立即关闭面板：让用户看到「切换中」反馈 + 卡片重排动画，切换完成后再关闭。
-    private func switchWbAccount(uid: String) {
-        Logger.log(.switchAccount, "[iBalance] switchWbAccount called: uid=\(uid)")
-        guard let account = config.workbuddyAccounts.first(where: { $0.uid == uid }) else {
-            Logger.log(.switchAccount, "[iBalance] account not found for uid=\(uid)")
-            return
-        }
-        Logger.log(.switchAccount, "[iBalance] found account: \(account.nickname)")
-        // 直接用 config 中的 token 切换，WorkBuddy Desktop 启动后会自行刷新 token
+    /// 统一编排各平台切号流程：后台执行平台特定的凭据写入/重启，回主线程刷新面板并关闭。
+    /// 各平台只提供 action，避免重复实现相同的线程切换、失败提示和收尾逻辑。
+    private func performAccountSwitch(serviceName: String,
+                                      failureMessage: String,
+                                      action: @escaping () -> Bool) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            let ok = WorkBuddyService.switchAccount(account)
-            // 切换完成 → 回主线程：重排卡片 + 触发刷新拉新账号余额（菜单栏/面板同步），失败发通知，0.6s 后关面板
+            guard self != nil else { return }
+            let ok = action()
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 if !ok {
-                    self.notify("WorkBuddy 切号失败", "写入认证文件未成功，已重启恢复原账号")
+                    self.notify("\(serviceName) 切号失败", failureMessage)
                 } else {
                     self.syncPanel()
                     self.onRefresh()
@@ -2684,6 +2781,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// 切换 WorkBuddy 账号：杀进程 → 写 auth 文件 → 重启 WorkBuddy Desktop。
+    /// 在后台线程执行（含 Thread.sleep），避免阻塞 UI。
+    /// 不立即关闭面板：让用户看到「切换中」反馈 + 卡片重排动画，切换完成后再关闭。
+    private func switchWbAccount(uid: String) {
+        Logger.log(.switchAccount, "[iBalance] switchWbAccount called: uid=\(uid)")
+        guard let account = config.workbuddyAccounts.first(where: { $0.uid == uid }) else {
+            Logger.log(.switchAccount, "[iBalance] account not found for uid=\(uid)")
+            return
+        }
+        Logger.log(.switchAccount, "[iBalance] found account: \(account.nickname)")
+        // 直接用 config 中的 token 切换，WorkBuddy Desktop 启动后会自行刷新 token
+        performAccountSwitch(serviceName: "WorkBuddy",
+                             failureMessage: "写入认证文件未成功，已重启恢复原账号") {
+            WorkBuddyService.switchAccount(account)
+        }
+    }
+
     /// 切换 ZCode 账号：杀进程 → 写 credentials/config → 重启 ZCode。
     /// 在后台线程执行（含等待进程退出），切换完成后再关闭面板（同 WB 流程）。
     private func switchZcodeAccount(uid: String) {
@@ -2692,22 +2806,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             Logger.log(.switchAccount, "[iBalance] zcode account not found for uid=\(uid)")
             return
         }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            let ok = ZcodeService.switchAccount(account)
-            // 切换完成 → 回主线程：重排卡片 + 触发刷新拉新账号余额（菜单栏/面板同步），失败发通知，0.6s 后关面板
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                if !ok {
-                    self.notify("ZCode 切号失败", "写入凭据文件未成功，已重启恢复原账号")
-                } else {
-                    self.syncPanel()
-                    self.onRefresh()
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                    self?.popoverController?.close()
-                }
-            }
+        performAccountSwitch(serviceName: "ZCode",
+                             failureMessage: "写入凭据文件未成功，已重启恢复原账号") {
+            ZcodeService.switchAccount(account)
+        }
+    }
+
+    /// 切换 Codex 账号：退出 Codex → 写 ~/.codex/auth.json → 重启 Codex。
+    /// 不立即关闭面板，让用户看到卡片上的切换中反馈。
+    private func switchCodexAccount(uid: String) {
+        Logger.log(.switchAccount, "[iBalance] switchCodexAccount called: uid=\(uid)")
+        guard let account = config.codexAccounts.first(where: { $0.uid == uid }) else {
+            Logger.log(.switchAccount, "[iBalance] Codex account not found for uid=\(uid)")
+            return
+        }
+        performAccountSwitch(serviceName: "Codex",
+                             failureMessage: "写入 ~/.codex/auth.json 未成功，已重启恢复原账号") {
+            CodexService.switchAccount(account)
         }
     }
 

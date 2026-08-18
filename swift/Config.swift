@@ -101,16 +101,22 @@ struct ZCodeAccount: Codable, Equatable {
 
 // MARK: - Codex 多号账号
 
-/// Codex Desktop 本机 auth.json 中的登录账号。token 仅用于调用 usage 接口，昵称固定使用邮箱。
+/// Codex Desktop 本机 auth.json 中的登录账号。
+/// refreshToken/idToken 用于切号后恢复完整登录态；旧配置缺失时仍兼容只使用 access token。
 struct CodexAccount: Codable, Equatable {
     var uid: String
     var token: String
     var email: String
+    var refreshToken: String
+    var idToken: String
 
-    init(uid: String, token: String, email: String) {
+    init(uid: String, token: String, email: String,
+         refreshToken: String = "", idToken: String = "") {
         self.uid = uid
         self.token = token
         self.email = email
+        self.refreshToken = refreshToken
+        self.idToken = idToken
     }
 
     init(from decoder: Decoder) throws {
@@ -118,6 +124,8 @@ struct CodexAccount: Codable, Equatable {
         uid = try c.decodeIfPresent(String.self, forKey: .uid) ?? ""
         token = try c.decodeIfPresent(String.self, forKey: .token) ?? ""
         email = try c.decodeIfPresent(String.self, forKey: .email) ?? ""
+        refreshToken = try c.decodeIfPresent(String.self, forKey: .refreshToken) ?? ""
+        idToken = try c.decodeIfPresent(String.self, forKey: .idToken) ?? ""
     }
 }
 
@@ -207,41 +215,101 @@ struct AppConfig: Codable {
 
 // MARK: - 加载 / 保存
 
-enum ConfigStore {
-    /// 优先 .app 同目录（用户可编辑），其次 Resources 内置默认值。
-    static func load() -> AppConfig {
-        let parentConfig = URL(fileURLWithPath: Bundle.main.bundlePath)
+/// 应用在用户目录中的持久化数据位置。
+/// 配置和缓存不放在 .app 旁边，避免移动或更新 App 时丢失用户数据。
+enum AppDataStore {
+    static let bundleIdentifier = Bundle.main.bundleIdentifier ?? "com.local.ibalance"
+
+    static var applicationSupportURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                             in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("Application Support", isDirectory: true)
+        return base.appendingPathComponent(bundleIdentifier, isDirectory: true)
+    }
+
+    static var configURL: URL {
+        applicationSupportURL.appendingPathComponent("config.json")
+    }
+
+    static var cacheURL: URL {
+        applicationSupportURL.appendingPathComponent("cache.json")
+    }
+
+    /// 旧版本把文件放在 .app 同目录；只在新位置没有对应文件时复制一次。
+    static func legacyURL(for filename: String) -> URL {
+        URL(fileURLWithPath: Bundle.main.bundlePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("config.json")
-        let resConfig = Bundle.main.url(forResource: "config", withExtension: "json")
-        let url: URL
-        if FileManager.default.fileExists(atPath: parentConfig.path) {
-            url = parentConfig
-        } else if let res = resConfig {
-            url = res
-        } else {
-            var cfg = AppConfig()
-            if cfg.traeStoragePath.isEmpty { cfg.traeStoragePath = detectTraeStoragePath() }
-            return cfg
+            .appendingPathComponent(filename)
+    }
+
+    static func prepareDirectory() {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: applicationSupportURL, withIntermediateDirectories: true)
+        // 配置包含 API Key / token，目录只允许当前用户访问。
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: applicationSupportURL.path)
+    }
+
+    /// 将旧版同目录文件迁移到 Application Support，保留旧文件作为可恢复副本。
+    @discardableResult
+    static func migrateIfNeeded(filename: String) -> Bool {
+        let destination: URL
+        switch filename {
+        case "config.json": destination = configURL
+        case "cache.json": destination = cacheURL
+        default: return false
         }
+        let source = legacyURL(for: filename)
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: destination.path),
+              fm.fileExists(atPath: source.path) else { return false }
+        prepareDirectory()
+        do {
+            try fm.copyItem(at: source, to: destination)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    static func secureWrite(_ data: Data, to url: URL) {
+        prepareDirectory()
+        guard (try? data.write(to: url, options: [.atomic])) != nil else { return }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+}
+
+enum ConfigStore {
+    /// 优先 Application Support 中的用户配置，其次迁移旧版同目录配置，最后使用 Resources 默认值。
+    static func load() -> AppConfig {
+        AppDataStore.prepareDirectory()
+        AppDataStore.migrateIfNeeded(filename: "config.json")
+        let resConfig = Bundle.main.url(forResource: "config", withExtension: "json")
+        let url = FileManager.default.fileExists(atPath: AppDataStore.configURL.path)
+            ? AppDataStore.configURL
+            : resConfig
         var cfg = AppConfig()
-        if let data = try? Data(contentsOf: url),
+        var shouldPersist = false
+        if let url,
+           let data = try? Data(contentsOf: url),
            let cfg2 = try? JSONDecoder().decode(AppConfig.self, from: data) {
             cfg = cfg2
+            // 首次使用 Resources 默认配置时也落到稳定路径，后续更新 App 不会覆盖用户设置。
+            shouldPersist = url != AppDataStore.configURL
         }
         if cfg.traeStoragePath.isEmpty { cfg.traeStoragePath = detectTraeStoragePath() }
+        if shouldPersist { save(cfg) }
         return cfg
     }
 
-    /// 写回 .app 同目录的 config.json（用户编辑这份）。Codable 序列化，弃用字段不再落盘。
+    /// 写回 Application Support 中的 config.json。Codable 序列化，弃用字段不再落盘。
     static func save(_ config: AppConfig) {
-        let parentURL = URL(fileURLWithPath: Bundle.main.bundlePath)
-            .deletingLastPathComponent()
-            .appendingPathComponent("config.json")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let out = try? encoder.encode(config) else { return }
-        try? out.write(to: parentURL, options: [.atomic])
+        AppDataStore.secureWrite(out, to: AppDataStore.configURL)
     }
 }
 
@@ -300,10 +368,12 @@ enum UDKey {
     // 面板区块折叠状态（Bool，设置/操作标题胶囊点击切换）
     static var settingsSectionCollapsed: String { "panel_settings_section_collapsed" }
     static var actionsSectionCollapsed: String { "panel_actions_section_collapsed" }
+    /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
+    static var balancePlatformOrder: String { "panel_balance_platform_order" }
 }
 
 /// 余额数值快照的磁盘缓存（cache-then-refresh）：启动时先显示上次数值再等网络刷新。
-/// 只存数值与更新时间，不含任何凭据/ token；文件为 .app 同目录 cache.json。
+/// 只存数值与更新时间，不含任何凭据/ token；文件位于 Application Support。
 struct BalanceCache: Codable {
     struct DsAmount: Codable { let symbol: String, totalRaw: String, total: Double }
     struct WbAmount: Codable { let remain: Double, total: Double }
@@ -324,14 +394,11 @@ struct BalanceCache: Codable {
 }
 
 enum BalanceCacheStore {
-    static var cacheURL: URL {
-        URL(fileURLWithPath: Bundle.main.bundlePath)
-            .deletingLastPathComponent()
-            .appendingPathComponent("cache.json")
-    }
-
     /// 读取上次会话的数值缓存；无文件或解码失败返回 nil（维持首启行为）
     static func load() -> BalanceCache? {
+        AppDataStore.prepareDirectory()
+        AppDataStore.migrateIfNeeded(filename: "cache.json")
+        let cacheURL = AppDataStore.cacheURL
         guard let data = try? Data(contentsOf: cacheURL),
               let cache = try? JSONDecoder().decode(BalanceCache.self, from: data) else { return nil }
         return cache
@@ -342,6 +409,6 @@ enum BalanceCacheStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let out = try? encoder.encode(cache) else { return }
-        try? out.write(to: cacheURL, options: [.atomic])
+        AppDataStore.secureWrite(out, to: AppDataStore.cacheURL)
     }
 }

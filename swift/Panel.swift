@@ -75,7 +75,7 @@ private enum Palette {
     /// 容器玻璃遮罩色（近黑半透明，加深毛玻璃底色）
     static let containerTint = NSColor(calibratedWhite: 0.02, alpha: 0.30)
     /// 容器玻璃渐变底色（中灰半透明）：与 containerTint 组成纵向渐变，顶部近黑 → 底部中灰
-    static let containerTintBottom = NSColor(calibratedWhite: 0.35, alpha: 0.30)
+    static let containerTintBottom = NSColor(calibratedWhite: 0.25, alpha: 0.30)
     /// 卡片圆角 10pt（对齐 macOS Big Sur+ NSPopover 窗口系统圆角）
     static let cardCornerRadius: CGFloat = 10
     /// 卡片边框色/分割线色（暗主题：浅灰半透明，1px 描边，统一白@10%）
@@ -461,10 +461,21 @@ extension RefreshIconButton: CAAnimationDelegate {
 /// 点击卡片触发 onClick 回调（如打开对应平台主页或应用）。
 class HoverCard: NSView {
     private var trackingArea: NSTrackingArea?
+    private weak var dragContentView: NSView?
+    private var dragNormalBackgroundColor: CGColor?
+    private var hasCapturedDragBackground = false
+    private var isMouseInside = false
+    private var isDragHoverLocked = false
     /// 点击回调：由外部设置，mouseUp 时触发
     var onClick: (() -> Void)?
     /// 右键点击回调：由外部设置，rightMouseDown 时触发（参数为事件，可用于弹出菜单定位）
     var onRightClick: ((NSEvent) -> Void)?
+    /// 拖拽回调：设置后，整张卡片都可用于排序拖拽。
+    var onDragStarted: ((NSPoint) -> Void)? {
+        didSet { window?.invalidateCursorRects(for: self) }
+    }
+    var onDragChanged: ((NSPoint) -> Void)?
+    var onDragEnded: (() -> Void)?
     /// hover 状态回调：true=进入，false=离开（如「悬停显示昵称」）
     var onHover: ((Bool) -> Void)?
     /// hover 效果容器：渐变 + 噪点统一淡入淡出
@@ -479,6 +490,70 @@ class HoverCard: NSView {
     private var noiseSize = CGSize.zero
     /// 渐变方向：水平向右为 0°，视觉顺时针偏移量（度）
     private let gradientAngleDeg: CGFloat = 60
+
+    var dragContentLayer: CALayer? { dragContentView?.layer }
+
+    func configureDragContentView(_ view: NSView) {
+        view.wantsLayer = true
+        dragContentView = view
+        if !hasCapturedDragBackground {
+            dragNormalBackgroundColor = layer?.backgroundColor
+            hasCapturedDragBackground = true
+        }
+    }
+
+    func setDragContentOpacity(_ opacity: Float) {
+        dragContentView?.wantsLayer = true
+        dragContentView?.layer?.opacity = opacity
+    }
+
+    /// 幽灵卡片移除后，实际卡片可能没有收到新的 mouseEntered/mouseExited，
+    /// 因此归位时必须用窗口当前光标位置重新判断 hover，而不是只依赖旧状态。
+    private func isPointerInsideCard() -> Bool {
+        guard let window else { return isMouseInside }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return bounds.contains(point)
+    }
+
+    /// 拖拽期间锁住 hover 材质，避免卡片随幽灵位置移动到光标下方时重新淡入变亮。
+    /// 归位交接时传入 animated=false，直接切换到最终状态，避免与幽灵卡片重叠一帧。
+    func setDragHoverLocked(_ locked: Bool, animated: Bool = true) {
+        guard isDragHoverLocked != locked else { return }
+        isDragHoverLocked = locked
+        if locked {
+            hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
+            layer?.removeAnimation(forKey: "borderWidthTransition")
+            // 占位卡片只保留静态内容，不继承按下拖动前已经存在的 hover 材质。
+            // 关闭隐式动画，避免从 hover 状态切到占位状态时再闪一帧。
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            hoverEffectLayer.opacity = 0
+            hoverEffectLayer.isHidden = true
+            layer?.backgroundColor = dragNormalBackgroundColor ?? kCardBackground.cgColor
+            layer?.borderWidth = 0
+            CATransaction.commit()
+            return
+        }
+
+        let showing = isPointerInsideCard()
+        isMouseInside = showing
+        hoverEffectLayer.isHidden = false
+        layer?.backgroundColor = dragNormalBackgroundColor ?? kCardBackground.cgColor
+        if !animated {
+            hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
+            layer?.removeAnimation(forKey: "borderWidthTransition")
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            hoverEffectLayer.opacity = showing ? 1 : 0
+            layer?.borderWidth = showing ? 0.8 : 0
+            CATransaction.commit()
+            onHover?(showing)
+            return
+        }
+        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: showing ? 1 : 0)
+        animateLayerKey(layer, keyPath: "borderWidth", to: showing ? 0.8 : 0)
+        onHover?(showing)
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -538,7 +613,7 @@ class HoverCard: NSView {
         noiseMaskLayer.endPoint = maxPt
     }
 
-    /// 生成白色噪点图：约 14% 像素随机白点（alpha 0~0.2），固定种子（同类同尺寸噪点稳定）
+    /// 生成白色噪点图：约 22% 像素随机白点（alpha 0~0.2），固定种子（同类同尺寸噪点稳定）
     private func makeNoiseImage(width: Int, height: Int) -> CGImage? {
         guard width > 0, height > 0 else { return nil }
         var px = [UInt8](repeating: 0, count: width * height * 4)
@@ -549,7 +624,7 @@ class HoverCard: NSView {
             return UInt8(truncatingIfNeeded: seed >> 33)
         }
         for i in 0..<(width * height) {
-            if rnd() < 35 {
+            if rnd() < 55 {
                 px[i * 4] = 255; px[i * 4 + 1] = 255; px[i * 4 + 2] = 255
                 px[i * 4 + 3] = rnd() / 5
             }
@@ -572,8 +647,25 @@ class HoverCard: NSView {
         trackingArea = ta
     }
 
+    /// 可排序卡片不把事件命中交给内部 label、图标等子视图，确保整张卡片都能开始拖拽。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if onDragStarted != nil, bounds.contains(point) {
+            return self
+        }
+        return super.hitTest(point)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if onDragStarted != nil {
+            addCursorRect(bounds, cursor: .openHand)
+        }
+    }
+
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        isMouseInside = true
+        if isDragHoverLocked { return }
         // 渐变 + 噪点背景淡入：顺时针偏 60°（从亮到暗，端点随宽高比自适应）
         animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 1)
         // 发丝边框淡入：0.8pt white@20%（色值由 addCard 预设）
@@ -583,6 +675,8 @@ class HoverCard: NSView {
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        isMouseInside = false
+        if isDragHoverLocked { return }
         // 渐变 + 噪点淡出，露出容器统一背景
         animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
         animateLayerKey(layer, keyPath: "borderWidth", to: 0)
@@ -591,7 +685,47 @@ class HoverCard: NSView {
 
     /// 点击卡片：mouseDown 记录按下位置，mouseUp 在 bounds 内时触发回调（避免拖出后误触）
     override func mouseDown(with event: NSEvent) {
-        // 不调用 super：避免被当作无意义点击传给父视图
+        guard onDragStarted != nil, let window else {
+            // 不调用 super：避免被当作无意义点击传给父视图
+            return
+        }
+
+        let start = event.locationInWindow
+        var dragging = false
+
+        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp],
+                                          until: .distantFuture,
+                                          inMode: .eventTracking,
+                                          dequeue: true) {
+            if next.type == .leftMouseDragged {
+                if !dragging {
+                    let current = next.locationInWindow
+                    let distance = hypot(current.x - start.x, current.y - start.y)
+                    guard distance >= 3 else { continue }
+                    dragging = true
+                    NSCursor.closedHand.push()
+                    onDragStarted?(current)
+                }
+                onDragChanged?(next.locationInWindow)
+            } else if next.type == .leftMouseUp {
+                if dragging {
+                    onDragChanged?(next.locationInWindow)
+                    onDragEnded?()
+                    NSCursor.pop()
+                } else {
+                    onClick?()
+                }
+                return
+            }
+        }
+
+        // 窗口关闭等异常情况下也要恢复拖拽状态，避免光标栈残留。
+        if dragging {
+            onDragEnded?()
+            NSCursor.pop()
+        } else {
+            onClick?()
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -609,9 +743,8 @@ class HoverCard: NSView {
 
 /// 操作磁贴按钮：纵向 icon + 多行文本（最多两行）。
 /// 继承 HoverCard：hover 效果与余额卡片完全统一（渐变+噪点背景、0.8pt white@20% 发丝边框、
-/// bounds 内 mouseUp 触发），额外叠加磁贴特有的 icon 软光晕与标题提亮。
+/// bounds 内 mouseUp 触发），叠加磁贴特有的 icon 软光晕。
 final class ActionTileButton: HoverCard {
-    private var _titleText: String = ""
     private let iconView = NSImageView()
     private let label = NSTextField(labelWithString: "")
     /// 目标-动作（与 NSButton 兼容，支持后续赋值）
@@ -622,7 +755,7 @@ final class ActionTileButton: HoverCard {
     /// icon 固定尺寸
     private let iconSize: CGFloat
 
-    init(symbol: String? = nil, bundleIcon iconName: String? = nil, title: String, target: AnyObject?, action: Selector?, iconSize: CGFloat = 18) {
+    init(symbol: String? = nil, bundleIcon iconName: String? = nil, title: String, target: AnyObject?, action: Selector?, iconSize: CGFloat = 16) {
         self.iconSize = iconSize
         super.init(frame: .zero)
         self.target = target
@@ -662,7 +795,8 @@ final class ActionTileButton: HoverCard {
             iconView.image = sym
             iconView.contentTintColor = kBalanceForeground
         }
-        label.font = .systemFont(ofSize: 10)
+        label.font = .systemFont(ofSize: 9)
+        // 文本用石墨灰系统语义色（弱于 icon 的 kBalanceForeground，降低存在感）
         label.textColor = .systemGray
         label.alignment = .center
         label.maximumNumberOfLines = 2
@@ -690,38 +824,27 @@ final class ActionTileButton: HoverCard {
             iconView.heightAnchor.constraint(equalToConstant: iconSize),
         ])
 
-        setTitle(title, highlighted: false)
+        setTitle(title)
         // 磁贴文本最多两行且会截断，toolTip 展示完整动作名（HIG：图标类控件应有悬停提示）
         toolTip = title
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func setTitle(_ title: String, highlighted: Bool) {
-        _titleText = title
+    func setTitle(_ title: String) {
+        // 文本始终石墨灰、icon 始终 kBalanceForeground，无高亮态
         label.stringValue = title
-        let textColor = highlighted ? NSColor.labelColor : NSColor.systemGray
-        // icon 始终使用 cardForeground（#E9E9E9），高亮时不提亮（由软光晕提供层次）
-        let iconColor = kBalanceForeground
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            label.animator().textColor = textColor
-            iconView.animator().contentTintColor = iconColor
-        }, completionHandler: nil)
     }
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)  // 卡片同款：渐变+噪点背景、发丝边框
-        // 磁贴特有：icon 软光晕 + 标题提亮
+        // 磁贴特有：icon 软光晕
         animateLayerKey(iconView.layer, keyPath: "shadowOpacity", to: 0.45, duration: 0.22)
-        setTitle(_titleText, highlighted: true)
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
         animateLayerKey(iconView.layer, keyPath: "shadowOpacity", to: 0.0, duration: 0.22)
-        setTitle(_titleText, highlighted: false)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -840,14 +963,29 @@ final class TintedVisualEffectView: NSVisualEffectView {
 /// 手动签到结果行状态：成功 / 失败 / 跳过（token 失效、退避中等）
 enum CheckinRowState { case ok, fail, skipped }
 
+/// 手动签到结果行中的 SF Symbol 信息项，与余额卡片副标题保持一致。
+struct CheckinInfoItem {
+    let symbol: String
+    let text: String
+}
+
 /// 手动签到结果行：状态符号 + 文本（由手动签到结果弹窗渲染）
 struct CheckinResultRow {
     let text: String
     let state: CheckinRowState
+    let infoItems: [CheckinInfoItem]
+
+    init(text: String, state: CheckinRowState, infoItems: [CheckinInfoItem] = []) {
+        self.text = text
+        self.state = state
+        self.infoItems = infoItems
+    }
 }
 
 /// 面板内容控制器：把 BalancePanelView 挂进 popover，宽度固定 245、高度自适应
 final class BalancePanelViewController: NSViewController {
+    /// 面板顶部暗色区域的固定高度；超过此位置后才开始向底部的渐变。
+    private let panelDarkRegionHeight: CGFloat = 300
     private let panel: BalancePanelView
 
     init(panel: BalancePanelView) {
@@ -896,11 +1034,11 @@ final class BalancePanelViewController: NSViewController {
         }
     }
 
-    /// 按当前开关状态刷新背景遮罩：渐变（起点=余额卡片底部）或单色近黑
+    /// 按当前开关状态刷新背景遮罩：渐变（起点=面板顶部 300pt）或单色近黑
     private func applyGradient() {
         guard let container = view as? TintedVisualEffectView else { return }
         container.tintBottomColor = panel.panelGradientEnabled ? Palette.containerTintBottom : nil
-        container.tintGradientStartY = panel.balanceSectionBottomY
+        container.tintGradientStartY = panelDarkRegionHeight
     }
 
     override func viewWillAppear() {
@@ -911,7 +1049,7 @@ final class BalancePanelViewController: NSViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
-        // 背景渐变从余额卡片底部开始：布局变化（折叠/展开/账号增删）后同步起点
+        // 背景渐变从面板顶部固定 300pt 开始；布局变化后同步背景状态
         applyGradient()
     }
 }
@@ -1048,6 +1186,24 @@ final class UsageDots: NSView {
     }
 }
 
+/// 余额平台标识与默认顺序：面板卡片排序与菜单栏条目共用。
+enum BalancePlatform: String, CaseIterable {
+    case deepSeek = "ds"
+    case zcode
+    case codex
+    case trae
+    case workBuddy = "wb"
+
+    static let defaultOrder: [String] = allCases.map(\.rawValue)
+
+    /// 归一化已保存的顺序：过滤未知平台，新增平台追加到末尾。
+    static func normalizedOrder(from saved: [String]) -> [String] {
+        let known = Set(defaultOrder)
+        let normalized = saved.filter { known.contains($0) }
+        return normalized + defaultOrder.filter { !normalized.contains($0) }
+    }
+}
+
 final class BalancePanelView: NSView {
 
     // MARK: - 对外回调（由 AppDelegate 接线到现有处理逻辑）
@@ -1055,7 +1211,6 @@ final class BalancePanelView: NSView {
     var onOpenCockpit: (() -> Void)?
     var onToggleAutoCheckin: (() -> Void)?
     var onAddWbAccount: (() -> Void)?
-    var onSetDsQuota: (() -> Void)?           // 设置 DeepSeek 常用充值额度
     var onSetInterval: ((Int) -> Void)?          // 秒数：60 / 180 / 300
     /// 手动刷新（刷新时间行内的刷新按钮触发）
     var onManualRefresh: (() -> Void)?
@@ -1090,8 +1245,12 @@ final class BalancePanelView: NSView {
     var onClickCodex: (() -> Void)?
     /// ZCode 非当前账号卡片点击：传入 uid，触发切号重启
     var onSwitchZcodeAccount: ((String) -> Void)?
+    /// Codex 非当前账号卡片点击：传入 uid，触发切号重启
+    var onSwitchCodexAccount: ((String) -> Void)?
     /// 右键点击余额卡片：传入卡片 menuBarId 和事件（用于弹出「在菜单栏显示」上下文菜单）
     var onRightClickCard: ((String, NSEvent) -> Void)?
+    /// 平台卡片排序完成：通知 AppDelegate 立即刷新菜单栏标题顺序
+    var onPlatformOrderChanged: (([String]) -> Void)?
 
     // MARK: - 余额展示控件
 
@@ -1138,15 +1297,18 @@ final class BalancePanelView: NSView {
     private struct CardStyle {
         let icon: String
         let name: String
-        let iconSize: CGFloat          // 当前账号 icon 尺寸（非当前固定 12.65）
-        let checkin: Bool              // 是否显示签到信息行（WB / TRAE）
-        let showsExpire: Bool          // 是否显示重置/到期倒计时行（ZCode / Codex）
-        let fallbackReward: Int        // reward 为 0 时的兜底值（WB 固定 +100，TRAE 显示 +???）
-        let menuBarIdPrefix: String    // 菜单栏 item id 前缀："trae:" / "wb:" / "zcode:"
-        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", iconSize: 20.47, checkin: true, showsExpire: false, fallbackReward: 100, menuBarIdPrefix: "wb:")
-        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", iconSize: 20.47, checkin: true, showsExpire: false, fallbackReward: 0, menuBarIdPrefix: "trae:")
-        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", iconSize: 18.47, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "zcode:")
-        static let codex = CardStyle(icon: "codex", name: "Codex", iconSize: 20.47, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "codex:")
+        let platformID: String
+        let iconSize: CGFloat           // 当前账号 icon 尺寸
+        let secondaryIconSize: CGFloat  // 非当前账号小卡片 icon 尺寸
+        let checkin: Bool               // 是否显示签到信息行（WB / TRAE）
+        let showsExpire: Bool           // 是否显示重置/到期倒计时行（ZCode / Codex）
+        let fallbackReward: Int         // reward 为 0 时的兜底值（WB 固定 +100，TRAE 显示 +???）
+        let menuBarIdPrefix: String     // 菜单栏 item id 前缀："trae:" / "wb:" / "zcode:"
+        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 20.47, secondaryIconSize: 12.65, checkin: true, showsExpire: false, fallbackReward: 100, menuBarIdPrefix: "wb:")
+        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", platformID: "trae", iconSize: 20.47, secondaryIconSize: 12.65, checkin: true, showsExpire: false, fallbackReward: 0, menuBarIdPrefix: "trae:")
+        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 17.55, secondaryIconSize: 12.02, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "zcode:")
+        // Codex 余额卡片图标整体缩小 5%（大卡片与小卡片统一口径）。
+        static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 19.45, secondaryIconSize: 12.02, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "codex:")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -1169,6 +1331,17 @@ final class BalancePanelView: NSView {
     private var codexCardsContainer: NSStackView!
     private var codexCardEntries: [CardEntry] = []
     private var codexCardUids: [String] = []
+    /// 平台卡片顺序：只在图标拖拽完成后写入，刷新余额不会改变用户排序。
+    private var platformOrder: [String] = []
+    private var platformCards: [String: NSView] = [:]
+    private var draggingPlatform: String?
+    /// 当前实际被拖动的账号卡片；用于占位内容，组幽灵的源视图单独记录。
+    private weak var draggingCard: NSView?
+    private weak var draggingGhostSourceView: NSView?
+    private weak var draggingGhostView: NSImageView?
+    private var draggingGhostOffset = NSPoint.zero
+    /// 当前拖动平台内的其他账号小卡片及其原始内容透明度。
+    private var draggingSiblingCardOpacities: [(card: HoverCard, opacity: Float)] = []
     private let updatedLabel = NSTextField(labelWithString: "")
     /// 刷新动效状态：true 时「更新于」区域脉冲显示「刷新中…」
     private var isRefreshing = false
@@ -1186,7 +1359,7 @@ final class BalancePanelView: NSView {
                                               title: "手动签到", target: nil, action: nil)
     private let zcodeAddBtn = ActionTileButton(bundleIcon: "zhipu",
                                                title: "添加账号", target: nil, action: nil,
-                                               iconSize: 17.1)  // 18 × 0.95，容器不变
+                                               iconSize: 14.45)  // 保持与基准 icon（16）的 ≈0.9 比例
     // 刷新间隔：MiniSegmentedControl（原生 .mini 尺寸，紧凑稳定）
     private let intervalSegment: MiniSegmentedControl = {
         let seg = MiniSegmentedControl(labels: ["1分钟", "3分钟", "5分钟"], trackingMode: .selectOne, target: nil, action: nil)
@@ -1200,6 +1373,8 @@ final class BalancePanelView: NSView {
     private(set) var panelGradientEnabled = true
 
     override init(frame frameRect: NSRect) {
+        let savedOrder = UserDefaults.standard.stringArray(forKey: UDKey.balancePlatformOrder) ?? []
+        platformOrder = BalancePlatform.normalizedOrder(from: savedOrder)
         super.init(frame: frameRect)
         build()
     }
@@ -1283,12 +1458,10 @@ final class BalancePanelView: NSView {
         autoCheckinSub.stringValue = s.lastCheckinTime ?? ""
         autoCheckinSub.isHidden = autoCheckinSub.stringValue.isEmpty
 
-        wbAddBtn.setTitle(s.wbOauthInProgress ? "取消添加" : "添加账号",
-                          highlighted: false)
+        wbAddBtn.setTitle(s.wbOauthInProgress ? "取消添加" : "添加账号")
         // 进行中反馈：签到磁贴背景脉冲 + 禁点；TRAE 采集对齐 WB 的文案切换 + 同款脉冲
         checkinBtn.setInProgress(s.checkinInProgress)
-        traeAddBtn.setTitle(s.traeCollectInProgress ? "采集中…" : "添加账号",
-                            highlighted: false)
+        traeAddBtn.setTitle(s.traeCollectInProgress ? "采集中…" : "添加账号")
         traeAddBtn.setInProgress(s.traeCollectInProgress)
 
         switch s.refreshIntervalSeconds {
@@ -1300,7 +1473,259 @@ final class BalancePanelView: NSView {
         hideWbNickSwitch.state = s.hideWbNickname ? .off : .on
     }
 
-    // MARK: - 多号卡片通用实现（WB / TRAE / ZCode）
+    // MARK: - 平台卡片排序
+
+    private var shouldReduceMotion: Bool {
+        if #available(macOS 10.12, *) {
+            return NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        }
+        return false
+    }
+
+    private func visiblePlatformIDs() -> [String] {
+        platformOrder.filter { id in
+            guard let card = platformCards[id] else { return false }
+            return !card.isHidden && card.frame.height > 0
+        }
+    }
+
+    private func makeDragSnapshot(of card: NSView) -> NSImage? {
+        guard !card.bounds.isEmpty,
+              let representation = card.bitmapImageRepForCachingDisplay(in: card.bounds) else { return nil }
+        // 先缓存拖动开始时的真实外观，让幽灵保留大卡片当前的 hover 样式；
+        // 原卡片随后才会切成无 hover 占位，避免两者同时显示 hover 背景。
+        card.cacheDisplay(in: card.bounds, to: representation)
+        let image = NSImage(size: card.bounds.size)
+        image.addRepresentation(representation)
+        return image
+    }
+
+    /// 平台排序对象与实际账号卡片并非总是同一层：DeepSeek 直接存卡片，
+    /// 多账号平台存的是账号卡片容器。拖动视觉必须统一取当前账号卡片。
+    private func draggableCard(for platformID: String) -> NSView? {
+        guard let platformView = platformCards[platformID] else { return nil }
+        if platformView is HoverCard { return platformView }
+        if let container = platformView as? NSStackView {
+            return container.arrangedSubviews.first(where: { $0 is HoverCard })
+        }
+        return platformView
+    }
+
+    /// 多账号平台有小卡片时，幽灵应覆盖整个账号组；单账号平台仍只显示当前卡片。
+    private func dragGhostSourceView(for platformView: NSView, card: NSView) -> NSView {
+        guard let container = platformView as? NSStackView,
+              container.arrangedSubviews.contains(where: { view in
+                  view is HoverCard && view !== card
+              }) else { return card }
+        return container
+    }
+
+    private func restoreDraggingSiblingCards() {
+        for item in draggingSiblingCardOpacities {
+            item.card.setDragContentOpacity(item.opacity)
+        }
+        draggingSiblingCardOpacities.removeAll()
+    }
+
+    private func beginPlatformDrag(_ id: String, locationInWindow: NSPoint) {
+        guard draggingPlatform == nil, let platformView = platformCards[id] else { return }
+        balanceGroupContainer.layoutSubtreeIfNeeded()
+
+        guard let card = draggableCard(for: id) else { return }
+        draggingPlatform = id
+        draggingCard = card
+
+        // 多账号平台的容器内还有非当前账号小卡片，它们同样属于占位组，
+        // 一起降低内容透明度，避免拖动时同组卡片仍保持满亮。
+        if let container = platformCards[id] as? NSStackView {
+            for sibling in container.arrangedSubviews.compactMap({ $0 as? HoverCard }) where sibling !== card {
+                let opacity = sibling.dragContentLayer?.opacity ?? 1
+                draggingSiblingCardOpacities.append((card: sibling, opacity: opacity))
+            }
+        }
+        let hoverCard = card as? HoverCard
+        let ghostSourceView = dragGhostSourceView(for: platformView, card: card)
+        draggingGhostSourceView = ghostSourceView
+        let ghostFrame = ghostSourceView.convert(ghostSourceView.bounds, to: self)
+        let pointer = convert(locationInWindow, from: nil)
+        draggingGhostOffset = NSPoint(x: pointer.x - ghostFrame.minX, y: pointer.y - ghostFrame.minY)
+
+        // 必须在锁住 hover 之前截图：幽灵保留按下瞬间的大卡片 hover 外观，
+        // 原卡片则继续留在排序流中并切成无 hover 占位。
+        var ghostReady = false
+        if let image = makeDragSnapshot(of: ghostSourceView) {
+            let ghost = NSImageView(frame: ghostFrame)
+            ghost.image = image
+            ghost.imageScaling = .scaleAxesIndependently
+            ghost.imageAlignment = .alignCenter
+            ghost.wantsLayer = true
+            ghost.layer?.cornerRadius = Palette.cardCornerRadius
+            ghost.layer?.cornerCurve = .continuous
+            ghost.layer?.shadowColor = NSColor.black.cgColor
+            ghost.layer?.shadowOffset = CGSize(width: 0, height: -3)
+            ghost.layer?.shadowRadius = 10
+            ghost.layer?.shadowOpacity = shouldReduceMotion ? 0.35 : 0.48
+            // 拖拽开始时直接显示到最终透明度，避免幽灵卡片从 0 淡入造成起手闪烁。
+            ghost.alphaValue = 0.96
+            addSubview(ghost, positioned: .above, relativeTo: nil)
+            draggingGhostView = ghost
+            movePlatformGhost(to: locationInWindow)
+            ghostReady = true
+        }
+        hoverCard?.setDragHoverLocked(true)
+
+        // 原卡片保留在排序流中作为轻量占位，避免其他卡片在拖动时失去节奏。
+        if let hoverCard = card as? HoverCard {
+            // 只降低内容层，保持卡片背景/hover 材质稳定，避免归位时背景闪亮。
+            hoverCard.setDragContentOpacity(ghostReady ? 0.18 : 0.88)
+        } else {
+            card.wantsLayer = true
+            card.layer?.opacity = ghostReady ? 0.18 : 0.88
+        }
+        // 小卡片仍需承担同组结构提示，不能和主拖动卡片一样降到几乎不可见。
+        let siblingOpacity: Float = ghostReady ? 0.4 : 0.88
+        for item in draggingSiblingCardOpacities {
+            item.card.setDragContentOpacity(siblingOpacity)
+        }
+    }
+
+    private func movePlatformGhost(to locationInWindow: NSPoint) {
+        guard let ghost = draggingGhostView else { return }
+        let pointer = convert(locationInWindow, from: nil)
+        ghost.frame.origin = NSPoint(x: pointer.x - draggingGhostOffset.x,
+                                     y: pointer.y - draggingGhostOffset.y)
+    }
+
+    private func updatePlatformDrag(_ id: String, locationInWindow: NSPoint) {
+        guard draggingPlatform == id else { return }
+        movePlatformGhost(to: locationInWindow)
+        balanceGroupContainer.layoutSubtreeIfNeeded()
+
+        let visibleIDs = Set(visiblePlatformIDs())
+        let remaining = platformOrder.filter { $0 != id && visibleIDs.contains($0) }
+        let targetIndex = min(remaining.count,
+                             remaining.reduce(into: 0) { result, candidate in
+                                 guard let card = platformCards[candidate] else { return }
+                                 let center = card.convert(NSPoint(x: card.bounds.midX, y: card.bounds.midY), to: nil)
+                                 // 面板是非 flipped 坐标：y 越大越靠上。
+                                 if center.y > locationInWindow.y { result += 1 }
+                             })
+        let targetID = targetIndex < remaining.count ? remaining[targetIndex] : nil
+
+        var nextOrder = platformOrder.filter { $0 != id }
+        if let targetID, let anchorIndex = nextOrder.firstIndex(of: targetID) {
+            nextOrder.insert(id, at: anchorIndex)
+        } else if let last = remaining.last, let lastIndex = nextOrder.firstIndex(of: last) {
+            nextOrder.insert(id, at: lastIndex + 1)
+        } else {
+            nextOrder.append(id)
+        }
+
+        if nextOrder != platformOrder {
+            platformOrder = nextOrder
+            applyPlatformOrder(animated: true)
+        }
+    }
+
+    private func endPlatformDrag() {
+        guard let id = draggingPlatform else { return }
+        draggingPlatform = nil
+        guard let platformView = platformCards[id] else {
+            draggingCard = nil
+            draggingGhostSourceView = nil
+            restoreDraggingSiblingCards()
+            draggingGhostView?.removeFromSuperview()
+            draggingGhostView = nil
+            return
+        }
+        let card = draggingCard ?? draggableCard(for: id) ?? platformView
+        draggingCard = nil
+        let hoverCard = card as? HoverCard
+
+        let ghost = draggingGhostView
+        draggingGhostView = nil
+        let ghostSourceView = draggingGhostSourceView ?? card
+        draggingGhostSourceView = nil
+        // 释放时以当前 arrangedSubview 的最终坐标为准，确保幽灵卡片归位到真实卡片位置。
+        balanceGroupContainer.layoutSubtreeIfNeeded()
+        platformView.layer?.removeAnimation(forKey: "platformReorder")
+        let finalFrame = ghostSourceView.convert(ghostSourceView.bounds, to: self)
+        if let ghost, !shouldReduceMotion {
+            // 归位阶段先隐藏占位卡片内容，避免幽灵卡片与占位卡片半透明叠加变亮。
+            let placeholderLayer = (card as? HoverCard)?.dragContentLayer ?? card.layer
+
+            // 拖动过程中一直使用 NSView.frame，这里也用同一坐标系做吸附，
+            // 避免在 frame 与 CALayer.position 之间切换时出现右上方跳动。
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                ghost.animator().frame = finalFrame
+            } completionHandler: { [weak self, weak ghost] in
+                // 归位完成后做一次原子交接：占位内容直接接管并移除幽灵，
+                // 避免额外的淡入动画在两层之间制造闪烁帧。
+                placeholderLayer?.removeAnimation(forKey: "platformDropRestore")
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                placeholderLayer?.opacity = 1
+                ghost?.alphaValue = 0
+                ghost?.removeFromSuperview()
+                // 幽灵与占位在同一个交接事务内恢复最终 hover 状态，
+                // 光标若已在卡片内则直接显示，避免多余的 hover 淡入闪烁。
+                hoverCard?.setDragHoverLocked(false, animated: false)
+                CATransaction.commit()
+                self?.restoreDraggingSiblingCards()
+                self?.draggingGhostOffset = .zero
+            }
+        } else {
+            ghost?.removeFromSuperview()
+            if let hoverCard = card as? HoverCard {
+                hoverCard.setDragContentOpacity(1)
+            } else {
+                card.layer?.opacity = 1
+            }
+            restoreDraggingSiblingCards()
+            hoverCard?.setDragHoverLocked(false, animated: false)
+            draggingGhostOffset = .zero
+        }
+        UserDefaults.standard.set(platformOrder, forKey: UDKey.balancePlatformOrder)
+        onPlatformOrderChanged?(platformOrder)
+    }
+
+    /// 调整 arrangedSubview 顺序，并仅用 Y 轴位移动画让相邻平台卡片平滑让位。
+    private func applyPlatformOrder(animated: Bool) {
+        let orderedViews = platformOrder.compactMap { platformCards[$0] }
+        guard orderedViews.count == platformCards.count else { return }
+
+        let oldFrames = Dictionary(uniqueKeysWithValues: orderedViews.map {
+            (ObjectIdentifier($0), $0.frame)
+        })
+        for (index, view) in orderedViews.enumerated() {
+            guard let currentIndex = balanceGroupContainer.arrangedSubviews.firstIndex(of: view),
+                  currentIndex != index else { continue }
+            balanceGroupContainer.removeArrangedSubview(view)
+            balanceGroupContainer.insertArrangedSubview(view, at: index)
+        }
+        for view in orderedViews {
+            balanceGroupContainer.setCustomSpacing(4, after: view)
+        }
+        balanceGroupContainer.layoutSubtreeIfNeeded()
+
+        guard animated, !shouldReduceMotion else { return }
+        for view in orderedViews {
+            guard let oldFrame = oldFrames[ObjectIdentifier(view)],
+                  oldFrame != view.frame,
+                  let layer = view.layer else { continue }
+            // 使用 transform.translation.y，明确锁住 X 轴，避免重排时出现水平漂移。
+            let animation = CABasicAnimation(keyPath: "transform.translation.y")
+            animation.fromValue = oldFrame.midY - view.frame.midY
+            animation.toValue = 0
+            animation.duration = 0.2
+            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer.add(animation, forKey: "platformReorder")
+        }
+    }
+
+    // MARK: - 多号卡片通用实现（WB / TRAE / ZCode / Codex）
 
     /// 重建多号卡片（账号列表变化时调用）：
     /// 当前账号全尺寸 icon + 点阵 + 签到/到期信息行；非当前账号小卡片（仅 icon 标题 + 额度）。
@@ -1365,8 +1790,8 @@ final class BalancePanelView: NSView {
                 nl.alphaValue = 0
                 return nl
             }()
-            // 非当前账号 icon 缩小至 12.65pt（约为大 icon 的 1/1.618），列宽不变；内边距加大增加卡片高度
-            let imgSize: CGFloat = isCurrent ? style.iconSize : 12.65
+            // 非当前账号 icon 尺寸按平台由 CardStyle 指定（约大 icon 的 1/1.618，Codex/ZCode 再缩 5%），列宽不变
+            let imgSize: CGFloat = isCurrent ? style.iconSize : style.secondaryIconSize
             let fgColor: NSColor = isCurrent ? kBalanceForeground : Palette.cardForegroundDimmed
             // 上下内边距大小卡统一 4pt
             let cardPadTop: CGFloat = 4
@@ -1401,7 +1826,13 @@ final class BalancePanelView: NSView {
                 }
             }, onRightClick: { [weak self] event in
                 self?.onRightClickCard?(style.menuBarIdPrefix + uid, event)
-            }, topPadding: cardPadTop, bottomPadding: cardPadBottom, cardBackground: nil)
+            }, onDragStarted: isCurrent ? { [weak self] point in
+                self?.beginPlatformDrag(style.platformID, locationInWindow: point)
+            } : nil, onDragChanged: isCurrent ? { [weak self] point in
+                self?.updatePlatformDrag(style.platformID, locationInWindow: point)
+            } : nil, onDragEnded: isCurrent ? { [weak self] in
+                self?.endPlatformDrag()
+            } : nil, topPadding: cardPadTop, bottomPadding: cardPadBottom, cardBackground: nil)
             cardRef = card
             // 悬停卡片时昵称淡入、离开淡出（设置关闭时完全不显示）
             if let hc = card as? HoverCard {
@@ -1475,7 +1906,7 @@ final class BalancePanelView: NSView {
         rebuildAccountCards(accounts, style: .codex, container: codexCardsContainer,
                             entries: &codexCardEntries, uids: &codexCardUids,
                             onCurrentClick: { [weak self] in self?.onClickCodex?() },
-                            onSwitch: nil)
+                            onSwitch: { [weak self] uid in self?.onSwitchCodexAccount?(uid) })
     }
     private func applyCodexCardData(_ accounts: [AccountCardSnapshot]) {
         applyAccountCardData(accounts, entries: &codexCardEntries, style: .codex)
@@ -1649,10 +2080,17 @@ final class BalancePanelView: NSView {
             balanceContentRow(icon: "deepseek", name: "DeepSeek", valueLabel: dsValueLabel, info: dsInfo, dots: dsDots)
         ], to: balanceGroupContainer, onClick: { [weak self] in self?.onClickDeepSeek?() }, onRightClick: { [weak self] event in
             self?.onRightClickCard?("ds", event)
+        }, onDragStarted: { [weak self] point in
+            self?.beginPlatformDrag("ds", locationInWindow: point)
+        }, onDragChanged: { [weak self] point in
+            self?.updatePlatformDrag("ds", locationInWindow: point)
+        }, onDragEnded: { [weak self] in
+            self?.endPlatformDrag()
         }, topPadding: 4, bottomPadding: 4, cardBackground: nil)
         dsCardRef = dsCard
-        // 平台间间隔 7pt（同平台内 trae/wb 容器内部 spacing=0 不加间隔）
-        balanceGroupContainer.setCustomSpacing(7, after: dsCard)
+        platformCards[BalancePlatform.deepSeek.rawValue] = dsCard
+        // 平台间间隔 4pt（同平台内 trae/wb 容器内部 spacing=0 不加间隔）
+        balanceGroupContainer.setCustomSpacing(4, after: dsCard)
 
         // ── ZCode 多账号卡片容器（动态创建，账号列表变化时重建；置于 DeepSeek 卡片下方）──
         zcodeCardsContainer = NSStackView(views: [])
@@ -1666,7 +2104,8 @@ final class BalancePanelView: NSView {
         zcodeCardsContainer.isHidden = true
         balanceGroupContainer.addArrangedSubview(zcodeCardsContainer)
         zcodeCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
-        balanceGroupContainer.setCustomSpacing(7, after: zcodeCardsContainer)
+        platformCards[BalancePlatform.zcode.rawValue] = zcodeCardsContainer
+        balanceGroupContainer.setCustomSpacing(4, after: zcodeCardsContainer)
 
         // ── Codex 多账号卡片容器（本机 auth.json 导入）──
         codexCardsContainer = NSStackView(views: [])
@@ -1678,7 +2117,8 @@ final class BalancePanelView: NSView {
         codexCardsContainer.isHidden = true
         balanceGroupContainer.addArrangedSubview(codexCardsContainer)
         codexCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
-        balanceGroupContainer.setCustomSpacing(7, after: codexCardsContainer)
+        platformCards[BalancePlatform.codex.rawValue] = codexCardsContainer
+        balanceGroupContainer.setCustomSpacing(4, after: codexCardsContainer)
 
         // ── TRAE 多账号卡片容器（动态创建，账号列表变化时重建）──
         // 单账号时也走容器：保证布局与 WB 多账号卡片一致
@@ -1692,7 +2132,8 @@ final class BalancePanelView: NSView {
         traeCardsContainer.layer?.masksToBounds = true
         balanceGroupContainer.addArrangedSubview(traeCardsContainer)
         traeCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
-        balanceGroupContainer.setCustomSpacing(7, after: traeCardsContainer)
+        platformCards[BalancePlatform.trae.rawValue] = traeCardsContainer
+        balanceGroupContainer.setCustomSpacing(4, after: traeCardsContainer)
 
         // ── WorkBuddy 多账号卡片容器（动态创建，账号列表变化时重建）──
         wbCardsContainer = NSStackView(views: [])
@@ -1703,7 +2144,11 @@ final class BalancePanelView: NSView {
         wbCardsContainer.translatesAutoresizingMaskIntoConstraints = false
         balanceGroupContainer.addArrangedSubview(wbCardsContainer)
         wbCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
-        balanceGroupContainer.setCustomSpacing(7, after: wbCardsContainer)
+        platformCards[BalancePlatform.workBuddy.rawValue] = wbCardsContainer
+        balanceGroupContainer.setCustomSpacing(4, after: wbCardsContainer)
+
+        // 应用上次拖拽保存的平台顺序；隐藏的账号组仍保留位置，之后重新出现时顺序不跳变。
+        applyPlatformOrder(animated: false)
 
         // 余额区块 → 设置区块（分割线已移除，用区块间距分隔）
         root.setCustomSpacing(10, after: balanceGroupContainer)
@@ -1777,12 +2222,13 @@ final class BalancePanelView: NSView {
         traeAddBtn.action = #selector(addTraeAccountTapped)
         zcodeAddBtn.target = self
         zcodeAddBtn.action = #selector(addZcodeAccountTapped)
-        let codexAddBtn = ActionTileButton(bundleIcon: "codex", title: "添加账号", target: self, action: #selector(addCodexAccountTapped), iconSize: 19)
+        // Codex 操作按钮图标与余额卡片保持同样的 5% 缩放口径。
+        let codexAddBtn = ActionTileButton(bundleIcon: "codex", title: "添加账号", target: self, action: #selector(addCodexAccountTapped), iconSize: 16.05)
         checkinBtn.target = self
         checkinBtn.action = #selector(manualCheckinTapped)
 
         let cockpitBtn = ActionTileButton(symbol: "gauge.with.needle", title: "Cockpit", target: self, action: #selector(openCockpitTapped))
-        let apiKeyBtn = ActionTileButton(bundleIcon: "deepseek", title: "配置Key", target: self, action: #selector(setApiKeyTapped))
+        let deepSeekSettingsBtn = ActionTileButton(bundleIcon: "deepseek", title: "Key / 额度", target: self, action: #selector(setApiKeyTapped))
         let aboutBtn = ActionTileButton(symbol: "info.circle", title: "关于", target: self, action: #selector(aboutTapped))
         let actionTiles = [
             cockpitBtn,
@@ -1790,8 +2236,7 @@ final class BalancePanelView: NSView {
             traeAddBtn,
             zcodeAddBtn,
             codexAddBtn,
-            apiKeyBtn,
-            ActionTileButton(bundleIcon: "deepseek", title: "日常额度", target: self, action: #selector(setDsQuotaTapped)),
+            deepSeekSettingsBtn,
             checkinBtn,
             ActionTileButton(symbol: "list.bullet.rectangle", title: "签到历史", target: self, action: #selector(checkinHistoryTapped)),
             aboutBtn,
@@ -1802,14 +2247,14 @@ final class BalancePanelView: NSView {
         traeAddBtn.toolTip = "添加 TRAE 账号"
         zcodeAddBtn.toolTip = "添加 ZCode 账号（JSON 导入）"
         codexAddBtn.toolTip = "添加 Codex 账号（JSON 导入 ~/.codex/auth.json）"
-        apiKeyBtn.toolTip = "配置 API Key"
+        deepSeekSettingsBtn.toolTip = "配置 DeepSeek API Key 和日常额度"
         let buildVer = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         aboutBtn.toolTip = "关于 iBalance（v\(buildVer)）"
-        // 按钮间固定间距 2pt（4×56 + 3×2 = 230：满行恰好撑满卡片内容宽度）
-        let tileSpacing: CGFloat = 2
+        // 按钮间水平间距 4pt（4×52 + 3×4 = 220 ≤ 内容宽 236，整体靠左）
+        let tileSpacing: CGFloat = 4
         for tile in actionTiles {
-            tile.widthAnchor.constraint(equalToConstant: 56).isActive = true
-            tile.heightAnchor.constraint(equalToConstant: 48).isActive = true
+            tile.widthAnchor.constraint(equalToConstant: 52).isActive = true
+            tile.heightAnchor.constraint(equalToConstant: 44).isActive = true
             tile.setContentHuggingPriority(.required, for: .horizontal)
             tile.setContentCompressionResistancePriority(.required, for: .horizontal)
         }
@@ -1825,7 +2270,7 @@ final class BalancePanelView: NSView {
             row.distribution = .fill
             row.spacing = tileSpacing
             row.translatesAutoresizingMaskIntoConstraints = false
-            row.heightAnchor.constraint(equalToConstant: 48).isActive = true
+            row.heightAnchor.constraint(equalToConstant: 44).isActive = true
             return row
         }
         // 设置区块 → 操作区块（分割线已移除，用区块间距分隔）
@@ -1837,9 +2282,15 @@ final class BalancePanelView: NSView {
         root.addArrangedSubview(actionTitle)
         pinFullWidth(actionTitle, in: root)
         root.setCustomSpacing(0, after: actionTitle)
-        // 磁贴行按内容宽靠左排（每行磁贴固定等宽，不满一行不被拉伸）；
-        // 左右内边距 0（磁贴行 230 ≤ 内容宽 236，余量留右侧）
-        let actionCard = addCard(rows: tileRows, to: root, spacing: 0, bottomPadding: 7, horizontalPadding: 0, stretchRows: false)
+        // App 宫格样式：行内容器内靠左（不满一行的末行也靠左），整个容器在卡片内水平居中；
+        // 左右内边距 0（容器宽 220 ≤ 内容宽 236），行间垂直间距 4pt
+        let tilesContainer = NSStackView(views: tileRows)
+        tilesContainer.orientation = .vertical
+        tilesContainer.alignment = .leading
+        tilesContainer.distribution = .fill
+        tilesContainer.spacing = 4
+        tilesContainer.translatesAutoresizingMaskIntoConstraints = false
+        let actionCard = addCard(rows: [tilesContainer], to: root, bottomPadding: 7, horizontalPadding: 0, stretchRows: false, centerRows: true)
 
         // 操作区块 → footer（分割线已移除，用区块间距分隔）
         root.setCustomSpacing(10, after: actionCard)
@@ -1886,17 +2337,17 @@ final class BalancePanelView: NSView {
 
     /// 卡片容器：NSVisualEffectView（自动适配深浅色）+ 圆角 + 内边距，宽度撑满 root。
     /// title 非空时在顶部加一行小标题；spacing 为行距（设置/操作卡片用 12，余额卡片用默认 6）。
-    /// onClick 非空时卡片使用 HoverCard（hover 高亮 + 点击回调）；设置/操作卡片用普通 NSView。
+    /// 有点击、右键或拖拽回调时卡片使用 HoverCard；设置/操作卡片用普通 NSView。
     /// bottomPadding: 卡片底部内边距（默认 7，操作卡片可减小以消除与 footer 间的空白）
     @discardableResult
-    private func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true) -> NSView {
+    private func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, onDragStarted: ((NSPoint) -> Void)? = nil, onDragChanged: ((NSPoint) -> Void)? = nil, onDragEnded: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true, centerRows: Bool = false) -> NSView {
         var all = rows
         if let t = title {
             all.insert(sectionTitleRow(name: t, color: titleColor), at: 0)
         }
         let stack = NSStackView(views: all)
         stack.orientation = .vertical
-        stack.alignment = .leading
+        stack.alignment = centerRows ? .centerX : .leading
         stack.distribution = .fill
         stack.spacing = spacing
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -1910,10 +2361,13 @@ final class BalancePanelView: NSView {
         // 卡片透明背景（露出 popover 原生玻璃），仅保留圆角 + 细边框区分
         // 余额卡片使用 HoverCard 获得 hover 高亮 + 点击回调；设置/操作卡片用普通 NSView
         let card: NSView
-        if onClick != nil || onRightClick != nil {
+        if onClick != nil || onRightClick != nil || onDragStarted != nil {
             let hc = HoverCard()
             hc.onClick = onClick
             hc.onRightClick = onRightClick
+            hc.onDragStarted = onDragStarted
+            hc.onDragChanged = onDragChanged
+            hc.onDragEnded = onDragEnded
             card = hc
         } else {
             card = NSView()
@@ -1931,6 +2385,9 @@ final class BalancePanelView: NSView {
         }
         card.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
+        if let hc = card as? HoverCard {
+            hc.configureDragContentView(stack)
+        }
         // ⚠️ 必须先加入层级：跨视图约束（card vs root）在激活时要求二者已有公共祖先，
         //    否则抛 NSGenericException "no common ancestor"
         root.addArrangedSubview(card)
@@ -2033,8 +2490,8 @@ final class BalancePanelView: NSView {
         iconView.setContentCompressionResistancePriority(.required, for: .horizontal)
         iconView.translatesAutoresizingMaskIntoConstraints = false
 
-        // iconContainer：撑满 row 高度，iconView 在内 centerY 居中
-        // iconTopAligned=true 时小 icon 向右上偏移（右4pt、上4pt），与大 icon 顶部对齐且视觉与标题同行
+        // iconContainer：撑满 row 高度，iconView 在内 centerY 居中。
+        // 拖拽由外层 HoverCard 接管，因此整张卡片而非仅 icon 可触发排序。
         let iconContainer = NSView()
         iconContainer.translatesAutoresizingMaskIntoConstraints = false
         iconContainer.addSubview(iconView)
@@ -2067,20 +2524,26 @@ final class BalancePanelView: NSView {
         nameLabel.font = .systemFont(ofSize: 12, weight: titleWeight)
         nameLabel.textColor = textColor
         nameLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        nameLabel.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        // 平台标题优先保持完整，昵称在有限空间内使用省略号。
+        nameLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        // 12pt 字体需要略高于字号本身的行框，避免字形下沿被裁切。
+        nameLabel.heightAnchor.constraint(equalToConstant: 16).isActive = true
 
         let titleRow: NSView
         if let nick = nickLabel {
-            // 昵称放标题后：10pt 字号（同三小项），6pt 间距
+            // 昵称放标题后：使用标题行剩余空间，单行尾部省略。
             nick.font = .systemFont(ofSize: 10)
+            nick.maximumNumberOfLines = 1
+            nick.lineBreakMode = .byTruncatingTail
+            nick.cell?.truncatesLastVisibleLine = true
+            nick.cell?.wraps = false
             nick.setContentHuggingPriority(.defaultLow, for: .horizontal)
             nick.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             // 用 firstBaseline 对齐：10pt 与 12pt 文字基线对齐，视觉居中
             let row = NSStackView(views: [nameLabel, nick])
             row.orientation = .horizontal
             row.alignment = .firstBaseline
-            row.spacing = 6
+            row.spacing = 4
             titleRow = row
         } else {
             titleRow = nameLabel
@@ -2110,9 +2573,10 @@ final class BalancePanelView: NSView {
         NSLayoutConstraint.activate([
             titleRow.leadingAnchor.constraint(equalTo: row1.leadingAnchor),
             titleRow.firstBaselineAnchor.constraint(equalTo: valueLabel.firstBaselineAnchor),
+            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: valueLabel.leadingAnchor, constant: -4),
             valueLabel.trailingAnchor.constraint(equalTo: row1.trailingAnchor),
             valueLabel.centerYAnchor.constraint(equalTo: row1.centerYAnchor),
-            row1.heightAnchor.constraint(equalToConstant: 14),
+            row1.heightAnchor.constraint(equalToConstant: 16),
         ])
 
         // 第二行：小项目（左）+ 点阵（右）同一行
@@ -2285,7 +2749,6 @@ final class BalancePanelView: NSView {
     @objc private func hideWbNicknameToggled() { onToggleHideWbNickname?() }
     @objc private func panelGradientToggled() { onTogglePanelGradient?() }
     @objc private func setApiKeyTapped() { onSetApiKey?() }
-    @objc private func setDsQuotaTapped() { onSetDsQuota?() }
 
     @objc private func aboutTapped() { onAbout?() }
     @objc private func manualCheckinTapped() { onManualCheckin?() }

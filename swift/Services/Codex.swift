@@ -19,7 +19,9 @@ enum CodexService {
             return .failure("未找到 ~/.codex/auth.json，请先在 Codex 中登录")
         }
         let payload = jwtPayload(token) ?? [:]
-        let idPayload = (tokens["id_token"] as? String).flatMap(jwtPayload) ?? [:]
+        let idToken = tokens["id_token"] as? String ?? ""
+        let refreshToken = tokens["refresh_token"] as? String ?? ""
+        let idPayload = jwtPayload(idToken) ?? [:]
         let profile = payload["https://api.openai.com/profile"] as? [String: Any]
         let idProfile = idPayload["https://api.openai.com/profile"] as? [String: Any]
         let auth = payload["https://api.openai.com/auth"] as? [String: Any]
@@ -34,12 +36,68 @@ enum CodexService {
             ?? ""
         guard !uid.isEmpty else { return .failure("无法解析 Codex 登录账号") }
         guard !email.isEmpty else { return .failure("无法从 Codex 登录凭据读取邮箱") }
-        return .success(CodexAccount(uid: uid, token: token, email: email))
+        return .success(CodexAccount(uid: uid, token: token, email: email,
+                                     refreshToken: refreshToken, idToken: idToken))
     }
 
     static func currentUid() -> String? {
         guard case .success(let account) = importCurrentAccount() else { return nil }
         return account.uid
+    }
+
+    // MARK: 账号切换（写 auth.json + 重启 Codex）
+
+    /// 切换 Codex 当前登录账号：退出 Codex → 原子更新 ~/.codex/auth.json → 重启 Codex。
+    /// 旧版配置中的账号可能只有 access token，此时仍写入 access_token/account_id，
+    /// 但不会复用当前账号的 refresh/id token，避免续期时串回原账号。
+    static func switchAccount(_ account: CodexAccount) -> Bool {
+        let t0 = Date()
+        Logger.log(.switchAccount, "[iBalance] Codex switchAccount start: uid=\(account.uid)")
+        ProcessUtil.killMainProcesses(bundleId: "com.openai.codex", label: "Codex")
+
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var tokens = json["tokens"] as? [String: Any] else {
+            Logger.log(.switchAccount, "[iBalance] Codex auth.json read failed, restarting original account")
+            restartCodex()
+            return false
+        }
+
+        tokens["access_token"] = account.token
+        tokens["account_id"] = account.uid
+        if account.idToken.isEmpty {
+            tokens.removeValue(forKey: "id_token")
+        } else {
+            tokens["id_token"] = account.idToken
+        }
+        if account.refreshToken.isEmpty {
+            tokens.removeValue(forKey: "refresh_token")
+        } else {
+            tokens["refresh_token"] = account.refreshToken
+        }
+        json["tokens"] = tokens
+
+        guard JSONSerialization.isValidJSONObject(json),
+              let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]) else {
+            Logger.log(.switchAccount, "[iBalance] Codex auth.json serialization failed, restarting original account")
+            restartCodex()
+            return false
+        }
+
+        do {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: authPath)
+            try out.write(to: URL(fileURLWithPath: authPath), options: [.atomic])
+            if let permissions = attrs?[.posixPermissions] {
+                try? FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: authPath)
+            }
+            restartCodex()
+            Logger.log(.switchAccount, "[iBalance] Codex switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
+            return true
+        } catch {
+            Logger.log(.switchAccount, "[iBalance] Codex auth.json write failed: \(error.localizedDescription)")
+            restartCodex()
+            return false
+        }
     }
 
     struct Usage {
@@ -86,5 +144,15 @@ enum CodexService {
         guard let data = Data(base64Encoded: raw),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return json
+    }
+
+    /// 重启 Codex（-n 确保退出旧进程后创建新实例）。
+    private static func restartCodex() {
+        let task = Process()
+        task.launchPath = "/usr/bin/open"
+        task.arguments = ["-n", "-a", "Codex"]
+        do { try task.run() } catch {
+            Logger.log(.switchAccount, "[iBalance] restart Codex failed: \(error.localizedDescription)")
+        }
     }
 }

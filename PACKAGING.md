@@ -4,11 +4,11 @@
 
 ## 核心原则
 
-**原项目的 `config.json` 一律不动** —— 用户的真实 API Key / Token / 账号信息必须保留。
+**原项目的用户数据一律不动** —— 真实 API Key / Token / 账号信息运行时保存在 `~/Library/Application Support/com.local.ibalance/`，源码目录中的旧版 `config.json` 只用于兼容迁移，不进入分发包。
 
 打包流程通过 **复制项目到临时副本** 实现：
 1. 把项目整体复制到 `/tmp/iBalance_pkg/iBalance`
-2. 在 **副本** 里把三处 `config.json` 替换为初始化模板
+2. 在 **副本** 里把构建模板和 App Resources 中的 `config.json` 替换为初始化模板
 3. 打包副本
 4. 删除副本
 
@@ -16,12 +16,11 @@
 
 ## 一、初始化 config.json 模板
 
-打包时写入 **副本** 三处的初始化内容（清空所有用户隐私数据）：
+打包时写入 **副本** 两处模板的初始化内容（清空所有用户隐私数据）：
 
 | 副本内路径 | 说明 |
 |-----------|------|
-| `config.json` | 根目录用户配置（用户编辑这份） |
-| `swift/config.json` | 编译模板（`build.sh` 会用它做字段级合并） |
+| `swift/config.json` | 编译模板（构建时复制到 App Resources） |
 | `iBalance.app/Contents/Resources/config.json` | App bundle 内运行时配置 |
 
 ```json
@@ -55,7 +54,7 @@
 - `debug_mode` 关闭
 - `refresh_interval` 恢复默认 300 秒
 
-> ⚠️ 本模板与第三节脚本中的 `INIT_CONFIG` 是同一份内容的两处拷贝。**新增/删除配置字段时必须两处同步修改**，且字段集合要与真实 `config.json` 对齐（可用 `python3 -c "import json;print(sorted(json.load(open('config.json'))))"` 对比，权威字段定义见 `swift/Config.swift` 的 `CodingKeys`）。
+> ⚠️ 本模板与第三节脚本中的 `INIT_CONFIG` 是同一份内容的两处拷贝。**新增/删除配置字段时必须两处同步修改**，字段集合以 `swift/Config.swift` 的 `CodingKeys` 为准。
 
 ## 二、打包排除清单
 
@@ -103,6 +102,7 @@ rsync -a \
   --exclude 'cockpit-tools-main/' \
   --exclude 'demo/' \
   --exclude 'docs/' \
+  --exclude '/config.json' \
   --exclude 'cache.json' \
   --exclude 'click_ibalance.lua' \
   --exclude 'iBalance-已损坏说明.html' \
@@ -118,7 +118,7 @@ rsync -a \
   --exclude '.DS_Store' \
   "$SRC/" "$PKG_DIR/iBalance/"
 
-# 3. 在副本里把三处 config.json 替换为初始化模板（内容见第一节）
+# 3. 在副本里把两个运行时模板 config.json 替换为初始化模板（内容见第一节）
 INIT_CONFIG='{
   "cockpit_app_id" : "com.jlcodes.cockpit-tools",
   "debug_mode" : false,
@@ -140,7 +140,6 @@ INIT_CONFIG='{
   "codex_accounts" : []
 }'
 
-echo "$INIT_CONFIG" > "$PKG_DIR/iBalance/config.json"
 echo "$INIT_CONFIG" > "$PKG_DIR/iBalance/swift/config.json"
 echo "$INIT_CONFIG" > "$PKG_DIR/iBalance/iBalance.app/Contents/Resources/config.json"
 
@@ -151,7 +150,7 @@ rm -f "$ZIP_OUT"
 # 5. 删除临时副本
 rm -rf "$PKG_DIR"
 
-# 原项目 config.json 全程未动，无需还原
+# 原项目用户数据全程未动，无需还原
 # 历史 zip（含旧的 iBalance.zip / iBalance-v*.zip）因排除规则不会进入新包，可保留作存档
 ```
 
@@ -163,11 +162,11 @@ rm -rf "$PKG_DIR"
 ```bash
 ZIP=iBalance/iBalance-v2026.8.17.1.zip
 
-# 1. config.json 体积应均为 475B（初始化版），不应出现 13034B（含真实 token）
+# 1. 模板 config.json 应为初始化版大小，不应出现含真实 token 的大文件
 unzip -l "$ZIP" | grep config.json
 
-# 2. 内容级防泄漏校验（比体积更可靠）：三处 config 的敏感字段必须为空
-for f in config.json swift/config.json iBalance.app/Contents/Resources/config.json; do
+# 2. 内容级防泄漏校验（比体积更可靠）：模板 config 的敏感字段必须为空
+for f in swift/config.json iBalance.app/Contents/Resources/config.json; do
   unzip -p "$ZIP" "iBalance/$f" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
@@ -189,8 +188,7 @@ rm -f "$TMP_PLIST"
 # 5. 顶层条目
 unzip -l "$ZIP" | awk '{print $4}' | grep -E '^iBalance/[^/]+/?$' | sort -u
 
-# 6. 原项目 config 未被修改（应仍含真实 api_key）
-grep deepseek_api_key iBalance/config.json
+# 6. 原项目用户配置不进入 zip；运行时会从 Application Support 读取
 ```
 
 ## 五、zip 内应包含的内容

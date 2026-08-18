@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # 编译 Swift 源码并打包成 iBalance.app
-# 产物：../iBalance.app（可双击运行）+ 同目录 config.json
+# 产物：../iBalance.app（可双击运行）；用户配置/缓存由 App 写入 Application Support
 # ============================================================
 set -euo pipefail
 
@@ -45,6 +45,31 @@ swiftc \
     "$OPT_FLAG" \
     "${SOURCES[@]}" \
     -o "$SCRIPT_DIR/iBalance"
+
+# 先停掉旧 iBalance 再删旧 bundle：旧进程还在跑时删 bundle，open 只会激活旧实例，
+# 新二进制根本没运行。SIGTERM + 1.0s 优雅退出，随后循环等 pgrep 为空，超时升级 SIGKILL。
+wait_iBalance_exit() {
+    local start=$SECONDS elapsed killed=0
+    while pgrep -x iBalance >/dev/null 2>&1; do
+        elapsed=$(( SECONDS - start ))
+        if (( elapsed >= 5 && killed == 0 )); then   # SIGTERM 后 5s 仍未退出，升级 SIGKILL
+            killall -9 iBalance 2>/dev/null || true
+            killed=1
+        fi
+        if (( elapsed >= 8 )); then                  # 共 8s 仍未退出，告警后继续（罕见）
+            echo "!! 旧 iBalance 进程未确认退出，继续构建"
+            return
+        fi
+        sleep 0.1
+    done
+}
+
+if pgrep -x iBalance >/dev/null 2>&1; then
+    echo "==> 停止运行中的 iBalance"
+    killall iBalance 2>/dev/null || true
+    sleep 1.0
+fi
+wait_iBalance_exit
 
 echo "==> 组装 .app bundle"
 rm -rf "$APP_DIR"
@@ -106,39 +131,13 @@ else
     echo "!! 未找到签名证书 '$SIGN_IDENTITY'，保留 linker ad-hoc 签名（重建后可能需重新授权磁盘访问）"
 fi
 
-# 写根目录 config.json（用户编辑这份，优先级高于 Resources）。
-# ⚠️ 覆盖保护：根目录已存在用户配置时做字段级合并（用户字段优先，模板只补充新增 key），
-# 绝不用模板直接覆盖（模板里 API Key 为空，直接 cp 会清掉用户真实配置）。
-ROOT_CONFIG="$SCRIPT_DIR/../config.json"
-if [[ -f "$ROOT_CONFIG" ]]; then
-    /usr/bin/python3 - "$CONFIG" "$ROOT_CONFIG" <<'PYEOF'
-import json, sys
-tpl_path, cur_path = sys.argv[1], sys.argv[2]
-try:
-    with open(tpl_path) as f: tpl = json.load(f)
-    with open(cur_path) as f: cur = json.load(f)
-except Exception as e:
-    print("!! config 合并解析失败（%s），保留用户原配置不动" % e)
-    sys.exit(0)
-tpl.update(cur)  # 模板打底补新增 key，用户字段优先覆盖
-with open(cur_path, "w") as f:
-    json.dump(tpl, f, indent=2, ensure_ascii=False, sort_keys=True)
-    f.write("\n")
-print("==> 根目录 config.json 已合并（用户字段保留）")
-PYEOF
-else
-    cp "$CONFIG" "$ROOT_CONFIG"
-fi
-
 echo "==> 完成"
 echo "    应用：$APP_DIR"
-echo "    配置：$SCRIPT_DIR/../config.json（编辑此文件改 API Key / 刷新间隔）"
+echo "    配置/缓存：~/Library/Application Support/com.local.ibalance/"
 echo ""
 
-# 重启 App（已运行则先终止再启动，确保加载新二进制）
-if pgrep -x iBalance >/dev/null 2>&1; then
-    killall iBalance 2>/dev/null
-    sleep 0.5
-fi
+# 重启 App：旧进程已在组装前停止；这里防御性确认无残留（pgrep 为空才 open，
+# 否则 open 只会激活旧实例，用户会误以为已升级）
+wait_iBalance_exit
 open "$APP_DIR"
 echo "==> iBalance 已重启"

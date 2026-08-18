@@ -1,9 +1,9 @@
 # 下个版本 TODO
 
 ## 1. 配置迁移到系统路径
-- [ ] 等 config 格式定型后，把用户配置从 `.app` 同目录迁移到系统路径（`~/Library/Application Support/iBalance/config.json`）
-- [ ] 首次启动做一次性迁移：检测旧位置 config.json 存在则搬移，避免用户丢配置
-- [ ] 更新 build.sh / 打包脚本：不再需要向 .app 旁写 config，简化打包流程
+- [x] 用户配置和余额缓存迁移到 `~/Library/Application Support/com.local.ibalance/`
+- [x] 首次启动兼容迁移旧位置 `config.json` / `cache.json`，并保留旧文件副本
+- [x] 更新 build.sh / 打包脚本：运行时不再依赖 `.app` 旁的用户配置
 
 ## 2. 菜单栏条目使用平台图标
 - [ ] 菜单栏各平台余额条目前加平台品牌 icon（DeepSeek / ZCode / TRAE / WorkBuddy，复用 `swift/icons/` 下的素材）
