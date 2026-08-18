@@ -35,8 +35,5 @@ iBalance-已损坏说明.html
 # SPM/swiftc 构建缓存
 swift/.build/
 
-# demo 编译产物（仅入库源码）
-demo/GlassBackgroundPanelDemo
-
 # Reasonix 本地工作状态（话题/剪贴板附件，不入库）
 .reasonix/

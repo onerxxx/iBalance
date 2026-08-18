@@ -34,7 +34,6 @@
 ├── macos-panel-ui-guide.md  # macOS 面板 UI 设计参考笔记
 ├── backups/                 # 大重构前的完整备份（如 v1.0-menubar-2026-08-12/）
 ├── cockpit-tools-main/      # Cockpit Tools 源码（外部项目，仅参考）
-├── demo/                    # 面板玻璃背景原型 Demo（GlassBackgroundPanelDemo）
 ├── docs/                    # 补充文档（card-drag-framework.md、menubar-template-pitfalls.md、
 │                            #   native-segmented-control-guide.md、iBalance-已损坏说明.html 等）
 ├── swift/

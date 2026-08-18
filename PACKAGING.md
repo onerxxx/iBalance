@@ -64,7 +64,6 @@
 |---------|------|
 | `backups/` | 项目历史备份，与发行版无关 |
 | `cockpit-tools-main/` | Cockpit Tools 参考源码（约 52MB），与发行版无关 |
-| `demo/` | UI 开发 demo，与发行版无关 |
 | `docs/` | 开发文档（segmented control 指南等），与发行版无关 |
 | `cache.json` | 运行时缓存（含账号用量数据），属用户隐私 |
 | `click_ibalance.lua` | Hammerspoon 调试脚本，仅开发用 |
@@ -100,7 +99,6 @@ mkdir -p "$PKG_DIR"
 rsync -a \
   --exclude 'backups/' \
   --exclude 'cockpit-tools-main/' \
-  --exclude 'demo/' \
   --exclude 'docs/' \
   --exclude '/config.json' \
   --exclude 'cache.json' \
@@ -177,7 +175,7 @@ print('$f', 'LEAK:' if leaks else 'OK', leaks)"
 done
 
 # 3. 应排除项应为空（含任何形式的嵌套 zip）
-unzip -l "$ZIP" | grep -E 'backups/|cockpit-tools-main/|demo/|docs/|cache\.json|click_ibalance\.lua|已损坏说明|\.reasonix/|\.git/|\.workbuddy/|__pycache__/|\.build/|\.build_state|/click$|/presskey$|iBalance[^/]*\.zip'
+unzip -l "$ZIP" | grep -E 'backups/|cockpit-tools-main/|docs/|cache\.json|click_ibalance\.lua|已损坏说明|\.reasonix/|\.git/|\.workbuddy/|__pycache__/|\.build/|\.build_state|/click$|/presskey$|iBalance[^/]*\.zip'
 
 # 4. zip 内 App 的完整版本号应与文件名一致（plutil 不支持读 stdin，需经临时文件）
 TMP_PLIST=$(mktemp)
