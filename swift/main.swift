@@ -443,7 +443,7 @@ final class InputDialog: NSObject {
 // MARK: - AppDelegate
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let statusBar = NSStatusBar.system
     private var statusItem: NSStatusItem!
@@ -460,18 +460,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var traeCollectInProgress = false
     // 手动签到进行中标记：防重复触发
     private var manualCheckinInProgress = false
-    // NSPopover 详情面板（左键打开；设置菜单保留给右键/齿轮）
-    private var popoverController: NSPopover?
+    // 无边框浮动窗口详情面板（左键打开；设置菜单保留给右键/齿轮）。
+    // 取代 NSPopover：系统 popover 顶部三角无法移除，玻璃容器本就自带，窗口只提供外壳。
+    private var panelWindow: PanelWindow?
     private var panelView: BalancePanelView?
-    /// 面板打开期间锁定的锚（X + 顶边 Y）：菜单栏 title 更新导致 button 宽度变化、
-    /// popover 自动 reposition 时，用 KVO 同步把 window 拉回原位（无动画，避免跳动）。
-    /// 锚定顶边而非 origin（左下角）：区块折叠/展开改变高度时底边伸缩，
-    /// 顶边保持贴住菜单栏不动（origin 锚会在高度变化时把顶边拽下来）。
-    private var panelAnchorX: CGFloat = 0
-    private var panelAnchorTopY: CGFloat = 0
-    private var panelAnchored = false
-    /// popover window 的 frame KVO 观察令牌：面板打开期间生效，关闭时移除。
-    private var panelFrameObserver: NSKeyValueObservation?
+    /// 「面板外点击 / Esc」关闭监视器（面板打开期间安装）
+    private var panelClickMonitorLocal: Any?
+    private var panelClickMonitorGlobal: Any?
+    private var panelKeyMonitor: Any?
+    /// 模态弹窗期间禁止面板外点击关闭（取代旧 popover 的 .applicationDefined 行为）
+    private var panelModalGuard = false
     // 最近一次面板关闭所在事件的时间戳（transient 面板外点击会先关闭面板，
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
@@ -815,8 +813,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             settingsMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: statusItem.button)
             return
         }
-        if popoverController?.isShown == true {
-            popoverController?.performClose(nil)
+        if panelWindow?.isVisible == true {
+            closePanel()
             return
         }
         // 点击图标时若面板刚被同一 click 的「面板外点击」(transient) 关闭，则不再重新弹出，
@@ -1131,7 +1129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                       percent: Bool, prefix: String = "") -> UsageRowSnapshot? {
             guard !uid.isEmpty, let cur = current,
                   let u = UsageStore.usage(platform: platform, uid: uid, current: cur, increasing: increasing) else { return nil }
-            return UsageRowSnapshot(icon: icon, name: name,
+            return UsageRowSnapshot(platform: platform, icon: icon, name: name,
                                     todayText: prefix + fmtUsage(u.today, percent: percent, decimals: decimals),
                                     weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals))
         }

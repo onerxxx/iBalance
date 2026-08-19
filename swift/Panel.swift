@@ -49,6 +49,7 @@ struct PanelSnapshot {
 
 /// 日/周用量行快照：icon + 平台名 + 已格式化的今日/本周用量文本
 struct UsageRowSnapshot {
+    var platform: String
     var icon: String
     var name: String
     var todayText: String
@@ -1362,6 +1363,13 @@ final class BalancePanelView: NSView {
     private let usageContentStack = NSStackView()
     private var usageCardRef: NSView?
     private var usageTitleRef: NSView?
+    /// 平台 id → 用量行视图（拖拽排序时复用实例做位移动画）
+    private var usageRowViews: [String: NSView] = [:]
+    /// 表头行（今日 / 本周 列名），排序时保持在最上
+    private var usageHeaderRowRef: NSView?
+    /// 用量数值列宽（表头与数值行共用，保证上下对齐）
+    private let usageColumnWidth: CGFloat = 56
+    private let usageColumnSpacing: CGFloat = 8
 
     private let autoCheckinSwitch = MiniSwitch()
     private let autoCheckinSub = NSTextField(labelWithString: "")
@@ -1411,7 +1419,23 @@ final class BalancePanelView: NSView {
             usageContentStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
-        s.usageRows.forEach { usageContentStack.addArrangedSubview(makeUsageRow($0)) }
+        usageRowViews.removeAll()
+        usageHeaderRowRef = nil
+        // 行序跟随平台卡片顺序（拖拽排序持久化于 platformOrder）
+        let orderIndex = Dictionary(uniqueKeysWithValues: platformOrder.enumerated().map { ($1, $0) })
+        let sortedRows = s.usageRows.sorted {
+            (orderIndex[$0.platform] ?? Int.max) < (orderIndex[$1.platform] ?? Int.max)
+        }
+        if !sortedRows.isEmpty {
+            let header = makeUsageHeaderRow()
+            usageHeaderRowRef = header
+            usageContentStack.addArrangedSubview(header)
+        }
+        for row in sortedRows {
+            let view = makeUsageRow(row)
+            usageRowViews[row.platform] = view
+            usageContentStack.addArrangedSubview(view)
+        }
         let hasUsage = !s.usageRows.isEmpty
         usageTitleRef?.isHidden = !hasUsage
         if hasUsage {
@@ -1653,6 +1677,38 @@ final class BalancePanelView: NSView {
         if nextOrder != platformOrder {
             platformOrder = nextOrder
             applyPlatformOrder(animated: true)
+            applyUsageOrder(animated: true)
+        }
+    }
+
+    /// 用量行跟随平台卡片顺序：重排 arrangedSubview 并用 Y 轴位移动画让行平滑让位（同 applyPlatformOrder 口径）
+    private func applyUsageOrder(animated: Bool) {
+        let orderedViews = platformOrder.compactMap { usageRowViews[$0] }
+        let dataRows = usageContentStack.arrangedSubviews.filter { $0 !== usageHeaderRowRef }
+        guard !orderedViews.isEmpty, orderedViews.count == dataRows.count else { return }
+        let oldFrames = Dictionary(uniqueKeysWithValues: orderedViews.map {
+            (ObjectIdentifier($0), $0.frame)
+        })
+        // 表头保持最上，数据行按平台顺序重排
+        let desired = (usageHeaderRowRef.map { [$0] } ?? []) + orderedViews
+        for (index, view) in desired.enumerated() {
+            guard let currentIndex = usageContentStack.arrangedSubviews.firstIndex(of: view),
+                  currentIndex != index else { continue }
+            usageContentStack.removeArrangedSubview(view)
+            usageContentStack.insertArrangedSubview(view, at: index)
+        }
+        usageContentStack.layoutSubtreeIfNeeded()
+        guard animated, !shouldReduceMotion else { return }
+        for view in orderedViews {
+            guard let oldFrame = oldFrames[ObjectIdentifier(view)],
+                  oldFrame != view.frame,
+                  let layer = view.layer else { continue }
+            let animation = CABasicAnimation(keyPath: "transform.translation.y")
+            animation.fromValue = oldFrame.midY - view.frame.midY
+            animation.toValue = 0
+            animation.duration = 0.2
+            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer.add(animation, forKey: "usageReorder")
         }
     }
 
@@ -1996,7 +2052,30 @@ final class BalancePanelView: NSView {
         items.forEach { stack.addArrangedSubview($0) }
     }
 
-    /// 日/周用量行：品牌 icon + 平台名 + 右侧「今日 x · 本周 y」
+    /// 用量表头行：「今日 / 本周」列名，右对齐固定列宽，与下方数值上下对齐
+    private func makeUsageHeaderRow() -> NSView {
+        func headerLabel(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.font = .systemFont(ofSize: 9)
+            l.textColor = .systemGray
+            l.alignment = .right
+            l.translatesAutoresizingMaskIntoConstraints = false
+            l.widthAnchor.constraint(equalToConstant: usageColumnWidth).isActive = true
+            return l
+        }
+        // 左列名「平台」左对齐（与下方 icon 左缘同起点），右两列列名右对齐
+        let platformHeader = NSTextField(labelWithString: "平台")
+        platformHeader.font = .systemFont(ofSize: 9)
+        platformHeader.textColor = .systemGray
+        let row = NSStackView(views: [platformHeader, stretchSpacer(), headerLabel("今日"), headerLabel("本周")])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = usageColumnSpacing
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
+    /// 日/周用量行：品牌 icon + 平台名 + 右侧两列数值（固定列宽右对齐，对齐表头）
     private func makeUsageRow(_ row: UsageRowSnapshot) -> NSView {
         let iconView = NSImageView()
         iconView.image = bundleIcon(row.icon, size: 14) ?? symbolImage("app.fill", size: 14)
@@ -2006,16 +2085,27 @@ final class BalancePanelView: NSView {
         iconView.widthAnchor.constraint(equalToConstant: 14).isActive = true
         iconView.heightAnchor.constraint(equalToConstant: 14).isActive = true
         let nameLabel = NSTextField(labelWithString: row.name)
-        nameLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        nameLabel.font = .systemFont(ofSize: 11)
         nameLabel.textColor = kBalanceForeground
-        let valueLabel = NSTextField(labelWithString: "今日\u{2009}\(row.todayText)\u{2009}\u{00B7}\u{2009}本周\u{2009}\(row.weekText)")
-        valueLabel.font = .systemFont(ofSize: 10)
-        valueLabel.textColor = .systemGray
-        let rowStack = NSStackView(views: [iconView, nameLabel, stretchSpacer(), valueLabel])
+        func valueLabel(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.font = .systemFont(ofSize: 10)
+            l.textColor = .systemGray
+            l.alignment = .right
+            l.translatesAutoresizingMaskIntoConstraints = false
+            l.widthAnchor.constraint(equalToConstant: usageColumnWidth).isActive = true
+            return l
+        }
+        let rowStack = NSStackView(views: [iconView, nameLabel, stretchSpacer(),
+                                           valueLabel(row.todayText), valueLabel(row.weekText)])
         rowStack.orientation = .horizontal
         rowStack.alignment = .centerY
-        rowStack.spacing = 6
+        rowStack.spacing = usageColumnSpacing
+        // icon↔标题 6pt（比列距略紧），其余保持列距 8pt
+        rowStack.setCustomSpacing(6, after: iconView)
         rowStack.translatesAutoresizingMaskIntoConstraints = false
+        // 位移动画需要 layer-backed
+        rowStack.wantsLayer = true
         return rowStack
     }
 
@@ -2087,7 +2177,8 @@ final class BalancePanelView: NSView {
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             root.topAnchor.constraint(equalTo: topAnchor, constant: 14),
-            root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
+            // 底部留给独立 footer 带：0（贴底）+ 24（footer 高）+ 10（与操作区块间距）
+            root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -34),
             root.widthAnchor.constraint(equalToConstant: 250 - 14),
         ])
 
@@ -2391,16 +2482,26 @@ final class BalancePanelView: NSView {
         quitBtn.translatesAutoresizingMaskIntoConstraints = false
         footer.addSubview(updatedLabel)
         footer.addSubview(quitBtn)
-        root.addArrangedSubview(footer)
-        pinFullWidth(footer, in: root)
+        // footer 不进 root：背景带单独提亮，且宽度忽略容器左右内边距擑满面板
+        footer.wantsLayer = true
+        footer.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        footer.layer?.cornerRadius = Palette.cardCornerRadius
+        footer.layer?.cornerCurve = .continuous
+        footer.layer?.masksToBounds = true
+        addSubview(footer)
         // 固定 footer 高度，避免子控件 intrinsicContentSize 变化时重新布局导致错位
-        let footerHeight: CGFloat = 20
+        let footerHeight: CGFloat = 24
         NSLayoutConstraint.activate([
+            footer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            // 贴面板底边（底边距 0），底角圆角与 popover 系统圆角吻合
+            footer.bottomAnchor.constraint(equalTo: bottomAnchor),
             footer.heightAnchor.constraint(equalToConstant: footerHeight),
             updatedLabel.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
             updatedLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: footerHeight),
-            quitBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            // 背景带擑满面板但按钮对齐内容右缘（root 左右内边距 7pt）
+            quitBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -7),
             quitBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             // 容器固定 22×22（HoverIconButton.buttonSize）；无边框按钮，
             // hover 时自绘大圆角淡白背景（圆角与卡片统一）
