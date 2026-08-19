@@ -443,7 +443,7 @@ final class InputDialog: NSObject {
 // MARK: - AppDelegate
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private let statusBar = NSStatusBar.system
     private var statusItem: NSStatusItem!
@@ -460,16 +460,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var traeCollectInProgress = false
     // 手动签到进行中标记：防重复触发
     private var manualCheckinInProgress = false
-    // 无边框浮动窗口详情面板（左键打开；设置菜单保留给右键/齿轮）。
-    // 取代 NSPopover：系统 popover 顶部三角无法移除，玻璃容器本就自带，窗口只提供外壳。
-    private var panelWindow: PanelWindow?
+    // NSPopover 详情面板（左键打开；设置菜单保留给右键/齿轮）
+    private var popoverController: NSPopover?
     private var panelView: BalancePanelView?
-    /// 「面板外点击 / Esc」关闭监视器（面板打开期间安装）
-    private var panelClickMonitorLocal: Any?
-    private var panelClickMonitorGlobal: Any?
-    private var panelKeyMonitor: Any?
-    /// 模态弹窗期间禁止面板外点击关闭（取代旧 popover 的 .applicationDefined 行为）
-    private var panelModalGuard = false
+    /// 面板打开期间锁定的锚（X + 顶边 Y）：菜单栏 title 更新导致 button 宽度变化、
+    /// popover 自动 reposition 时，用 KVO 同步把 window 拉回原位（无动画，避免跳动）。
+    /// 锚定顶边而非 origin（左下角）：区块折叠/展开改变高度时底边伸缩，
+    /// 顶边保持贴住菜单栏不动（origin 锚会在高度变化时把顶边拽下来）。
+    private var panelAnchorX: CGFloat = 0
+    private var panelAnchorTopY: CGFloat = 0
+    private var panelAnchored = false
+    /// popover window 的 frame KVO 观察令牌：面板打开期间生效，关闭时移除。
+    private var panelFrameObserver: NSKeyValueObservation?
     // 最近一次面板关闭所在事件的时间戳（transient 面板外点击会先关闭面板，
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
@@ -813,8 +815,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settingsMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: statusItem.button)
             return
         }
-        if panelWindow?.isVisible == true {
-            closePanel()
+        if popoverController?.isShown == true {
+            popoverController?.performClose(nil)
             return
         }
         // 点击图标时若面板刚被同一 click 的「面板外点击」(transient) 关闭，则不再重新弹出，

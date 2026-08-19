@@ -2482,15 +2482,22 @@ final class BalancePanelView: NSView {
         quitBtn.translatesAutoresizingMaskIntoConstraints = false
         footer.addSubview(updatedLabel)
         footer.addSubview(quitBtn)
-        // footer 不进 root：背景带单独提亮，且宽度忽略容器左右内边距擑满面板
-        footer.wantsLayer = true
-        footer.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.08).cgColor
-        footer.layer?.cornerRadius = Palette.cardCornerRadius
-        footer.layer?.cornerCurve = .continuous
-        footer.layer?.masksToBounds = true
+        // footer 不进 root：宽度忽略容器左右内边距擑满面板；无背景、顶部加分割线
         addSubview(footer)
+        // 顶部分割线：满宽 1pt 细线
+        let footerDivider = NSView()
+        footerDivider.wantsLayer = true
+        footerDivider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        footerDivider.translatesAutoresizingMaskIntoConstraints = false
+        footer.addSubview(footerDivider)
+        NSLayoutConstraint.activate([
+            footerDivider.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
+            footerDivider.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            footerDivider.topAnchor.constraint(equalTo: footer.topAnchor),
+            footerDivider.heightAnchor.constraint(equalToConstant: 1),
+        ])
         // 固定 footer 高度，避免子控件 intrinsicContentSize 变化时重新布局导致错位
-        let footerHeight: CGFloat = 24
+        let footerHeight: CGFloat = 28
         NSLayoutConstraint.activate([
             footer.leadingAnchor.constraint(equalTo: leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: trailingAnchor),
