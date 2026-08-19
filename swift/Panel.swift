@@ -1041,7 +1041,7 @@ final class BalancePanelViewController: NSViewController {
         panel.onContentChanged = { [weak self] in
             guard let self else { return }
             self.panel.layoutSubtreeIfNeeded()
-            self.preferredContentSize = NSSize(width: 247, height: self.panel.fittingSize.height + 24)
+            self.preferredContentSize = self.panel.fittingSize
         }
     }
 
@@ -1055,7 +1055,7 @@ final class BalancePanelViewController: NSViewController {
     override func viewWillAppear() {
         super.viewWillAppear()
         // 让 popover 按内容实际高度撑开
-        preferredContentSize = NSSize(width: 247, height: panel.fittingSize.height + 24)
+        preferredContentSize = panel.fittingSize
     }
 
     override func viewDidLayout() {
@@ -2177,8 +2177,7 @@ final class BalancePanelView: NSView {
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             root.topAnchor.constraint(equalTo: topAnchor, constant: 14),
-            // 底部留给独立 footer 带：0（贴底）+ 24（footer 高）+ 10（与操作区块间距）
-            root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -34),
+            root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
             root.widthAnchor.constraint(equalToConstant: 250 - 14),
         ])
 
@@ -2482,33 +2481,16 @@ final class BalancePanelView: NSView {
         quitBtn.translatesAutoresizingMaskIntoConstraints = false
         footer.addSubview(updatedLabel)
         footer.addSubview(quitBtn)
-        // footer 不进 root：宽度忽略容器左右内边距擑满面板；无背景、顶部加分割线
-        addSubview(footer)
-        // 顶部分割线：满宽 1pt 细线
-        let footerDivider = NSView()
-        footerDivider.wantsLayer = true
-        footerDivider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        footerDivider.translatesAutoresizingMaskIntoConstraints = false
-        footer.addSubview(footerDivider)
-        NSLayoutConstraint.activate([
-            footerDivider.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
-            footerDivider.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
-            footerDivider.topAnchor.constraint(equalTo: footer.topAnchor),
-            footerDivider.heightAnchor.constraint(equalToConstant: 1),
-        ])
+        root.addArrangedSubview(footer)
+        pinFullWidth(footer, in: root)
         // 固定 footer 高度，避免子控件 intrinsicContentSize 变化时重新布局导致错位
-        let footerHeight: CGFloat = 28
+        let footerHeight: CGFloat = 20
         NSLayoutConstraint.activate([
-            footer.leadingAnchor.constraint(equalTo: leadingAnchor),
-            footer.trailingAnchor.constraint(equalTo: trailingAnchor),
-            // 贴面板底边（底边距 0），底角圆角与 popover 系统圆角吻合
-            footer.bottomAnchor.constraint(equalTo: bottomAnchor),
             footer.heightAnchor.constraint(equalToConstant: footerHeight),
             updatedLabel.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
             updatedLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: footerHeight),
-            // 背景带擑满面板但按钮对齐内容右缘（root 左右内边距 7pt）
-            quitBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -7),
+            quitBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
             quitBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             // 容器固定 22×22（HoverIconButton.buttonSize）；无边框按钮，
             // hover 时自绘大圆角淡白背景（圆角与卡片统一）

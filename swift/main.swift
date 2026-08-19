@@ -463,15 +463,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // NSPopover 详情面板（左键打开；设置菜单保留给右键/齿轮）
     private var popoverController: NSPopover?
     private var panelView: BalancePanelView?
-    /// 面板打开期间锁定的锚（X + 顶边 Y）：菜单栏 title 更新导致 button 宽度变化、
-    /// popover 自动 reposition 时，用 KVO 同步把 window 拉回原位（无动画，避免跳动）。
-    /// 锚定顶边而非 origin（左下角）：区块折叠/展开改变高度时底边伸缩，
-    /// 顶边保持贴住菜单栏不动（origin 锚会在高度变化时把顶边拽下来）。
-    private var panelAnchorX: CGFloat = 0
-    private var panelAnchorTopY: CGFloat = 0
-    private var panelAnchored = false
-    /// popover window 的 frame KVO 观察令牌：面板打开期间生效，关闭时移除。
-    private var panelFrameObserver: NSKeyValueObservation?
     // 最近一次面板关闭所在事件的时间戳（transient 面板外点击会先关闭面板，
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
@@ -920,37 +911,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // ⚠️ 必须在 show 之前激活 App：LSUIElement 应用默认不活跃，popover 首帧会按
         // 「非活跃」渲染（玻璃材质整体偏暗），激活后才呈现正常色调（官方推荐姿势）。
         NSApp.activate(ignoringOtherApps: true)
+        // 只使用 status item button 的完整 bounds：NSStatusBarButton 的 cell/imageRect
+        // 不保证是可供 NSPopover 使用的定位矩形，macOS 27 下会触发 AppKit 断言并闪退。
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // popover 窗口默认不是 key window：.transient 只在 key window 状态下
         // 才会响应「面板外点击」关闭，且非 key 时玻璃材质同样偏暗 → 强制置 key。
         popover.contentViewController?.view.window?.makeKey()
-        // 锁定面板原始 origin，并用 KVO 监听 popover window frame 变化：
-        // 菜单栏 title 更新导致 button 宽度变化、popover 自动 reposition 时，
-        // 立即（无动画）把 window 拉回原位，避免面板跳动后归位的视觉抖动。
-        startPanelOriginLock()
-    }
-
-    /// 启用面板位置锁定：记录顶边锚点，KVO 监听 window frame，顶边偏离时立即无动画拉回。
-    private func startPanelOriginLock() {
-        guard let w = popoverController?.contentViewController?.view.window else { return }
-        panelAnchorX = w.frame.minX
-        panelAnchorTopY = w.frame.maxY
-        panelAnchored = true
-        // 移除旧观察（若有），再重新添加
-        panelFrameObserver?.invalidate()
-        panelFrameObserver = w.observe(\.frame, options: [.new]) { [weak self] win, _ in
-            guard let self = self, self.panelAnchored else { return }
-            // 期望 origin = 顶边贴住锚点（高度变化时 y 随高度下移，顶边恒定）
-            let expected = NSPoint(x: self.panelAnchorX, y: self.panelAnchorTopY - win.frame.height)
-            // 仅当偏离时才校正（避免无谓的 setFrameOrigin 循环）
-            if win.frame.origin != expected {
-                // 禁用动画：直接 setFrameOrigin 会触发默认动画，需包裹 NSAnimationContext
-                NSAnimationContext.beginGrouping()
-                NSAnimationContext.current.duration = 0
-                win.setFrameOrigin(expected)
-                NSAnimationContext.endGrouping()
-            }
-        }
     }
 
     // MARK: - NSPopoverDelegate
@@ -970,10 +936,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// popover 关闭后归还焦点（隐藏 App），让之前活跃的应用恢复前台，
     /// 避免菜单栏小工具霸占焦点。
     func popoverDidClose(_ notification: Notification) {
-        // 移除面板位置锁定：停用 KVO + 清空顶边锚点
-        panelFrameObserver?.invalidate()
-        panelFrameObserver = nil
-        panelAnchored = false
         // 记录关闭时正在处理的事件时间戳：transient「面板外点击」关闭时，
         // currentEvent 即该 click（onStatusItemClicked 用它识别同一 click，避免抖动重弹）
         lastCloseEventTime = NSApp.currentEvent?.timestamp ?? 0
@@ -1487,7 +1449,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // 面板打开时同步重绘
         syncPanel()
-        // 面板位置锁定由 startPanelOriginLock 的 KVO 接管：origin 偏离时立即无动画拉回
     }
 
     // MARK: - 请求编排（四服务并行，各自独立更新 UI）
