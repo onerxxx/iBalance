@@ -11,9 +11,8 @@ import UserNotifications
 // v44 重写：回归原生 NSAlert 布局——标题/说明用 messageText / informativeText（系统排版，
 // 系统字号、换行与间距），按钮用 alert.addButton（系统按钮行：第一个添加的在右侧，
 // 即默认主操作，回车触发；后续按钮往左排，取消按钮绑 Esc）。
-// 仅两类内容放 accessoryView：输入控件（输入框/下拉）、含可点链接的富文本说明
-// （informativeText 不支持可点击链接）。间距全部交给系统，不再做视图树居中、
-// 隐藏占位按钮等 hack。调用侧 API 与旧版保持一致，各弹窗零改动。
+// 需要自定义排版的内容放 accessoryView：输入控件、含可点链接的富文本说明。
+// 标题和图标统一使用 NSAlert 原生标题区，保持各弹窗结构一致。
 
 enum DialogMetrics {
     /// accessoryView 默认内容宽（NSAlert 按此宽度自适应窗口；窗口宽 ≈ 此值 + 系统边距 16×2）
@@ -81,10 +80,20 @@ final class DialogShell {
     /// 添加按钮（原生按钮行：第一个添加的在右侧，即默认主操作）。
     /// 返回按钮索引，present() 返回值与之比较。
     @discardableResult
-    func addButton(_ title: String, keyEquivalent: String = "") -> Int {
+    func addButton(_ title: String, keyEquivalent: String = "", tintColor: NSColor? = nil) -> Int {
         let btn = alert.addButton(withTitle: title)
         if !keyEquivalent.isEmpty {
             btn.keyEquivalent = keyEquivalent
+        }
+        if let tintColor {
+            // macOS 26 的 NSAlert rounded 次按钮使用 tintProminence 控制主次层级；
+            // contentTintColor 仅适用于无边框按钮，bezelColor 在该 appearance 下会被忽略。
+            if #available(macOS 26.0, *) {
+                btn.tintProminence = .primary
+            } else {
+                // 旧系统没有 tintProminence，尽量使用支持情况依 appearance 而定的 bezelColor。
+                btn.bezelColor = tintColor
+            }
         }
         let idx = buttonCount
         buttonCount += 1
@@ -145,6 +154,11 @@ final class DialogShell {
         // NSAlert 视图树在 runModal 后才完成真实布局，图标/标题居中需在模态运行中微调
         DispatchQueue.main.async { [weak self] in
             self?.centerIconAndTitle()
+            // 长内容 accessoryView 的最终布局可能晚于首帧完成，再校正一次标题区，
+            // 避免手动签到结果弹窗的图标/标题被 NSAlert 重新布局后偏移。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.centerIconAndTitle()
+            }
         }
         let resp = alert.runModal()
         return resp.rawValue >= 1000 ? resp.rawValue - 1000 : -1
@@ -160,7 +174,10 @@ final class DialogShell {
         cv.layoutSubtreeIfNeeded()
 
         let title = alert.messageText
-        let iconView = findSubview(named: "_NSAlertImageView", in: cv)
+        // 不同 macOS 版本的 NSAlert 图标私有类名可能不同；优先使用已知类名，
+        // 找不到时回退到内容树中的第一个 NSImageView，避免长内容弹窗无法进入居中逻辑。
+        let iconView = (findSubview(named: "_NSAlertImageView", in: cv) as? NSImageView)
+            ?? findFirstImageView(in: cv)
         let titleField = title.isEmpty ? nil : findTextField(withText: title, in: cv)
         if iconView == nil || titleField == nil {
             if retries > 0 {
@@ -172,8 +189,14 @@ final class DialogShell {
         }
 
         if let iconView {
-            let size = iconView.frame.size
-            iconView.frame.origin.x = (cv.bounds.width - size.width) / 2
+            // NSAlert 会把图标放进一个约等于图标大小的左侧 slot；移动 imageView
+            // 本身会被 slot 裁住，因此优先移动这个窄容器，才能把整枚图标移到窗口中心。
+            if let iconSlot = iconView.superview,
+               iconSlot.bounds.width <= iconView.bounds.width + 2 {
+                centerViewHorizontally(iconSlot, in: cv)
+            } else {
+                centerViewHorizontally(iconView, in: cv)
+            }
             // 图标顶部与窗口顶部的间距 +4pt（整体下移）
             iconView.frame.origin.y -= 4
         }
@@ -188,8 +211,21 @@ final class DialogShell {
             attr.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: attr.length))
             tf.attributedStringValue = attr
             // 标题字段若为固有宽度（标题较短时），frame 也一并居中
-            tf.frame.origin.x = (cv.bounds.width - tf.frame.width) / 2
+            centerViewHorizontally(tf, in: cv)
         }
+    }
+
+    /// 将外层容器的水平中心转换到视图父容器坐标系后定位。
+    /// NSAlert 标题/图标通常嵌套在私有容器中，不能直接用 contentView 的宽度计算 frame.origin.x。
+    private func centerViewHorizontally(_ view: NSView, in container: NSView) {
+        guard let superview = view.superview else { return }
+        let centerInSuperview = container.convert(
+            NSPoint(x: container.bounds.midX, y: container.bounds.midY),
+            to: superview
+        ).x
+        var frame = view.frame
+        frame.origin.x = centerInSuperview - frame.width / 2
+        view.frame = frame
     }
 
     /// 按类名查找私有视图（如 _NSAlertImageView），找不到返回 nil
@@ -199,6 +235,19 @@ final class DialogShell {
         }
         for sub in view.subviews {
             if let found = findSubview(named: className, in: sub) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    /// NSAlert 的图标视图在不同系统版本中使用不同私有类名，通用兜底查找。
+    private func findFirstImageView(in view: NSView) -> NSImageView? {
+        if let imageView = view as? NSImageView {
+            return imageView
+        }
+        for sub in view.subviews {
+            if let found = findFirstImageView(in: sub) {
                 return found
             }
         }
@@ -362,6 +411,125 @@ final class DeepSeekSettingsDialog: NSObject {
         let idx = popup.indexOfSelectedItem
         let quota = idx < presets.count ? presets[idx].value : 0
         return (apiKey.isEmpty ? nil : apiKey, quota)
+    }
+}
+
+/// 各平台刷新 / 自动签到开关弹窗：沿用 DialogShell 的原生标题、说明和按钮布局。
+@MainActor
+final class PlatformAutomationSettingsDialog: NSObject {
+    private struct Row {
+        let name: String
+        let refresh: NSButton
+        let checkin: NSButton?
+    }
+
+    private let rows: [Row]
+    private let initialConfig: AppConfig
+
+    init(config: AppConfig) {
+        initialConfig = config
+        func makeCheckbox(label: String, isOn: Bool) -> NSButton {
+            let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+            checkbox.controlSize = .small
+            checkbox.alignment = .center
+            checkbox.state = isOn ? .on : .off
+            checkbox.setAccessibilityLabel(label)
+            return checkbox
+        }
+
+        rows = [
+            Row(name: "DeepSeek",
+                refresh: makeCheckbox(label: "DeepSeek 刷新", isOn: config.deepseekRefreshEnabled),
+                checkin: nil),
+            Row(name: "WorkBuddy",
+                refresh: makeCheckbox(label: "WorkBuddy 刷新", isOn: config.workbuddyEnabled),
+                checkin: makeCheckbox(label: "WorkBuddy 自动签到", isOn: config.workbuddyAutoCheckin)),
+            Row(name: "TRAE",
+                refresh: makeCheckbox(label: "TRAE 刷新", isOn: config.traeRefreshEnabled),
+                checkin: makeCheckbox(label: "TRAE 自动签到", isOn: config.traeAutoCheckin)),
+            Row(name: "ZCode",
+                refresh: makeCheckbox(label: "ZCode 刷新", isOn: config.zcodeRefreshEnabled),
+                checkin: nil),
+            Row(name: "Codex",
+                refresh: makeCheckbox(label: "Codex 刷新", isOn: config.codexRefreshEnabled),
+                checkin: nil),
+        ]
+        super.init()
+    }
+
+    func present() -> AppConfig? {
+        let shell = DialogShell()
+        let icon = NSImage(systemSymbolName: "circle.grid.2x2.topleft.checkmark.filled", accessibilityDescription: nil)
+        shell.addIcon(icon)
+        shell.addTitle("平台刷新与签到")
+        shell.addInfo("选择哪些平台参与自动刷新；支持签到的平台还可以单独控制自动签到。")
+        shell.contentWidth = DialogMetrics.width + 8
+
+        let headerName = NSTextField(labelWithString: "平台")
+        let headerRefresh = NSTextField(labelWithString: "刷新")
+        let headerCheckin = NSTextField(labelWithString: "签到")
+        for label in [headerName, headerRefresh, headerCheckin] {
+            label.font = .systemFont(ofSize: 11, weight: .semibold)
+            label.textColor = .secondaryLabelColor
+        }
+        headerRefresh.alignment = .center
+        headerCheckin.alignment = .center
+
+        var gridRows: [[NSView]] = [[headerName, headerRefresh, headerCheckin]]
+        for row in rows {
+            let name = NSTextField(labelWithString: row.name)
+            name.font = .systemFont(ofSize: 12)
+            name.textColor = .labelColor
+            let checkinView: NSView
+            if let checkin = row.checkin {
+                checkinView = checkin
+            } else {
+                let unavailable = NSTextField(labelWithString: "—")
+                unavailable.alignment = .center
+                unavailable.font = .systemFont(ofSize: 12)
+                unavailable.textColor = .tertiaryLabelColor
+                unavailable.setAccessibilityLabel("该平台不支持签到")
+                checkinView = unavailable
+            }
+            gridRows.append([name, row.refresh, checkinView])
+        }
+
+        // NSGridView 让每一列共享同一条轨道：平台列左对齐，两个控件列居中，
+        // 表头、checkbox 和「—」占位符天然保持表格对齐，不再手算坐标。
+        let grid = NSGridView(views: gridRows)
+        let headerHeight: CGFloat = 22
+        let rowHeight: CGFloat = 27
+        let rowSpacing: CGFloat = 4
+        grid.rowSpacing = rowSpacing
+        grid.columnSpacing = 4
+        grid.xPlacement = .fill
+        grid.yPlacement = .center
+        grid.column(at: 0).width = 116
+        grid.column(at: 0).xPlacement = .leading
+        grid.column(at: 1).width = 54
+        grid.column(at: 1).xPlacement = .center
+        grid.column(at: 2).width = 54
+        grid.column(at: 2).xPlacement = .center
+        grid.row(at: 0).height = headerHeight
+        for index in 1...rows.count {
+            grid.row(at: index).height = rowHeight
+        }
+        let gridHeight = headerHeight + CGFloat(rows.count) * rowHeight
+            + CGFloat(rows.count) * rowSpacing
+        shell.addContent(grid, height: gridHeight)
+        let save = shell.addButton("保存", keyEquivalent: "\r")
+        shell.addButton("取消", keyEquivalent: "\u{1b}")
+        guard shell.present() == save else { return nil }
+
+        var updatedConfig = initialConfig
+        updatedConfig.deepseekRefreshEnabled = rows[0].refresh.state == .on
+        updatedConfig.workbuddyEnabled = rows[1].refresh.state == .on
+        updatedConfig.workbuddyAutoCheckin = rows[1].checkin?.state == .on
+        updatedConfig.traeRefreshEnabled = rows[2].refresh.state == .on
+        updatedConfig.traeAutoCheckin = rows[2].checkin?.state == .on
+        updatedConfig.zcodeRefreshEnabled = rows[3].refresh.state == .on
+        updatedConfig.codexRefreshEnabled = rows[4].refresh.state == .on
+        return updatedConfig
     }
 }
 
@@ -841,6 +1009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onToggleHideWbNickname = { [weak self] in self?.onToggleHideWbNickname() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onAbout = { [weak self] in self?.onAbout() }
+        panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
         panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
         panel.onQuit = { [weak self] in self?.onQuit() }
@@ -1206,6 +1375,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
+    /// 打开平台开关弹窗：保存后同步右键菜单、自动签到定时器和面板状态。
+    @objc private func onManagePlatformToggles() {
+        let oldConfig = config
+        let dialog = PlatformAutomationSettingsDialog(config: oldConfig)
+        guard let updated = keepPanelAliveDuring({ dialog.present() }) else { return }
+
+        config = updated
+        ConfigStore.save(config)
+        autoCheckinMenuItem.state = (config.traeAutoCheckin || config.workbuddyAutoCheckin) ? .on : .off
+
+        if config.traeAutoCheckin || config.workbuddyAutoCheckin {
+            startCheckinTimer()
+            if !oldConfig.traeAutoCheckin && config.traeAutoCheckin {
+                Task { await traeAutoCheckinIfNeeded() }
+            }
+            if !oldConfig.workbuddyAutoCheckin && config.workbuddyAutoCheckin {
+                Task { await wbAutoCheckinIfNeeded() }
+            }
+        } else {
+            stopCheckinTimer()
+        }
+        syncPanel()
+    }
+
     @objc private func onQuit() {
         NSApp.terminate(nil)
     }
@@ -1515,6 +1708,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func refreshOneDeepSeek(_ cfg: AppConfig) async {
+        guard cfg.deepseekRefreshEnabled else {
+            failedServices.remove("DeepSeek")
+            return
+        }
         let ds = await DeepSeekService.fetch(apiKey: cfg.deepseekApiKey)
         // 已取消（被新刷新取代）：取消导致的失败不写缓存也不报错，避免旧结果覆盖新缓存
         guard !Task.isCancelled else { return }
@@ -1542,6 +1739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func refreshOneWorkBuddy(_ cfg: AppConfig) async {
         guard cfg.workbuddyEnabled else {
+            failedServices.remove("WorkBuddy")
             return
         }
         // 主账号（当前登录）：用 authInfo 直接查询
@@ -1604,6 +1802,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 遍历 config 中导入的 ZCode 账号，逐号查询 Coding Plan 用量（本平台无签到）
     private func refreshOneZcode(_ cfg: AppConfig) async {
+        guard cfg.zcodeRefreshEnabled else {
+            failedServices.remove("ZCode")
+            return
+        }
         var zcodeFailed = false
         for ac in cfg.zcodeAccounts {
             if Task.isCancelled { return }  // 被新刷新取代：不再发后续账号请求
@@ -1647,6 +1849,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 读取本机 auth.json 后调用官方 usage 接口。Codex usage 返回 used_percent，卡片展示剩余百分比。
     private func refreshOneCodex(_ cfg: AppConfig) async {
+        guard cfg.codexRefreshEnabled else {
+            failedServices.remove("Codex")
+            return
+        }
         var accounts = cfg.codexAccounts
         // auth.json 是当前登录态的权威来源；登录切换后自动更新对应账号 token/email。
         if case .success(let current) = CodexService.importCurrentAccount() {
@@ -1692,6 +1898,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func refreshOneTrae(_ cfg: AppConfig) async {
+        guard cfg.traeRefreshEnabled else {
+            failedServices.remove("TRAE")
+            return
+        }
         // 主账号（当前登录）：从 storage.json 解密查询
         let mainUid = TraeService.readAuthInfo(storagePath: cfg.traeStoragePath)?.uid ?? ""
         var traeFailed = false
@@ -1971,9 +2181,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         shell.addTitle("添加 WorkBuddy 账号")
         // 收窄一档：长文规格 width+8（240+8=248，与关于弹窗基准一致），替代 inputWidth(280)
         shell.contentWidth = DialogMetrics.width + 8
-        shell.addInfo("OAuth 导入：打开浏览器登录新账号，登录成功后自动采集凭据。\n\nJSON 导入：读取 WorkBuddy Desktop 当前登录账号（auth 文件），适合已在 Desktop 登录的账号。")
+        shell.addInfo("OAuth 导入：打开浏览器登录新账号，登录成功后自动采集凭据。\n\nJSON 导入：直接读取你在 WorkBuddy App 中登录的账号。已经登录 App 的话，选择这个即可。")
         let oauth = shell.addButton("OAuth 导入", keyEquivalent: "\r")
-        let json = shell.addButton("JSON 导入")
+        let json = shell.addButton("JSON 导入 (推荐)", tintColor: .systemBlue)
         shell.addButton("取消", keyEquivalent: "\u{1b}")
         let clicked = keepPanelAliveDuring { shell.present() }
         if clicked == oauth {
@@ -2219,7 +2429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         shell.addIcon(NSApp.applicationIconImage)
         shell.addTitle("手动签到完成")
         // 手动签到结果较长，info 容器在输入类弹窗基准上加宽 25pt，减少账号名称换行。
-        shell.contentWidth = DialogMetrics.inputWidth + 25
+        shell.contentWidth = DialogMetrics.inputWidth
 
         let para = NSMutableParagraphStyle()
         para.lineSpacing = 3

@@ -5,7 +5,7 @@
 //   横幅    离线提示（条件显示）
 //   卡片 ×4 DeepSeek / ZCode / TRAE（含用量进度条）/ WorkBuddy
 //   设置卡片  自动签到开关 / 刷新间隔 / 昵称开关 / 调试
-//   操作卡片  Cockpit / 添加 WB 账号 / API Key / 关于
+//   操作卡片  Cockpit / 添加账号 / API Key / 平台开关 / 关于
 //   底部    更新于 HH:mm:ss + 退出按钮
 //
 // v1.1：原右键菜单的全部选项搬入弹窗；右键菜单保留作为兜底。
@@ -245,11 +245,13 @@ final class MiniSegmentedControl: NSSegmentedControl {
     }
 }
 
-/// 设置卡片行容器：hover 时仅提亮文本颜色（secondaryLabel/tertiaryLabel → labelColor），
+/// 设置卡片行容器：hover 时仅提亮文本颜色（secondaryLabel/tertiaryLabel → hoverTextColor），
 /// switch/radio 等控件保持不变；无背景变化。光标变为 pointingHand 提示可点击。
 final class HoverRowView: NSView {
     private var trackingArea: NSTrackingArea?
     private var labels: [NSTextField] = []
+    private var highlightedLabels: [NSTextField] = []
+    var hoverTextColor: NSColor = .labelColor
     /// 需要 hover 提亮的 tint 控件 setter：contentTintColor 为 systemGray 的 NSImageView / NSButton
     /// 跟随整行 hover 提亮为 labelColor，行为与下方选项小字（systemGray 文字）一致。
     /// 用闭包捕获具体类型，使 animator().contentTintColor 能正确解析（NSControl 父类不暴露该属性）。
@@ -283,14 +285,13 @@ final class HoverRowView: NSView {
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
         collectLabels()
+        highlightedLabels = labels.filter {
+            $0.textColor == NSColor.systemGray || $0.textColor == NSColor.tertiaryLabelColor
+        }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.22
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            for l in labels {
-                if l.textColor == NSColor.systemGray || l.textColor == NSColor.tertiaryLabelColor {
-                    l.animator().textColor = NSColor.labelColor
-                }
-            }
+            for l in highlightedLabels { l.animator().textColor = self.hoverTextColor }
             for setter in tintables { setter(NSColor.labelColor) }
         }, completionHandler: nil)
     }
@@ -300,13 +301,10 @@ final class HoverRowView: NSView {
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.22
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            for l in labels {
-                if l.textColor == NSColor.labelColor {
-                    l.animator().textColor = NSColor.systemGray
-                }
-            }
+            for l in highlightedLabels { l.animator().textColor = NSColor.systemGray }
             for setter in tintables { setter(NSColor.systemGray) }
         }, completionHandler: nil)
+        highlightedLabels.removeAll()
     }
 }
 
@@ -995,8 +993,8 @@ struct CheckinResultRow {
 
 /// 面板内容控制器：把 BalancePanelView 挂进 popover，宽度固定 245、高度自适应
 final class BalancePanelViewController: NSViewController {
-    /// 面板顶部暗色区域的固定高度；超过此位置后才开始向底部的渐变。
-    private let panelDarkRegionHeight: CGFloat = 300
+    /// 面板顶部暗色区域的固定高度；在原 300pt 基础上缩短 30%，从 210pt 开始渐变。
+    private let panelDarkRegionHeight: CGFloat = 210
     private let panel: BalancePanelView
 
     init(panel: BalancePanelView) {
@@ -1045,7 +1043,7 @@ final class BalancePanelViewController: NSViewController {
         }
     }
 
-    /// 按当前开关状态刷新背景遮罩：渐变（起点=面板顶部 300pt）或单色近黑
+    /// 按当前开关状态刷新背景遮罩：渐变（起点=面板顶部 210pt）或单色近黑
     private func applyGradient() {
         guard let container = view as? TintedVisualEffectView else { return }
         container.tintBottomColor = panel.panelGradientEnabled ? Palette.containerTintBottom : nil
@@ -1060,7 +1058,7 @@ final class BalancePanelViewController: NSViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
-        // 背景渐变从面板顶部固定 300pt 开始；布局变化后同步背景状态
+        // 背景渐变从面板顶部固定 210pt 开始；布局变化后同步背景状态
         applyGradient()
     }
 }
@@ -1232,6 +1230,8 @@ final class BalancePanelView: NSView {
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
     var onPanelGradientChanged: (() -> Void)?
     var onAbout: (() -> Void)?
+    /// 管理各平台刷新与自动签到开关
+    var onManagePlatformToggles: (() -> Void)?
     var onManualCheckin: (() -> Void)?
     /// 查看签到历史（各账号签到记录列表）
     var onShowCheckinHistory: (() -> Void)?
@@ -1370,6 +1370,7 @@ final class BalancePanelView: NSView {
     /// 用量数值列宽（表头与数值行共用，保证上下对齐）
     private let usageColumnWidth: CGFloat = 56
     private let usageColumnSpacing: CGFloat = 8
+    private let usageHorizontalInset: CGFloat = 8
 
     private let autoCheckinSwitch = MiniSwitch()
     private let autoCheckinSub = NSTextField(labelWithString: "")
@@ -2056,7 +2057,7 @@ final class BalancePanelView: NSView {
     private func makeUsageHeaderRow() -> NSView {
         func headerLabel(_ text: String) -> NSTextField {
             let l = NSTextField(labelWithString: text)
-            l.font = .systemFont(ofSize: 9)
+            l.font = .systemFont(ofSize: 9, weight: .semibold)
             l.textColor = .systemGray
             l.alignment = .right
             l.translatesAutoresizingMaskIntoConstraints = false
@@ -2065,31 +2066,41 @@ final class BalancePanelView: NSView {
         }
         // 左列名「平台」左对齐（与下方 icon 左缘同起点），右两列列名右对齐
         let platformHeader = NSTextField(labelWithString: "平台")
-        platformHeader.font = .systemFont(ofSize: 9)
+        platformHeader.font = .systemFont(ofSize: 9, weight: .semibold)
         platformHeader.textColor = .systemGray
         let row = NSStackView(views: [platformHeader, stretchSpacer(), headerLabel("今日"), headerLabel("本周")])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = usageColumnSpacing
         row.translatesAutoresizingMaskIntoConstraints = false
-        return row
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: usageHorizontalInset),
+            row.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -usageHorizontalInset),
+            row.topAnchor.constraint(equalTo: container.topAnchor),
+            row.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        return container
     }
 
     /// 日/周用量行：品牌 icon + 平台名 + 右侧两列数值（固定列宽右对齐，对齐表头）
     private func makeUsageRow(_ row: UsageRowSnapshot) -> NSView {
+        let usageIconSize: CGFloat = 13
         let iconView = NSImageView()
-        iconView.image = bundleIcon(row.icon, size: 14) ?? symbolImage("app.fill", size: 14)
+        iconView.image = bundleIcon(row.icon, size: usageIconSize) ?? symbolImage("app.fill", size: usageIconSize)
         iconView.image?.isTemplate = true
         iconView.contentTintColor = kBalanceForeground
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.widthAnchor.constraint(equalToConstant: 14).isActive = true
         iconView.heightAnchor.constraint(equalToConstant: 14).isActive = true
         let nameLabel = NSTextField(labelWithString: row.name)
-        nameLabel.font = .systemFont(ofSize: 11)
+        nameLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         nameLabel.textColor = kBalanceForeground
         func valueLabel(_ text: String) -> NSTextField {
             let l = NSTextField(labelWithString: text)
-            l.font = .systemFont(ofSize: 10)
+            l.font = .systemFont(ofSize: 10, weight: .semibold)
             l.textColor = .systemGray
             l.alignment = .right
             l.translatesAutoresizingMaskIntoConstraints = false
@@ -2106,7 +2117,11 @@ final class BalancePanelView: NSView {
         rowStack.translatesAutoresizingMaskIntoConstraints = false
         // 位移动画需要 layer-backed
         rowStack.wantsLayer = true
-        return rowStack
+        // 用量条目 hover 时提亮到项目统一的 E9E9E9 前景色。
+        let hoverRow = wrapHoverRow(rowStack, hoverTextColor: kBalanceForeground,
+                                    horizontalPadding: usageHorizontalInset)
+        hoverRow.wantsLayer = true
+        return hoverRow
     }
 
     /// 单项：SF Symbol icon + 文本，中间细空格
@@ -2298,6 +2313,7 @@ final class BalancePanelView: NSView {
         // ── 日/周用量区块（可折叠；行内容随快照重建）──
         var usageCollapseTargets: [NSView] = []
         let usageTitle = collapsibleSectionTitle(name: "用量", key: UDKey.usageSectionCollapsed,
+                                                 titleWeight: .semibold,
                                                  targets: { usageCollapseTargets })
         root.addArrangedSubview(usageTitle)
         pinFullWidth(usageTitle, in: root)
@@ -2308,7 +2324,7 @@ final class BalancePanelView: NSView {
         usageContentStack.distribution = .fill
         usageContentStack.spacing = 6
         usageContentStack.translatesAutoresizingMaskIntoConstraints = false
-        let usageCard = addCard(rows: [usageContentStack], to: root, spacing: 6)
+        let usageCard = addCard(rows: [usageContentStack], to: root, spacing: 6, horizontalPadding: 0)
         usageCardRef = usageCard
         usageCollapseTargets = [usageCard]
         let usageCollapsed = UserDefaults.standard.bool(forKey: UDKey.usageSectionCollapsed)
@@ -2394,6 +2410,7 @@ final class BalancePanelView: NSView {
         let cockpitBtn = ActionTileButton(symbol: "gauge.with.needle", title: "Cockpit", target: self, action: #selector(openCockpitTapped))
         let deepSeekSettingsBtn = ActionTileButton(bundleIcon: "deepseek", title: "Key / 额度", target: self, action: #selector(setApiKeyTapped))
         let aboutBtn = ActionTileButton(symbol: "info.circle", title: "关于", target: self, action: #selector(aboutTapped))
+        let platformTogglesBtn = ActionTileButton(symbol: "circle.grid.2x2.topleft.checkmark.filled", title: "平台开关", target: self, action: #selector(platformTogglesTapped))
         let actionTiles = [
             cockpitBtn,
             wbAddBtn,
@@ -2403,6 +2420,7 @@ final class BalancePanelView: NSView {
             deepSeekSettingsBtn,
             checkinBtn,
             ActionTileButton(symbol: "list.bullet.rectangle", title: "签到历史", target: self, action: #selector(checkinHistoryTapped)),
+            platformTogglesBtn,
             aboutBtn,
         ]
         // 各按钮悬停提示（HIG：图标类控件应有 tooltip）
@@ -2412,6 +2430,7 @@ final class BalancePanelView: NSView {
         zcodeAddBtn.toolTip = "添加 ZCode 账号（JSON 导入）"
         codexAddBtn.toolTip = "添加 Codex 账号（JSON 导入 ~/.codex/auth.json）"
         deepSeekSettingsBtn.toolTip = "配置 DeepSeek API Key 和日常额度"
+        platformTogglesBtn.toolTip = "管理各平台刷新与自动签到开关"
         let buildVer = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         aboutBtn.toolTip = "关于 iBalance（v\(buildVer)）"
         // 按钮间水平间距 4pt（4×52 + 3×4 = 220 ≤ 内容宽 236，整体靠左）
@@ -2587,9 +2606,10 @@ final class BalancePanelView: NSView {
     /// 标题文字左对齐余额标题（内边距 8），箭头（▸ 折叠 / ▾ 展开）靠右贴卡片内边界。
     /// targets 闭包返回随折叠一起隐藏的视图（build 在区块内容创建后才会填充，闭包按引用取最新值）；
     /// 初始折叠态由 build 在填完 targets 后自行应用（isHidden + 间距）。
-    private func collapsibleSectionTitle(name: String, key: String, targets: @escaping () -> [NSView]) -> HoverCard {
+    private func collapsibleSectionTitle(name: String, key: String, titleWeight: NSFont.Weight = .bold,
+                                         targets: @escaping () -> [NSView]) -> HoverCard {
         let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 12, weight: .bold)
+        label.font = .systemFont(ofSize: 12, weight: titleWeight)
         label.textColor = .systemGray
         let chevron = NSImageView()
         chevron.contentTintColor = .systemGray
@@ -2819,14 +2839,16 @@ final class BalancePanelView: NSView {
     }
 
     /// 用 HoverRowView 包裹行视图：获得 hover 时 8% 背景圆角 + pointingHand 光标
-    private func wrapHoverRow(_ row: NSView) -> HoverRowView {
+    private func wrapHoverRow(_ row: NSView, hoverTextColor: NSColor = .labelColor,
+                              horizontalPadding: CGFloat = 0) -> HoverRowView {
         let hover = HoverRowView()
+        hover.hoverTextColor = hoverTextColor
         hover.translatesAutoresizingMaskIntoConstraints = false
         row.translatesAutoresizingMaskIntoConstraints = false
         hover.addSubview(row)
         NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: hover.leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: hover.trailingAnchor),
+            row.leadingAnchor.constraint(equalTo: hover.leadingAnchor, constant: horizontalPadding),
+            row.trailingAnchor.constraint(equalTo: hover.trailingAnchor, constant: -horizontalPadding),
             row.topAnchor.constraint(equalTo: hover.topAnchor),
             row.bottomAnchor.constraint(equalTo: hover.bottomAnchor),
         ])
@@ -2913,6 +2935,8 @@ final class BalancePanelView: NSView {
     @objc private func hideWbNicknameToggled() { onToggleHideWbNickname?() }
     @objc private func panelGradientToggled() { onTogglePanelGradient?() }
     @objc private func setApiKeyTapped() { onSetApiKey?() }
+
+    @objc private func platformTogglesTapped() { onManagePlatformToggles?() }
 
     @objc private func aboutTapped() { onAbout?() }
     @objc private func manualCheckinTapped() { onManualCheckin?() }

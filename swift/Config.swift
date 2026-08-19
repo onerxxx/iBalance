@@ -138,6 +138,11 @@ struct AppConfig: Codable {
     var workbuddyDecimals: Int = 2
     var traeStoragePath: String = ""
     var traeDecimals: Int = 0
+    /// 各平台独立刷新开关。WorkBuddy 沿用历史字段 workbuddyEnabled，保持旧配置兼容。
+    var deepseekRefreshEnabled: Bool = true
+    var traeRefreshEnabled: Bool = true
+    var zcodeRefreshEnabled: Bool = true
+    var codexRefreshEnabled: Bool = true
     var workbuddyEnabled: Bool = true
     var traeAutoCheckin: Bool = true
     var hideWbNickname: Bool = true
@@ -160,6 +165,10 @@ struct AppConfig: Codable {
         case workbuddyDecimals = "workbuddy_decimals"
         case traeStoragePath = "trae_storage_path"
         case traeDecimals = "trae_decimals"
+        case deepseekRefreshEnabled = "deepseek_refresh_enabled"
+        case traeRefreshEnabled = "trae_refresh_enabled"
+        case zcodeRefreshEnabled = "zcode_refresh_enabled"
+        case codexRefreshEnabled = "codex_refresh_enabled"
         case workbuddyEnabled = "workbuddy_enabled"
         case traeAutoCheckin = "trae_auto_checkin"
         case hideWbNickname = "hide_wb_nickname"
@@ -190,6 +199,10 @@ struct AppConfig: Codable {
         workbuddyDecimals = try c.decodeIfPresent(Int.self, forKey: .workbuddyDecimals) ?? legacy ?? 2
         traeStoragePath = try c.decodeIfPresent(String.self, forKey: .traeStoragePath) ?? ""
         traeDecimals = try c.decodeIfPresent(Int.self, forKey: .traeDecimals) ?? 0
+        deepseekRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .deepseekRefreshEnabled) ?? true
+        traeRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .traeRefreshEnabled) ?? true
+        zcodeRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .zcodeRefreshEnabled) ?? true
+        codexRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .codexRefreshEnabled) ?? true
         workbuddyEnabled = try c.decodeIfPresent(Bool.self, forKey: .workbuddyEnabled) ?? true
         traeAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .traeAutoCheckin) ?? true
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? true
