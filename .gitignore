@@ -1,11 +1,9 @@
 # 用户配置：含真实 API Key / WorkBuddy token / ZCode JWT，严禁入库
 # swift/config.json 是 build.sh 的打包源，仅本地保留（根目录 config.json 已于 2026-08-20 移除，
-# 保留 /config.json 规则防止误提交；backups/ 内历史副本同样含真实凭据，一并忽略）
+# 保留 /config.json 规则防止误提交；backups/ 历史备份含真实凭据，整个目录不入库）
 /config.json
 /swift/config.json
-backups/*/config.json
-# 含真实凭据的历史配置备份（2026-08-20 移除根 config 时的副本）
-backups/config.json.bak-*
+/backups/
 
 # 余额数值磁盘缓存（cache-then-refresh 启动秒显，运行时状态不入库）
 /cache.json
