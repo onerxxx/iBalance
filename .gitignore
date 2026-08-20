@@ -1,9 +1,11 @@
-# 用户配置：含真实 API Key / WorkBuddy token / 千问 ticket / ZCode JWT，严禁入库
-# 根目录与 swift/ 两份都不跟踪（swift/config.json 是 build.sh 的打包源，仅本地保留）；
-# backups/ 内的根 config.json 副本同样含真实凭据，一并忽略（备份内的 swift/ 模板是空 Key，可留）
+# 用户配置：含真实 API Key / WorkBuddy token / ZCode JWT，严禁入库
+# swift/config.json 是 build.sh 的打包源，仅本地保留（根目录 config.json 已于 2026-08-20 移除，
+# 保留 /config.json 规则防止误提交；backups/ 内历史副本同样含真实凭据，一并忽略）
 /config.json
 /swift/config.json
 backups/*/config.json
+# 含真实凭据的历史配置备份（2026-08-20 移除根 config 时的副本）
+backups/config.json.bak-*
 
 # 余额数值磁盘缓存（cache-then-refresh 启动秒显，运行时状态不入库）
 /cache.json
@@ -34,6 +36,10 @@ iBalance-已损坏说明.html
 
 # SPM/swiftc 构建缓存
 swift/.build/
+/.build/
+
+# Impeccable 本地设计上下文（工具产物，不入库）
+.impeccable.md
 
 # Reasonix 本地工作状态（话题/剪贴板附件，不入库）
 .reasonix/

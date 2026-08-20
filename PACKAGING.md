@@ -4,7 +4,7 @@
 
 ## 核心原则
 
-**原项目的用户数据一律不动** —— 真实 API Key / Token / 账号信息运行时保存在 `~/Library/Application Support/com.local.ibalance/`，源码目录中的旧版 `config.json` 只用于兼容迁移，不进入分发包。
+**原项目的用户数据一律不动** —— 真实 API Key / Token / 账号信息运行时保存在 `~/Library/Application Support/com.local.ibalance/`，仓库内 `swift/config.json` 只是编译模板（含真实凭据的本地快照，不进入分发包，打包时替换为初始化模板）。根目录 `config.json` 已于 2026-08-20 移除。
 
 打包流程通过 **复制项目到临时副本** 实现：
 1. 把项目整体复制到 `/tmp/iBalance_pkg/iBalance`
@@ -100,7 +100,6 @@ rsync -a \
   --exclude 'backups/' \
   --exclude 'cockpit-tools-main/' \
   --exclude 'docs/' \
-  --exclude '/config.json' \
   --exclude 'cache.json' \
   --exclude 'click_ibalance.lua' \
   --exclude 'iBalance-已损坏说明.html' \
@@ -199,7 +198,6 @@ iBalance/
 ├── macos-panel-ui-guide.md
 ├── reasonix.toml
 ├── .gitignore
-├── config.json                  ← 初始化版（475B）
 ├── iBalance.app/                ← 可执行 App（含初始化 config）
 ├── swift/                       ← 源码
 │   ├── Services/

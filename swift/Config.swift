@@ -148,6 +148,15 @@ struct AppConfig: Codable {
     var hideWbNickname: Bool = true
     /// 面板背景渐变开关：true = 顶部暗 → 底部中灰纵向渐变；false = 恢复单色近黑遮罩
     var panelGradientEnabled: Bool = true
+    /// Mono 字体开关：true = 余额卡片与用量列表使用 DepartureMono（拉丁字符），
+    /// 缺字（中文等）通过 cascade 级联回退系统字体
+    var monoFontEnabled: Bool = false
+    /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
+    var fadeHintBandHeight: Double = 54
+    var fadeHintHighlightAlpha: Double = -0.6
+    var fadeHintMaskMidAlpha: Double = 0.45
+    var fadeHintArrowAlpha: Double = 0.75
+    var fadeHintBobAmplitude: Double = 2
     var cockpitAppId: String = "com.jlcodes.cockpit-tools"
     var workbuddyAutoCheckin: Bool = true
     var workbuddyAccounts: [WBAccount] = []
@@ -157,6 +166,10 @@ struct AppConfig: Codable {
     /// 菜单栏条目可见性：key 格式见 MenuBarItemId，value=true 显示、false 隐藏；
     /// 未显式记录的条目使用默认值（主账号默认显示，非主账号默认隐藏，ZCode 默认隐藏）。
     var menuBarVisible: [String: Bool] = [:]
+    /// 面板余额卡片可见性：key = 平台 ID（"ds" / "zcode" / "codex" / "trae" / "wb"），
+    /// value=true 显示、false 隐藏；未记录的平台默认显示（true）。
+    /// 空账号组（如 ZCode 未导入）即使设为 true 也维持隐藏，不产生空白占位。
+    var panelCardVisible: [String: Bool] = [:]
 
     enum CodingKeys: String, CodingKey {
         case deepseekApiKey = "deepseek_api_key"
@@ -173,6 +186,12 @@ struct AppConfig: Codable {
         case traeAutoCheckin = "trae_auto_checkin"
         case hideWbNickname = "hide_wb_nickname"
         case panelGradientEnabled = "panel_gradient_enabled"
+        case monoFontEnabled = "mono_font_enabled"
+        case fadeHintBandHeight = "fade_hint_band_height"
+        case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
+        case fadeHintMaskMidAlpha = "fade_hint_mask_mid_alpha"
+        case fadeHintArrowAlpha = "fade_hint_arrow_alpha"
+        case fadeHintBobAmplitude = "fade_hint_bob_amplitude"
         case cockpitAppId = "cockpit_app_id"
         case workbuddyAutoCheckin = "workbuddy_auto_checkin"
         case workbuddyAccounts = "workbuddy_accounts"
@@ -180,6 +199,7 @@ struct AppConfig: Codable {
         case zcodeAccounts = "zcode_accounts"
         case codexAccounts = "codex_accounts"
         case menuBarVisible = "menubar_visible"
+        case panelCardVisible = "panel_card_visible"
     }
 
     // 仅解码用的 legacy 字段（旧版统一 "decimals"，新版按服务拆分；读取兼容两者）
@@ -207,6 +227,12 @@ struct AppConfig: Codable {
         traeAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .traeAutoCheckin) ?? true
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? true
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
+        monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
+        fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
+        fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
+        fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55
+        fadeHintArrowAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintArrowAlpha) ?? 0.8
+        fadeHintBobAmplitude = try c.decodeIfPresent(Double.self, forKey: .fadeHintBobAmplitude) ?? 2.6
         cockpitAppId = try c.decodeIfPresent(String.self, forKey: .cockpitAppId) ?? "com.jlcodes.cockpit-tools"
         cockpitAppId = cockpitAppId.isEmpty ? "com.jlcodes.cockpit-tools" : cockpitAppId
         workbuddyAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .workbuddyAutoCheckin) ?? true
@@ -223,6 +249,8 @@ struct AppConfig: Codable {
             .filter { !$0.uid.isEmpty && !$0.token.isEmpty && !$0.email.isEmpty }
         // 菜单栏条目可见性（缺省为空字典，未记录的条目走默认值逻辑）
         menuBarVisible = try c.decodeIfPresent([String: Bool].self, forKey: .menuBarVisible) ?? [:]
+        // 面板余额卡片可见性（缺省为空字典，未记录的平台默认显示）
+        panelCardVisible = try c.decodeIfPresent([String: Bool].self, forKey: .panelCardVisible) ?? [:]
     }
 }
 

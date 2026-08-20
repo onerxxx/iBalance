@@ -1,7 +1,7 @@
 # AGENT.md — iBalance 项目指南
 
 本文件面向在本仓库中工作的 AI Agent / 开发者，介绍项目结构、构建流程与关键注意事项。
-（2026-08-19 更新：千问平台已下线，ZCode / Codex 已接入，配置迁移 Application Support，签名证书已重建。）
+（2026-08-20 更新：根目录 `config.json` 已移除，用户配置唯一权威来源为 `~/Library/Application Support/com.local.ibalance/`；2026-08-19 千问平台已下线，ZCode / Codex 已接入，配置迁移 Application Support，签名证书已重建。）
 
 ## 项目概述
 
@@ -24,8 +24,7 @@
 
 ```
 .
-├── config.json              # 旧版用户配置（仅首次启动迁移用）⚠️ 含真实凭据，已 git-ignore
-├── cache.json               # 旧版余额缓存（同上，迁移后保留为副本）
+├── cache.json               # 旧版余额缓存（迁移后保留为副本）
 ├── iBalance.app/            # 构建产物（可双击运行的 .app bundle）
 ├── IMPROVEMENTS.md          # 改进优化建议清单
 ├── PACKAGING.md             # 分发打包流程（zip 排除清单 + 敏感字段泄漏校验）
@@ -190,7 +189,7 @@ swiftc -framework Cocoa swift-tools/click.swift -o swift-tools/click
 
 ## 安全注意
 
-- 根目录 `config.json` 与 `swift/config.json` 均含真实凭据，**已 git-ignore（含 backups/ 内副本），不要提交到 git，不要在日志/回复中泄露**。
-- ⚠️ **`swift/config.json`（模板）当前仍写有真实 API Key 与 WorkBuddy 账号 token**：它会被 build.sh 拷进 .app 作为内置 fallback，打 zip 时必须靠 `PACKAGING.md` 的泄漏校验清空；条件允许应尽快将模板恢复为空凭据。
+- ⚠️ **`swift/config.json`（模板）当前仍写有真实 API Key 与 WorkBuddy 账号 token**：它会被 build.sh 拷进 .app 作为内置 fallback，打 zip 时必须靠 `PACKAGING.md` 的泄漏校验清空；条件允许应尽快将模板恢复为空凭据。**运行时真实配置在 `~/Library/Application Support/com.local.ibalance/config.json`，不要把它当成模板改**。
+- 根目录 `config.json` 已于 2026-08-20 移除（备份至 `backups/config.json.bak-2026-08-20`）；`.gitignore` 仍保留 `/config.json` 规则防止误提交。
 - TRAE storage.json 解密、Codex auth.json / ZCode 凭据读写涉及用户本地凭据，改动需格外谨慎（写文件保持原权限、原子写入、失败恢复原账号）。
 - 打 zip 分发前必须走 `PACKAGING.md` 的泄漏校验（zip 内模板 config 的敏感字段必须为空）。

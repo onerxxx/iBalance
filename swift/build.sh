@@ -47,21 +47,31 @@ swiftc \
     -o "$SCRIPT_DIR/iBalance"
 
 # 先停掉旧 iBalance 再删旧 bundle：旧进程还在跑时删 bundle，open 只会激活旧实例，
-# 新二进制根本没运行。SIGTERM + 1.0s 优雅退出，随后循环等 pgrep 为空，超时升级 SIGKILL。
+# 新二进制根本没运行。SIGTERM + 1.0s 优雅退出，随后循环等 pgrep 为空，超时升级 SIGKILL，
+# 最终用"不同 PID"作为通过判据，防止 macOS SIGTERM 被忽略 / 弹窗未响应导致 open 激活老进程。
 wait_iBalance_exit() {
     local start=$SECONDS elapsed killed=0
+    local old_pids="$(pgrep -x iBalance 2>/dev/null)"
+    [ -z "$old_pids" ] && return 0
     while pgrep -x iBalance >/dev/null 2>&1; do
         elapsed=$(( SECONDS - start ))
-        if (( elapsed >= 5 && killed == 0 )); then   # SIGTERM 后 5s 仍未退出，升级 SIGKILL
+        if (( elapsed >= 3 && killed == 0 )); then   # SIGTERM 后 3s 仍未退出，升级 SIGKILL（更早强制）
+            for p in $old_pids; do kill -9 "$p" 2>/dev/null || true; done
             killall -9 iBalance 2>/dev/null || true
             killed=1
         fi
-        if (( elapsed >= 8 )); then                  # 共 8s 仍未退出，告警后继续（罕见）
-            echo "!! 旧 iBalance 进程未确认退出，继续构建"
-            return
+        if (( elapsed >= 10 )); then                 # 共 10s 仍未退出（极罕见：调试器 / 系统 io hang）
+            echo "!! 旧 iBalance 进程仍未退出（pid=$old_pids），告警后仍尝试 open 新 bundle —— macOS 可能激活老实例"
+            return 1
         fi
         sleep 0.1
     done
+    # 确认 PID 完全不重叠：避免有同名残留新启的实例
+    local any_remain=0
+    for op in $old_pids; do
+        if kill -0 "$op" 2>/dev/null; then any_remain=1; break; fi
+    done
+    return $any_remain
 }
 
 if pgrep -x iBalance >/dev/null 2>&1; then
@@ -119,6 +129,12 @@ cp "$SCRIPT_DIR/icons/"*.png "$RESOURCES_DIR/" 2>/dev/null || true
 # 拷贝 PDF 图标（菜单栏平台图标矢量版，优先于同名 SVG 加载）
 cp "$SCRIPT_DIR/icons/"*.pdf "$RESOURCES_DIR/" 2>/dev/null || true
 
+# 拷贝字体（Mono 开关：DepartureMono，运行时按进程注册）
+if [[ -d "$SCRIPT_DIR/fonts" ]]; then
+    cp "$SCRIPT_DIR/fonts/"*.otf "$RESOURCES_DIR/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/fonts/"*.ttf "$RESOURCES_DIR/" 2>/dev/null || true
+fi
+
 # 代码签名（保持固定签名身份）：
 # ad-hoc 签名每次编译都会生成新哈希，macOS TCC 按签名识别应用，
 # 导致"完全磁盘访问"等授权每次重建都被重置；
@@ -136,8 +152,37 @@ echo "    应用：$APP_DIR"
 echo "    配置/缓存：~/Library/Application Support/com.local.ibalance/"
 echo ""
 
-# 重启 App：旧进程已在组装前停止；这里防御性确认无残留（pgrep 为空才 open，
-# 否则 open 只会激活旧实例，用户会误以为已升级）
-wait_iBalance_exit
+# 重启 App：两道保险
+#   1) 旧 PID 必须都退出（wait_iBalance_exit 记录的 old_pids，在第 3s 就升级 SIGKILL）
+#   2) open 前再用 pgrep 确认残留，仍有就按 PID 逐个 -9，再 sleep 2s 轮询；
+#      只有残留为 0 才执行 open，避免 macOS `open` 看到同名实例直接激活老进程、
+#      用户以为升级成功其实一直跑旧二进制（footer 不更新等"幽灵 bug"的根源）。
+wait_iBalance_exit || echo "!! wait_iBalance_exit 未完全确认退出，进入兜底"
+final_start=$SECONDS
+while pgrep -x iBalance >/dev/null 2>&1; do
+    for p in $(pgrep -x iBalance 2>/dev/null); do
+        echo "    -> 强制清理残留 pid=$p"
+        kill -9 "$p" 2>/dev/null || true
+    done
+    sleep 0.5
+    if (( SECONDS - final_start >= 6 )); then
+        echo "!! 清理超时（6s），放弃重启 —— 请手动关闭 iBalance 后双击 App 启动"
+        exit 1
+    fi
+done
 open "$APP_DIR"
-echo "==> iBalance 已重启"
+# 启动验证：新进程 PID ≠ 原 PID（若 open 激活的是其他旧 bundle 会告警）
+sleep 2
+new_pid=$(pgrep -x iBalance 2>/dev/null | head -1)
+if [ -n "$new_pid" ]; then
+    new_cmd=$(ps -o command= -p "$new_pid" 2>/dev/null | tr -s ' ')
+    if [[ "$new_cmd" == "$APP_DIR"* ]]; then
+        echo "==> iBalance 已重启（pid=$new_pid）"
+    else
+        echo "!! 警告：当前运行中的 iBalance 不是本次构建的 bundle"
+        echo "    运行路径:  $new_cmd"
+        echo "    目标 bundle: $APP_DIR/Contents/MacOS/iBalance"
+    fi
+else
+    echo "!! iBalance 未成功启动，请手动双击 App"
+fi

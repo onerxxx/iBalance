@@ -10,13 +10,17 @@
 //
 // v1.1：原右键菜单的全部选项搬入弹窗；右键菜单保留作为兜底。
 import Cocoa
+import CoreImage
 
 /// 面板数据快照（由 AppDelegate 从各服务缓存 + 设置状态构建）
-struct PanelSnapshot {
+struct PanelSnapshot: Equatable {
     var ds: String?                 // DeepSeek 余额（已格式化，含货币符号）
     var dsUsedRatio: Double = 0     // DeepSeek 已用占比（0~1），基于常用充值额度计算；0=未设置不显示点阵
     var dsPulsing: Bool = false     // DeepSeek 余额被消耗（usedRatio 上升）→ 点阵脉冲
     var dsInfoText: String?         // DeepSeek 副标题文字（nil 显示默认提示）
+    /// 面板余额卡片可见性：key = 平台 ID（"ds" / "zcode" / "codex" / "trae" / "wb"），
+    /// value=true 显示、false 隐藏；未记录的平台默认 true。
+    var panelCardVisible: [String: Bool] = [:]
     /// TRAE 多账号余额卡片数据（每号一条，当前账号排首位）
     var traeAccounts: [AccountCardSnapshot] = []
     /// WorkBuddy 多账号余额卡片数据（每号一条）
@@ -45,10 +49,12 @@ struct PanelSnapshot {
     var hideWbNickname = true
     /// 面板背景渐变开关（同步自配置，VC 据此决定遮罩渐变/单色）
     var panelGradientEnabled = true
+    /// Mono 字体开关（同步自配置；余额卡片与用量列表 DepartureMono ↔ 系统字体）
+    var monoFontEnabled = false
 }
 
 /// 日/周用量行快照：icon + 平台名 + 已格式化的今日/本周用量文本
-struct UsageRowSnapshot {
+struct UsageRowSnapshot: Equatable {
     var platform: String
     var icon: String
     var name: String
@@ -58,7 +64,7 @@ struct UsageRowSnapshot {
 
 /// 多号余额卡片统一快照（WorkBuddy / TRAE / ZCode 共用，复用同一套卡片渲染逻辑）。
 /// 无签到平台（ZCode / Codex）的 checkin 字段保持默认；expireText 为当前账号重置/到期副标题。
-struct AccountCardSnapshot {
+struct AccountCardSnapshot: Equatable {
     var uid: String
     var nickname: String
     var value: String?              // 已格式化的剩余额度
@@ -99,6 +105,40 @@ private enum Palette {
 private let kBalanceForeground = Palette.cardForeground
 private let kCardBackground = Palette.cardBackground
 private let kCardBackgroundHover = Palette.cardBackgroundHover
+/// 用量行 hover 背景色（#8aa78880：青灰绿，50% 半透明）
+private let kUsageHoverBackground = NSColor(srgbRed: 0x8a / 255.0, green: 0xa7 / 255.0,
+                                            blue: 0x88 / 255.0, alpha: 0.5)
+
+/// DepartureMono（像素风等宽字体，无中文字形）：
+/// 拉丁字符用 DepartureMono，缺字（中文/特殊符号）通过 cascade 级联自动回退系统字体。
+/// 字体文件随 App 打包在 Resources/，首次使用时按进程注册（幂等）。
+enum MonoFontProvider {
+    /// PostScript 名（实测字体内部命名，NSFont(name:) 需用 PostScript 名）
+    private static let postScriptName = "DepartureMono-Regular"
+    private static var registered = false
+
+    static func register() {
+        guard !registered else { return }
+        registered = true
+        guard let url = Bundle.main.url(forResource: "DepartureMono-Regular", withExtension: "otf")
+            ?? Bundle.main.url(forResource: "DepartureMono-Regular", withExtension: "ttf")
+        else { return }
+        CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+    }
+
+    /// DepartureMono + 系统字体级联：weight 仅作用于中文回退部分
+    /// （DepartureMono 只有 Regular 一档，拉丁字符统一常规字重）
+    static func font(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+        register()
+        if let base = NSFont(name: postScriptName, size: size) {
+            let cascade = NSFont.systemFont(ofSize: size, weight: weight).fontDescriptor
+            let desc = base.fontDescriptor.addingAttributes([.cascadeList: [cascade]])
+            if let f = NSFont(descriptor: desc, size: size) { return f }
+            return base
+        }
+        return .systemFont(ofSize: size, weight: weight)
+    }
+}
 
 /// 通用 layer keypath 过渡（borderWidth / shadowOpacity 等），0.22s easeInEaseOut
 private func animateLayerKey(_ layer: CALayer?, keyPath: String, to value: Any?, duration: Double = 0.22) {
@@ -245,13 +285,27 @@ final class MiniSegmentedControl: NSSegmentedControl {
     }
 }
 
+/// 面板滚动 hover 同步：内容滚动后 AppKit 不会补发 mouseEntered/mouseExited，
+/// 面板控制器在滚动时遍历视图树，让所有可 hover 视图按当前光标位置重算状态。
+protocol PanelScrollHoverSync: AnyObject {
+    func syncHoverForCurrentPointer()
+}
+
 /// 设置卡片行容器：hover 时仅提亮文本颜色（secondaryLabel/tertiaryLabel → hoverTextColor），
 /// switch/radio 等控件保持不变；无背景变化。光标变为 pointingHand 提示可点击。
-final class HoverRowView: NSView {
+final class HoverRowView: NSView, PanelScrollHoverSync {
     private var trackingArea: NSTrackingArea?
+    /// 当前 hover 状态（滚动同步时用于判断是否需要切换）
+    private var isMouseInside = false
     private var labels: [NSTextField] = []
     private var highlightedLabels: [NSTextField] = []
     var hoverTextColor: NSColor = .labelColor
+    /// hover 时行背景色（nil = 不绘制背景，保持原文本/tint 提亮行为）
+    var hoverBackgroundColor: NSColor? = nil
+    /// 行背景圆角（hoverBackgroundColor 非 nil 时生效）
+    var backgroundCornerRadius: CGFloat = 6
+    /// hover 时是否对灰色文本/tint 做提亮（false = 仅背景变化，用于用量行等）
+    var enablesTextBrightening: Bool = true
     /// 需要 hover 提亮的 tint 控件 setter：contentTintColor 为 systemGray 的 NSImageView / NSButton
     /// 跟随整行 hover 提亮为 labelColor，行为与下方选项小字（systemGray 文字）一致。
     /// 用闭包捕获具体类型，使 animator().contentTintColor 能正确解析（NSControl 父类不暴露该属性）。
@@ -284,6 +338,17 @@ final class HoverRowView: NSView {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        isMouseInside = true
+        if let bg = hoverBackgroundColor {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.22)
+            wantsLayer = true
+            layer?.cornerRadius = backgroundCornerRadius
+            layer?.cornerCurve = .continuous
+            layer?.backgroundColor = bg.cgColor
+            CATransaction.commit()
+        }
+        guard enablesTextBrightening else { return }
         collectLabels()
         highlightedLabels = labels.filter {
             $0.textColor == NSColor.systemGray || $0.textColor == NSColor.tertiaryLabelColor
@@ -298,6 +363,14 @@ final class HoverRowView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        isMouseInside = false
+        if hoverBackgroundColor != nil {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.22)
+            layer?.backgroundColor = nil
+            CATransaction.commit()
+        }
+        guard enablesTextBrightening else { return }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.22
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -305,6 +378,16 @@ final class HoverRowView: NSView {
             for setter in tintables { setter(NSColor.systemGray) }
         }, completionHandler: nil)
         highlightedLabels.removeAll()
+    }
+
+    // MARK: - 面板滚动 hover 同步
+    func syncHoverForCurrentPointer() {
+        guard let window else { return }
+        let p = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        // visibleRect 已被滚动视口裁剪：滚出可视区的行不再参与 hover
+        let inside = visibleRect.contains(p)
+        if inside == isMouseInside { return }
+        if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
 }
 
@@ -342,10 +425,12 @@ final class RefreshRow: NSStackView {
 /// 无边框图标按钮：使用 macOS 原生 bezelStyle 实现 hover 时自动显示圆角背景，
 /// 系统自动处理背景绘制，仅用 tracking area 管理图标颜色变化。
 /// hover 时系统渲染浅色圆角背景（略大于图标），图标同步提亮为 labelColor。
-final class HoverIconButton: NSButton {
+final class HoverIconButton: NSButton, PanelScrollHoverSync {
     /// 按钮容器尺寸（正方形）
     static let buttonSize: CGFloat = 22
     private var trackingArea: NSTrackingArea?
+    /// 当前 hover 状态（滚动同步时用于判断是否需要切换）
+    private var isMouseInside = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -375,6 +460,7 @@ final class HoverIconButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        isMouseInside = true
         contentTintColor = .labelColor
         // hover 背景：极淡白底淡入（0.22s，同全项目过渡节奏）
         animateLayerKey(layer, keyPath: "backgroundColor",
@@ -383,8 +469,18 @@ final class HoverIconButton: NSButton {
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        isMouseInside = false
         contentTintColor = .systemGray
         animateLayerKey(layer, keyPath: "backgroundColor", to: NSColor.clear.cgColor)
+    }
+
+    // MARK: - 面板滚动 hover 同步
+    func syncHoverForCurrentPointer() {
+        guard let window else { return }
+        let p = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        let inside = visibleRect.contains(p)
+        if inside == isMouseInside { return }
+        if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
 }
 
@@ -468,7 +564,7 @@ extension RefreshIconButton: CAAnimationDelegate {
 
 /// 余额卡片容器：hover 时显示 8% 背景圆角，并切换签到信息子视图颜色。
 /// 点击卡片触发 onClick 回调（如打开对应平台主页或应用）。
-class HoverCard: NSView {
+class HoverCard: NSView, PanelScrollHoverSync {
     private var trackingArea: NSTrackingArea?
     private weak var dragContentView: NSView?
     private var dragNormalBackgroundColor: CGColor?
@@ -522,6 +618,17 @@ class HoverCard: NSView {
         guard let window else { return isMouseInside }
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         return bounds.contains(point)
+    }
+
+    // MARK: - 面板滚动 hover 同步
+    /// 滚动后 AppKit 不补发 enter/exit：按当前光标位置重算 hover（visibleRect 已按滚动视口裁剪）。
+    /// 拖拽锁定期间跳过（材质由 setDragHoverLocked 全权管理）。
+    func syncHoverForCurrentPointer() {
+        guard let window, !isDragHoverLocked else { return }
+        let p = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        let inside = visibleRect.contains(p)
+        if inside == isMouseInside { return }
+        if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
 
     /// 拖拽期间锁住 hover 材质，避免卡片随幽灵位置移动到光标下方时重新淡入变亮。
@@ -654,6 +761,26 @@ class HoverCard: NSView {
                                 owner: self, userInfo: nil)
         addTrackingArea(ta)
         trackingArea = ta
+    }
+
+    /// 点击后鼠标通常仍停留在卡片内，AppKit 不会重新派发 mouseExited；
+    /// 主动清除 hover 材质，避免点击可折叠标题后高亮一直残留。
+    func clearHoverEffect(animated: Bool = true) {
+        isMouseInside = false
+        guard !isDragHoverLocked else { return }
+        if animated {
+            animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
+            animateLayerKey(layer, keyPath: "borderWidth", to: 0)
+        } else {
+            hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
+            layer?.removeAnimation(forKey: "borderWidthTransition")
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            hoverEffectLayer.opacity = 0
+            layer?.borderWidth = 0
+            CATransaction.commit()
+        }
+        onHover?(false)
     }
 
     /// 可排序卡片不把事件命中交给内部 label、图标等子视图，确保整张卡片都能开始拖拽。
@@ -991,11 +1118,490 @@ struct CheckinResultRow {
     }
 }
 
-/// 面板内容控制器：把 BalancePanelView 挂进 popover，宽度固定 245、高度自适应
+/// 隐藏原生滚动条；使用 Chrome 经典冲量-速度（Velocity-Impulse）物理模型 + CVDisplayLink 帧同步。
+/// 普通鼠标滚轮：同向输入直接累加速度（越连滚越快）、阻尼滑行至停止；触控板精确滚动交系统原生。
+private final class QuietScrollView: NSScrollView {
+
+    // MARK: - 平滑参数（调手感只改这里）
+    /// 单格滚轮的目标速度冲量（pt/s）：越大每格滑行越远；同向连滚线性叠加。
+    /// 1 ≈ 单格最终滑行 ~0.2~0.5pt；必须连续滚几十格才看得出动。
+    private let impulseGain: Double = 1
+    /// 同向叠加时的额外加速度系数：1.0 = 纯线性叠加（滚 N 格 = N×冲量，最线性稳定）；
+    /// >1 = 连滚额外提一下爆发力；<1 = 连滚衰减（几乎不用）
+    private let accelerateFactor: Double = 1.0
+    /// 最小步长（pt）：低于该阈值的小输入对齐到此值，避免滚轮"最小一格"的细碎抖动
+    private let minStep: Double = 6
+    /// 最小归一化行单位：每次输入步长 / 36 得到 normalizedLines，若 < 此值则夹到此值。
+    /// 调小可让"单格"冲量更小（极端精细）；标准单格（3 line ≈ 36pt）normalizedLines=1.0 不受影响。
+    private let minNormalizedLines: Double = 0.1
+    /// 【延迟感核心】60fps 下每帧 velocity 向 targetVelocity 逼近的跟随率：
+    /// 越小 → 延迟越重、越"沉"、越油润，滚轮不会一下猛冲；
+    /// 0.12 → 强延迟（~14 帧才追上目标的 80%，前 220ms 几乎感觉不到速度爬上去）
+    /// 0.20 → 中强延迟（~8 帧追上 80%）
+    /// 1.00 → 完全无延迟（= 旧直接 velocity=冲量 模型）
+    private let followPerFrameAt60fps: Double = 0.12
+    /// 60fps 基准下每帧 targetVelocity 阻尼（目标速度自己先衰减，velocity 跟着慢慢追 → 全程油润延迟感）：
+    /// 0.993 → 衰减极慢，小冲量下（impulseGain=1）单格总滑行约 3 秒
+    /// 0.990 → 约 2 秒（之前默认）
+    /// 0.978 → 约 1.0~1.3s
+    private let dampingPerFrameAt60fps: Double = 0.993
+    /// 停手阈值（pt/帧）：速度 < 此值直接收尾。对应 pt/s 要乘 60：
+    /// 0.002 pt/帧 ≈ 0.12 pt/s，几乎完全停下来才收尾，保证滑行尾巴拖得更久。
+    private let minVelocityPerFrame: Double = 0.002
+    /// 判定是否进入收尾的"无新输入"等待（秒）：防止用户中间停顿 0.1~0.2s 时被误收尾
+    private let settleIdle: CFTimeInterval = 0.4
+    /// 目标速度硬上限（pt/s）：防止疯狂连滚几十格时速度爆掉，飞出天际
+    private let maxTargetVelocity: Double = 1500
+
+    // MARK: - 滚动状态
+    /// CVDisplayLink：与显示器刷新率（60/120/144Hz ProMotion）同步帧输出
+    private var displayLink: CVDisplayLink?
+    /// 上一次 CVDisplayLink 回调到达时间（秒），用于按真实 dt 归一化阻尼/跟随率
+    private var lastFrameTime: CFTimeInterval = 0
+    /// 目标速度：每格滚轮直接写到这里，它先衰减（pt/s）
+    private var targetVelocity: Double = 0
+    /// 实际速度：通过 EMA 低通慢慢向 targetVelocity 靠拢（延迟感的核心）
+    private var velocity: Double = 0
+    /// 最近一次滚轮事件到达时间，用于检测"停手无新输入"时可以进入收尾
+    private var lastEventTime: CFTimeInterval = 0
+    /// 【原始滚动能漏网的最后一道防线】
+    /// 我们记录期望的 contentView.bounds.origin.y；每帧先校验，发现与真实值差 >0.5pt 就强拉回来。
+    /// （防止 super.scrollWheel 的隐式 CA 动画下一帧才执行，导致 3~40pt 的原生大跳被用户看见）
+    /// -1 = 尚未初始化（首次从 clip 读）。
+    private var expectedOriginY: CGFloat = -1
+    private var linkRunning: Bool { displayLink.map { CVDisplayLinkIsRunning($0) } ?? false }
+
+    func hideScrollers() {
+        verticalScroller?.alphaValue = 0
+        horizontalScroller?.alphaValue = 0
+    }
+
+    // MARK: - 滚轮拦截：彻底接管非精确滚轮
+    override func scrollWheel(with event: NSEvent) {
+        // 触控板 / Magic Mouse（hasPreciseScrollingDeltas=true）：
+        // 自带连续滚动 + 系统惯性 + 相位字段，直接透传
+        if event.hasPreciseScrollingDeltas {
+            stopPipelineImmediately()
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let clip = contentView
+        // 1) 让系统按默认逻辑滚一次原始步长 → 拿到"系统对该滚轮事件换算后的真实像素位移 + 方向"
+        //    【关键】包在禁用隐式动画的 CATransaction 里，确保 AppKit/NSScrollView 的 bounds 修改同步生效，
+        //    不会因为有 CA 动画下一帧才改 bounds → 读不到 rawStep → 导致原始阶梯大跳漏网！
+        let beforeY = clip.bounds.origin.y
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        super.scrollWheel(with: event)
+        CATransaction.commit()
+        var rawStep = Double(clip.bounds.origin.y - beforeY)
+
+        // 2) 立即撤销原始"阶梯跳"——接下来的滚动全部由我们的 CVDisplayLink 平滑管线按帧吐出
+        if rawStep != 0 {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            var origin = clip.bounds.origin
+            origin.y = beforeY
+            clip.setBoundsOrigin(origin)
+            reflectScrolledClipView(clip)
+            CATransaction.commit()
+        }
+
+        // 3) 兜底：如果 CATransaction 同步仍没拿到 rawStep（极少见的 AppKit 差异），
+        //    手动按 deltaY × 行高估算，保证不会因为 rawStep==0 return 漏掉一格原生大跳
+        if rawStep == 0 {
+            let ls = lineScroll > 0 ? lineScroll : 16.0  // 每行 ~16pt 兜底
+            let perEvent = CGFloat(event.deltaY) * ls     // event.deltaY 通常一格 = 3 line
+            // 自然滚动偏好已经体现在 deltaY 符号上，这里按"向上/向下"手动对齐 NSScrollView 方向：
+            // 内容向下走（滚到后面）= origin.y 增大，正常 macOS 普通滚轮 deltaY<0 = 滚下 = 内容向上 = origin.y 增大
+            rawStep = Double(-perEvent)
+            if rawStep != 0 {
+                // 确保 bounds 在兜底分支里也维持 beforeY（防止 super 异步动画下一帧把内容翻过去）
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                var origin = clip.bounds.origin
+                origin.y = beforeY
+                clip.setBoundsOrigin(origin)
+                reflectScrolledClipView(clip)
+                CATransaction.commit()
+            }
+        }
+        guard rawStep != 0 else { return }
+
+        // 4) 最小步长归一化
+        if abs(rawStep) < minStep {
+            rawStep = (rawStep > 0 ? 1.0 : -1.0) * minStep
+        }
+
+        // 4) 计算本次冲量：以步长绝对值做权重（多 line 事件更大）× 基准冲量
+        //    rawStep 典型值：3 line ≈ 36~48pt，除以 36pt 归一化到"标准单格 = 1 倍冲量"
+        let normalizedLines = abs(rawStep) / 36.0
+        let sign: Double = rawStep > 0 ? 1.0 : -1.0
+        let impulse = sign * impulseGain * max(minNormalizedLines, normalizedLines)
+
+        // 5) 写入 targetVelocity（不直接动 velocity——它会通过 EMA 低通慢慢向 target 靠拢 = 延迟感）
+        if targetVelocity == 0 {
+            targetVelocity = impulse
+        } else {
+            let movingSameDir = (targetVelocity > 0) == (impulse > 0)
+            if movingSameDir {
+                // 同向：accelerateFactor=1.0 纯线性叠加 → 连滚速度线性累加不爆炸，滚很多格输出也稳定
+                targetVelocity = targetVelocity * accelerateFactor + impulse
+            } else {
+                // 方向翻转：直接用新冲量替换，避免左右互搏猛减速再反向
+                targetVelocity = impulse
+                velocity = 0  // 反向同时把当前实际速度清零，防止旧方向尾巴拖
+            }
+        }
+        // 6) 防止连滚过多格速度爆掉：夹到 ±maxTargetVelocity 硬上限
+        if targetVelocity > maxTargetVelocity { targetVelocity = maxTargetVelocity }
+        if targetVelocity < -maxTargetVelocity { targetVelocity = -maxTargetVelocity }
+        lastEventTime = CFAbsoluteTimeGetCurrent()
+        // 7) 同步记录 expectedOriginY：此时我们已经把原始大跳撤销了，bounds 停在 beforeY
+        //    后面 CVDisplayLink 的 applyDelta 会从这个基准慢慢推进，兜底对齐也从这里开始判
+        expectedOriginY = beforeY
+
+        ensureDisplayLink()
+    }
+
+    // MARK: - CVDisplayLink 生命周期
+    private func ensureDisplayLink() {
+        if linkRunning { return }
+        if displayLink == nil {
+            var link: CVDisplayLink?
+            guard CVDisplayLinkCreateWithActiveCGDisplays(&link) == kCVReturnSuccess, let link = link else { return }
+            displayLink = link
+            // CVDisplayLink 回调是后台高优线程；Unmanaged 传 self 避免循环引用
+            let selfOpaque = Unmanaged.passUnretained(self).toOpaque()
+            CVDisplayLinkSetOutputCallback(link, { (_, _, _, _, _, userInfo) -> CVReturn in
+                guard let info = userInfo else { return kCVReturnError }
+                let obj = Unmanaged<QuietScrollView>.fromOpaque(info).takeUnretainedValue()
+                obj.onLinkTick()
+                return kCVReturnSuccess
+            }, selfOpaque)
+        }
+        lastFrameTime = CFAbsoluteTimeGetCurrent()
+        CVDisplayLinkStart(displayLink!)
+    }
+
+    /// 立刻关停管线 + 清空所有状态（触控板事件进来时调用，避免两者抢滚动控制权）
+    private func stopPipelineImmediately() {
+        if let link = displayLink, CVDisplayLinkIsRunning(link) {
+            CVDisplayLinkStop(link)
+        }
+        targetVelocity = 0
+        velocity = 0
+        lastFrameTime = 0
+        lastEventTime = 0
+        expectedOriginY = -1
+    }
+
+    /// CVDisplayLink 后台线程回调：跳回主线程再操作 AppKit
+    private func onLinkTick() {
+        if Thread.isMainThread { mainTick() }
+        else { DispatchQueue.main.async { self.mainTick() } }
+    }
+
+    // MARK: - 主循环（EMA 低通跟随 + 双变量衰减 = 全程油润延迟感）
+    private func mainTick() {
+        let clip = contentView
+        // ★ 兜底对齐：每一帧先校验真实 origin.y 和我们期望的值。任何 AppKit 异步动画/原生大跳漏网都会被这里立即拉回来。
+        if expectedOriginY >= 0 {
+            let actualY = clip.bounds.origin.y
+            let drift = abs(actualY - expectedOriginY)
+            if drift > 0.5 {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                var origin = clip.bounds.origin
+                origin.y = expectedOriginY
+                clip.setBoundsOrigin(origin)
+                reflectScrolledClipView(clip)
+                CATransaction.commit()
+            }
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let dt = lastFrameTime > 0 ? now - lastFrameTime : (1.0 / 60.0)
+        lastFrameTime = now
+        guard dt > 0 else { return }
+
+        // 0) 真实 dt 归一化：把"每 1/60 秒的基准系数"换算到当前帧长下
+        let baselineFrame: Double = 1.0 / 60.0
+        let framesEquiv = dt / baselineFrame
+
+        // 1) targetVelocity 先阻尼衰减（它总是在前面先"瘦下去"）
+        let dampingThisFrame = pow(dampingPerFrameAt60fps, framesEquiv)
+        targetVelocity *= dampingThisFrame
+
+        // 2) velocity EMA 向 targetVelocity 逼近——**延迟感的核心**
+        //    归一化公式：follow = 1 - (1 - follow60)^(framesEquiv)
+        //    跟随率不会直接加到 1，而是一步步靠拢 → 起步有爬升、停止有拖尾
+        let followThisFrame = 1.0 - pow(1.0 - followPerFrameAt60fps, framesEquiv)
+        velocity = velocity * (1.0 - followThisFrame) + targetVelocity * followThisFrame
+
+        // 3) 本帧位移 = 实际速度 × dt，并写到 NSScrollView
+        let deltaPt = velocity * dt
+        let moved = applyDelta(CGFloat(deltaPt))
+
+        // 4) 到达边界（moved 没写满）或"长时间无新输入 + 两者都足够小" → 直接收尾停止
+        let sinceLastEvent = now - lastEventTime
+        let vPerFrame = abs(velocity) * baselineFrame      // 统一成"每帧 pt"便于判断
+        let tPerFrame = abs(targetVelocity) * baselineFrame
+        let idleSettled = sinceLastEvent >= settleIdle
+            && vPerFrame < minVelocityPerFrame
+            && tPerFrame < minVelocityPerFrame
+        if idleSettled {
+            targetVelocity = 0
+            velocity = 0
+        }
+        let blocked = abs(moved - CGFloat(deltaPt)) > 0.01   // 到达边界被钳制
+        if blocked {
+            targetVelocity = 0
+            velocity = 0
+        }
+        if velocity == 0 && targetVelocity == 0 {
+            if let link = displayLink, CVDisplayLinkIsRunning(link) {
+                CVDisplayLinkStop(link)
+            }
+            return
+        }
+    }
+
+    /// 真正把一帧位移写到 NSScrollView（含边界钳制），返回实际生效位移；同步更新 expectedOriginY
+    @discardableResult
+    private func applyDelta(_ dy: CGFloat) -> CGFloat {
+        let clip = contentView
+        var origin = clip.bounds.origin
+        let docH = documentView?.frame.height ?? 0
+        let maxY = max(0, docH - clip.bounds.height)
+        let oldY = origin.y
+        let newY = origin.y + dy
+        origin.y = max(0, min(maxY, newY))
+        // 禁用隐式动画直接写，避免任何 AppKit 层的补间抢走控制权
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        clip.setBoundsOrigin(origin)
+        reflectScrolledClipView(clip)
+        CATransaction.commit()
+        expectedOriginY = origin.y
+        return origin.y - oldY
+    }
+}
+
+/// 提示层贴靠边：bottom = 面板底缘（下方还有内容），top = 面板顶缘（上方还有内容）
+enum FadeHintEdge { case top, bottom }
+
+/// 滚动提示层可调参数（config.json 持久化；「滚动提示」弹窗滑杆实时预览）
+struct FadeHintParams: Equatable {
+    /// 提示条带高度（pt）
+    var bandHeight: Double = 54
+    /// 贴靠边高光渐变最亮处 alpha
+    var highlightAlpha: Double = -0.6
+    /// 底色遮罩 50% 处 alpha（贴靠边恒为 1）
+    var maskMidAlpha: Double = 0.45
+    /// 箭头描边 alpha
+    var arrowAlpha: Double = 0.75
+    /// 箭头浮动幅度（pt，2s 周期）
+    var bobAmplitude: Double = 2
+}
+
+/// 面板顶/底缘「还有内容」提示层：半透明底色渐变遮罩 + 透明白高光
+/// 渐变 + 指向箭头（2s 周期轻微浮动，top 指上 / bottom 指下）。
+/// 由控制器在内容超出视口且未滚到对应边缘时显示；纯视觉层，鼠标/滚轮事件全部穿透。
+/// （原磨砂快照 + CIGaussianBlur 方案已移除，现为纯静态遮罩，无需滚动时刷新）
+private final class ScrollFadeHint: NSView {
+    override var isFlipped: Bool { true }
+
+    let edge: FadeHintEdge
+
+    /// 可调参数（调参弹窗滑杆拖动时实时赋值 → applyParams 即时生效）
+    var params = FadeHintParams() {
+        didSet {
+            guard oldValue != params else { return }
+            applyParams()
+        }
+    }
+
+    /// 底色遮罩层：半透明容器色，mask 控制不透明度渐变（贴靠边最深 → 对侧透明）
+    private let tintLayer = CALayer()
+    private let tintMaskLayer = CAGradientLayer()
+    private let gradientLayer = CAGradientLayer()
+    /// darken 蒙版：负值高光时作为 gradientLayer 的 mask，控制透明度渐变；
+    /// 灰阶本身均匀无 RGB 插值，渐变只发生在蒙版 alpha，避免渐变带状/ muddy。
+    private let gradientMaskLayer = CAGradientLayer()
+    private let arrowLayer = CAShapeLayer()
+    private var isShown = false
+
+    init(edge: FadeHintEdge) {
+        self.edge = edge
+        super.init(frame: .zero)
+        wantsLayer = true
+        // 本视图翻转坐标系（y=0 在顶）；贴靠边的 y：top=0，bottom=1
+        let nearY: CGFloat = edge == .top ? 0 : 1
+        let farY: CGFloat = edge == .top ? 1 : 0
+        // 底色遮罩层最底：半透明容器色打底
+        tintLayer.backgroundColor = Palette.containerTint.cgColor
+        tintMaskLayer.locations = [0, 0.5, 1]
+        tintMaskLayer.startPoint = CGPoint(x: 0.5, y: farY)
+        tintMaskLayer.endPoint = CGPoint(x: 0.5, y: nearY)
+        tintLayer.mask = tintMaskLayer
+        layer?.addSublayer(tintLayer)
+        gradientLayer.locations = [0, 0.5, 1]
+        gradientLayer.startPoint = CGPoint(x: 0.5, y: farY)
+        gradientLayer.endPoint = CGPoint(x: 0.5, y: nearY)
+        layer?.addSublayer(gradientLayer)
+        // darken 蒙版：与高光同向（对侧透明 → 贴靠边满），applyParams 负值分支挂到 gradientLayer.mask
+        gradientMaskLayer.locations = [0, 0.5, 1]
+        gradientMaskLayer.startPoint = CGPoint(x: 0.5, y: farY)
+        gradientMaskLayer.endPoint = CGPoint(x: 0.5, y: nearY)
+        // 箭头：圆角折线 chevron，bottom 指下 / top 指上（路径 y 向下，以 bounds 左上为原点）
+        arrowLayer.fillColor = nil
+        arrowLayer.lineWidth = 1.8
+        arrowLayer.lineCap = .round
+        arrowLayer.lineJoin = .round
+        arrowLayer.bounds = CGRect(x: 0, y: 0, width: 9, height: 4.2)
+        let tipY: CGFloat = edge == .top ? 0 : 4.2
+        let baseY: CGFloat = edge == .top ? 4.2 : 0
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 0, y: baseY))
+        path.addLine(to: CGPoint(x: 4.5, y: tipY))
+        path.addLine(to: CGPoint(x: 9, y: baseY))
+        arrowLayer.path = path
+        layer?.addSublayer(arrowLayer)
+        applyParams()
+        alphaValue = 0
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 参数变化即时生效：颜色/渐变重设 + 浮动动画按新幅度重建
+    /// （bandHeight 由 VC 的约束更新）
+    private func applyParams() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        // 底色遮罩不透明度：0（对侧）→ maskMidAlpha（50%）→ 1（贴靠边）
+        tintMaskLayer.colors = [
+            NSColor.white.withAlphaComponent(0).cgColor,
+            NSColor.white.withAlphaComponent(params.maskMidAlpha).cgColor,
+            NSColor.white.cgColor,
+        ]
+        // 高光渐变：
+        //  · 正值 → 白色高光，Normal 混合（常规提亮）：透明度直接编码在渐变颜色 alpha 里。
+        //  · 负值 → 灰阶 + Photoshop「变暗 Darken」混合模式：逐通道取 min(底色, 灰阶)，
+        //           已暗通道保持原样、仅压暗亮于灰阶的通道，因此比直接叠黑色更保留内容色相。
+        //    关键：darken 的透明度渐变放进 gradientMaskLayer（纯 alpha 蒙版，无 RGB 插值），
+        //          gradientLayer 本身只铺均匀灰阶（backgroundColor）+ compositingFilter，
+        //          避免渐变颜色插值与混合模式叠加产生带状/ muddy。
+        //    灰阶：darken 即「变暗」，源灰阶本应偏暗——不再是 1−|alpha| 的近白灰，
+        //          取 0.3×(1−|alpha|)（下限 0.05，−0.7 → 0.09），始终落在暗灰区间。
+        //    强度：由蒙版 alpha 随 |alpha| 缩放（对侧 0 → 贴靠边 |alpha|），曲线 0 → 0.39 → 1 同高光形状；
+        //          |alpha| 越大、灰阶越暗 + 蒙版越满，效果越深。
+        //    说明：纯黑源在 Darken 下与 Normal 等价（min(底,0)=0），故下限保留 0.05 而非 0。
+        let hiAbs = abs(params.highlightAlpha)
+        if params.highlightAlpha >= 0 {
+            gradientLayer.compositingFilter = nil
+            gradientLayer.mask = nil
+            gradientLayer.backgroundColor = nil
+            gradientLayer.colors = [
+                NSColor.white.withAlphaComponent(0).cgColor,
+                NSColor.white.withAlphaComponent(hiAbs * 0.39).cgColor,
+                NSColor.white.withAlphaComponent(hiAbs).cgColor,
+            ]
+        } else {
+            gradientLayer.compositingFilter = CIFilter(name: "CIDarkenBlendMode")
+            // 均匀暗灰铺底（无渐变颜色），透明度交给蒙版
+            let grayLevel = CGFloat(max(0.05, 0.3 * (1 - hiAbs)))
+            gradientLayer.colors = nil
+            gradientLayer.backgroundColor = NSColor(white: grayLevel, alpha: 1).cgColor
+            // darken 蒙版：对侧透明 → 贴靠边，强度随 |alpha| 缩放（曲线 0 → 0.39 → 1 同高光形状）
+            let peak = min(1, hiAbs)
+            gradientMaskLayer.colors = [
+                NSColor.white.withAlphaComponent(0).cgColor,
+                NSColor.white.withAlphaComponent(0.39 * peak).cgColor,
+                NSColor.white.withAlphaComponent(peak).cgColor,
+            ]
+            gradientLayer.mask = gradientMaskLayer
+        }
+        arrowLayer.strokeColor = NSColor.white.withAlphaComponent(params.arrowAlpha).cgColor
+        CATransaction.commit()
+        // 浮动幅度变化：重建动画（正在显示时立即以新幅度浮动）
+        arrowLayer.removeAnimation(forKey: "fadeHintBob")
+        updateBobAnimation()
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        tintLayer.frame = bounds
+        tintMaskLayer.frame = CGRect(origin: .zero, size: bounds.size)
+        gradientLayer.frame = bounds
+        gradientMaskLayer.frame = CGRect(origin: .zero, size: bounds.size)
+        // 箭头偏向贴靠边：top 层放 0.36 高度处（靠上），bottom 层放 0.64（靠下）
+        let yRatio = edge == .top ? 0.36 : 0.64
+        arrowLayer.position = CGPoint(x: bounds.midX, y: bounds.height * yRatio)
+        CATransaction.commit()
+    }
+
+    private func updateBobAnimation() {
+        let key = "fadeHintBob"
+        if isShown && arrowLayer.animation(forKey: key) == nil {
+            // 1s 单程 + 自动回返 = 2s 完整周期，与全局脉冲节奏一致；
+            // 浮动方向朝贴靠边外：bottom 向下(+)，top 向上(−)
+            let amp = CGFloat(params.bobAmplitude)
+            guard amp > 0 else { return }
+            let bob = CABasicAnimation(keyPath: "transform.translation.y")
+            bob.fromValue = 0
+            bob.toValue = edge == .top ? -amp : amp
+            bob.duration = 1.0
+            bob.autoreverses = true
+            bob.repeatCount = .infinity
+            bob.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            arrowLayer.add(bob, forKey: key)
+        } else if !isShown {
+            arrowLayer.removeAnimation(forKey: key)
+        }
+    }
+
+    /// 显示/隐藏提示层（0.22s easeInEaseOut，与全局 hover 过渡一致）
+    func setShown(_ shown: Bool) {
+        guard isShown != shown else { return }
+        isShown = shown
+        updateBobAnimation()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            self.animator().alphaValue = shown ? 1 : 0
+        }
+    }
+
+    /// 纯指示层：不参与命中测试，滚轮与点击穿透到下方滚动内容
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// 面板内容控制器：把 BalancePanelView 挂进 popover，宽度固定 250，高度受屏幕可用空间限制；
+/// 内容超高时通过纵向滚动查看底部设置、操作和更新时间。
 final class BalancePanelViewController: NSViewController {
     /// 面板顶部暗色区域的固定高度；在原 300pt 基础上缩短 30%，从 210pt 开始渐变。
     private let panelDarkRegionHeight: CGFloat = 210
     private let panel: BalancePanelView
+    private let scrollView = QuietScrollView()
+    /// 底部「下方还有内容」提示层（磨砂 + 渐变 + 箭头），盖在 scrollView 之上
+    private let fadeHint = ScrollFadeHint(edge: .bottom)
+    /// 顶部「上方还有内容」提示层，与底缘对称
+    private let topHint = ScrollFadeHint(edge: .top)
+    /// 提示层参数（AppDelegate 启动时从 config 写入）
+    var fadeHintParams = FadeHintParams()
+    /// 提示层高度约束（bandHeight 参数实时调整用）
+    private var fadeHintHeightConstraint: NSLayoutConstraint?
+    private var topHintHeightConstraint: NSLayoutConstraint?
+    private var fadeObservers: [NSObjectProtocol] = []
+    private var maximumHeight: CGFloat = 750
+    private var contentSizeDirty = true
+    /// 首次打开归位标记：只在 App 启动后第一次弹出时滚到最上方，
+    /// 之后开关面板保留用户上次滚动位置
+    private var didScrollToTopOnce = false
 
     init(panel: BalancePanelView) {
         self.panel = panel
@@ -1003,6 +1609,10 @@ final class BalancePanelViewController: NSViewController {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        fadeObservers.forEach(NotificationCenter.default.removeObserver)
+    }
 
     override func loadView() {
         // 容器用 NSVisualEffectView 提供更深毛玻璃（.menu 比 .popover 默认更深，仍保留透明质感）
@@ -1022,13 +1632,61 @@ final class BalancePanelViewController: NSViewController {
         container.layer?.cornerCurve = .continuous
         container.layer?.masksToBounds = true
         container.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(panel)
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasHorizontalScroller = false
+        scrollView.hasVerticalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.verticalScrollElasticity = .automatic
+        container.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            panel.topAnchor.constraint(equalTo: container.topAnchor),
-            panel.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            panel.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            panel.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: container.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
+        // 底部「下方还有内容」提示层：底色渐变遮罩 + 高光渐变 + 下箭头，内容超高且未滚到底时显示
+        fadeHint.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(fadeHint)
+        fadeHintHeightConstraint = fadeHint.heightAnchor.constraint(equalToConstant: fadeHintParams.bandHeight)
+        NSLayoutConstraint.activate([
+            fadeHint.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            fadeHint.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            fadeHint.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            fadeHintHeightConstraint!,
+        ])
+        // 顶部「上方还有内容」提示层：与底缘对称，未滚到顶时显示
+        topHint.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(topHint)
+        topHintHeightConstraint = topHint.heightAnchor.constraint(equalToConstant: fadeHintParams.bandHeight)
+        NSLayoutConstraint.activate([
+            topHint.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            topHint.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            topHint.topAnchor.constraint(equalTo: container.topAnchor),
+            topHintHeightConstraint!,
+        ])
+        // 初始参数（可能由 AppDelegate 在 view 加载前写入）：应用到两个提示层
+        fadeHint.params = fadeHintParams
+        topHint.params = fadeHintParams
+        // NSScrollView 的 document view 用 frame 承载完整内容；viewport 高度由 preferredContentSize 控制。
+        panel.translatesAutoresizingMaskIntoConstraints = true
+        scrollView.documentView = panel
+        // 滚动位置 / 内容尺寸变化时刷新底部提示可见性
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        panel.postsFrameChangedNotifications = true
+        fadeObservers.append(NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main
+        ) { [weak self] _ in
+            self?.updateFadeHint()
+            // 滚动后修正各卡片/按钮的 hover 状态（AppKit 不补发 enter/exit 事件）
+            self?.syncHoverAfterScroll()
+        })
+        fadeObservers.append(NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification, object: panel, queue: .main
+        ) { [weak self] _ in self?.updateFadeHint() })
         view = container
         // 渐变开关状态变化（update 同步时触发）：立即刷新遮罩绘制
         panel.onPanelGradientChanged = { [weak self] in
@@ -1037,10 +1695,116 @@ final class BalancePanelViewController: NSViewController {
         // 区块折叠/展开后按新内容高度收缩 popover（与 viewWillAppear 同一套口径），
         // 避免 preferredContentSize 固定不变时根布局把其余区块拉伸填高
         panel.onContentChanged = { [weak self] in
-            guard let self else { return }
-            self.panel.layoutSubtreeIfNeeded()
-            self.preferredContentSize = self.panel.fittingSize
+            self?.invalidateContentSize()
         }
+        updateContentSize()
+    }
+
+    /// 在面板展示前设置当前屏幕允许的最大高度；超出的内容保留在 document view 中滚动查看。
+    func setMaximumHeight(_ height: CGFloat) {
+        let nextHeight = max(1, height)
+        guard abs(maximumHeight - nextHeight) > 0.5 else { return }
+        maximumHeight = nextHeight
+        contentSizeDirty = true
+        guard isViewLoaded else { return }
+        updateContentSize()
+    }
+
+    private func invalidateContentSize() {
+        contentSizeDirty = true
+        updateContentSize()
+    }
+
+    private func updateContentSize() {
+        guard contentSizeDirty else { return }
+        contentSizeDirty = false
+        panel.layoutSubtreeIfNeeded()
+        let contentSize = panel.fittingSize
+        let width = max(250, contentSize.width)
+        let contentHeight = max(1, contentSize.height)
+        let nextFrame = NSRect(x: 0, y: 0, width: width, height: contentHeight)
+        if panel.frame != nextFrame { panel.frame = nextFrame }
+        let viewportHeight = min(contentHeight, maximumHeight)
+        // 滚动条始终隐藏（初始化 hasVerticalScroller=false，这里不再动态开启）
+        let nextContentSize = NSSize(width: width, height: viewportHeight)
+        if preferredContentSize != nextContentSize { preferredContentSize = nextContentSize }
+        updateFadeHint()
+    }
+
+    /// 提示层参数实时生效（调参弹窗滑杆拖动时由 AppDelegate 调用）：
+    /// 参数下发到两个提示层 + 高度约束同步
+    func applyFadeHintParams(_ p: FadeHintParams) {
+        fadeHintParams = p
+        guard isViewLoaded else { return }
+        fadeHint.params = p
+        topHint.params = p
+        fadeHintHeightConstraint?.constant = p.bandHeight
+        topHintHeightConstraint?.constant = p.bandHeight
+        view.needsLayout = true
+        view.layoutSubtreeIfNeeded()
+        updateFadeHint()
+    }
+
+    /// 顶/底提示可见性：仅当内容超出视口（可滚动）且未滚到对应边缘时显示
+    private func updateFadeHint() {
+        guard isViewLoaded else { return }
+        let clip = scrollView.contentView
+        let viewportHeight = clip.bounds.height
+        let contentHeight = panel.bounds.height
+        guard contentHeight > viewportHeight + 0.5 else {
+            fadeHint.setShown(false)
+            topHint.setShown(false)
+            return
+        }
+        let visible = clip.documentVisibleRect
+        // 文档视图非翻转（原点在左下）：滚到底部时可见区域 minY ≈ 0，
+        // 滚到顶部时可见区域 maxY ≈ 内容高度
+        let atBottom = panel.isFlipped
+            ? visible.maxY >= contentHeight - 0.5
+            : visible.minY <= 0.5
+        let atTop = panel.isFlipped
+            ? visible.minY <= 0.5
+            : visible.maxY >= contentHeight - 0.5
+        fadeHint.setShown(!atBottom)
+        topHint.setShown(!atTop)
+    }
+
+    /// 首次打开把内容归位到最上方：文档视图非翻转（原点在左下），clip view 默认
+    /// origin (0,0) 对应内容底部，不显式滚动会先展示底部内容。
+    /// 目标点必须按「文档高度 − 视口高度」精确计算：直接滚 (0, docHeight) 会把
+    /// origin 推出有效范围，视口整个落在文档上方外部 → 面板只剩背景（内容空白）；
+    /// scroll(to:) 并不会自动把越界点收敛到最大滚动位。
+    private func scrollToTopIfNeeded() {
+        guard !didScrollToTopOnce else { return }
+        didScrollToTopOnce = true
+        scrollToTopNow()
+    }
+
+    private func scrollToTopNow() {
+        guard let doc = scrollView.documentView else { return }
+        view.layoutSubtreeIfNeeded()
+        let clip = scrollView.contentView
+        let clipHeight = clip.bounds.height
+        guard clipHeight > 0 else {
+            // 布局尚未定稿（popover 还没把容器尺寸应用下来，clip 高度为 0）：
+            // 下一 runloop 重试，避免此时按满高计算 origin 造成越界空白
+            DispatchQueue.main.async { [weak self] in self?.scrollToTopNow() }
+            return
+        }
+        clip.scroll(to: NSPoint(x: 0, y: max(0, doc.bounds.height - clipHeight)))
+        scrollView.reflectScrolledClipView(clip)
+        updateFadeHint()
+    }
+
+    /// 滚动后修正 hover：内容移动后 AppKit 不补发 mouseEntered/mouseExited，
+    /// 遍历面板视图树，让所有可 hover 视图按当前光标位置重算状态
+    private func syncHoverAfterScroll() {
+        guard isViewLoaded, view.window != nil else { return }
+        func walk(_ v: NSView) {
+            if let syncable = v as? PanelScrollHoverSync { syncable.syncHoverForCurrentPointer() }
+            for sub in v.subviews { walk(sub) }
+        }
+        walk(panel)
     }
 
     /// 按当前开关状态刷新背景遮罩：渐变（起点=面板顶部 210pt）或单色近黑
@@ -1052,14 +1816,35 @@ final class BalancePanelViewController: NSViewController {
 
     override func viewWillAppear() {
         super.viewWillAppear()
-        // 让 popover 按内容实际高度撑开
-        preferredContentSize = panel.fittingSize
+        // 让 popover 按内容实际高度撑开；超过屏幕的部分由 scrollView 承载。
+        updateContentSize()
+        // App 启动后首次弹出：内容归位到最上方（默认会显示底部）
+        scrollToTopIfNeeded()
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        // NSScrollView 在内容尺寸更新后可能立即显示 overlay scroller，弹出完成后再明确隐藏一次。
+        scrollView.hideScrollers()
+        // 弹出动画可能调整视口尺寸，展示完成后按最终布局刷新一次提示状态
+        updateFadeHint()
+        // 面板关闭时不保证补发 mouseExited：打开时按光标位置同步，
+        // 清掉上一次会话残留的 hover 高亮（光标就在卡片上时则正确点亮）
+        syncHoverAfterScroll()
+    }
+
+    override func viewDidDisappear() {
+        super.viewDidDisappear()
+        // 面板关闭后停止箭头浮动动画，避免不可见时持续渲染
+        fadeHint.setShown(false)
+        topHint.setShown(false)
     }
 
     override func viewDidLayout() {
         super.viewDidLayout()
         // 背景渐变从面板顶部固定 210pt 开始；布局变化后同步背景状态
         applyGradient()
+        updateFadeHint()
     }
 }
 
@@ -1227,6 +2012,8 @@ final class BalancePanelView: NSView {
     var onToggleHideWbNickname: (() -> Void)?
     /// 面板渐变背景开关（设置卡片开关触发）
     var onTogglePanelGradient: (() -> Void)?
+    /// Mono 字体开关（设置卡片开关触发：余额卡片与用量列表切换 DepartureMono）
+    var onToggleMonoFont: (() -> Void)?
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
     var onPanelGradientChanged: (() -> Void)?
     var onAbout: (() -> Void)?
@@ -1271,7 +2058,7 @@ final class BalancePanelView: NSView {
     /// DeepSeek 卡片副标题标签（可更新文本，如显示日常额度信息）
     private let dsInfoLabel = NSTextField(labelWithString: "打开官网 usage 页面")
     private lazy var dsInfo: NSStackView = {
-        dsInfoLabel.font = .systemFont(ofSize: 9)
+        registerFont(dsInfoLabel, size: 9)
         dsInfoLabel.textColor = .systemGray
         // 固定行高与 TRAE/WB 签到信息（icon+label 组合）一致：给 stackView 设高度约束，
         // 并降低 label 垂直拥抱优先级，让约束优先于 intrinsicContentSize（9pt 字体固有行高约 11pt）
@@ -1355,12 +2142,17 @@ final class BalancePanelView: NSView {
     private var draggingSiblingCardOpacities: [(card: HoverCard, opacity: Float)] = []
     private let updatedLabel = NSTextField(labelWithString: "")
     /// 刷新动效状态：true 时「更新于」区域脉冲显示「刷新中…」
-    private var isRefreshing = false
+    /// setter 私有，仅 setRefreshing(_:) 可写；getter internal，供 AppDelegate 调试日志用。
+    private(set) var isRefreshing: Bool = false
+    /// 相同快照只同步一次，避免菜单栏标题刷新时重复遍历和重排整个面板。
+    private var lastSnapshot: PanelSnapshot?
 
     // MARK: - 设置/操作控件
 
     /// 日/周用量区块：内容行动态重建（随快照变化）
     private let usageContentStack = NSStackView()
+    /// 用量数据未变化时复用已有行，避免每次余额刷新都销毁/重建 NSView。
+    private var renderedUsageRows: [UsageRowSnapshot] = []
     private var usageCardRef: NSView?
     private var usageTitleRef: NSView?
     /// 平台 id → 用量行视图（拖拽排序时复用实例做位移动画）
@@ -1371,6 +2163,9 @@ final class BalancePanelView: NSView {
     private let usageColumnWidth: CGFloat = 56
     private let usageColumnSpacing: CGFloat = 8
     private let usageHorizontalInset: CGFloat = 8
+    /// 用量行行内垂直缩进（原行间距 6pt 移入行内：行间距 0，每行上下统一缩进 2pt）
+    private let usageRowTopInset: CGFloat = 2
+    private let usageRowBottomInset: CGFloat = 2
 
     private let autoCheckinSwitch = MiniSwitch()
     private let autoCheckinSub = NSTextField(labelWithString: "")
@@ -1395,6 +2190,45 @@ final class BalancePanelView: NSView {
     private let gradientSwitch = MiniSwitch()
     /// 渐变开关状态（update 同步；VC 读取决定遮罩渐变/单色）
     private(set) var panelGradientEnabled = true
+    /// Mono 字体开关（update 时随快照同步状态）
+    private let monoSwitch = MiniSwitch()
+    /// Mono 字体开关状态（update 同步；变化时对已注册 label 就地切换字体，不重建卡片）
+    private(set) var monoFontEnabled = false
+
+    // MARK: - 字体策略（Mono 开关：余额卡片 + 用量列表）
+
+    /// 需跟随 Mono 开关切换字体的 label 注册项（weak：卡片重建后旧 label 释放自动失效）
+    private struct FontTarget {
+        weak var label: NSTextField?
+        let size: CGFloat
+        let weight: NSFont.Weight
+        /// 关闭 Mono 时是否用等宽数字系统字体（余额数值等右对齐数字列）
+        let monoDigits: Bool
+    }
+    private var fontTargets: [FontTarget] = []
+
+    /// 按当前 Mono 开关状态取字体：开 = DepartureMono（中文级联回退系统字体），关 = 系统字体
+    private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
+        if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
+        return monoDigits
+            ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
+            : .systemFont(ofSize: size, weight: weight)
+    }
+
+    /// 注册 label 并立即应用当前字体策略（开关切换时 applyFontPolicy() 就地更新，不重建视图）
+    private func registerFont(_ label: NSTextField, size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) {
+        label.font = uiFont(size: size, weight: weight, monoDigits: monoDigits)
+        fontTargets.append(FontTarget(label: label, size: size, weight: weight, monoDigits: monoDigits))
+        if fontTargets.count % 32 == 0 { fontTargets.removeAll { $0.label == nil } }
+    }
+
+    /// Mono 开关变化：对所有存活 label 就地切换字体（保留点阵脉冲等动画状态）
+    private func applyFontPolicy() {
+        for t in fontTargets {
+            t.label?.font = uiFont(size: t.size, weight: t.weight, monoDigits: t.monoDigits)
+        }
+        fontTargets.removeAll { $0.label == nil }
+    }
 
     override init(frame frameRect: NSRect) {
         let savedOrder = UserDefaults.standard.stringArray(forKey: UDKey.balancePlatformOrder) ?? []
@@ -1407,35 +2241,54 @@ final class BalancePanelView: NSView {
 
     // MARK: - 数据更新
 
-    func update(_ s: PanelSnapshot) {
+    /// 按快照刷新面板内容。传入 force=true 时跳过「内容未变则去重」的 guard，
+    /// 用于 performRefresh 收尾时强制恢复 footer 文本（lastSnapshot 与 snapshot 可能完全相同）。
+    func update(_ s: PanelSnapshot, force: Bool = false) {
+        let previousSnapshot = lastSnapshot
+        let same = s == lastSnapshot
+        Logger.log(.refresh, "Panel.update: isRefreshing=\(isRefreshing) updatedAt=\(s.updatedAt) failed=\(s.failedText ?? "nil") same=\(same) force=\(force) prevUpdatedAt=\(previousSnapshot?.updatedAt ?? "nil")")
+        guard !same || force else { return }
+        lastSnapshot = s
+        var contentSizeChanged = previousSnapshot == nil
+            || previousSnapshot?.offline != s.offline
+            || previousSnapshot?.lastCheckinTime != s.lastCheckinTime
+
         // 渐变开关状态同步（VC 通过 onPanelGradientChanged 即时刷新遮罩绘制）
         let gradientChanged = s.panelGradientEnabled != panelGradientEnabled
         panelGradientEnabled = s.panelGradientEnabled
         gradientSwitch.state = s.panelGradientEnabled ? .on : .off
         if gradientChanged { onPanelGradientChanged?() }
+        // Mono 字体开关状态同步：变化时对已注册 label 就地切换字体（不重建卡片）
+        let monoChanged = s.monoFontEnabled != monoFontEnabled
+        monoFontEnabled = s.monoFontEnabled
+        monoSwitch.state = s.monoFontEnabled ? .on : .off
+        if monoChanged { applyFontPolicy() }
         offlineBanner.isHidden = !s.offline
 
-        // 日/周用量行重建（无数据时整个区块隐藏）
-        usageContentStack.arrangedSubviews.forEach {
-            usageContentStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        usageRowViews.removeAll()
-        usageHeaderRowRef = nil
         // 行序跟随平台卡片顺序（拖拽排序持久化于 platformOrder）
         let orderIndex = Dictionary(uniqueKeysWithValues: platformOrder.enumerated().map { ($1, $0) })
         let sortedRows = s.usageRows.sorted {
             (orderIndex[$0.platform] ?? Int.max) < (orderIndex[$1.platform] ?? Int.max)
         }
-        if !sortedRows.isEmpty {
-            let header = makeUsageHeaderRow()
-            usageHeaderRowRef = header
-            usageContentStack.addArrangedSubview(header)
-        }
-        for row in sortedRows {
-            let view = makeUsageRow(row)
-            usageRowViews[row.platform] = view
-            usageContentStack.addArrangedSubview(view)
+        if sortedRows != renderedUsageRows {
+            contentSizeChanged = true
+            usageContentStack.arrangedSubviews.forEach {
+                usageContentStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+            usageRowViews.removeAll()
+            usageHeaderRowRef = nil
+            if !sortedRows.isEmpty {
+                let header = makeUsageHeaderRow()
+                usageHeaderRowRef = header
+                usageContentStack.addArrangedSubview(header)
+            }
+            for row in sortedRows {
+                let view = makeUsageRow(row)
+                usageRowViews[row.platform] = view
+                usageContentStack.addArrangedSubview(view)
+            }
+            renderedUsageRows = sortedRows
         }
         let hasUsage = !s.usageRows.isEmpty
         usageTitleRef?.isHidden = !hasUsage
@@ -1470,6 +2323,7 @@ final class BalancePanelView: NSView {
         // ZCode 多账号卡片：uid 列表变化时重建，否则就地更新数据
         let newZcodeUids = s.zcodeAccounts.map(\.uid)
         if newZcodeUids != zcodeCardUids {
+            contentSizeChanged = true
             rebuildZcodeCards(s.zcodeAccounts)
         } else {
             applyZcodeCardData(s.zcodeAccounts)
@@ -1478,6 +2332,7 @@ final class BalancePanelView: NSView {
         // Codex 多账号卡片：uid 列表变化时重建，否则就地更新
         let newCodexUids = s.codexAccounts.map(\.uid)
         if newCodexUids != codexCardUids {
+            contentSizeChanged = true
             rebuildCodexCards(s.codexAccounts)
         } else {
             applyCodexCardData(s.codexAccounts)
@@ -1486,6 +2341,7 @@ final class BalancePanelView: NSView {
         // TRAE 多账号卡片：uid 列表变化 时重建，否则就地更新数据
         let newTraeUids = s.traeAccounts.map(\.uid)
         if newTraeUids != traeCardUids {
+            contentSizeChanged = true
             rebuildTraeCards(s.traeAccounts)
         } else {
             applyTraeCardData(s.traeAccounts)
@@ -1494,9 +2350,35 @@ final class BalancePanelView: NSView {
         // WorkBuddy 多账号卡片：uid 列表变化 时重建，否则就地更新数据
         let newUids = s.wbAccounts.map(\.uid)
         if newUids != wbCardUids {
+            contentSizeChanged = true
             rebuildWbCards(s.wbAccounts)
         } else {
             applyWbCardData(s.wbAccounts)
+        }
+
+        // ── 面板余额卡片显隐（平台开关：用户可强制隐藏某平台整组卡片）──
+        // 空账号组（ZCode/Codex 未导入）即使配置为 true 也维持隐藏；
+        // 用户配置为 false 时，无论容器重建后的状态如何，一律强制隐藏。
+        // DS 是单卡片，永远有内容（标题+value占位），直接按配置切换。
+        for pid in [BalancePlatform.deepSeek.rawValue,
+                    BalancePlatform.zcode.rawValue,
+                    BalancePlatform.codex.rawValue,
+                    BalancePlatform.trae.rawValue,
+                    BalancePlatform.workBuddy.rawValue] {
+            guard let view = platformCards[pid] else { continue }
+            let userWantsShow = s.panelCardVisible[pid] ?? true
+            let shouldHide: Bool
+            if pid == BalancePlatform.deepSeek.rawValue {
+                shouldHide = !userWantsShow
+            } else {
+                // 多账号组：空容器由重建逻辑设为 isHidden=true，用户开关为 true 时不打扰；
+                // 用户开关为 false 时强制隐藏，覆盖重建结果
+                shouldHide = !userWantsShow || view.isHidden
+            }
+            if view.isHidden != shouldHide {
+                view.isHidden = shouldHide
+                contentSizeChanged = true
+            }
         }
 
         // 刷新中时底部显示「刷新中…」并保持脉冲，刷新完成后恢复更新时间；
@@ -1525,6 +2407,7 @@ final class BalancePanelView: NSView {
         }
 
         hideWbNickSwitch.state = s.hideWbNickname ? .off : .on
+        if contentSizeChanged { onContentChanged?() }
     }
 
     // MARK: - 平台卡片排序
@@ -1846,7 +2729,7 @@ final class BalancePanelView: NSView {
             let info: NSStackView?
             if isCurrent && style.showsExpire {
                 let label = NSTextField(labelWithString: "")
-                label.font = .systemFont(ofSize: 9)
+                registerFont(label, size: 9)
                 label.textColor = .systemGray
                 label.setContentHuggingPriority(.defaultLow, for: .vertical)
                 label.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
@@ -2057,7 +2940,7 @@ final class BalancePanelView: NSView {
     private func makeUsageHeaderRow() -> NSView {
         func headerLabel(_ text: String) -> NSTextField {
             let l = NSTextField(labelWithString: text)
-            l.font = .systemFont(ofSize: 9, weight: .semibold)
+            registerFont(l, size: 10, weight: .semibold)
             l.textColor = .systemGray
             l.alignment = .right
             l.translatesAutoresizingMaskIntoConstraints = false
@@ -2066,7 +2949,7 @@ final class BalancePanelView: NSView {
         }
         // 左列名「平台」左对齐（与下方 icon 左缘同起点），右两列列名右对齐
         let platformHeader = NSTextField(labelWithString: "平台")
-        platformHeader.font = .systemFont(ofSize: 9, weight: .semibold)
+        registerFont(platformHeader, size: 10, weight: .semibold)
         platformHeader.textColor = .systemGray
         let row = NSStackView(views: [platformHeader, stretchSpacer(), headerLabel("今日"), headerLabel("本周")])
         row.orientation = .horizontal
@@ -2079,8 +2962,8 @@ final class BalancePanelView: NSView {
         NSLayoutConstraint.activate([
             row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: usageHorizontalInset),
             row.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -usageHorizontalInset),
-            row.topAnchor.constraint(equalTo: container.topAnchor),
-            row.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            row.topAnchor.constraint(equalTo: container.topAnchor, constant: usageRowTopInset),
+            row.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -usageRowBottomInset),
         ])
         return container
     }
@@ -2096,12 +2979,12 @@ final class BalancePanelView: NSView {
         iconView.widthAnchor.constraint(equalToConstant: 14).isActive = true
         iconView.heightAnchor.constraint(equalToConstant: 14).isActive = true
         let nameLabel = NSTextField(labelWithString: row.name)
-        nameLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        registerFont(nameLabel, size: 12, weight: .semibold)
         nameLabel.textColor = kBalanceForeground
         func valueLabel(_ text: String) -> NSTextField {
             let l = NSTextField(labelWithString: text)
-            l.font = .systemFont(ofSize: 10, weight: .semibold)
-            l.textColor = .systemGray
+            registerFont(l, size: 11, weight: .semibold, monoDigits: true)
+            l.textColor = kBalanceForeground
             l.alignment = .right
             l.translatesAutoresizingMaskIntoConstraints = false
             l.widthAnchor.constraint(equalToConstant: usageColumnWidth).isActive = true
@@ -2117,9 +3000,13 @@ final class BalancePanelView: NSView {
         rowStack.translatesAutoresizingMaskIntoConstraints = false
         // 位移动画需要 layer-backed
         rowStack.wantsLayer = true
-        // 用量条目 hover 时提亮到项目统一的 E9E9E9 前景色。
+        // 用量条目 hover：不做文本提亮，改为整行背景色变化（#8aa788aa 圆角底）
         let hoverRow = wrapHoverRow(rowStack, hoverTextColor: kBalanceForeground,
-                                    horizontalPadding: usageHorizontalInset)
+                                    horizontalPadding: usageHorizontalInset,
+                                    topInset: usageRowTopInset,
+                                    bottomInset: usageRowBottomInset)
+        hoverRow.hoverBackgroundColor = kUsageHoverBackground
+        hoverRow.enablesTextBrightening = false
         hoverRow.wantsLayer = true
         return hoverRow
     }
@@ -2132,7 +3019,7 @@ final class BalancePanelView: NSView {
         iconView.imageScaling = .scaleProportionallyUpOrDown
         iconView.translatesAutoresizingMaskIntoConstraints = false
         let label = NSTextField(labelWithString: "\u{2009}\(text)")
-        label.font = .systemFont(ofSize: 9, weight: .regular)
+        registerFont(label, size: 9, weight: .regular)
         label.textColor = .systemGray
         label.translatesAutoresizingMaskIntoConstraints = false
         let row = NSStackView(views: [iconView, label])
@@ -2142,17 +3029,31 @@ final class BalancePanelView: NSView {
         return row
     }
 
-    /// 刷新动效：开始 → 「更新于」区域脉冲显示「刷新中…」；结束 → 停止动画（文字由 update() 恢复）。
-    /// 由 AppDelegate 在 onRefresh/performRefresh 完成时调用。
-    func setRefreshing(_ on: Bool) {
-        guard on != isRefreshing else { return }
+    /// 刷新动效：开始 → 「更新于」区域脉冲显示「刷新中…」；结束 → 停止动画并立即恢复真实时间文本。
+    /// 设计：刷新收尾快照去重（same=true）时，后续 `Panel.update` 会跳过，footer 就会卡在"刷新中…"直到下次快照变化。
+    /// 所以 `setRefreshing(false)` **不依赖下一次 update**，直接按 lastSnapshot（或传入快照）把文字写回去。
+    func setRefreshing(_ on: Bool, fallback: PanelSnapshot? = nil) {
+        guard on != isRefreshing else {
+            Logger.log(.refresh, "Panel.setRefreshing(\(on)): no-op (isRefreshing already \(isRefreshing))")
+            return
+        }
         isRefreshing = on
         if on {
             startPulseAnimation()
             updatedLabel.stringValue = "刷新中…"
+            Logger.log(.refresh, "Panel.setRefreshing(true): pulse ON, label set to 刷新中…")
         } else {
             stopRefreshAnimations()
-            // 恢复文字交由下一次 update() 写入真实更新时间
+            let snap = lastSnapshot ?? fallback
+            let footer: String
+            if let s = snap {
+                footer = s.updatedAt.isEmpty ? "尚未更新"
+                    : "更新于 \(s.updatedAt)" + (s.failedText.map { " · \($0)" } ?? "")
+            } else {
+                footer = "尚未更新"
+            }
+            updatedLabel.stringValue = footer
+            Logger.log(.refresh, "Panel.setRefreshing(false): pulse OFF, label restored to \"\(footer)\" (snap=\(snap != nil ? "last" : "none"))")
         }
     }
 
@@ -2322,9 +3223,9 @@ final class BalancePanelView: NSView {
         usageContentStack.orientation = .vertical
         usageContentStack.alignment = .width
         usageContentStack.distribution = .fill
-        usageContentStack.spacing = 6
+        usageContentStack.spacing = 0
         usageContentStack.translatesAutoresizingMaskIntoConstraints = false
-        let usageCard = addCard(rows: [usageContentStack], to: root, spacing: 6, horizontalPadding: 0)
+        let usageCard = addCard(rows: [usageContentStack], to: root, spacing: 6, topPadding: 2, horizontalPadding: 0)
         usageCardRef = usageCard
         usageCollapseTargets = [usageCard]
         let usageCollapsed = UserDefaults.standard.bool(forKey: UDKey.usageSectionCollapsed)
@@ -2340,6 +3241,8 @@ final class BalancePanelView: NSView {
         hideWbNickSwitch.action = #selector(hideWbNicknameToggled)
         gradientSwitch.target = self
         gradientSwitch.action = #selector(panelGradientToggled)
+        monoSwitch.target = self
+        monoSwitch.action = #selector(monoFontToggled)
         // 刷新间隔行：标题 + 手动刷新按钮 + spacer + NSSegmentedControl
         intervalSegment.target = self
         intervalSegment.action = #selector(intervalChanged)
@@ -2380,6 +3283,7 @@ final class BalancePanelView: NSView {
             switchRow(title: "自动签到", sub: autoCheckinSub, sw: autoCheckinSwitch),
             switchRow(title: "悬停卡片时显示昵称", sub: nil, sw: hideWbNickSwitch),
             switchRow(title: "面板渐变背景", sub: nil, sw: gradientSwitch),
+            switchRow(title: "Mono 字体", sub: nil, sw: monoSwitch),
         ].map { wrapHoverRow($0) }
         // 「设置」标题：可折叠标题条（hover 余额卡片样式，点击折叠整个设置卡片）
         var settingCollapseTargets: [NSView] = []
@@ -2628,6 +3532,8 @@ final class BalancePanelView: NSView {
         hc.onClick = {
             let collapsed = !UserDefaults.standard.bool(forKey: key)
             UserDefaults.standard.set(collapsed, forKey: key)
+            // 点击时鼠标仍在标题范围内，主动清掉 HoverCard 的 hover 材质。
+            hc.clearHoverEffect(animated: false)
             apply(collapsed)
         }
         hc.wantsLayer = true
@@ -2705,7 +3611,7 @@ final class BalancePanelView: NSView {
 
         // 标题行：nameLabel（平台名，kBalanceForeground）+ 可选 nickLabel（昵称，systemGray 石墨灰）
         let nameLabel = NSTextField(labelWithString: name)
-        nameLabel.font = .systemFont(ofSize: 12, weight: titleWeight)
+        registerFont(nameLabel, size: 12, weight: titleWeight)
         nameLabel.textColor = textColor
         nameLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         // 平台标题优先保持完整，昵称在有限空间内使用省略号。
@@ -2716,7 +3622,7 @@ final class BalancePanelView: NSView {
         let titleRow: NSView
         if let nick = nickLabel {
             // 昵称放标题后：使用标题行剩余空间，单行尾部省略。
-            nick.font = .systemFont(ofSize: 10)
+            registerFont(nick, size: 10)
             nick.maximumNumberOfLines = 1
             nick.lineBreakMode = .byTruncatingTail
             nick.cell?.truncatesLastVisibleLine = true
@@ -2737,7 +3643,7 @@ final class BalancePanelView: NSView {
         titleRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         // 额度值（固定宽 60pt，右对齐，字号 12pt semibold）
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        registerFont(valueLabel, size: 12, weight: .semibold, monoDigits: true)
         valueLabel.textColor = textColor
         valueLabel.alignment = .right
         valueLabel.lineBreakMode = .byClipping
@@ -2840,7 +3746,8 @@ final class BalancePanelView: NSView {
 
     /// 用 HoverRowView 包裹行视图：获得 hover 时 8% 背景圆角 + pointingHand 光标
     private func wrapHoverRow(_ row: NSView, hoverTextColor: NSColor = .labelColor,
-                              horizontalPadding: CGFloat = 0) -> HoverRowView {
+                              horizontalPadding: CGFloat = 0, topInset: CGFloat = 0,
+                              bottomInset: CGFloat = 0) -> HoverRowView {
         let hover = HoverRowView()
         hover.hoverTextColor = hoverTextColor
         hover.translatesAutoresizingMaskIntoConstraints = false
@@ -2849,8 +3756,8 @@ final class BalancePanelView: NSView {
         NSLayoutConstraint.activate([
             row.leadingAnchor.constraint(equalTo: hover.leadingAnchor, constant: horizontalPadding),
             row.trailingAnchor.constraint(equalTo: hover.trailingAnchor, constant: -horizontalPadding),
-            row.topAnchor.constraint(equalTo: hover.topAnchor),
-            row.bottomAnchor.constraint(equalTo: hover.bottomAnchor),
+            row.topAnchor.constraint(equalTo: hover.topAnchor, constant: topInset),
+            row.bottomAnchor.constraint(equalTo: hover.bottomAnchor, constant: -bottomInset),
         ])
         return hover
     }
@@ -2934,6 +3841,7 @@ final class BalancePanelView: NSView {
     @objc private func addTraeAccountTapped() { onCollectTraeAccount?() }
     @objc private func hideWbNicknameToggled() { onToggleHideWbNickname?() }
     @objc private func panelGradientToggled() { onTogglePanelGradient?() }
+    @objc private func monoFontToggled() { onToggleMonoFont?() }
     @objc private func setApiKeyTapped() { onSetApiKey?() }
 
     @objc private func platformTogglesTapped() { onManagePlatformToggles?() }

@@ -6,6 +6,50 @@
 import Cocoa
 import UserNotifications
 
+// MARK: - 辅助工具
+
+/// 简单的 leading debouncer + 延迟 coalescing：窗口内最后一次调用延迟 window 后执行。
+/// 用于把刷新过程中 10+ 次 updateTitle() 合并为 1~2 次标题渲染，消除主线程位图烘焙卡顿。
+@MainActor
+final class TitleDebouncer {
+    private let window: TimeInterval
+    private var workItem: DispatchWorkItem?
+    private var leadingDone = false
+    private let queue = DispatchQueue.main
+
+    init(window: TimeInterval) { self.window = window }
+
+    /// 调度任务：首次立即执行（leading），之后 window 内的调用合并为最后一次，
+    /// 在静默 window 秒后再执行（trailing）。
+    func dispatch(_ tag: String, @_implicitSelfCapture block: @escaping @MainActor () -> Void) {
+        workItem?.cancel()
+        if !leadingDone {
+            leadingDone = true
+            // 首次（leading）：立即执行，但把 leading 锁在 window 内
+            block()
+            let item = DispatchWorkItem { [weak self] in self?.leadingDone = false }
+            workItem = item
+            queue.asyncAfter(deadline: .now() + window, execute: item)
+            return
+        }
+        // 非首次：trailing coalescing
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { block() }
+            self?.leadingDone = false
+        }
+        workItem = item
+        queue.asyncAfter(deadline: .now() + window, execute: item)
+    }
+
+    /// 立刻执行一次（取消待 coalesce 的 trailing）；用于刷新收尾保证最终状态已绘。
+    func flush(@_implicitSelfCapture block: @escaping @MainActor () -> Void) {
+        workItem?.cancel()
+        workItem = nil
+        leadingDone = false
+        block()
+    }
+}
+
 // MARK: - 弹窗统一封装（原生 NSAlert 设定）
 //
 // v44 重写：回归原生 NSAlert 布局——标题/说明用 messageText / informativeText（系统排版，
@@ -414,13 +458,15 @@ final class DeepSeekSettingsDialog: NSObject {
     }
 }
 
-/// 各平台刷新 / 自动签到开关弹窗：沿用 DialogShell 的原生标题、说明和按钮布局。
+/// 各平台刷新 / 自动签到 / 卡片显示开关弹窗：沿用 DialogShell 的原生标题、说明和按钮布局。
 @MainActor
 final class PlatformAutomationSettingsDialog: NSObject {
     private struct Row {
         let name: String
+        let platformID: String
         let refresh: NSButton
         let checkin: NSButton?
+        let card: NSButton
     }
 
     private let rows: [Row]
@@ -438,21 +484,31 @@ final class PlatformAutomationSettingsDialog: NSObject {
         }
 
         rows = [
-            Row(name: "DeepSeek",
+            Row(name: "DeepSeek", platformID: "ds",
                 refresh: makeCheckbox(label: "DeepSeek 刷新", isOn: config.deepseekRefreshEnabled),
-                checkin: nil),
-            Row(name: "WorkBuddy",
+                checkin: nil,
+                card: makeCheckbox(label: "DeepSeek 卡片显示",
+                                   isOn: config.panelCardVisible["ds"] ?? true)),
+            Row(name: "WorkBuddy", platformID: "wb",
                 refresh: makeCheckbox(label: "WorkBuddy 刷新", isOn: config.workbuddyEnabled),
-                checkin: makeCheckbox(label: "WorkBuddy 自动签到", isOn: config.workbuddyAutoCheckin)),
-            Row(name: "TRAE",
+                checkin: makeCheckbox(label: "WorkBuddy 自动签到", isOn: config.workbuddyAutoCheckin),
+                card: makeCheckbox(label: "WorkBuddy 卡片显示",
+                                   isOn: config.panelCardVisible["wb"] ?? true)),
+            Row(name: "TRAE", platformID: "trae",
                 refresh: makeCheckbox(label: "TRAE 刷新", isOn: config.traeRefreshEnabled),
-                checkin: makeCheckbox(label: "TRAE 自动签到", isOn: config.traeAutoCheckin)),
-            Row(name: "ZCode",
+                checkin: makeCheckbox(label: "TRAE 自动签到", isOn: config.traeAutoCheckin),
+                card: makeCheckbox(label: "TRAE 卡片显示",
+                                   isOn: config.panelCardVisible["trae"] ?? true)),
+            Row(name: "ZCode", platformID: "zcode",
                 refresh: makeCheckbox(label: "ZCode 刷新", isOn: config.zcodeRefreshEnabled),
-                checkin: nil),
-            Row(name: "Codex",
+                checkin: nil,
+                card: makeCheckbox(label: "ZCode 卡片显示",
+                                   isOn: config.panelCardVisible["zcode"] ?? true)),
+            Row(name: "Codex", platformID: "codex",
                 refresh: makeCheckbox(label: "Codex 刷新", isOn: config.codexRefreshEnabled),
-                checkin: nil),
+                checkin: nil,
+                card: makeCheckbox(label: "Codex 卡片显示",
+                                   isOn: config.panelCardVisible["codex"] ?? true)),
         ]
         super.init()
     }
@@ -461,21 +517,23 @@ final class PlatformAutomationSettingsDialog: NSObject {
         let shell = DialogShell()
         let icon = NSImage(systemSymbolName: "circle.grid.2x2.topleft.checkmark.filled", accessibilityDescription: nil)
         shell.addIcon(icon)
-        shell.addTitle("平台刷新与签到")
-        shell.addInfo("选择哪些平台参与自动刷新；支持签到的平台还可以单独控制自动签到。")
-        shell.contentWidth = DialogMetrics.width + 8
+        shell.addTitle("平台开关")
+        shell.addInfo("选择各平台是否参与刷新、自动签到（支持签到的平台），以及是否在面板显示余额卡片。")
+        shell.contentWidth = DialogMetrics.width + 8 + 60
 
         let headerName = NSTextField(labelWithString: "平台")
         let headerRefresh = NSTextField(labelWithString: "刷新")
         let headerCheckin = NSTextField(labelWithString: "签到")
-        for label in [headerName, headerRefresh, headerCheckin] {
+        let headerCard = NSTextField(labelWithString: "卡片")
+        for label in [headerName, headerRefresh, headerCheckin, headerCard] {
             label.font = .systemFont(ofSize: 11, weight: .semibold)
             label.textColor = .secondaryLabelColor
         }
         headerRefresh.alignment = .center
         headerCheckin.alignment = .center
+        headerCard.alignment = .center
 
-        var gridRows: [[NSView]] = [[headerName, headerRefresh, headerCheckin]]
+        var gridRows: [[NSView]] = [[headerName, headerRefresh, headerCheckin, headerCard]]
         for row in rows {
             let name = NSTextField(labelWithString: row.name)
             name.font = .systemFont(ofSize: 12)
@@ -491,10 +549,10 @@ final class PlatformAutomationSettingsDialog: NSObject {
                 unavailable.setAccessibilityLabel("该平台不支持签到")
                 checkinView = unavailable
             }
-            gridRows.append([name, row.refresh, checkinView])
+            gridRows.append([name, row.refresh, checkinView, row.card])
         }
 
-        // NSGridView 让每一列共享同一条轨道：平台列左对齐，两个控件列居中，
+        // NSGridView 让每一列共享同一条轨道：平台列左对齐，三个控件列居中，
         // 表头、checkbox 和「—」占位符天然保持表格对齐，不再手算坐标。
         let grid = NSGridView(views: gridRows)
         let headerHeight: CGFloat = 22
@@ -510,6 +568,8 @@ final class PlatformAutomationSettingsDialog: NSObject {
         grid.column(at: 1).xPlacement = .center
         grid.column(at: 2).width = 54
         grid.column(at: 2).xPlacement = .center
+        grid.column(at: 3).width = 54
+        grid.column(at: 3).xPlacement = .center
         grid.row(at: 0).height = headerHeight
         for index in 1...rows.count {
             grid.row(at: index).height = rowHeight
@@ -529,6 +589,9 @@ final class PlatformAutomationSettingsDialog: NSObject {
         updatedConfig.traeAutoCheckin = rows[2].checkin?.state == .on
         updatedConfig.zcodeRefreshEnabled = rows[3].refresh.state == .on
         updatedConfig.codexRefreshEnabled = rows[4].refresh.state == .on
+        for row in rows {
+            updatedConfig.panelCardVisible[row.platformID] = (row.card.state == .on)
+        }
         return updatedConfig
     }
 }
@@ -634,6 +697,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 最近一次面板关闭所在事件的时间戳（transient 面板外点击会先关闭面板，
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
+    // 面板打开期间钉住的 popover 窗口位置：菜单栏内容增减（数值刷新、右键切换
+    // 「在菜单栏显示」等）会让按钮宽度/坐标变化，AppKit 默认拖动 popover 跟随按钮；
+    // 这里记录弹出完成时的窗口 origin，任何被动移动都立即拉回 → 面板全程不动。
+    // 菜单栏本身宽度和坐标不受影响，正常自适应。
+    private var panelPinnedOrigin: NSPoint?
+    private var panelMoveObserver: NSObjectProtocol?
     private var settingsMenu: NSMenu!
     /// 面板最近一次释放拖拽后的平台顺序；面板未拖拽前回退到 UserDefaults。
     private var menuBarPlatformOrder: [String]?
@@ -643,6 +712,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 进行中的刷新任务：onRefresh 触发时先取消旧任务，保证同一时刻只有一个刷新在跑
     private var refreshTask: Task<Void, Never>?
+    /// 刷新序号（递增）：日志中关联 onRefresh / performRefresh / refreshOne*
+    private var refreshSeq: Int64 = 0
+    /// updateTitle 去抖：180ms 窗口内多次调用合并为一次，避免刷新过程中每账号回调
+    /// 都重建 attributed string + 烘焙位图导致主线程卡顿。
+    private var titleDebouncer: TitleDebouncer!
+    /// updateTitle 调用计数：诊断刷新触发了多少次标题重建。
+    private var updateTitleCallCount: Int64 = 0
+    private var updateTitleRenderCount: Int64 = 0
 
     /// 本轮刷新获取失败的服务名集合（footer 展示「xx 刷新失败」）：
     /// 只统计「有凭据/账号却获取失败」的服务，未配置（空 key/ticket、无账号）不计入；
@@ -683,8 +760,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var isOffline = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 调试锚点：任何启动方式下都用 stderr 打一条，用于确认「入口确实被调用」。
+        // 背景：之前 GUI 会话下 applicationDidFinishLaunching 一直不被触发的嫌疑最大。
+        let buildVersion = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "dev"
+        let pidInfo = "pid=\(ProcessInfo.processInfo.processIdentifier), tty=\(ProcessInfo.processInfo.environment["TERM"] ?? "none")"
+        fputs("[iBalance][LIFECYCLE] applicationDidFinishLaunching: build=\(buildVersion), \(pidInfo)\n", stderr)
+        fflush(stderr)
+
         // 隐藏 Dock 图标（与 Info.plist LSUIElement 双保险）
         NSApp.setActivationPolicy(.accessory)
+        titleDebouncer = TitleDebouncer(window: 0.18)
+        Logger.log(.refresh, "=== iBalance launched (build=\(buildVersion)) ===")
 
         // 安装主菜单：菜单栏 App 虽不显示菜单条，但 Edit 菜单的快捷键
         // （Cmd+C/V/X/A）会分发给弹窗内 NSTextField 的 field editor，
@@ -1008,6 +1094,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
         panel.onToggleHideWbNickname = { [weak self] in self?.onToggleHideWbNickname() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
+        panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
@@ -1059,7 +1146,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 固定深色外观：面板背景是深色纯色，强制 darkAqua 保证 labelColor 等动态颜色
         // 在浅色系统外观下也渲染为深色模式取值（否则深色底配黑字不可读），且不受焦点影响
         popover.appearance = NSAppearance(named: .darkAqua)
-        popover.contentViewController = BalancePanelViewController(panel: panel)
+        let panelVC = BalancePanelViewController(panel: panel)
+        panelVC.fadeHintParams = Self.fadeHintParams(from: config)
+        popover.contentViewController = panelVC
         // 面板自带 320 内在宽度，直接按约束解出真实高度，避免零尺寸 popover
         popover.contentSize = panel.fittingSize
         popoverController = popover
@@ -1077,15 +1166,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if Date().timeIntervalSince(lastRefreshTime) >= 60 {
             onRefresh()
         }
+        // 面板内容过高时让内部滚动，而不是让 NSPopover 为适应屏幕横向挪动并改变箭头锚点。
+        if let panelController = popover.contentViewController as? BalancePanelViewController {
+            panelController.setMaximumHeight(maximumPopoverHeight(for: button))
+            _ = panelController.view // 兼容 macOS 12：访问 view 会触发一次懒加载
+            popover.contentSize = panelController.preferredContentSize
+        }
         // ⚠️ 必须在 show 之前激活 App：LSUIElement 应用默认不活跃，popover 首帧会按
         // 「非活跃」渲染（玻璃材质整体偏暗），激活后才呈现正常色调（官方推荐姿势）。
         NSApp.activate(ignoringOtherApps: true)
-        // 只使用 status item button 的完整 bounds：NSStatusBarButton 的 cell/imageRect
-        // 不保证是可供 NSPopover 使用的定位矩形，macOS 27 下会触发 AppKit 断言并闪退。
+        // 使用 status item button 的完整 bounds，让 NSPopover 以菜单栏内容中心对齐。
+        // 不使用 cell/imageRect，避免 macOS 27 下传入不稳定定位矩形触发 AppKit 断言。
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // popover 窗口默认不是 key window：.transient 只在 key window 状态下
         // 才会响应「面板外点击」关闭，且非 key 时玻璃材质同样偏暗 → 强制置 key。
         popover.contentViewController?.view.window?.makeKey()
+    }
+
+    /// 计算 status item 下方到屏幕可见区域底部的高度，popover 超出后由内容滚动承载。
+    /// 面板最大高度硬上限：屏幕空间再大也不超过 750pt，超出部分由内部滚动承载
+    private let panelHeightCap: CGFloat = 750
+
+    private func maximumPopoverHeight(for button: NSView) -> CGFloat {
+        guard let screen = button.window?.screen ?? NSScreen.main else { return 640 }
+        let visibleFrame = screen.visibleFrame
+        let margin: CGFloat = 8
+        // 额外留出 popover 箭头、阴影和系统边距，确保 NSPopover 不会为了避让屏幕
+        // 自动改到侧边弹出；超出的内容由 NSScrollView 滚动承载。
+        // safeHeight 同时受 750pt 硬上限约束（两个返回分支都经过它）。
+        let safeHeight = min(max(1, visibleFrame.height - 48), panelHeightCap)
+
+        if let window = button.window {
+            let buttonRect = window.convertToScreen(button.convert(button.bounds, to: nil))
+            let available = buttonRect.minY - visibleFrame.minY - margin
+            if available > 0 { return min(available, safeHeight) }
+        }
+
+        // 状态栏坐标暂不可用时，仍限制在屏幕可见区域内，避免首次展示触发 popover 重定位。
+        return safeHeight
     }
 
     // MARK: - NSPopoverDelegate
@@ -1108,7 +1226,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 记录关闭时正在处理的事件时间戳：transient「面板外点击」关闭时，
         // currentEvent 即该 click（onStatusItemClicked 用它识别同一 click，避免抖动重弹）
         lastCloseEventTime = NSApp.currentEvent?.timestamp ?? 0
+        // 解除面板位置钉住（面板已关，此后菜单栏重排不再影响任何东西）
+        panelPinnedOrigin = nil
+        if let o = panelMoveObserver {
+            NotificationCenter.default.removeObserver(o)
+            panelMoveObserver = nil
+        }
         NSApp.hide(nil)
+    }
+
+    /// 弹出动画完成后记录 popover 窗口位置并监听被动移动：
+    /// AppKit 在按钮宽度/坐标变化时会移动 popover 窗口跟随按钮，这里立即拉回原位。
+    func popoverDidShow(_ notification: Notification) {
+        guard let popover = popoverController,
+              let window = popover.contentViewController?.view.window else { return }
+        panelPinnedOrigin = window.frame.origin
+        if let o = panelMoveObserver {
+            NotificationCenter.default.removeObserver(o)
+        }
+        panelMoveObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pinPanelWindowIfNeeded() }
+        }
+    }
+
+    /// 把 popover 窗口拉回弹出时记录的水平位置（面板打开期间生效）。
+    /// 只钉 X：菜单栏按钮只在水平方向移动；Y 不动——面板内容增减导致高度变化时
+    /// 窗口自然向下扩展（顶部箭头位置稳定），不与该行为打架。
+    private func pinPanelWindowIfNeeded() {
+        guard let pinned = panelPinnedOrigin,
+              let window = popoverController?.contentViewController?.view.window,
+              abs(window.frame.minX - pinned.x) > 0.1 else { return }
+        var origin = window.frame.origin
+        origin.x = pinned.x
+        window.setFrameOrigin(origin)
     }
 
     /// 从当前缓存构建面板数据快照（离线横幅 / 四服务 / 设置状态 / 更新时间）
@@ -1116,6 +1268,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         var s = PanelSnapshot()
         s.offline = isOffline
         s.updatedAt = lastUpdatedAt
+        // 面板余额卡片显示设置（由平台开关弹窗维护，未记录的平台默认 true）
+        s.panelCardVisible = config.panelCardVisible
         // 刷新失败标记：按固定顺序列出本轮获取失败的服务（footer 展示，成功即自动清除）
         if !failedServices.isEmpty {
             let order = ["DeepSeek", "WorkBuddy", "TRAE", "ZCode", "Codex"]
@@ -1152,7 +1306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: UDKey.traeCheckinDate(ac.uid)) == today
-            snap.checkinFailed = UserDefaults.standard.string(forKey: UDKey.traeCheckinFailDate(ac.uid)) == today
+            // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）
+            snap.checkinFailed = config.traeAutoCheckin
+                && UserDefaults.standard.string(forKey: UDKey.traeCheckinFailDate(ac.uid)) == today
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
             snap.pulsing = traePulsing[ac.uid] ?? false
@@ -1176,7 +1332,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: UDKey.wbCheckinDate(ac.uid)) == today
-            snap.checkinFailed = UserDefaults.standard.string(forKey: UDKey.wbCheckinFailDate(ac.uid)) == today
+            // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）
+            snap.checkinFailed = config.workbuddyAutoCheckin
+                && UserDefaults.standard.string(forKey: UDKey.wbCheckinFailDate(ac.uid)) == today
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
             snap.pulsing = wbPulsing[ac.uid] ?? false
@@ -1316,23 +1474,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.refreshIntervalSeconds = Int(config.refreshInterval)
         s.hideWbNickname = config.hideWbNickname
         s.panelGradientEnabled = config.panelGradientEnabled
+        s.monoFontEnabled = config.monoFontEnabled
         return s
     }
 
+    /// 判断当前 seq 是否"拥有"写 UI 权限：未被取消 + 仍是最新 seq。
+    /// 背景：onRefresh 的取消是合作式的，URLSession 不会因 cancel() 立刻中断，
+    /// 旧 seq 的 refreshOne* 仍可能跑完并尝试写 failedServices / cache / syncPanel，
+    /// 从而覆盖掉新 seq 的「刷新中…」动效与失败统计。本 guard 作为统一闸门。
+    private func ownsRefresh(_ seq: Int64) -> Bool {
+        !Task.isCancelled && refreshSeq == seq
+    }
+
     /// 数据变化时同步刷新面板（面板打开时才重绘）
-    private func syncPanel() {
-        guard popoverController?.isShown == true, let panel = panelView else { return }
+    private func syncPanel(file: StaticString = #file, line: Int = #line) {
+        guard let panel = panelView else { return }
+        let shown = popoverController?.isShown == true
+        Logger.log(.refresh, "syncPanel [\(line)] shown=\(shown) updatedAt=\(lastUpdatedAt) isRefreshing=\(panel.isRefreshing) failed=\(failedServices.sorted())")
+        guard shown else { return }
         panel.update(makePanelSnapshot())
+    }
+
+    /// 无条件刷新一次 panel 文本（用于 performRefresh 收尾：setRefreshing(false) 之后
+    /// 必须把 updatedLabel 从"刷新中…"改回真实"更新于 XX"，即便 popover 此时是关着的
+    /// —— 否则下次开面板时第一帧会短暂显示"刷新中…"再被 showPanel 的 update() 修正）。
+    private func forceUpdatePanelFooter() {
+        guard let panel = panelView else {
+            Logger.log(.refresh, "forceUpdatePanelFooter: panelView == nil, skip")
+            return
+        }
+        let s = makePanelSnapshot()
+        Logger.log(.refresh, "forceUpdatePanelFooter: calling panel.update(updatedAt=\(s.updatedAt), failed=\(s.failedText ?? "nil"), isRefreshing=\(panel.isRefreshing))")
+        panel.update(s, force: true)
     }
 
     // MARK: - 菜单回调
 
     @objc private func onRefresh() {
+        refreshSeq &+= 1
+        let seq = refreshSeq
+        let cancelledOld = refreshTask != nil
+        // 每轮刷新独立统计失败：上一轮被取消的服务不会把"历史未移除失败"带到本轮 footer。
+        failedServices.removeAll()
         panelView?.setRefreshing(true)   // 面板显示「刷新中…」脉冲提示
+        Logger.log(.refresh, "[\(seq)] onRefresh triggered (cancelledOld=\(cancelledOld)): refreshing=YES set")
         // 取消进行中的旧刷新再起新任务：定时器/网络恢复/开面板/手动可并发触发，
         // 不取消会导致旧任务慢响应覆盖新缓存，且重复请求有触发风控的风险
         refreshTask?.cancel()
-        refreshTask = Task { await performRefresh() }
+        refreshTask = Task { [weak self] in
+            let t0 = Date()
+            await self?.performRefresh(seq: seq)
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            Logger.log(.refresh, "[\(seq)] refreshTask scope END (elapsed=\(ms)ms, cancelled=\(Task.isCancelled))")
+        }
     }
 
     /// 子菜单单选切换刷新间隔（tag = 秒数：60 / 180 / 300）
@@ -1375,6 +1569,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
+    /// Mono 字体：余额卡片与用量列表切换 DepartureMono（中文回退系统字体），
+    /// 保存后经快照同步，面板对已注册 label 就地换字体（不重建卡片）
+    @objc private func onToggleMonoFont() {
+        config.monoFontEnabled = !config.monoFontEnabled
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
     /// 打开平台开关弹窗：保存后同步右键菜单、自动签到定时器和面板状态。
     @objc private func onManagePlatformToggles() {
         let oldConfig = config
@@ -1401,6 +1603,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func onQuit() {
         NSApp.terminate(nil)
+    }
+
+    // MARK: - 滚动提示层参数
+
+    private static func fadeHintParams(from c: AppConfig) -> FadeHintParams {
+        var p = FadeHintParams()
+        p.bandHeight = c.fadeHintBandHeight
+        p.highlightAlpha = c.fadeHintHighlightAlpha
+        p.maskMidAlpha = c.fadeHintMaskMidAlpha
+        p.arrowAlpha = c.fadeHintArrowAlpha
+        p.bobAmplitude = c.fadeHintBobAmplitude
+        return p
     }
 
     @objc private func onAbout() {
@@ -1568,7 +1782,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - 统一格式化标题（用缓存 + 当前小数位）
 
-    private func updateTitle() {
+    /// 对外入口：走 TitleDebouncer，180ms 窗口内多次调用合并为 1~2 次渲染。
+    /// 诊断日志：打印每次「请求刷新」次数与真正「位图烘焙」次数，刷新结束后
+    /// 用 `call-render=N/M` 判断主线程是否被高频 updateTitle 冲击。
+    private func updateTitle(tag: String = #function) {
+        updateTitleCallCount &+= 1
+        let callNo = updateTitleCallCount
+        titleDebouncer.dispatch("updateTitle@\(callNo)#\(tag)") { [weak self] in
+            self?.updateTitleImpl(tag: "debounced@\(callNo)#\(tag)")
+        }
+    }
+
+    /// 实际绘制：构建 attributed string → 烘焙 3x 位图 template → 赋给 button.image。
+    /// 每次都会打印耗时，便于定位「菜单栏位图烘焙太重导致主线程卡顿」。
+    private func updateTitleImpl(tag: String) {
+        let t0 = Date()
+        updateTitleRenderCount &+= 1
         // 菜单栏字号 = 系统默认
         let menuSize = NSFont.menuBarFont(ofSize: 0).pointSize
         let baseFont = NSFont.systemFont(ofSize: menuSize, weight: .regular)
@@ -1603,6 +1832,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             append("⚠︎ 离线")
             statusItem.button?.attributedTitle = NSAttributedString(string: "")
             statusItem.button?.image = renderTemplateTitleImage(attr)
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): offline, \(ms)ms")
+            // 面板打开时同步重绘
+            syncPanel()
             return
         }
 
@@ -1640,6 +1873,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
         statusItem.button?.image = renderTemplateTitleImage(attr)
 
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        let slow = ms >= 10 ? " SLOW!" : ""
+        Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): call-render=\(updateTitleCallCount)/\(updateTitleRenderCount), attrLen=\(attr.length), \(ms)ms\(slow)")
+
         // 面板打开时同步重绘
         syncPanel()
     }
@@ -1648,35 +1885,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 主刷新流程：离线直接返回；在线则并行拉取四个服务，先到先显示。
     /// 任务被取消时（新刷新已发起）不再写时间戳/停动效，交由新任务收尾。
-    private func performRefresh() async {
-        guard !Task.isCancelled else { return }
+    /// `totalBudget` 是总超时：超过后先把刷新动效停掉（面板不再显示「刷新中…」），
+    /// 避免单个慢接口让菜单栏和面板永远显示「在刷」。
+    private func performRefresh(seq: Int64) async {
+        let totalBudget: TimeInterval = 45
+        let t0 = Date()
+        Logger.log(.refresh, "[\(seq)] performRefresh start, isCancelled=\(Task.isCancelled), online=\(NetworkMonitor.shared.isOnline)")
+        guard !Task.isCancelled else {
+            Logger.log(.refresh, "[\(seq)] performRefresh aborted: already cancelled at entry")
+            return
+        }
         guard NetworkMonitor.shared.isOnline else {
             isOffline = true
             panelView?.setRefreshing(false)
-            updateTitle()
+            Logger.log(.refresh, "[\(seq)] performRefresh offline: stopping spinner")
+            titleDebouncer.flush { self.updateTitleImpl(tag: "refresh-offline") }
             return
         }
         isOffline = false
         let cfg = config
 
+        // 总超时守护：45s 后若仍在等待子请求，强制停动效并标记卡住。
+        // 用 Task 而非 Task.sleep + cancel，因为取消子 async-let 可能仍挂在 URLSession 上，
+        // 这里只保证 UI 不再假死（动效被停），实际网络请求由系统 timeout 自行收尾。
+        let watchdog = Task {
+            try? await Task.sleep(nanoseconds: UInt64(totalBudget * 1_000_000_000))
+            if Task.isCancelled { return }
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            Logger.log(.refresh, "[\(seq)] WATCHDOG: refresh NOT finished after \(ms)ms > budget \(Int(totalBudget))s — forcing spinner OFF")
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                // 只在「没有比我新的刷新任务启动」时才敢关停效；如果已有新 seq，它会管理动效。
+                if self.refreshSeq == seq {
+                    self.panelView?.setRefreshing(false)
+                    self.titleDebouncer.flush { self.updateTitleImpl(tag: "watchdog-fallback") }
+                    self.syncPanel()
+                }
+            }
+        }
+        defer { watchdog.cancel() }
+
         // 服务并行请求，先到先显示：每个服务返回后立即写缓存并重绘标题，互不等待
-        async let a: Void = refreshOneDeepSeek(cfg)
-        async let b: Void = refreshOneWorkBuddy(cfg)
-        async let c: Void = refreshOneTrae(cfg)
-        async let e: Void = refreshOneZcode(cfg)
-        async let f: Void = refreshOneCodex(cfg)
+        async let a: Void = refreshOneDeepSeek(cfg, seq: seq)
+        async let b: Void = refreshOneWorkBuddy(cfg, seq: seq)
+        async let c: Void = refreshOneTrae(cfg, seq: seq)
+        async let e: Void = refreshOneZcode(cfg, seq: seq)
+        async let f: Void = refreshOneCodex(cfg, seq: seq)
         _ = await (a, b, c, e, f)
 
+        let totalMs = Int(Date().timeIntervalSince(t0) * 1000)
+        Logger.log(.refresh, "[\(seq)] performRefresh all children joined in \(totalMs)ms")
+
         // 已被取消（被更新的刷新取代）→ 不写收尾状态，避免提前停掉新任务的刷新动效
-        guard !Task.isCancelled else { return }
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] performRefresh aborted: not owner after children joined (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq))")
+            return
+        }
         // 记录更新时间（面板底部展示）
         lastUpdatedAt = Self.dfClock.string(from: Date())
         lastRefreshTime = Date()  // 记录本次刷新完成时间，用于面板打开时节流
         saveBalanceCache()  // 数值快照落盘，供下次启动秒显
-        // 各服务并行返回时已先行刷新菜单栏；这里再统一补一次，确保本轮所有账号最终一致。
-        updateTitle()
-        panelView?.setRefreshing(false)  // 先停动效，syncPanel 再写入真实更新时间
-        syncPanel()
+        // 各服务并行返回时已先行刷新菜单栏；这里 flush 一次，确保本轮所有账号最终一致。
+        titleDebouncer.flush { self.updateTitleImpl(tag: "refresh-finalize-\(seq)") }
+        // 停动效 + 立即恢复 footer 文字（不依赖后续 update 以免 same=true 被跳过）。
+        // fallback=makePanelSnapshot() 保证首次刷新（lastSnapshot==nil）时也能写出时间。
+        panelView?.setRefreshing(false, fallback: makePanelSnapshot())
+        Logger.log(.refresh, "[\(seq)] performRefresh done: refreshing=OFF (total=\(totalMs)ms), updatedAt=\(lastUpdatedAt)")
+        // 无论面板是否显示都要写一次 panel：保证 updatedLabel.stringValue 不再停留在"刷新中…"，
+        // 同时 failedServices / lastUpdatedAt 直接写入 popover 内的视图，下次开面板的
+        // 第一帧就是正确外观（不会先闪"刷新中…"再被 showPanel() 纠正）。
+        forceUpdatePanelFooter()
     }
 
     /// 启动缓存回灌：把上次会话的数值缓存灌回内存并立即绘标题（cache-then-refresh）
@@ -1707,19 +1985,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         BalanceCacheStore.save(c)
     }
 
-    private func refreshOneDeepSeek(_ cfg: AppConfig) async {
+    private func refreshOneDeepSeek(_ cfg: AppConfig, seq: Int64) async {
+        let t0 = Date()
         guard cfg.deepseekRefreshEnabled else {
-            failedServices.remove("DeepSeek")
+            Logger.log(.refresh, "[\(seq)] DeepSeek: disabled, skipped")
+            if ownsRefresh(seq) { failedServices.remove("DeepSeek") }
             return
         }
-        let ds = await DeepSeekService.fetch(apiKey: cfg.deepseekApiKey)
-        // 已取消（被新刷新取代）：取消导致的失败不写缓存也不报错，避免旧结果覆盖新缓存
-        guard !Task.isCancelled else { return }
+        let ds = await Logger.measure("[\(seq)] DeepSeek.fetch") {
+            await DeepSeekService.fetch(apiKey: cfg.deepseekApiKey)
+        }
+        // 已取消（被新刷新取代）/ 已不是 owner：不写缓存、不动失败标记、不刷 UI，
+        // 避免旧结果覆盖新缓存/覆盖新 seq 的「刷新中…」动效。
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] DeepSeek: not owner after fetch (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip writeback")
+            return
+        }
         if let bal = ds.balance {
             let totalNum = Double(bal.totalRaw) ?? 0
             cacheDs = (bal.symbol, bal.totalRaw, totalNum)
             UsageStore.observe(platform: "ds", uid: "main", value: totalNum, increasing: false)
-            // 脉冲：已用占比（=额度-余额）上升（余额被消耗）→ pulsing；稳定或回升 → 停止
             if config.deepseekCommonQuota > 0 {
                 let used = max(0, config.deepseekCommonQuota - totalNum)
                 updatePulsingState(prevRatio: &prevDsRatio, pulsing: &dsPulsing,
@@ -1729,63 +2014,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 dsPulsing = false
             }
             failedServices.remove("DeepSeek")
+            Logger.log(.refresh, "[\(seq)] DeepSeek: OK value=\(bal.totalRaw) (elapsed=\(Int(Date().timeIntervalSince(t0)*1000))ms)")
         }
         if !ds.error.isEmpty {
             notify("DeepSeek 余额查询", ds.error)
             failedServices.insert("DeepSeek")
+            Logger.log(.refresh, "[\(seq)] DeepSeek: ERROR \(ds.error)")
         }
-        updateTitle()
+        updateTitle(tag: "ds-\(seq)")
     }
 
-    private func refreshOneWorkBuddy(_ cfg: AppConfig) async {
+    private func refreshOneWorkBuddy(_ cfg: AppConfig, seq: Int64) async {
+        let t0 = Date()
         guard cfg.workbuddyEnabled else {
-            failedServices.remove("WorkBuddy")
+            Logger.log(.refresh, "[\(seq)] WorkBuddy: disabled, skipped")
+            if ownsRefresh(seq) { failedServices.remove("WorkBuddy") }
             return
         }
         // 主账号（当前登录）：用 authInfo 直接查询
         var wbFailed = false
-        if let wb = await WorkBuddyService.fetchSummary() {
-            guard !Task.isCancelled else { return }
+        let mainStart = Date()
+        let mainWb: (remain: Double, total: Double)? = await Logger.measure("[\(seq)] WB.main.fetchSummary") {
+            await WorkBuddyService.fetchSummary()
+        }
+        if let wb = mainWb {
+            guard ownsRefresh(seq) else {
+                Logger.log(.refresh, "[\(seq)] WorkBuddy: not owner after main fetch (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip writeback")
+                return
+            }
             cacheWb = wb
             if let uid = WorkBuddyService.authInfo()?.uid {
                 cacheWbAccounts[uid] = wb
                 UsageStore.observe(platform: "wb", uid: uid, value: wb.remain, increasing: false)
                 updatePulsingForWb(uid: uid, remain: wb.remain, total: wb.total)
             }
-            updateTitle()
+            Logger.log(.refresh, "[\(seq)] WB.main: OK remain=\(wb.remain) total=\(wb.total) (\(Int(Date().timeIntervalSince(mainStart)*1000))ms)")
+            updateTitle(tag: "wb-main-\(seq)")
         } else if WorkBuddyService.authInfo() != nil {
             wbFailed = true  // 有登录态但获取失败（未登录则不计）
+            Logger.log(.refresh, "[\(seq)] WB.main: fetchSummary returned nil (FAILED)")
         }
         // 多号：遍历其余账号，先刷新 token 再查额度
         let accounts = wbCheckinAccounts()
-        for ac in accounts {
-            if Task.isCancelled { return }  // 被新刷新取代：不再发后续账号请求
+        Logger.log(.refresh, "[\(seq)] WB: total accounts=\(accounts.count), non-main=\(max(0,accounts.count-1))")
+        for (i, ac) in accounts.enumerated() {
+            if !ownsRefresh(seq) {
+                Logger.log(.refresh, "[\(seq)] WB.sub[\(i)/\(accounts.count)]: not owner (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip remaining")
+                return
+            }
             if ac.uid == WorkBuddyService.authInfo()?.uid { continue } // 主账号已查
-            let refreshed = await WorkBuddyService.refreshTokenIfNeeded(account: ac)
+            let acctag = "[\(seq)] WB.sub[\(i)/\(accounts.count)] uid=\(ac.uid)"
+            let refreshed = await Logger.measure("\(acctag).refreshToken") {
+                await WorkBuddyService.refreshTokenIfNeeded(account: ac)
+            }
             if refreshed != ac {
+                Logger.log(.refresh, "\(acctag): token refreshed (new expiresAt=\(refreshed.expiresAt))")
                 if let idx = config.workbuddyAccounts.firstIndex(where: { $0.uid == ac.uid }) {
                     config.workbuddyAccounts[idx] = refreshed
                     ConfigStore.save(config)
                 }
             }
-            if let r = await WorkBuddyService.fetchSummaryForAccount(token: refreshed.token, uid: refreshed.uid, domain: refreshed.domain) {
-                guard !Task.isCancelled else { return }
+            let fetchTag = "\(acctag).fetchSummary"
+            let ft0 = Date()
+            if let r = await Logger.measure(fetchTag, {
+                await WorkBuddyService.fetchSummaryForAccount(token: refreshed.token, uid: refreshed.uid, domain: refreshed.domain)
+            }) {
+                guard ownsRefresh(seq) else {
+                    Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
+                    return
+                }
                 cacheWbAccounts[refreshed.uid] = r
                 UsageStore.observe(platform: "wb", uid: refreshed.uid, value: r.remain, increasing: false)
                 updatePulsingForWb(uid: refreshed.uid, remain: r.remain, total: r.total)
-                // 非当前账号也要立即同步菜单栏，不能只刷新面板。
-                updateTitle()
-            } else if !Task.isCancelled {
+                Logger.log(.refresh, "\(acctag): OK remain=\(r.remain) total=\(r.total) (\(Int(Date().timeIntervalSince(ft0)*1000))ms)")
+                updateTitle(tag: "wb-sub-\(i)-\(seq)")
+            } else if ownsRefresh(seq) {
                 wbFailed = true  // 该号 token 刷新或查询失败
+                Logger.log(.refresh, "\(acctag): fetchSummaryForAccount returned nil (FAILED)")
             }
         }
-        // 收口失败标记：取消导致的提前 return 走不到这里（不动旧状态，由新刷新重判）
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] WorkBuddy: not owner at tail (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip finalize")
+            return
+        }
+        // 收口失败标记：取消 / 新 seq 已接管时走不到这里，避免把失败标记污染本轮
         if wbFailed { failedServices.insert("WorkBuddy") }
         else { failedServices.remove("WorkBuddy") }
+        Logger.log(.refresh, "[\(seq)] WorkBuddy: done failed=\(wbFailed) total=\(Int(Date().timeIntervalSince(t0)*1000))ms")
         syncPanel()
         // 补全签到 streak/reward（auto-checkin 关闭时也能显示，与 TRAE 侧对齐）
-        guard !Task.isCancelled else { return }  // 取消后不再发签到状态请求，减少对风控接口的打扰
-        await wbCheckinStatusFill()
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] WB.checkinStatus: not owner, skip")
+            return
+        }
+        let cs0 = Date()
+        await Logger.measure("[\(seq)] WB.checkinStatusFill") { await wbCheckinStatusFill() }
+        Logger.log(.refresh, "[\(seq)] WB.checkinStatusFill done in \(Int(Date().timeIntervalSince(cs0)*1000))ms")
     }
 
     /// WB 脉冲计算：usedRatio = (total-remain)/total，上升 → pulsing=true（被消耗）；稳定/回升 → false
@@ -1801,14 +2125,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - ZCode（智谱 Coding Plan）余额刷新
 
     /// 遍历 config 中导入的 ZCode 账号，逐号查询 Coding Plan 用量（本平台无签到）
-    private func refreshOneZcode(_ cfg: AppConfig) async {
+    private func refreshOneZcode(_ cfg: AppConfig, seq: Int64) async {
+        let t0 = Date()
         guard cfg.zcodeRefreshEnabled else {
-            failedServices.remove("ZCode")
+            Logger.log(.refresh, "[\(seq)] ZCode: disabled, skipped")
+            if ownsRefresh(seq) { failedServices.remove("ZCode") }
             return
         }
         var zcodeFailed = false
-        for ac in cfg.zcodeAccounts {
-            if Task.isCancelled { return }  // 被新刷新取代：不再发后续账号请求
+        Logger.log(.refresh, "[\(seq)] ZCode: accounts=\(cfg.zcodeAccounts.count)")
+        for (i, ac) in cfg.zcodeAccounts.enumerated() {
+            if !ownsRefresh(seq) {
+                Logger.log(.refresh, "[\(seq)] ZCode[\(i)/\(cfg.zcodeAccounts.count)]: not owner (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip remaining")
+                return
+            }
+            let acctag = "[\(seq)] ZCode[\(i)/\(cfg.zcodeAccounts.count)] uid=\(ac.uid)"
             // 存量账号自动回填昵称（早期导入无 nickname）：credentials.json 可解出且 uid 匹配时写入一次
             if ac.nickname.isEmpty, let nick = ZcodeService.autoNickname(forUid: ac.uid),
                let idx = config.zcodeAccounts.firstIndex(where: { $0.uid == ac.uid }) {
@@ -1819,12 +2150,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 保留卡片"套餐已到期"提示，避免无效请求与误判失败
             if let cached = cacheZcodeAccounts[ac.uid],
                cached.planEndsAt > 0, cached.planEndsAt <= Date().timeIntervalSince1970 {
+                Logger.log(.refresh, "\(acctag): plan expired at \(cached.planEndsAt), skip fetch")
                 continue
             }
-            let r = await ZcodeService.fetchBalance(token: ac.token)
-            if Task.isCancelled { return }
+            let r = await Logger.measure("\(acctag).fetchBalance") {
+                await ZcodeService.fetchBalance(token: ac.token)
+            }
+            guard ownsRefresh(seq) else {
+                Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
+                return
+            }
             guard r.total > 0 else {
                 zcodeFailed = true  // 该号获取失败（token 失效或网络错误）
+                Logger.log(.refresh, "\(acctag): total<=0, marked failed")
                 continue
             }
             cacheZcodeAccounts[ac.uid] = r
@@ -1837,20 +2175,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                newRatio: r.total > 0 ? (r.total - r.remain) / r.total : 0)
             prevZcodeRatio[ac.uid] = prev
             zcodePulsing[ac.uid] = pulsing
+            Logger.log(.refresh, "\(acctag): OK remain=\(r.remain) total=\(r.total)")
             // ZCode 没有主账号单独刷新路径，每个账号写入后立即更新菜单栏。
-            updateTitle()
+            updateTitle(tag: "zcode-\(i)-\(seq)")
+        }
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] ZCode: not owner at tail, skip finalize")
+            return
         }
         if zcodeFailed { failedServices.insert("ZCode") }
         else { failedServices.remove("ZCode") }
+        Logger.log(.refresh, "[\(seq)] ZCode: done failed=\(zcodeFailed) total=\(Int(Date().timeIntervalSince(t0)*1000))ms")
         syncPanel()
     }
 
     // MARK: - Codex usage 刷新
 
     /// 读取本机 auth.json 后调用官方 usage 接口。Codex usage 返回 used_percent，卡片展示剩余百分比。
-    private func refreshOneCodex(_ cfg: AppConfig) async {
+    private func refreshOneCodex(_ cfg: AppConfig, seq: Int64) async {
+        let t0 = Date()
         guard cfg.codexRefreshEnabled else {
-            failedServices.remove("Codex")
+            Logger.log(.refresh, "[\(seq)] Codex: disabled, skipped")
+            if ownsRefresh(seq) { failedServices.remove("Codex") }
             return
         }
         var accounts = cfg.codexAccounts
@@ -1871,17 +2217,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         guard !accounts.isEmpty else {
-            failedServices.remove("Codex")
+            Logger.log(.refresh, "[\(seq)] Codex: no accounts, skip")
+            if ownsRefresh(seq) { failedServices.remove("Codex") }
             return
         }
+        Logger.log(.refresh, "[\(seq)] Codex: accounts=\(accounts.count)")
         var failed = false
-        for account in accounts {
-            if Task.isCancelled { return }
-            guard let usage = await CodexService.fetchUsage(token: account.token,
-                                                            fallbackUid: account.uid,
-                                                            fallbackEmail: account.email) else {
-                failed = true
+        for (i, account) in accounts.enumerated() {
+            if !ownsRefresh(seq) {
+                Logger.log(.refresh, "[\(seq)] Codex[\(i)/\(accounts.count)] uid=\(account.uid): not owner, skip remaining")
+                return
+            }
+            let acctag = "[\(seq)] Codex[\(i)/\(accounts.count)] uid=\(account.uid)"
+            guard let usage = await Logger.measure("\(acctag).fetchUsage", {
+                await CodexService.fetchUsage(token: account.token,
+                                              fallbackUid: account.uid,
+                                              fallbackEmail: account.email)
+            }) else {
+                if ownsRefresh(seq) {   // 只在仍是 owner 时标记失败，避免污染新 seq
+                    failed = true
+                }
+                Logger.log(.refresh, "\(acctag): fetchUsage returned nil (FAILED)")
                 continue
+            }
+            guard ownsRefresh(seq) else {
+                Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
+                return
             }
             if let idx = config.codexAccounts.firstIndex(where: { $0.uid == account.uid }),
                !usage.email.isEmpty, config.codexAccounts[idx].email != usage.email {
@@ -1890,54 +2251,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             cacheCodexAccounts[account.uid] = (usage.usedPercent, usage.resetAt)
             UsageStore.observe(platform: "codex", uid: account.uid, value: usage.usedPercent, increasing: true)
-            updateTitle()
+            Logger.log(.refresh, "\(acctag): OK used=\(usage.usedPercent)%")
+            updateTitle(tag: "codex-\(i)-\(seq)")
+        }
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] Codex: not owner at tail, skip finalize")
+            return
         }
         if failed { failedServices.insert("Codex") }
         else { failedServices.remove("Codex") }
+        Logger.log(.refresh, "[\(seq)] Codex: done failed=\(failed) total=\(Int(Date().timeIntervalSince(t0)*1000))ms")
         syncPanel()
     }
 
-    private func refreshOneTrae(_ cfg: AppConfig) async {
+    private func refreshOneTrae(_ cfg: AppConfig, seq: Int64) async {
+        let t0 = Date()
         guard cfg.traeRefreshEnabled else {
-            failedServices.remove("TRAE")
+            Logger.log(.refresh, "[\(seq)] TRAE: disabled, skipped")
+            if ownsRefresh(seq) { failedServices.remove("TRAE") }
             return
         }
         // 主账号（当前登录）：从 storage.json 解密查询
         let mainUid = TraeService.readAuthInfo(storagePath: cfg.traeStoragePath)?.uid ?? ""
         var traeFailed = false
-        if let t = await TraeService.fetchCredits(storagePath: cfg.traeStoragePath) {
-            guard !Task.isCancelled else { return }
+        let mainStart = Date()
+        let mainTrae: (limit: Double, used: Double)? = await Logger.measure("[\(seq)] TRAE.main.fetchCredits") {
+            await TraeService.fetchCredits(storagePath: cfg.traeStoragePath)
+        }
+        if let t = mainTrae {
+            guard ownsRefresh(seq) else {
+                Logger.log(.refresh, "[\(seq)] TRAE: not owner after main fetch (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip writeback")
+                return
+            }
             cacheTrae = t
             if !mainUid.isEmpty {
                 cacheTraeAccounts[mainUid] = t
                 UsageStore.observe(platform: "trae", uid: mainUid, value: t.used, increasing: true)
                 updatePulsingForTrae(uid: mainUid, limit: t.limit, used: t.used)
             }
-            updateTitle()
+            Logger.log(.refresh, "[\(seq)] TRAE.main: OK limit=\(t.limit) used=\(t.used) (\(Int(Date().timeIntervalSince(mainStart)*1000))ms)")
+            updateTitle(tag: "trae-main-\(seq)")
         } else if !mainUid.isEmpty {
             traeFailed = true  // 有登录态但获取失败（未登录则不计）
+            Logger.log(.refresh, "[\(seq)] TRAE.main: fetchCredits returned nil (FAILED)")
         }
         // 多号：遍历 config 中预存的其他账号，用各自加密块解密 token 后查额度
-        for ac in config.traeAccounts where ac.uid != mainUid {
-            if Task.isCancelled { return }  // 被新刷新取代：不再发后续账号请求
+        let subs = config.traeAccounts.filter { $0.uid != mainUid }
+        Logger.log(.refresh, "[\(seq)] TRAE: total subs=\(subs.count)")
+        for (i, ac) in subs.enumerated() {
+            if !ownsRefresh(seq) {
+                Logger.log(.refresh, "[\(seq)] TRAE.sub[\(i)/\(subs.count)]: not owner (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip remaining")
+                return
+            }
+            let acctag = "[\(seq)] TRAE.sub[\(i)/\(subs.count)] uid=\(ac.uid)"
+            let ft0 = Date()
             if let token = TraeService.getTokenFromEncrypted(ac.encryptedAuthInfo),
-               let r = await TraeService.fetchCreditsForToken(token) {
-                guard !Task.isCancelled else { return }
+               let r = await Logger.measure("\(acctag).fetchCreditsForToken", {
+                   await TraeService.fetchCreditsForToken(token)
+               }) {
+                guard ownsRefresh(seq) else {
+                    Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
+                    return
+                }
                 cacheTraeAccounts[ac.uid] = r
                 UsageStore.observe(platform: "trae", uid: ac.uid, value: r.used, increasing: true)
                 updatePulsingForTrae(uid: ac.uid, limit: r.limit, used: r.used)
+                Logger.log(.refresh, "\(acctag): OK limit=\(r.limit) used=\(r.used) (\(Int(Date().timeIntervalSince(ft0)*1000))ms)")
                 // 非当前账号也要立即同步菜单栏，不能只刷新面板。
-                updateTitle()
-            } else if !Task.isCancelled {
+                updateTitle(tag: "trae-sub-\(i)-\(seq)")
+            } else if ownsRefresh(seq) {
                 traeFailed = true  // 该号解密或获取失败
+                Logger.log(.refresh, "\(acctag): FAILED (no token or nil response)")
             }
+        }
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] TRAE: not owner at tail, skip finalize")
+            return
         }
         if traeFailed { failedServices.insert("TRAE") }
         else { failedServices.remove("TRAE") }
+        Logger.log(.refresh, "[\(seq)] TRAE: done failed=\(traeFailed) total=\(Int(Date().timeIntervalSince(t0)*1000))ms")
         syncPanel()
         // 补全签到 streak/reward（auto-checkin 关闭时也能显示）
-        guard !Task.isCancelled else { return }  // 取消后不再发签到状态请求，减少对风控接口的打扰
-        await traeCheckinStatusFill()
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] TRAE.checkinStatus: not owner, skip")
+            return
+        }
+        let cs0 = Date()
+        await Logger.measure("[\(seq)] TRAE.checkinStatusFill") { await traeCheckinStatusFill() }
+        Logger.log(.refresh, "[\(seq)] TRAE.checkinStatusFill done in \(Int(Date().timeIntervalSince(cs0)*1000))ms")
     }
 
     /// TRAE 脉冲计算：usedRatio 上升 → pulsing=true（被消耗）；稳定/回升 → false
@@ -2224,7 +2626,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ConfigStore.save(config)
         syncPanel()
         // 导入后立即拉取余额刷新卡片；自动签到开启时补一次签到（与 OAuth 导入对齐）
-        Task { await refreshOneWorkBuddy(config) }
+        refreshSeq &+= 1
+        let importSeq = refreshSeq
+        Logger.log(.refresh, "[\(importSeq)] onImportWbAuthFile triggering ad-hoc WB refresh")
+        Task { await refreshOneWorkBuddy(config, seq: importSeq) }
         if config.workbuddyAutoCheckin {
             Task { await wbAutoCheckinIfNeeded() }
         }
@@ -2367,10 +2772,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         Task {
             // 与自动签到完全一致的逻辑链路（每日守卫、token 刷新、退避均生效）；
-            // force 绕过两平台错峰就绪时刻：手动一键签到立即全签
-            async let traeTask = traeAutoCheckinIfNeeded(force: true)
-            async let wbTask = wbAutoCheckinIfNeeded(force: true)
-            _ = await (traeTask, wbTask)
+            // force 绕过两平台错峰就绪时刻：手动一键签到立即全签；
+            // 平台开关里关闭了签到的平台，手动签到同样跳过（与自动签到行为一致）
+            await withTaskGroup(of: Void.self) { group in
+                if config.traeAutoCheckin {
+                    group.addTask { await self.traeAutoCheckinIfNeeded(force: true) }
+                }
+                if config.workbuddyAutoCheckin {
+                    group.addTask { await self.wbAutoCheckinIfNeeded(force: true) }
+                }
+            }
 
             // ── 汇总各账号签到结果 ──
             var rows: [CheckinResultRow] = []
@@ -2387,6 +2798,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                                      streak: streak, reward: reward)
                     rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：", state: .ok, infoItems: infoItems))
                     okCount += 1
+                } else if !config.traeAutoCheckin {
+                    rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：已跳过（签到已关闭）", state: .skipped))
                 } else if failed {
                     rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：签到失败", state: .fail))
                     failCount += 1
@@ -2404,6 +2817,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                                      streak: streak, reward: reward)
                     rows.append(CheckinResultRow(text: "WorkBuddy · \(ac.nickname)：", state: .ok, infoItems: infoItems))
                     okCount += 1
+                } else if !config.workbuddyAutoCheckin {
+                    rows.append(CheckinResultRow(text: "WorkBuddy · \(ac.nickname)：已跳过（签到已关闭）", state: .skipped))
                 } else if failed {
                     rows.append(CheckinResultRow(text: "WorkBuddy · \(ac.nickname)：签到失败", state: .fail))
                     failCount += 1

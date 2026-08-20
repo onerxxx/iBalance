@@ -16,11 +16,18 @@ enum HTTP {
         req.httpMethod = method
         req.httpBody = body
         for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        let t0 = Date()
+        let tag = "\(method) \(url.absoluteString)"
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            Logger.log(.network, "\(tag) → HTTP \(code) (\(ms)ms, \(data.count)B)")
             return (data, code)
         } catch {
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            let ns = error as NSError
+            Logger.log(.network, "\(tag) → ERROR \(ns.domain)/\(ns.code) after \(ms)ms: \(error.localizedDescription)")
             return (nil, 0)
         }
     }
@@ -34,12 +41,19 @@ enum HTTP {
                                  timeout: TimeInterval,
                                  retries: Int = 1,
                                  backoff: TimeInterval = 2) async -> (Data?, Int) {
+        let tag = "\(method) \(url.absoluteString) timeout=\(timeout)s retries=\(retries)"
         var attempt = 0
         while true {
             let r = await request(url: url, method: method, headers: headers, body: body, timeout: timeout)
-            if r.1 != 0 || attempt >= retries { return r }
+            if r.1 != 0 || attempt >= retries {
+                if r.1 == 0 {
+                    Logger.log(.network, "RETRY EXHAUSTED: \(tag) — giving up after \(attempt + 1) attempt(s)")
+                }
+                return r
+            }
             attempt += 1
             let delayNs = UInt64(backoff * Double(attempt) * 1_000_000_000)
+            Logger.log(.network, "RETRY \(attempt)/\(retries): \(tag) — waiting \(backoff * Double(attempt))s")
             try? await Task.sleep(nanoseconds: delayNs)
         }
     }
