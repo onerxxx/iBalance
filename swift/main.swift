@@ -692,6 +692,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 最近一次面板关闭所在事件的时间戳（transient 面板外点击会先关闭面板，
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
+    /// 面板打开期间锁定的锚（X + 顶边 Y）：菜单栏 title 更新导致 button 宽度变化、
+    /// popover 自动 reposition 时，用 KVO 同步把 window 拉回原位（无动画，避免跳动）。
+    /// 锚定顶边而非 origin（左下角）：区块折叠/展开改变高度时底边伸缩，
+    /// 顶边保持贴住菜单栏不动（origin 锚会在高度变化时把顶边拽下来）。
+    private var panelAnchorX: CGFloat = 0
+    private var panelAnchorTopY: CGFloat = 0
+    private var panelAnchored = false
+    /// popover window 的 frame KVO 观察令牌：面板打开期间生效，关闭时移除。
+    private var panelFrameObserver: NSKeyValueObservation?
+    /// 置顶浮动窗（pin 开启时承载面板内容，复用实例避免反复建窗）
+    private var floatingPanel: NSPanel?
+    /// pin 时预建的下一轮面板（unpin/重开面板时由 showPanel 恢复为 panelView）
+    private var prebuiltPanelView: BalancePanelView?
+    /// 内容转移中标志：popover 关闭由 pin 转移引发，popoverDidClose 跳过
+    /// 「记录事件时间戳 + NSApp.hide」（hide 会连浮动窗一起隐藏）
+    private var isTransferringPanel = false
     private var settingsMenu: NSMenu!
     /// 面板最近一次释放拖拽后的平台顺序；面板未拖拽前回退到 UserDefaults。
     private var menuBarPlatformOrder: [String]?
@@ -1047,6 +1063,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 左键点击 → 切换详情面板；右键 → 手动弹出设置菜单。
     @objc private func onStatusItemClicked(_ sender: Any?) {
+        // 置顶浮动窗打开时：点击图标 = 关闭浮窗并复位 pin（与点击关闭 popover 语义一致），
+        // 关闭后归还焦点（同 popoverDidClose）
+        if let fp = floatingPanel, fp.isVisible {
+            fp.orderOut(nil)
+            panelView?.resetPin()
+            NSApp.hide(nil)
+            return
+        }
         if NSApp.currentEvent?.type == .rightMouseDown {
             settingsMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: statusItem.button)
             return
@@ -1085,12 +1109,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
+        panel.onToggleSubAccountDim = { [weak self] in self?.onToggleSubAccountDim() }
         panel.onToggleDebugUsage = { [weak self] in self?.onToggleDebugUsage() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
         panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
         panel.onQuit = { [weak self] in self?.onQuit() }
+        // 右上角 pin：置顶常驻——内容转移至无边框 NSPanel 浮动窗口（无箭头、
+        // 浮层层级、背景原生拖动）；取消置顶时装回 popover 回到按钮下方
+        panel.onTogglePin = { [weak self] in self?.togglePanelPin() }
         // 余额卡片点击：DeepSeek 打开浏览器，TRAE / WorkBuddy / ZCode 启动应用
         panel.onClickDeepSeek = {
             NSWorkspace.shared.open(URL(string: "https://platform.deepseek.com/usage")!)
@@ -1150,6 +1178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 复用已构建的 popover/panel 展示，不再重建视图层级（消除高频点击延迟）。
     private func showPanel() {
+        // pin 期间预建的面板在此接管（置顶期间 panelView 指向浮窗面板以保证数据刷新）
+        if let pre = prebuiltPanelView {
+            panelView = pre
+            prebuiltPanelView = nil
+        }
         guard let button = statusItem.button else { return }
         if popoverController == nil { buildPanelOnce() }   // 兜底：未预构建时按需构建一次
         guard let popover = popoverController, let panel = panelView else { return }
@@ -1174,6 +1207,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // popover 窗口默认不是 key window：.transient 只在 key window 状态下
         // 才会响应「面板外点击」关闭，且非 key 时玻璃材质同样偏暗 → 强制置 key。
         popover.contentViewController?.view.window?.makeKey()
+        // 锁定面板原始 origin，并用 KVO 监听 popover window frame 变化：
+        // 菜单栏 title 更新导致 button 宽度变化、popover 自动 reposition 时，
+        // 立即（无动画）把 window 拉回原位，避免面板跳动后归位的视觉抖动。
+        startPanelOriginLock()
+    }
+
+    /// 启用面板位置锁定：记录顶边锚点，KVO 监听 window frame，顶边偏离时立即无动画拉回。
+    private func startPanelOriginLock() {
+        guard let w = popoverController?.contentViewController?.view.window else { return }
+        panelAnchorX = w.frame.minX
+        panelAnchorTopY = w.frame.maxY
+        panelAnchored = true
+        // 移除旧观察（若有），再重新添加
+        panelFrameObserver?.invalidate()
+        panelFrameObserver = w.observe(\.frame, options: [.new]) { [weak self] win, _ in
+            guard let self = self, self.panelAnchored else { return }
+            // 期望 origin = 顶边贴住锚点（高度变化时 y 随高度下移，顶边恒定）
+            let expected = NSPoint(x: self.panelAnchorX, y: self.panelAnchorTopY - win.frame.height)
+            // 仅当偏离时才校正（避免无谓的 setFrameOrigin 循环）
+            if win.frame.origin != expected {
+                // 禁用动画：直接 setFrameOrigin 会触发默认动画，需包裹 NSAnimationContext
+                NSAnimationContext.beginGrouping()
+                NSAnimationContext.current.duration = 0
+                win.setFrameOrigin(expected)
+                NSAnimationContext.endGrouping()
+            }
+        }
+    }
+
+    /// 切换面板置顶（popover ↔ 无边框 NSPanel 浮动窗口）：
+    /// - 置顶：popover 内容（contentViewController）转移至 NSPanel——无边框窗口
+    ///   天然无箭头，浮层层级 + 背景原生拖动；面板背景为 TintedVisualEffectView
+    ///   （毛玻璃 + 圆角 + 裁剪），透明窗口承载后外观与 popover 无缝。
+    /// - 取消：浮窗退场，showPanel 把同一 VC 装回 popover，回到按钮下方。
+    private func togglePanelPin() {
+        // 取消置顶：浮窗退场，弹出预建的 popover（pin 时已 buildPanelOnce）零构建等待
+        if let fp = floatingPanel, fp.isVisible {
+            fp.orderOut(nil)
+            fp.contentViewController = nil
+            // popoverController == nil 的兜底（预建异常时现场重建）仍由 showPanel 处理
+            showPanel()
+            return
+        }
+        guard let popover = popoverController, popover.isShown,
+              let vc = popover.contentViewController,
+              let popWindow = vc.view.window else { return }
+        // 用内容视图自身的屏幕位置定位浮窗：popover 窗口 frame 含箭头/阴影边距，
+        // 直接套用会向左上偏移；无边框浮窗内容铺满窗口，与原内容像素级重合
+        let viewFrame = popWindow.convertToScreen(vc.view.convert(vc.view.bounds, to: nil))
+        let fp = floatingPanel ?? makeFloatingPanel()
+        floatingPanel = fp
+        // 转移标志：popover 关闭回调跳过「记录点击时间戳 + NSApp.hide」
+        //（hide 会隐藏包括新浮窗在内的全部窗口）
+        isTransferringPanel = true
+        // 先挂载（窗口按 preferredContentSize 自动定形），再 setFrame 覆盖为
+        // 内容视图的实际屏幕位置——顺序颠倒会被挂载时的自动 resize 带偏
+        fp.contentViewController = vc
+        fp.setFrame(viewFrame, display: false)
+        popWindow.orderOut(nil)
+        popover.close()
+        isTransferringPanel = false
+        fp.orderFrontRegardless()
+        // 预建下一轮 popover：unpin / 点击菜单栏重开面板时零构建等待。
+        // 面板重建是百毫秒级主线程工作，放在 pin 之后执行——浮窗刚显示、用户
+        // 尚未开始拖动，卡顿感知极弱；旧 popover（含转移过的 VC）在此整体释放。
+        // ⚠️ 置顶期间 panelView 必须继续指向浮窗中的面板（数据刷新目标），
+        // 预建面板单独存放，showPanel 时恢复
+        let pinnedPanel = panelView
+        popoverController = nil
+        buildPanelOnce()
+        prebuiltPanelView = panelView
+        panelView = pinnedPanel
+    }
+
+    /// 置顶浮动窗：无边框 + 不激活（点击面板不抢 App 焦点，与 popover 行为一致）、
+    /// 透明背景（圆角玻璃由面板容器自绘）、浮层层级、跟随全部 Space。
+    /// ⚠️ 不用 isMovableByWindowBackground：borderless 窗口上系统会显示灰色拖动
+    /// 示意条；也不用 titled+fullSizeContentView 规避——透明 titlebar 会截获顶部
+    /// 鼠标事件（「余额」标题行的 pin 按钮在 titlebar 区收不到点击，无法解除置顶）。
+    /// 拖动改由面板视图自绘（BalancePanelView.mouseDown）
+    private func makeFloatingPanel() -> NSPanel {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 400),
+                        styleMask: [.nonactivatingPanel, .borderless],
+                        backing: .buffered, defer: false)
+        p.level = .floating
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.collectionBehavior = [.canJoinAllSpaces]
+        p.hidesOnDeactivate = false
+        return p
     }
 
     /// 计算 status item 下方到屏幕可见区域底部的高度，popover 超出后由内容滚动承载。
@@ -1209,22 +1333,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func keepPanelAliveDuring<T>(_ block: () -> T) -> T {
         guard let popover = popoverController, popover.isShown else { return block() }
         popover.behavior = .applicationDefined
-        defer { popover.behavior = .transient }
+        // 恢复时尊重 pin 置顶态（置顶期间本就是 applicationDefined，不能被重置回 transient）
+        defer { popover.behavior = popover.contentViewController?.view.window?.level == .floating
+                ? .applicationDefined : .transient }
         return block()
     }
 
     /// popover 关闭后归还焦点（隐藏 App），让之前活跃的应用恢复前台，
     /// 避免菜单栏小工具霸占焦点。
     func popoverDidClose(_ notification: Notification) {
+        // 移除面板位置锁定：停用 KVO + 清空顶边锚点
+        panelFrameObserver?.invalidate()
+        panelFrameObserver = nil
+        panelAnchored = false
+        // pin 转移触发的关闭：不记事件时间戳、不 hide（hide 会连浮动窗一起隐藏）
+        if isTransferringPanel { return }
         // 记录关闭时正在处理的事件时间戳：transient「面板外点击」关闭时，
         // currentEvent 即该 click（onStatusItemClicked 用它识别同一 click，避免抖动重弹）
         lastCloseEventTime = NSApp.currentEvent?.timestamp ?? 0
         NSApp.hide(nil)
     }
 
-    /// 弹出动画完成后无需额外处理。
-    /// 历史：曾用「记录 origin + didMove 拉回」的 X 钉住机制防止标题刷新导致面板
-    /// 跟随按钮移动，但与折叠/展开的 popover resize 动画互相拉扯引发细微左右偏移，已整体移除。
+    /// 弹出动画完成后无需额外处理。面板位置锁定见 startPanelOriginLock。
+    /// 历史（防「菜单栏内容变化导致面板移动/闪动」的方案演进，拦截类全部失败）：
+    /// ① didMove 拉回：通知路径不可靠，未生效；② 异步拉回：中间态上屏，偶发闪动；
+    /// ③ KVO 拉回但裸调 setFrameOrigin：隐式移动动画与系统定位器互搏，仍闪动；
+    /// ④ 冻结按钮画布宽度：透明区永久占位、推挤左邻图标，更差。
+    /// 最终回归早期 origin 锁定方案（顶边锚 + KVO + duration=0 无动画拉回）：
+    /// 拉回必须禁动画是关键，锚顶边让折叠/展开的高度动画自洽。
     func popoverDidShow(_ notification: Notification) {}
 
     /// 从当前缓存构建面板数据快照（离线横幅 / 四服务 / 设置状态 / 更新时间）
@@ -1456,6 +1592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.refreshIntervalSeconds = Int(config.refreshInterval)
         s.panelGradientEnabled = config.panelGradientEnabled
         s.monoFontEnabled = config.monoFontEnabled
+        s.subAccountDimEnabled = config.subAccountDimEnabled
         return s
     }
 
@@ -1507,10 +1644,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         !Task.isCancelled && refreshSeq == seq
     }
 
-    /// 数据变化时同步刷新面板（面板打开时才重绘）
+    /// 数据变化时同步刷新面板（面板打开时才重绘；置顶浮窗显示中也算「打开」）
     private func syncPanel(file: StaticString = #file, line: Int = #line) {
         guard let panel = panelView else { return }
-        let shown = popoverController?.isShown == true
+        let shown = popoverController?.isShown == true || floatingPanel?.isVisible == true
         Logger.log(.refresh, "syncPanel [\(line)] shown=\(shown) updatedAt=\(lastUpdatedAt) isRefreshing=\(panel.isRefreshing) failed=\(failedServices.sorted())")
         guard shown else { return }
         panel.update(makePanelSnapshot())
@@ -1584,10 +1721,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// Mono 字体：余额卡片与用量列表切换 DepartureMono（中文回退系统字体），
+    /// Mono 字体：余额卡片与用量列表切换 SF Mono（中文回退系统字体），
     /// 保存后经快照同步，面板对已注册 label 就地换字体（不重建卡片）
     @objc private func onToggleMonoFont() {
         config.monoFontEnabled = !config.monoFontEnabled
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
+    /// 弱化非当前账号：切换小卡片整卡降透明（悬停复亮）的新设计
+    @objc private func onToggleSubAccountDim() {
+        config.subAccountDimEnabled = !config.subAccountDimEnabled
         ConfigStore.save(config)
         syncPanel()
     }
@@ -1710,7 +1854,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let currentlyVisible = isMenuBarVisible(id: itemId, isCurrent: isCurrent)
         config.menuBarVisible[itemId] = !currentlyVisible
         ConfigStore.save(config)
-        updateTitle()
+        // 用户主动操作：立即渲染并立即应用位图（菜单栏瞬间反馈），面板由 KVO 钉住
+        updateTitle(immediate: true)
         syncPanel()
     }
 
@@ -1816,6 +1961,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// 用户主动操作（右键切换显隐等）的立即通道：跳过去抖当场渲染并应用位图
+    /// （菜单栏瞬间反馈），面板位置由 startPanelOriginLock 的 KVO 锁定接管。
+    private func updateTitle(immediate: Bool, tag: String = #function) {
+        guard immediate else { updateTitle(tag: tag); return }
+        updateTitleCallCount &+= 1
+        let callNo = updateTitleCallCount
+        titleDebouncer.flush { [weak self] in
+            self?.updateTitleImpl(tag: "immediate@\(callNo)#\(tag)")
+        }
+    }
+
     /// 实际绘制：构建 attributed string → 烘焙 3x 位图 template → 赋给 button.image。
     /// 每次都会打印耗时，便于定位「菜单栏位图烘焙太重导致主线程卡顿」。
     private func updateTitleImpl(tag: String) {
@@ -1902,6 +2058,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // 面板打开时同步重绘
         syncPanel()
+        // 面板位置锁定由 startPanelOriginLock 的 KVO 接管：origin 偏离时立即无动画拉回
     }
 
     // MARK: - 请求编排（四服务并行，各自独立更新 UI）

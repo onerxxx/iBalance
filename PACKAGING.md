@@ -75,7 +75,6 @@
 | `__pycache__/` | Python 字节码缓存（调试脚本用） |
 | `swift/.build/` | Swift 编译中间产物 |
 | `swift/.build_state` | 构建状态文件 |
-| `swift-tools/click` / `swift-tools/presskey` | 已编译的二进制工具，仅保留源码 |
 | `.DS_Store` | macOS 文件系统元数据（rsync 中无 `/` 的模式匹配任意层级，递归排除） |
 
 ## 三、打包命令
@@ -110,8 +109,6 @@ rsync -a \
   --exclude 'swift/.build/' \
   --exclude 'swift/.build_state' \
   --exclude 'iBalance*.zip' \
-  --exclude 'swift-tools/click' \
-  --exclude 'swift-tools/presskey' \
   --exclude '.DS_Store' \
   "$SRC/" "$PKG_DIR/iBalance/"
 
@@ -174,7 +171,7 @@ print('$f', 'LEAK:' if leaks else 'OK', leaks)"
 done
 
 # 3. 应排除项应为空（含任何形式的嵌套 zip）
-unzip -l "$ZIP" | grep -E 'backups/|cockpit-tools-main/|docs/|cache\.json|click_ibalance\.lua|已损坏说明|\.reasonix/|\.git/|\.workbuddy/|__pycache__/|\.build/|\.build_state|/click$|/presskey$|iBalance[^/]*\.zip'
+unzip -l "$ZIP" | grep -E 'backups/|cockpit-tools-main/|docs/|cache\.json|click_ibalance\.lua|已损坏说明|\.reasonix/|\.git/|\.workbuddy/|__pycache__/|\.build/|\.build_state|iBalance[^/]*\.zip'
 
 # 4. zip 内 App 的完整版本号应与文件名一致（plutil 不支持读 stdin，需经临时文件）
 TMP_PLIST=$(mktemp)
@@ -217,7 +214,4 @@ iBalance/
 │   ├── build.sh
 │   ├── config.json              ← 初始化版（475B）
 │   └── main.swift
-└── swift-tools/                 ← 辅助工具源码
-    ├── click.swift
-    └── presskey.swift
 ```

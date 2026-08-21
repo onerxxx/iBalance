@@ -2,7 +2,7 @@
 
 > 适用对象：iBalance 菜单栏面板（NSPopover，固定宽 260pt，深色毛玻璃）
 > 依据：Apple Human Interface Guidelines（macOS）+ 项目现有实现（`swift/Panel.swift` ~1560 行、`swift/main.swift` ~2226 行）
-> 更新日期：2026-08-16
+> 更新日期：2026-08-21（§1.3 增补双形态分段控件规范与容器塌缩教训）
 
 ---
 
@@ -60,13 +60,38 @@ Footer（更新时间 + 退出按钮）
 
 ### 1.3 分段控件 NSSegmentedControl
 
-**现状**：`MiniSegmentedControl`（`.mini` + 0.81 视觉缩放），用于刷新间隔三选一。选中段高亮色通过 `selectedSegmentBezelColor = #666666` 显式设置。
+**现状**：刷新间隔三选一有**双形态**——原生 `MiniSegmentedControl`（默认）与 Mono 字符风格 `MonoSegmentedControl`（Mono 开关开启时），同框 crossfade 显隐切换。
 
 - **适用**：2~4 个互斥选项、每个选项文案 ≤ 4 个字。刷新间隔是教科书级的正确用法。
 - **最佳实践**：
   - `trackingMode = .selectOne`（默认即正确）。
   - 段数超过 4 或文案变长时，降级为 `NSPopUpButton`（见 §5）。
   - 宽度用 hugging 约束贴合内容，不要拉伸——当前 `setContentHuggingPriority(.required, for: .horizontal)` 正确。
+
+#### 1.3.1 原生形态：MiniSegmentedControl + CompactSegmentedCell
+
+- `.mini` + `.rounded` + `darkAqua` appearance，`selectedSegmentBezelColor = #666666`（AppKit bezel 会提亮渐变，填暗一档补偿），监听 `systemColorsDidChangeNotification` 在主题色变化时重设。
+- `CompactSegmentedCell`（自定义 cell）收窄每段标题水平内边距：系统 `.mini` 每段约 7pt/侧，38pt 段装不下「3分钟」@9pt（25+14≈39pt 会省略号截断）。做法是 `drawSegment` 临时清空标题让 super 只画背景/选中 bezel，再水平余量均分居中自绘标题（且 `draw(in:)` 垂直不居中偏上 ~3pt，需手动 `midY - 高/2` 定位）。
+- 换 cell 时机在 `viewDidMoveToWindow`（此刻 segment 已配好，直接复制配置；target/action 在 NSControl 层不受影响）。
+- 每段宽度 `setWidth(38)`，并**显式加总宽约束**（3×38=114）钉死——setWidth 未必被 intrinsic 采纳，不加约束会吃掉行内余量把低压缩阻力的 label 压窄。
+
+#### 1.3.2 Mono 字符形态：MonoSegmentedControl（全自绘）
+
+**排版**：`[1│3│5]` —— 方括号包裹 + 段间 `│`（U+2502，DepartureMono 已覆盖），与 MonoCharSwitch 同一设计语言：DepartureMono 12pt semibold，kern=3pt；括号 `kBalanceForeground`、竖线 `tertiaryLabelColor`、选中数字 `kBalanceForeground` / 未选中 `secondaryLabelColor`。末字符不附 kern（避免测量含不可见尾部字距）。`draw` 内内容**右对齐**（右缘贴设置行尾），`intrinsicContentSize` 按富文本实测。
+
+**命中区**（视觉紧凑 + 点击宽松的关键）：控件本体撑满 overlay 容器全部宽度（远大于 ~69pt 的视觉内容），命中边界 = 视觉分隔符 `│` 的**中点向两侧外延**——点数字/方括号/竖线左半 → 竖线左侧段，竖线右半/右侧空白 → 右侧段，最左空白归第 0 段。命中计算必须用与 `renderedString()` 相同的排版参数（digitWidth/kern/separatorWidth/bracketWidth），保证与视觉严格对应。
+
+**双形态同框切换架构**：
+
+- 固定宽 overlay 容器（`intervalSegmentBox`，占满刷新按钮后的整行剩余空间，低拥抱优先级替代 stretchSpacer）：原生段 trailing 对齐，`monoSegmentBox` leading~trailing 填满。
+- `applySwitchVisuals()` 用 `crossfade`（0.35s ease-out cubic）切换显隐，切换前同步 `monoSegment.selectedSegment = intervalSegment.selectedSegment`，并配合 `playCharBlurTransition`（CSS blur 式模糊→清晰）。
+- action 回调读**可见控件**的状态：`intervalSegment.isHidden ? monoSegment.selectedSegment : intervalSegment.selectedSegment`。
+
+**⚠️ 布局血泪教训（容器高度塌缩 → 点击失效）**：
+
+- 子视图撑起无高度约束的容器，必须用 **leading/trailing + top/bottom 四边贴满 + 自身 heightAnchor**；
+- 用 `centerY + 固定高` 对齐且容器无高度约束 → 容器高度塌缩为 0：AppKit **不裁剪子视图**，视觉「看似正常」（内容溢出绘制），但 `hitTest` 判定点击在 bounds 外 → **点击完全失效**（极难排查：显示正常+点击死的组合）。
+- 行内不放 stretchSpacer 承担剩余空间：spacer 会把点击切成「整行点击」误触其他行为（如触发刷新）；让分段容器自身低拥抱吃掉剩余空间。
 
 ### 1.4 按钮 NSButton
 
@@ -315,7 +340,8 @@ hover 高亮：    HoverCard white@5% + 0.8pt white@14% border（0.22s easeInEas
 | 控件 | 基类 | 尺寸/特征 | 核心行为 |
 |---|---|---|---|
 | `MiniSwitch` | `NSSwitch` | `.mini` + 0.81x 缩放 | 中心锚点修复（`layout()` 里恢复 anchorPoint + 补偿 position） |
-| `MiniSegmentedControl` | `NSSegmentedControl` | `.mini` + 0.81x 缩放 | `selectedSegmentBezelColor = #666666`，右中心锚点 |
+| `MiniSegmentedControl` | `NSSegmentedControl` | `.mini`，38pt/段 ×3 = 114pt | `CompactSegmentedCell` 收窄标题内边距；`selectedSegmentBezelColor = #666666` |
+| `MonoSegmentedControl` | `NSControl`（全自绘） | 内容 ~69pt / 命中区 ~行宽 | `[1│3│5]` DepartureMono 12pt semibold 右对齐；命中边界=视觉竖线中点外延（§1.3.2） |
 | `HoverCard` | `NSView` | 自适应高度 | hover: white@5% bg + 0.8pt white@14% border（0.22s ease）；支持 onClick / onHighlightChange |
 | `HoverRowView` | `NSView` | 自适应高度 | hover: 文本从 systemGray 提亮到 labelColor；点击回调 |
 | `HoverIconButton` | `NSButton` | 22×22 固定 | recessed bezel；进入 mouse tracking 区域时显示 1pt white@20% 边框 |
@@ -364,6 +390,8 @@ hover 高亮：    HoverCard white@5% + 0.8pt white@14% border（0.22s easeInEas
 ## 9. 落地检查清单（新增/修改控件时过一遍）
 
 - [ ] 控件尺寸档位为 `.mini`，或复用 `MiniSwitch` / `MiniSegmentedControl` 子类
+- [ ] 子视图撑无高度约束的容器：四边贴满 + 自身 heightAnchor（禁 centerY；塌缩 0 高 = 视觉正常但点击失效，§1.3.2）
+- [ ] 自绘控件点击命中区与视觉排版用同一套度量参数；扩命中区靠撑大 bounds，不靠视觉重排
 - [ ] 颜色走 `Palette` 枚举或系统语义色；硬编码色有注释说明原因
 - [ ] 深色面板内控件设 `appearance = NSAppearance(named: .darkAqua)`
 - [ ] 分段控件显式设置 `selectedSegmentBezelColor`

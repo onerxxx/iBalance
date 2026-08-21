@@ -148,9 +148,11 @@ struct AppConfig: Codable {
     var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
     /// 面板背景渐变开关：true = 顶部暗 → 底部中灰纵向渐变；false = 恢复单色近黑遮罩
     var panelGradientEnabled: Bool = true
-    /// Mono 字体开关：true = 余额卡片与用量列表使用 DepartureMono（拉丁字符），
-    /// 缺字（中文等）通过 cascade 级联回退系统字体
+    /// Mono 字体开关：true = 余额卡片与用量列表使用 SF Mono（系统等宽字体），
+    /// 缺字（中文等）自动级联回退系统字体
     var monoFontEnabled: Bool = false
+    /// 弱化非当前账号开关：true = 非当前账号小卡片整卡降透明（悬停复亮），强化主账号层级
+    var subAccountDimEnabled: Bool = false
     /// 调试用量开关：开启后用量区显示本地生成的七日样例数据，不读取真实用量。
     var debugUsageEnabled: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
@@ -189,6 +191,7 @@ struct AppConfig: Codable {
         case hideWbNickname = "hide_wb_nickname"
         case panelGradientEnabled = "panel_gradient_enabled"
         case monoFontEnabled = "mono_font_enabled"
+        case subAccountDimEnabled = "sub_account_dim_enabled"
         case debugUsageEnabled = "debug_usage_enabled"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
@@ -231,6 +234,7 @@ struct AppConfig: Codable {
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? false
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
+        subAccountDimEnabled = try c.decodeIfPresent(Bool.self, forKey: .subAccountDimEnabled) ?? false
         debugUsageEnabled = try c.decodeIfPresent(Bool.self, forKey: .debugUsageEnabled) ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18

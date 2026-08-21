@@ -55,9 +55,6 @@
 │   ├── AppIcon.icns         # Finder/Launchpad 图标
 │   ├── .build_state         # 构建计数器（版本号用，勿删）
 │   └── icons/               # SVG（菜单栏 template 图标 + 面板品牌图标）/ PNG / PDF（菜单栏矢量图标）
-└── swift-tools/             # 独立小工具（模拟点击/按键，各自独立编译）
-    ├── click.swift / click
-    └── presskey.swift / presskey
 ```
 
 ## 构建与运行
@@ -172,14 +169,6 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 - 修改配置后调用 `ConfigStore.save(config)`（Codable 序列化，弃用字段不再落盘；经 `AppDataStore.secureWrite` 原子写入 Application Support 并设 0600 权限）。
 - 通知 API 用 completion-handler 重载（尾随 `{ _ in }`），避免 Swift 6 解析到 async 重载报错。
 - 隐藏调试开关：`--show-panel` 启动后自动弹出详情面板；`--spin-demo` 旋转常开（跳过启动刷新，避免刷新回调停掉演示动画）。
-
-## swift-tools（独立小工具）
-
-`click.swift` / `presskey.swift` 是模拟鼠标点击 / 键盘按键的命令行工具，与主程序无依赖关系，单独用 `swiftc` 编译：
-
-```bash
-swiftc -framework Cocoa swift-tools/click.swift -o swift-tools/click
-```
 
 ## 外部依赖
 
