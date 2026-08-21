@@ -129,15 +129,10 @@ final class DialogShell {
         if !keyEquivalent.isEmpty {
             btn.keyEquivalent = keyEquivalent
         }
-        if let tintColor {
+        if tintColor != nil {
             // macOS 26 的 NSAlert rounded 次按钮使用 tintProminence 控制主次层级；
             // contentTintColor 仅适用于无边框按钮，bezelColor 在该 appearance 下会被忽略。
-            if #available(macOS 26.0, *) {
-                btn.tintProminence = .primary
-            } else {
-                // 旧系统没有 tintProminence，尽量使用支持情况依 appearance 而定的 bezelColor。
-                btn.bezelColor = tintColor
-            }
+            btn.tintProminence = .primary
         }
         let idx = buttonCount
         buttonCount += 1
@@ -697,12 +692,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 最近一次面板关闭所在事件的时间戳（transient 面板外点击会先关闭面板，
     // 随后同一 click 的 mouseUp 才触发 status item action → 用于识别「本次点击已关闭面板」）
     private var lastCloseEventTime: TimeInterval = 0
-    // 面板打开期间钉住的 popover 窗口位置：菜单栏内容增减（数值刷新、右键切换
-    // 「在菜单栏显示」等）会让按钮宽度/坐标变化，AppKit 默认拖动 popover 跟随按钮；
-    // 这里记录弹出完成时的窗口 origin，任何被动移动都立即拉回 → 面板全程不动。
-    // 菜单栏本身宽度和坐标不受影响，正常自适应。
-    private var panelPinnedOrigin: NSPoint?
-    private var panelMoveObserver: NSObjectProtocol?
     private var settingsMenu: NSMenu!
     /// 面板最近一次释放拖拽后的平台顺序；面板未拖拽前回退到 UserDefaults。
     private var menuBarPlatformOrder: [String]?
@@ -727,6 +716,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var failedServices: Set<String> = []
 
     private var config = AppConfig()
+    /// 调试用量样例缓存：开启时只在切换开关时重新随机，避免面板普通刷新时图表跳动。
+    private var debugUsageRows: [UsageRowSnapshot] = []
     // 缓存原始数据，切换小数位时即时重绘（仅在主线程变更）
     private var cacheDs: (symbol: String, totalRaw: String, total: Double)?
     private var cacheWb: (remain: Double, total: Double)?
@@ -1092,9 +1083,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onSetInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
         panel.onManualRefresh = { [weak self] in self?.onRefresh() }
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
-        panel.onToggleHideWbNickname = { [weak self] in self?.onToggleHideWbNickname() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
+        panel.onToggleDebugUsage = { [weak self] in self?.onToggleDebugUsage() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
@@ -1146,6 +1137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 固定深色外观：面板背景是深色纯色，强制 darkAqua 保证 labelColor 等动态颜色
         // 在浅色系统外观下也渲染为深色模式取值（否则深色底配黑字不可读），且不受焦点影响
         popover.appearance = NSAppearance(named: .darkAqua)
+        // 注：曾用 hasFullSizeContent=true 让背景延伸盖住箭头实现「箭头同色」，
+        // 但该模式会放大 AppKit resize 的重新锚定噪声（折叠/展开时面板左右抖动），已回滚。
         let panelVC = BalancePanelViewController(panel: panel)
         panelVC.fadeHintParams = Self.fadeHintParams(from: config)
         popover.contentViewController = panelVC
@@ -1184,8 +1177,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// 计算 status item 下方到屏幕可见区域底部的高度，popover 超出后由内容滚动承载。
-    /// 面板最大高度硬上限：屏幕空间再大也不超过 750pt，超出部分由内部滚动承载
-    private let panelHeightCap: CGFloat = 750
+    /// 面板最大高度硬上限：屏幕空间再大也不超过 760pt，超出部分由内部滚动承载
+    private let panelHeightCap: CGFloat = 760
 
     private func maximumPopoverHeight(for button: NSView) -> CGFloat {
         guard let screen = button.window?.screen ?? NSScreen.main else { return 640 }
@@ -1226,42 +1219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 记录关闭时正在处理的事件时间戳：transient「面板外点击」关闭时，
         // currentEvent 即该 click（onStatusItemClicked 用它识别同一 click，避免抖动重弹）
         lastCloseEventTime = NSApp.currentEvent?.timestamp ?? 0
-        // 解除面板位置钉住（面板已关，此后菜单栏重排不再影响任何东西）
-        panelPinnedOrigin = nil
-        if let o = panelMoveObserver {
-            NotificationCenter.default.removeObserver(o)
-            panelMoveObserver = nil
-        }
         NSApp.hide(nil)
     }
 
-    /// 弹出动画完成后记录 popover 窗口位置并监听被动移动：
-    /// AppKit 在按钮宽度/坐标变化时会移动 popover 窗口跟随按钮，这里立即拉回原位。
-    func popoverDidShow(_ notification: Notification) {
-        guard let popover = popoverController,
-              let window = popover.contentViewController?.view.window else { return }
-        panelPinnedOrigin = window.frame.origin
-        if let o = panelMoveObserver {
-            NotificationCenter.default.removeObserver(o)
-        }
-        panelMoveObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didMoveNotification, object: window, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.pinPanelWindowIfNeeded() }
-        }
-    }
-
-    /// 把 popover 窗口拉回弹出时记录的水平位置（面板打开期间生效）。
-    /// 只钉 X：菜单栏按钮只在水平方向移动；Y 不动——面板内容增减导致高度变化时
-    /// 窗口自然向下扩展（顶部箭头位置稳定），不与该行为打架。
-    private func pinPanelWindowIfNeeded() {
-        guard let pinned = panelPinnedOrigin,
-              let window = popoverController?.contentViewController?.view.window,
-              abs(window.frame.minX - pinned.x) > 0.1 else { return }
-        var origin = window.frame.origin
-        origin.x = pinned.x
-        window.setFrameOrigin(origin)
-    }
+    /// 弹出动画完成后无需额外处理。
+    /// 历史：曾用「记录 origin + didMove 拉回」的 X 钉住机制防止标题刷新导致面板
+    /// 跟随按钮移动，但与折叠/展开的 popover resize 动画互相拉扯引发细微左右偏移，已整体移除。
+    func popoverDidShow(_ notification: Notification) {}
 
     /// 从当前缓存构建面板数据快照（离线横幅 / 四服务 / 设置状态 / 更新时间）
     private func makePanelSnapshot() -> PanelSnapshot {
@@ -1306,9 +1270,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: UDKey.traeCheckinDate(ac.uid)) == today
-            // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）
+            // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）；
+            // 风控（9074/操作太频繁）也显示角标，但颜色为橙黄（checkinRisk）
+            let traeRiskToday = UserDefaults.standard.string(forKey: UDKey.traeCheckinRiskDate(ac.uid)) == today
             snap.checkinFailed = config.traeAutoCheckin
-                && UserDefaults.standard.string(forKey: UDKey.traeCheckinFailDate(ac.uid)) == today
+                && (UserDefaults.standard.string(forKey: UDKey.traeCheckinFailDate(ac.uid)) == today || traeRiskToday)
+            snap.checkinRisk = config.traeAutoCheckin && traeRiskToday
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
             snap.pulsing = traePulsing[ac.uid] ?? false
@@ -1420,9 +1387,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                       percent: Bool, prefix: String = "") -> UsageRowSnapshot? {
             guard !uid.isEmpty, let cur = current,
                   let u = UsageStore.usage(platform: platform, uid: uid, current: cur, increasing: increasing) else { return nil }
+            let daily = UsageStore.weeklyUsage(platform: platform, uid: uid)
             return UsageRowSnapshot(platform: platform, icon: icon, name: name,
                                     todayText: prefix + fmtUsage(u.today, percent: percent, decimals: decimals),
-                                    weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals))
+                                    weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals),
+                                    dailyUsage: daily,
+                                    dailyUsageTexts: daily.map { prefix + fmtUsage($0, percent: percent, decimals: decimals) })
         }
         if let ds = cacheDs,
            let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds", uid: "main",
@@ -1450,32 +1420,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                               decimals: 1, percent: true) {
             s.usageRows.append(row)
         }
+        // 调试模式始终提供完整的七日样例，即使本机尚未配置任何平台账号，方便直接观察面积图。
+        s.debugUsageEnabled = config.debugUsageEnabled
+        if config.debugUsageEnabled {
+            if debugUsageRows.isEmpty { debugUsageRows = makeDebugUsageRows() }
+            s.usageRows = debugUsageRows
+        }
         // ── 设置/操作状态 ──
         s.traeAutoCheckin = config.traeAutoCheckin
         s.wbAutoCheckin = config.workbuddyAutoCheckin
-        // 自动签到副标题：今日签到统计「M-d x成功 x失败」（手动一键签到写同一套标记，自然计入；
-        // 失败按 failed_date==today 口径，昨日失败残留不计）
+        // 自动签到副标题：今日签到统计「M-d x成功 x失败 x风控」（手动一键签到写同一套标记，自然计入；
+        // 失败/风控按各自 date==today 口径，昨日残留不计；风控 = TRAE claim 返回 9074/操作太频繁，
+        // 单独计数不再计入失败，无风控时保持原「x成功 x失败」格式）
         var okCount = 0
         var failCount = 0
+        var riskCount = 0
         for ac in traeAccountsList {
             if UserDefaults.standard.string(forKey: UDKey.traeCheckinDate(ac.uid)) == today { okCount += 1 }
             if UserDefaults.standard.string(forKey: UDKey.traeCheckinFailDate(ac.uid)) == today { failCount += 1 }
+            if UserDefaults.standard.string(forKey: UDKey.traeCheckinRiskDate(ac.uid)) == today { riskCount += 1 }
         }
         for ac in accounts {
             if UserDefaults.standard.string(forKey: UDKey.wbCheckinDate(ac.uid)) == today { okCount += 1 }
             if UserDefaults.standard.string(forKey: UDKey.wbCheckinFailDate(ac.uid)) == today { failCount += 1 }
         }
-        if okCount + failCount > 0 {
-            s.lastCheckinTime = "\(Self.dfMonthDay.string(from: Date())) \(okCount)成功 \(failCount)失败"
+        if okCount + failCount + riskCount > 0 {
+            var text = "\(Self.dfMonthDay.string(from: Date())) \(okCount)成功"
+            if failCount > 0 { text += " \(failCount)失败" }
+            if riskCount > 0 { text += " \(riskCount)风控" }
+            s.lastCheckinTime = text
         }
         s.wbOauthInProgress = wbOauthInProgress
         s.traeCollectInProgress = traeCollectInProgress
         s.checkinInProgress = manualCheckinInProgress
         s.refreshIntervalSeconds = Int(config.refreshInterval)
-        s.hideWbNickname = config.hideWbNickname
         s.panelGradientEnabled = config.panelGradientEnabled
         s.monoFontEnabled = config.monoFontEnabled
         return s
+    }
+
+    /// 生成调试用量：七天随机样例只保存在内存，不写入 UsageStore / usage.json。
+    /// 非百分比平台的「本周」为七日合计；百分比平台取本周峰值，避免合计超过 100%。
+    private func makeDebugUsageRows() -> [UsageRowSnapshot] {
+        let definitions: [(platform: String, icon: String, name: String,
+                           percent: Bool, prefix: String, decimals: Int,
+                           lower: Double, upper: Double)] = [
+            ("ds", "deepseek", "DeepSeek", false, "¥", 2, 0.08, 3.80),
+            ("wb", "workbuddy", "WorkBuddy", false, "", config.workbuddyDecimals, 30, 480),
+            ("trae", "trae-color", "TRAE", false, "", config.traeDecimals, 8, 120),
+            ("zcode", "zhipu", "ZCode", true, "", 1, 8, 92),
+            ("codex", "codex", "Codex", true, "", 1, 12, 96),
+        ]
+
+        return definitions.map { item in
+            var daily = (0..<7).map { _ in
+                Double.random(in: item.lower...item.upper)
+            }
+            // 给图表制造一个清晰的局部峰值，让面积图的平滑转角更容易观察。
+            if let peakIndex = daily.indices.randomElement() {
+                daily[peakIndex] = min(item.upper, daily[peakIndex] * (item.percent ? 1.12 : 1.45))
+            }
+            let dailyTexts = daily.map {
+                item.percent
+                    ? String(format: "%.1f%%", $0)
+                    : item.prefix + fmtAmountCommas($0, decimals: item.decimals)
+            }
+            let today = daily.last ?? 0
+            let week = item.percent ? (daily.max() ?? 0) : daily.reduce(0, +)
+            let todayText = item.percent
+                ? String(format: "%.1f%%", today)
+                : item.prefix + fmtAmountCommas(today, decimals: item.decimals)
+            let weekText = item.percent
+                ? String(format: "%.1f%%", week)
+                : item.prefix + fmtAmountCommas(week, decimals: item.decimals)
+            return UsageRowSnapshot(platform: item.platform, icon: item.icon, name: item.name,
+                                    todayText: todayText, weekText: weekText,
+                                    dailyUsage: daily, dailyUsageTexts: dailyTexts)
+        }
     }
 
     /// 判断当前 seq 是否"拥有"写 UI 权限：未被取消 + 仍是最新 seq。
@@ -1556,12 +1577,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         refreshIntervalMenuItem.title = "刷新时间（\(minutes)分钟）"
     }
 
-    @objc private func onToggleHideWbNickname() {
-        config.hideWbNickname = !config.hideWbNickname
-        ConfigStore.save(config)
-        syncPanel()
-    }
-
     /// 面板渐变背景：切换后立即保存并刷新面板（VC 经快照同步后重绘遮罩）
     @objc private func onTogglePanelGradient() {
         config.panelGradientEnabled = !config.panelGradientEnabled
@@ -1573,6 +1588,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 保存后经快照同步，面板对已注册 label 就地换字体（不重建卡片）
     @objc private func onToggleMonoFont() {
         config.monoFontEnabled = !config.monoFontEnabled
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
+    /// 调试用量：切换开启时生成一组新的随机七日样例，关闭后恢复真实用量。
+    @objc private func onToggleDebugUsage() {
+        config.debugUsageEnabled.toggle()
+        debugUsageRows = config.debugUsageEnabled ? makeDebugUsageRows() : []
         ConfigStore.save(config)
         syncPanel()
     }
@@ -2556,7 +2579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let content = UNMutableNotificationContent()
                 content.title = "WorkBuddy 自动签到（\(ac.nickname)）"
                 content.body = r.creditDesc.isEmpty ? "签到成功 ✓" : "签到成功 ✓ 积分：\(r.creditDesc)"
-                UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_auto_checkin_\(ac.uid)", content: content, trigger: nil)) { _ in }
+                Task { try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_auto_checkin_\(ac.uid)", content: content, trigger: nil)) }
                 // 签到成功清除失败标记（含日期口径，用于卡片角标/统计）
                 UserDefaults.standard.set(false, forKey: UDKey.wbCheckinFailed(ac.uid))
                 UserDefaults.standard.removeObject(forKey: UDKey.wbCheckinFailDate(ac.uid))
@@ -2647,7 +2670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let guide = UNMutableNotificationContent()
         guide.title = "请在浏览器中登录 WorkBuddy 账号"
         guide.body = "登录成功后自动采集，无需其他操作（10 分钟内有效）"
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_oauth_guide", content: guide, trigger: nil)) { _ in }
+        try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_oauth_guide", content: guide, trigger: nil))
 
         let result = await WorkBuddyService.collectAccount(isCancelled: { [weak self] in self?.wbOauthCancelled ?? true })
 
@@ -2673,7 +2696,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let content = UNMutableNotificationContent()
         content.title = success ? "WorkBuddy 账号采集成功" : "WorkBuddy 账号采集失败"
         content.body = msg
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_oauth_result", content: content, trigger: nil)) { _ in }
+        try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_oauth_result", content: content, trigger: nil))
 
         if success, config.workbuddyAutoCheckin {
             Task { await wbAutoCheckinIfNeeded() }
@@ -2791,6 +2814,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             for ac in traeCheckinAccounts() {
                 let dateKey = UserDefaults.standard.string(forKey: UDKey.traeCheckinDate(ac.uid)) ?? ""
                 let failed = UserDefaults.standard.string(forKey: UDKey.traeCheckinFailDate(ac.uid)) == today
+                let risk = UserDefaults.standard.string(forKey: UDKey.traeCheckinRiskDate(ac.uid)) == today
                 let streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
                 let reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
                 if dateKey == today {
@@ -2800,8 +2824,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     okCount += 1
                 } else if !config.traeAutoCheckin {
                     rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：已跳过（签到已关闭）", state: .skipped))
-                } else if failed {
-                    rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：签到失败", state: .fail))
+                } else if failed || risk {
+                    rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：\(risk ? "签到失败（风控）" : "签到失败")", state: .fail))
                     failCount += 1
                 } else {
                     rows.append(CheckinResultRow(text: "TRAE · \(ac.username)：未签到（token 失效或退避中）", state: .skipped))
@@ -2990,7 +3014,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let dateKey = UDKey.traeCheckinDate(ac.uid)
             let streakKey = UDKey.traeCheckinStreak(ac.uid)
             let rewardKey = UDKey.traeCheckinReward(ac.uid)
-            let timeKey = UDKey.traeLastCheckinTime(ac.uid)
             let prevStreak = UserDefaults.standard.integer(forKey: streakKey)
             let prevReward = UserDefaults.standard.integer(forKey: rewardKey)
             // 仅当今天已签到且 streak/reward 均有值时才跳过
@@ -3070,11 +3093,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 continue
             }
 
+            // 风控日手动重试额度（force 专用）：手动一键签到时对风控账号放行 status/claim 重试，
+            // 否则风控退避到明天、当天角标状态永远无法更新；每账号每天最多 maxManualRiskRetriesPerDay 次，
+            // 同一轮签到内只消耗一次额度（status/claim 共享），防止反复触发服务端风控
+            let riskToday = UserDefaults.standard.string(forKey: UDKey.traeCheckinRiskDate(ac.uid)) == today
+            var manualRiskRetryUsed = Self.manualRetryCount(key: UDKey.traeManualRetryCount(ac.uid), today: today)
+            var manualRiskRetryGranted = false
+            func grantManualRiskRetry() -> Bool {
+                if manualRiskRetryGranted { return true }
+                guard manualRiskRetryUsed < Self.maxManualRiskRetriesPerDay else { return false }
+                manualRiskRetryUsed += 1
+                manualRiskRetryGranted = true
+                UserDefaults.standard.set("\(today)|\(manualRiskRetryUsed)", forKey: UDKey.traeManualRetryCount(ac.uid))
+                return true
+            }
             // status 退避：status 查询失败时短退避，避免反复打触发风控
             let statusRetryKey = UDKey.traeStatusRetry(ac.uid)
             if let rt = UserDefaults.standard.object(forKey: statusRetryKey) as? Date, Date() < rt {
-                log("[\(ac.uid)] status 退避期内，跳过")
-                continue
+                if force && riskToday && grantManualRiskRetry() {
+                    log("[\(ac.uid)] status 退避期内，手动重试 \(manualRiskRetryUsed)/\(Self.maxManualRiskRetriesPerDay)")
+                } else {
+                    log("[\(ac.uid)] status 退避期内，跳过")
+                    continue
+                }
             }
             let stOpt = await TraeService.fetchCheckinStatus(token: tk, storagePath: config.traeStoragePath)
             guard let st = stOpt else {
@@ -3114,16 +3155,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     UserDefaults.standard.removeObject(forKey: retryKey)
                     UserDefaults.standard.set(false, forKey: failedKey)
                     UserDefaults.standard.removeObject(forKey: UDKey.traeCheckinFailDate(ac.uid))
+                    UserDefaults.standard.removeObject(forKey: UDKey.traeCheckinRiskDate(ac.uid))
                     log("[\(ac.uid)] 服务端已签到，补全 streak=\(newStreak) reward=\(newReward)")
                 }
                 syncPanel()
                 continue
             }
-            // 退避检查：在退避期内不调 claim，避免频繁请求触发服务端风控
+            // 退避检查：在退避期内不调 claim，避免频繁请求触发服务端风控。
+            // 旧版本风控只写了 failDate（无 riskDate）：检测到「剩余退避 > 30 分钟」的
+            // 长退避（普通失败仅退避 5 分钟，只有风控会封顶到明天）即视为存量风控，
+            // 补写风控标记迁移口径（角标橙黄、统计计「风控」）——不依赖手动签到，自动轮询即可完成迁移。
+            // 风控退避例外：手动签到且当日额度未用完时放行重试（否则当天角标状态永远无法更新）
             if let retryTime = UserDefaults.standard.object(forKey: retryKey) as? Date,
                Date() < retryTime {
-                log("[\(ac.uid)] 退避期内，跳过（至 \(retryTime)）")
-                continue
+                let legacyRiskBackoff = !riskToday && retryTime.timeIntervalSinceNow > 1800
+                if legacyRiskBackoff {
+                    UserDefaults.standard.set(today, forKey: UDKey.traeCheckinRiskDate(ac.uid))
+                    UserDefaults.standard.removeObject(forKey: UDKey.traeCheckinFailDate(ac.uid))
+                    log("[\(ac.uid)] 存量风控退避（无风控标记），补写风控标记")
+                }
+                if force && (riskToday || legacyRiskBackoff) && grantManualRiskRetry() {
+                    log("[\(ac.uid)] 风控退避期内，手动重试 \(manualRiskRetryUsed)/\(Self.maxManualRiskRetriesPerDay)")
+                } else {
+                    log("[\(ac.uid)] 退避期内，跳过（至 \(retryTime)）")
+                    continue
+                }
             }
             // 已签（dateKey==today）但状态补全未确认成功（如 status 查询失败）→
             // 不发起 claim，等待下轮补写历史，避免对已签账号误触发签到接口
@@ -3159,6 +3215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 UserDefaults.standard.set(false, forKey: failedKey)
                 UserDefaults.standard.removeObject(forKey: retryKey)
                 UserDefaults.standard.removeObject(forKey: UDKey.traeCheckinFailDate(ac.uid))
+                UserDefaults.standard.removeObject(forKey: UDKey.traeCheckinRiskDate(ac.uid))
                 log("[\(ac.uid)] 签到成功 streak=\(newStreak) reward=\(reward)")
                 // 刷新该账号余额：主账号从 storage.json 查询；其他账号用 token 查询
                 if ac.uid == mainUid {
@@ -3174,16 +3231,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let content = UNMutableNotificationContent()
                 content.title = "TRAE 自动签到"
                 content.body = "账号 \(ac.username) 签到成功 ✓"
-                UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "trae_auto_checkin_\(ac.uid)", content: content, trigger: nil)) { _ in }
+                Task { try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "trae_auto_checkin_\(ac.uid)", content: content, trigger: nil)) }
             } else {
-                // 签到失败：记录失败标记 + 当日日期（用于卡片角标与「x成功 x失败」统计）
+                // 风控判定：9074（操作太过频繁）是服务端对非客户端流量的传输层风控，
+                // 提示文案含「频繁/frequent/rate limit/too many」同理 → 记风控标记
+                // （角标橙黄色、统计计「x风控」不计「x失败」），重试无意义，当天不再尝试；
+                // 其他失败记失败标记，退避 5 分钟
+                let msg = (respJson?["msg"] as? String) ?? (respJson?["message"] as? String) ?? ""
+                let lower = msg.lowercased()
+                let isRisk = bizCode == 9074 || msg.contains("频繁")
+                    || lower.contains("frequent") || lower.contains("rate limit") || lower.contains("too many")
                 UserDefaults.standard.set(true, forKey: failedKey)
-                UserDefaults.standard.set(today, forKey: UDKey.traeCheckinFailDate(ac.uid))
-                // 9074（操作太过频繁）是服务端对非客户端流量的传输层风控，重试无意义，当天不再尝试；
-                // 其他失败退避 5 分钟
-                let backoff: TimeInterval = (bizCode == 9074) ? Self.secondsUntilTomorrow() : 300
+                if isRisk {
+                    UserDefaults.standard.set(today, forKey: UDKey.traeCheckinRiskDate(ac.uid))
+                    UserDefaults.standard.removeObject(forKey: UDKey.traeCheckinFailDate(ac.uid))
+                } else {
+                    UserDefaults.standard.set(today, forKey: UDKey.traeCheckinFailDate(ac.uid))
+                    UserDefaults.standard.removeObject(forKey: UDKey.traeCheckinRiskDate(ac.uid))
+                }
+                let backoff: TimeInterval = isRisk ? Self.secondsUntilTomorrow() : 300
                 UserDefaults.standard.set(Date().addingTimeInterval(backoff), forKey: retryKey)
-                log("[\(ac.uid)] 签到失败，退避 \(backoff)s")
+                log("[\(ac.uid)] 签到失败（\(isRisk ? "风控" : "待重试")），退避 \(backoff)s")
             }
             // 账号间间隔 3 秒，避免同设备短时间内连续请求签到触发服务端风控
             if ac.uid != accounts.last?.uid {
@@ -3550,6 +3618,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return ts
     }
 
+    /// 风控日手动重试：每账号每天最多放行次数（手动签到对风控退避账号的请求额度）
+    private static let maxManualRiskRetriesPerDay = 3
+
+    /// 读取风控日手动重试计数（"日期|次数"格式；日期不符自动归零）
+    private static func manualRetryCount(key: String, today: String) -> Int {
+        guard let saved = UserDefaults.standard.string(forKey: key) else { return 0 }
+        let parts = saved.split(separator: "|", maxSplits: 1)
+        guard parts.count == 2, parts[0] == today, let n = Int(parts[1]) else { return 0 }
+        return n
+    }
+
     private static func nowTimeString() -> String {
         dfTime.string(from: Date())
     }
@@ -3622,7 +3701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "ibalance_\(title)", content: content, trigger: nil)) { _ in }
+        Task { try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "ibalance_\(title)", content: content, trigger: nil)) }
     }
 }
 

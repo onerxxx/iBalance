@@ -11,7 +11,8 @@ PLIST="$SCRIPT_DIR/Info.plist"
 CONFIG="$SCRIPT_DIR/config.json"
 
 # 产物输出到上级目录（与 .sh/.py 同级，方便分发）
-APP_DIR="$SCRIPT_DIR/../iBalance.app"
+# 用 cd+pwd 解析掉路径里的 "swift/../"，保证与 ps 报告的进程路径一致，避免启动验证误报
+APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/iBalance.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
@@ -32,7 +33,7 @@ if [[ "${1:-}" == "--release" ]]; then
 fi
 
 echo "==> 编译源文件（${#SOURCES[@]} 个 .swift，模式：${BUILD_MODE}）"
-# -target arm64-apple-macos12 保证兼容 macOS 12+（Apple Silicon）
+# -target arm64-apple-macos26 仅支持 macOS 26+（Liquid Glass 适配基线）
 # -framework Network：NWPathMonitor 离线感知需要
 swiftc \
     -parse-as-library \
@@ -41,7 +42,7 @@ swiftc \
     -framework Security \
     -framework Network \
     -lsqlite3 \
-    -target arm64-apple-macos12 \
+    -target arm64-apple-macos26 \
     "$OPT_FLAG" \
     "${SOURCES[@]}" \
     -o "$SCRIPT_DIR/iBalance"
@@ -61,7 +62,7 @@ wait_iBalance_exit() {
             killed=1
         fi
         if (( elapsed >= 10 )); then                 # 共 10s 仍未退出（极罕见：调试器 / 系统 io hang）
-            echo "!! 旧 iBalance 进程仍未退出（pid=$old_pids），告警后仍尝试 open 新 bundle —— macOS 可能激活老实例"
+            echo "!! 旧 iBalance 进程仍未退出（pid=${old_pids}），告警后仍尝试 open 新 bundle —— macOS 可能激活老实例"
             return 1
         fi
         sleep 0.1
@@ -177,7 +178,7 @@ new_pid=$(pgrep -x iBalance 2>/dev/null | head -1)
 if [ -n "$new_pid" ]; then
     new_cmd=$(ps -o command= -p "$new_pid" 2>/dev/null | tr -s ' ')
     if [[ "$new_cmd" == "$APP_DIR"* ]]; then
-        echo "==> iBalance 已重启（pid=$new_pid）"
+        echo "==> iBalance 已重启（pid=${new_pid}）"
     else
         echo "!! 警告：当前运行中的 iBalance 不是本次构建的 bundle"
         echo "    运行路径:  $new_cmd"

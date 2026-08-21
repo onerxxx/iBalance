@@ -145,12 +145,14 @@ struct AppConfig: Codable {
     var codexRefreshEnabled: Bool = true
     var workbuddyEnabled: Bool = true
     var traeAutoCheckin: Bool = true
-    var hideWbNickname: Bool = true
+    var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
     /// 面板背景渐变开关：true = 顶部暗 → 底部中灰纵向渐变；false = 恢复单色近黑遮罩
     var panelGradientEnabled: Bool = true
     /// Mono 字体开关：true = 余额卡片与用量列表使用 DepartureMono（拉丁字符），
     /// 缺字（中文等）通过 cascade 级联回退系统字体
     var monoFontEnabled: Bool = false
+    /// 调试用量开关：开启后用量区显示本地生成的七日样例数据，不读取真实用量。
+    var debugUsageEnabled: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
     var fadeHintBandHeight: Double = 54
     var fadeHintHighlightAlpha: Double = -0.6
@@ -187,6 +189,7 @@ struct AppConfig: Codable {
         case hideWbNickname = "hide_wb_nickname"
         case panelGradientEnabled = "panel_gradient_enabled"
         case monoFontEnabled = "mono_font_enabled"
+        case debugUsageEnabled = "debug_usage_enabled"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
         case fadeHintMaskMidAlpha = "fade_hint_mask_mid_alpha"
@@ -225,9 +228,10 @@ struct AppConfig: Codable {
         codexRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .codexRefreshEnabled) ?? true
         workbuddyEnabled = try c.decodeIfPresent(Bool.self, forKey: .workbuddyEnabled) ?? true
         traeAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .traeAutoCheckin) ?? true
-        hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? true
+        hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? false
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
+        debugUsageEnabled = try c.decodeIfPresent(Bool.self, forKey: .debugUsageEnabled) ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
         fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55
@@ -303,6 +307,7 @@ enum AppDataStore {
         switch filename {
         case "config.json": destination = configURL
         case "cache.json": destination = cacheURL
+        case "usage.json": destination = usageURL
         default: return false
         }
         let source = legacyURL(for: filename)
@@ -404,6 +409,10 @@ enum UDKey {
     static func traeCheckinReady(_ uid: String) -> String { "trae_checkin_ready_\(uid)" }
     /// claim 失败标记（Bool）
     static func traeCheckinFailed(_ uid: String) -> String { "trae_checkin_failed_\(uid)" }
+    /// 当日风控标记（claim 返回 9074/操作太频繁 → 角标橙黄、统计计「风控」不计「失败」）
+    static func traeCheckinRiskDate(_ uid: String) -> String { "trae_checkin_risk_date_\(uid)" }
+    /// 风控日手动重试计数（"日期|次数"；手动签到对风控账号放行 claim 的每日额度）
+    static func traeManualRetryCount(_ uid: String) -> String { "trae_manual_retry_count_\(uid)" }
     /// claim 失败后的下次重试时间（Date）
     static func traeNextRetryTime(_ uid: String) -> String { "trae_next_retry_time_\(uid)" }
     /// status 查询失败后的退避截止时间（Date）
@@ -470,6 +479,30 @@ struct UsageBaselines: Codable {
         var dayBase: Double
         var weekKey: String
         var weekBase: Double
+        /// 当天累计用量快照：yyyy-MM-dd → 用量；保留最近 60 天用于趋势统计。
+        var dailyUsage: [String: Double]
+
+        private enum CodingKeys: String, CodingKey {
+            case dayKey, dayBase, weekKey, weekBase, dailyUsage
+        }
+
+        init(dayKey: String, dayBase: Double, weekKey: String, weekBase: Double) {
+            self.dayKey = dayKey
+            self.dayBase = dayBase
+            self.weekKey = weekKey
+            self.weekBase = weekBase
+            self.dailyUsage = [:]
+        }
+
+        /// 兼容旧版 usage.json：历史字段不存在时从空记录开始累计。
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            dayKey = try c.decode(String.self, forKey: .dayKey)
+            dayBase = try c.decode(Double.self, forKey: .dayBase)
+            weekKey = try c.decode(String.self, forKey: .weekKey)
+            weekBase = try c.decode(Double.self, forKey: .weekBase)
+            dailyUsage = try c.decodeIfPresent([String: Double].self, forKey: .dailyUsage) ?? [:]
+        }
     }
     var entries: [String: Entry] = [:]
 }
@@ -493,6 +526,8 @@ enum UsageStore {
     }
 
     private static func load() -> UsageBaselines {
+        AppDataStore.prepareDirectory()
+        AppDataStore.migrateIfNeeded(filename: "usage.json")
         guard let data = try? Data(contentsOf: AppDataStore.usageURL),
               let s = try? JSONDecoder().decode(UsageBaselines.self, from: data) else { return UsageBaselines() }
         return s
@@ -513,23 +548,66 @@ enum UsageStore {
         let wk = weekKey(for: now)
         var e = memory.entries[key] ?? UsageBaselines.Entry(dayKey: dk, dayBase: value, weekKey: wk, weekBase: value)
         var changed = memory.entries[key] == nil
-        if e.dayKey != dk { e.dayKey = dk; e.dayBase = value; changed = true }
-        else if increasing ? value < e.dayBase : value > e.dayBase { e.dayBase = value; changed = true }
+        if e.dayKey != dk {
+            e.dayKey = dk
+            e.dayBase = value
+            changed = true
+        } else {
+            let todayUsage = increasing ? max(0, value - e.dayBase) : max(0, e.dayBase - value)
+            if todayUsage > (e.dailyUsage[dk] ?? 0) {
+                e.dailyUsage[dk] = todayUsage
+                changed = true
+            }
+            // 余额充值/额度重置时校准基线，但保留当天已经记录过的最大用量。
+            if increasing ? value < e.dayBase : value > e.dayBase {
+                e.dayBase = value
+                changed = true
+            }
+        }
         if e.weekKey != wk { e.weekKey = wk; e.weekBase = value; changed = true }
         else if increasing ? value < e.weekBase : value > e.weekBase { e.weekBase = value; changed = true }
+        // 控制 usage.json 体积；保留最近 60 天的各平台/账号用量历史。
+        let cutoff = Calendar.current.date(byAdding: .day, value: -60, to: now) ?? now
+        let cutoffKey = dayFormatter.string(from: cutoff)
+        let trimmed = e.dailyUsage.filter { $0.key >= cutoffKey }
+        if trimmed.count != e.dailyUsage.count {
+            e.dailyUsage = trimmed
+            changed = true
+        }
         memory.entries[key] = e
         if changed { save() }
     }
 
-    /// 当前日/周用量；当日尚无观测基线（今天未刷新过）返回 nil。
+    /// 当前日/周用量；从未观测过的账号返回 nil（行不显示）。
+    /// 跨天/跨周后尚未刷新时返回宽限值（今天 0 / 本周 0）而非 nil——
+    /// 否则 0 点后到下次成功刷新前，所有用量行判定为无数据，整个板块会消失。
     static func usage(platform: String, uid: String, current: Double, increasing: Bool) -> (today: Double, week: Double)? {
         guard let e = memory.entries["\(platform):\(uid)"] else { return nil }
         let now = Date()
-        guard e.dayKey == dayFormatter.string(from: now) else { return nil }
-        let today = increasing ? max(0, current - e.dayBase) : max(0, e.dayBase - current)
+        let today = e.dayKey == dayFormatter.string(from: now)
+            ? (increasing ? max(0, current - e.dayBase) : max(0, e.dayBase - current))
+            : 0
         let week = e.weekKey == weekKey(for: now)
             ? (increasing ? max(0, current - e.weekBase) : max(0, e.weekBase - current))
             : 0
         return (today, week)
+    }
+
+    /// 返回本周一至周日的每日用量；尚未观测的日期用 0 填充，兼容旧版无历史记录的数据。
+    static func weeklyUsage(platform: String, uid: String) -> [Double] {
+        guard let e = memory.entries["\(platform):\(uid)"] else {
+            return Array(repeating: 0, count: 7)
+        }
+        let now = Date()
+        guard e.weekKey == weekKey(for: now) else {
+            return Array(repeating: 0, count: 7)
+        }
+        var cal = Calendar.current
+        cal.firstWeekday = 2
+        let start = cal.dateInterval(of: .weekOfYear, for: now)?.start ?? now
+        return (0..<7).map { offset in
+            guard let date = cal.date(byAdding: .day, value: offset, to: start) else { return 0 }
+            return e.dailyUsage[dayFormatter.string(from: date)] ?? 0
+        }
     }
 }
