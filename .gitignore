@@ -26,8 +26,8 @@ __pycache__/
 *.swp
 *~
 
-# Cockpit Tools 源码参照（第三方本地副本，不入库）
-cockpit-tools-main/
+# Cockpit Tools 源码参照（第三方本地副本，含各版本目录，不入库）
+cockpit-tools*/
 
 # 分发给用户的「已损坏」修复说明页，不入库
 iBalance-已损坏说明.html

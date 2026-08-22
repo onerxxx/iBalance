@@ -148,11 +148,9 @@ struct AppConfig: Codable {
     var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
     /// 面板背景渐变开关：true = 顶部暗 → 底部中灰纵向渐变；false = 恢复单色近黑遮罩
     var panelGradientEnabled: Bool = true
-    /// Mono 字体开关：true = 余额卡片与用量列表使用 SF Mono（系统等宽字体），
-    /// 缺字（中文等）自动级联回退系统字体
+    /// Mono 字体开关：true = 余额卡片与用量列表使用 DepartureMono（拉丁字符），
+    /// 缺字（中文等）通过 cascade 级联回退系统字体
     var monoFontEnabled: Bool = false
-    /// 弱化非当前账号开关：true = 非当前账号小卡片整卡降透明（悬停复亮），强化主账号层级
-    var subAccountDimEnabled: Bool = false
     /// 调试用量开关：开启后用量区显示本地生成的七日样例数据，不读取真实用量。
     var debugUsageEnabled: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
@@ -174,6 +172,10 @@ struct AppConfig: Codable {
     /// value=true 显示、false 隐藏；未记录的平台默认显示（true）。
     /// 空账号组（如 ZCode 未导入）即使设为 true 也维持隐藏，不产生空白占位。
     var panelCardVisible: [String: Bool] = [:]
+    /// 置顶浮窗尺寸（用户 resize 把手结果，跨 pin 会话/重启保留；
+    /// 0 = 未记录，pin 时按面板当前尺寸）
+    var floatingPanelWidth: Double = 0
+    var floatingPanelHeight: Double = 0
 
     enum CodingKeys: String, CodingKey {
         case deepseekApiKey = "deepseek_api_key"
@@ -191,7 +193,6 @@ struct AppConfig: Codable {
         case hideWbNickname = "hide_wb_nickname"
         case panelGradientEnabled = "panel_gradient_enabled"
         case monoFontEnabled = "mono_font_enabled"
-        case subAccountDimEnabled = "sub_account_dim_enabled"
         case debugUsageEnabled = "debug_usage_enabled"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
@@ -206,6 +207,8 @@ struct AppConfig: Codable {
         case codexAccounts = "codex_accounts"
         case menuBarVisible = "menubar_visible"
         case panelCardVisible = "panel_card_visible"
+        case floatingPanelWidth = "floating_panel_width"
+        case floatingPanelHeight = "floating_panel_height"
     }
 
     // 仅解码用的 legacy 字段（旧版统一 "decimals"，新版按服务拆分；读取兼容两者）
@@ -234,7 +237,6 @@ struct AppConfig: Codable {
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? false
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
-        subAccountDimEnabled = try c.decodeIfPresent(Bool.self, forKey: .subAccountDimEnabled) ?? false
         debugUsageEnabled = try c.decodeIfPresent(Bool.self, forKey: .debugUsageEnabled) ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
@@ -259,6 +261,8 @@ struct AppConfig: Codable {
         menuBarVisible = try c.decodeIfPresent([String: Bool].self, forKey: .menuBarVisible) ?? [:]
         // 面板余额卡片可见性（缺省为空字典，未记录的平台默认显示）
         panelCardVisible = try c.decodeIfPresent([String: Bool].self, forKey: .panelCardVisible) ?? [:]
+        floatingPanelWidth = try c.decodeIfPresent(Double.self, forKey: .floatingPanelWidth) ?? 0
+        floatingPanelHeight = try c.decodeIfPresent(Double.self, forKey: .floatingPanelHeight) ?? 0
     }
 }
 
@@ -613,5 +617,31 @@ enum UsageStore {
             guard let date = cal.date(byAdding: .day, value: offset, to: start) else { return 0 }
             return e.dailyUsage[dayFormatter.string(from: date)] ?? 0
         }
+    }
+
+    /// 平台级汇总：全部账号的今日/本周用量对应相加（差值按账号独立计算后求和，
+    /// 余额型/已用型/百分比口径不受影响）。任一账号有观测记录即返回，全部无记录返回 nil。
+    static func usage(platform: String, accounts: [(uid: String, current: Double)],
+                      increasing: Bool) -> (today: Double, week: Double)? {
+        var today: Double = 0
+        var week: Double = 0
+        var any = false
+        for a in accounts where !a.uid.isEmpty {
+            guard let u = usage(platform: platform, uid: a.uid, current: a.current, increasing: increasing) else { continue }
+            any = true
+            today += u.today
+            week += u.week
+        }
+        return any ? (today, week) : nil
+    }
+
+    /// 平台级汇总：全部账号本周每日用量对应相加，无记录账号贡献 0
+    static func weeklyUsage(platform: String, uids: [String]) -> [Double] {
+        var sum = Array(repeating: Double.zero, count: 7)
+        for uid in uids where !uid.isEmpty {
+            let daily = weeklyUsage(platform: platform, uid: uid)
+            for i in 0..<7 where i < daily.count { sum[i] += daily[i] }
+        }
+        return sum
     }
 }

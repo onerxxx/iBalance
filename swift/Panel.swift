@@ -14,10 +14,8 @@ import CoreImage
 
 /// 面板数据快照（由 AppDelegate 从各服务缓存 + 设置状态构建）
 struct PanelSnapshot: Equatable {
-    var ds: String?                 // DeepSeek 余额（已格式化，含货币符号）
-    var dsUsedRatio: Double = 0     // DeepSeek 已用占比（0~1），基于常用充值额度计算；0=未设置不显示点阵
-    var dsPulsing: Bool = false     // DeepSeek 余额被消耗（usedRatio 上升）→ 点阵脉冲
-    var dsInfoText: String?         // DeepSeek 副标题文字（nil 显示默认提示）
+    /// DeepSeek 卡片数据（单元素，走多号卡片管线；uid 恒 "ds"，无昵称无签到）
+    var dsAccounts: [AccountCardSnapshot] = []
     /// 面板余额卡片可见性：key = 平台 ID（"ds" / "zcode" / "codex" / "trae" / "wb"），
     /// value=true 显示、false 隐藏；未记录的平台默认 true。
     var panelCardVisible: [String: Bool] = [:]
@@ -48,10 +46,8 @@ struct PanelSnapshot: Equatable {
     var refreshIntervalSeconds: Int = 300
     /// 面板背景渐变开关（同步自配置，VC 据此决定遮罩渐变/单色）
     var panelGradientEnabled = true
-    /// Mono 字体开关（同步自配置；余额卡片与用量列表 SF Mono ↔ 系统字体）
+    /// Mono 字体开关（同步自配置；余额卡片与用量列表 DepartureMono ↔ 系统字体）
     var monoFontEnabled = false
-    /// 弱化非当前账号开关（同步自配置；开启后小卡片整卡降透明，悬停复亮）
-    var subAccountDimEnabled = false
     /// 调试用量开关（开启后显示本地生成的七日样例数据）
     var debugUsageEnabled = false
 }
@@ -85,6 +81,8 @@ struct AccountCardSnapshot: Equatable {
     var checkinRisk: Bool = false   // 签到失败为风控（TRAE 返回 9074/操作太频繁）→ 角标橙黄色
     var streak: Int = 0             // 连续签到天数
     var reward: Int = 0             // 最近一次签到积分奖励
+    var inMenuBar: Bool = false     // 该账号数值显示在菜单栏 → 卡片 icon 叠加透明渐变标记
+    var hideDots: Bool = false      // 隐藏点阵（DeepSeek 未配置日常额度时；多号平台恒 false）
 }
 
 /// 配色 token：集中管理所有自定义颜色，避免硬编码散落各处
@@ -157,13 +155,9 @@ private func bundleIcon(_ name: String, size: CGFloat) -> NSImage? {
     img.size = NSSize(width: size, height: size)
     return img
 }
-/// Mono 字体提供：
-/// - font()：SF Mono（NSFont.monospacedSystemFont，系统等宽字体，原生支持 weight，
-///   中文等缺字自动级联回退系统字体）——面板文本/数值/图表等通用用途。
-/// - pixelFont()：DepartureMono（像素风等宽，无中文字形，级联回退系统字体）——
-///   字符 UI 控件（[▪] 开关 / [1│3│5] 分段）与 ASCII 像素图标的专属字体：
-///   ▪（U+25AA）在 SF Mono 中不覆盖（会回退 emoji 字体），点阵字符类视觉必须保留像素字体。
-///   字体文件随 App 打包在 Resources/，首次使用时按进程注册（幂等）。
+/// DepartureMono（像素风等宽字体，无中文字形）：
+/// 拉丁字符用 DepartureMono，缺字（中文/特殊符号）通过 cascade 级联自动回退系统字体。
+/// 字体文件随 App 打包在 Resources/，首次使用时按进程注册（幂等）。
 enum MonoFontProvider {
     /// PostScript 名（实测字体内部命名，NSFont(name:) 需用 PostScript 名）
     private static let postScriptName = "DepartureMono-Regular"
@@ -178,14 +172,9 @@ enum MonoFontProvider {
         CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
     }
 
-    /// SF Mono（系统等宽）：weight 全档原生支持
-    static func font(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        NSFont.monospacedSystemFont(ofSize: size, weight: weight)
-    }
-
     /// DepartureMono + 系统字体级联：weight 仅作用于中文回退部分
     /// （DepartureMono 只有 Regular 一档，拉丁字符统一常规字重）
-    static func pixelFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+    static func font(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
         register()
         if let base = NSFont(name: postScriptName, size: size) {
             let cascade = NSFont.systemFont(ofSize: size, weight: weight).fontDescriptor
@@ -297,7 +286,7 @@ final class MonoCharSwitch: NSControl {
     /// 单字符渲染宽度（DepartureMono 等宽，`[`/`▪`/`×`/`]` 同宽）
     private var charWidth: CGFloat {
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.pixelFont(size: fontSize, weight: .semibold),
+            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
         ]
         return ("0" as NSString).size(withAttributes: attrs).width
     }
@@ -314,7 +303,7 @@ final class MonoCharSwitch: NSControl {
         // 开用 U+25AA BLACK SMALL SQUARE，关用 ×(U+00D7)
         let text = on ? "[▪]" : "[×]"
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.pixelFont(size: fontSize, weight: .semibold),
+            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
             // 选中态亮色用 kBalanceForeground（#E9E9E9），与折叠标题/余额卡前景一致
             .foregroundColor: on ? kBalanceForeground : NSColor.secondaryLabelColor,
             .kern: kern,
@@ -395,7 +384,7 @@ final class MonoSegmentedControl: NSControl {
     /// 单段数字渲染宽度（DepartureMono 等宽，各段同宽）
     private var digitWidth: CGFloat {
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.pixelFont(size: fontSize, weight: .semibold),
+            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
         ]
         return ("0" as NSString).size(withAttributes: attrs).width
     }
@@ -403,7 +392,7 @@ final class MonoSegmentedControl: NSControl {
     /// 制表符竖线渲染宽度（等宽字体下与数字同宽，但显式测量避免字体差异）
     private var separatorWidth: CGFloat {
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.pixelFont(size: fontSize, weight: .semibold),
+            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
         ]
         return (separator as NSString).size(withAttributes: attrs).width
     }
@@ -411,7 +400,7 @@ final class MonoSegmentedControl: NSControl {
     /// 方括号渲染宽度（等宽字体下与数字同宽）
     private var bracketWidth: CGFloat {
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.pixelFont(size: fontSize, weight: .semibold),
+            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
         ]
         return (bracket as NSString).size(withAttributes: attrs).width
     }
@@ -422,7 +411,7 @@ final class MonoSegmentedControl: NSControl {
     }
 
     private func renderedString() -> NSAttributedString {
-        let font = MonoFontProvider.pixelFont(size: fontSize, weight: .semibold)
+        let font = MonoFontProvider.font(size: fontSize, weight: .semibold)
         let separatorAttrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: NSColor.tertiaryLabelColor,
@@ -575,9 +564,12 @@ final class MiniSegmentedControl: NSSegmentedControl {
 }
 
 /// 面板滚动 hover 同步：内容滚动后 AppKit 不会补发 mouseEntered/mouseExited，
-/// 面板控制器在滚动时遍历视图树，让所有可 hover 视图按当前光标位置重算状态。
+/// 面板控制器在滚动时用 AppKit hitTest 判定光标所在视图（与系统 tracking 同源，
+/// 无边框浮窗中也可靠——各视图自行 convert 判定曾在浮窗中持续误判），遍历视图树
+/// 按外部判定结果同步 hover 状态。
 protocol PanelScrollHoverSync: AnyObject {
-    func syncHoverForCurrentPointer()
+    /// 按外部（hitTest）判定同步 hover：inside = 光标命中本视图
+    func syncHoverState(_ inside: Bool)
 }
 
 /// 设置卡片行容器：hover 时仅提亮文本颜色（secondaryLabel/tertiaryLabel → hoverTextColor），
@@ -758,11 +750,7 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     }
 
     // MARK: - 面板滚动 hover 同步
-    func syncHoverForCurrentPointer() {
-        guard let window else { return }
-        let p = convert(window.convertFromScreen(NSRect(origin: NSEvent.mouseLocation, size: .zero)).origin, from: nil)
-        // visibleRect 已被滚动视口裁剪：滚出可视区的行不再参与 hover
-        let inside = p != .zero && visibleRect.contains(p)
+    func syncHoverState(_ inside: Bool) {
         if inside == isMouseInside { return }
         if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
@@ -775,7 +763,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         didSet { needsDisplay = true }
     }
     var onHoverChanged: ((Bool) -> Void)?
-    /// Mono 字体开关：开启时图表内所有文本（标题/刻度/数值/日期）用 SF Mono
+    /// Mono 字体开关：开启时图表内所有文本（标题/刻度/数值/日期）用 DepartureMono
     var monoFontEnabled = false {
         didSet { needsDisplay = true }
     }
@@ -786,7 +774,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     /// 视图移出 window（子弹窗关闭）时暂停，重新出现时复用。
     private weak var blinkLink: CADisplayLink?
 
-    /// 按当前 Mono 开关取字体（与面板 uiFont 同策略：开 = SF Mono，关 = 系统字体）
+    /// 按当前 Mono 开关取字体（与面板 uiFont 同策略：开 = DepartureMono 级联，关 = 系统字体）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
         monoFontEnabled ? MonoFontProvider.font(size: size, weight: weight)
                         : .systemFont(ofSize: size, weight: weight)
@@ -817,11 +805,8 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         onHoverChanged?(false)
     }
 
-    func syncHoverForCurrentPointer() {
-        guard let window else { return }
-        let p = convert(window.convertFromScreen(NSRect(origin: NSEvent.mouseLocation, size: .zero)).origin, from: nil)
-        let inside = p != .zero && visibleRect.contains(p)
-        if inside { onHoverChanged?(true) } else { onHoverChanged?(false) }
+    func syncHoverState(_ inside: Bool) {
+        onHoverChanged?(inside)
     }
 
     // MARK: - 当日圆点 Pulse Dot（1.8s 周期：中心点常亮 + 光环向外扩散淡出，前 70% 扩散后 30% 停顿）
@@ -1303,10 +1288,7 @@ final class HoverIconButton: NSButton, PanelScrollHoverSync {
     }
 
     // MARK: - 面板滚动 hover 同步
-    func syncHoverForCurrentPointer() {
-        guard let window else { return }
-        let p = convert(window.convertFromScreen(NSRect(origin: NSEvent.mouseLocation, size: .zero)).origin, from: nil)
-        let inside = p != .zero && visibleRect.contains(p)
+    func syncHoverState(_ inside: Bool) {
         if inside == isMouseInside { return }
         if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
@@ -1460,10 +1442,7 @@ final class RefreshIconButton: NSButton, PanelScrollHoverSync {
     }
 
     // MARK: - 面板滚动 hover 同步
-    func syncHoverForCurrentPointer() {
-        guard let window else { return }
-        let p = convert(window.convertFromScreen(NSRect(origin: NSEvent.mouseLocation, size: .zero)).origin, from: nil)
-        let inside = p != .zero && visibleRect.contains(p)
+    func syncHoverState(_ inside: Bool) {
         if inside == isMouseInside { return }
         if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
@@ -1526,12 +1505,10 @@ class HoverCard: NSView, PanelScrollHoverSync {
     }
 
     // MARK: - 面板滚动 hover 同步
-    /// 滚动后 AppKit 不补发 enter/exit：按当前光标位置重算 hover（visibleRect 已按滚动视口裁剪）。
+    /// 滚动后 AppKit 不补发 enter/exit：按外部（hitTest）判定同步。
     /// 拖拽锁定期间跳过（材质由 setDragHoverLocked 全权管理）。
-    func syncHoverForCurrentPointer() {
-        guard let window, !isDragHoverLocked else { return }
-        let p = convert(window.convertFromScreen(NSRect(origin: NSEvent.mouseLocation, size: .zero)).origin, from: nil)
-        let inside = p != .zero && visibleRect.contains(p)
+    func syncHoverState(_ inside: Bool) {
+        guard !isDragHoverLocked else { return }
         if inside == isMouseInside { return }
         if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
@@ -2441,6 +2418,112 @@ private final class ScrollFadeHint: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+/// 置顶浮窗右下角 resize 把手：自绘两条 45° 斜线 + 承载拖拽 resize。
+/// 浮窗是 borderless + nonactivating（不能加 .resizable：macOS 26 下无边框面板
+/// 无系统边缘热区，且有空闲 CPU 飙高的系统 bug），resize 由本视图自绘实现。
+final class PanelResizeHandle: NSView {
+    static let minWidth: CGFloat = 240
+    static let maxWidth: CGFloat = 480
+    static let minHeight: CGFloat = 220
+
+    /// 拖动结束且尺寸有变化时上报最终窗口尺寸（AppDelegate 持久化到 config）
+    var onResizeEnded: ((NSSize) -> Void)?
+
+    private var hovered = false
+    private var trackingArea: NSTrackingArea?
+
+    override func draw(_ dirtyRect: NSRect) {
+        let color = (hovered ? NSColor.labelColor : NSColor.systemGray).withAlphaComponent(0.9)
+        color.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1.5
+        path.lineCapStyle = .round
+        // 两条 45° 斜线（右下朝向），长 6pt、间隔 4pt，贴角落内缩 2.5pt
+        let inset: CGFloat = 2.5
+        let len: CGFloat = 6
+        for offset in [CGFloat(0), CGFloat(4)] {
+            path.move(to: NSPoint(x: bounds.maxX - inset - len - offset, y: bounds.minY + inset))
+            path.line(to: NSPoint(x: bounds.maxX - inset - offset, y: bounds.minY + inset + len))
+        }
+        path.stroke()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = trackingArea { removeTrackingArea(ta) }
+        let ta = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        trackingArea = ta
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        needsDisplay = true
+    }
+
+    override func resetCursorRects() {
+        // 仅高度可调：纵向 resize 光标（上下双向箭头），不再用 crosshair
+        addCursorRect(bounds, cursor: .resizeUpDown)
+    }
+
+    /// 浮窗是 nonactivatingPanel（不激活 App、不成 key window）：用户在其他应用
+    /// 前台点击把手属于「非活跃窗口首次点击」，默认被系统吞掉——必须接受首次鼠标事件
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    // MARK: - 拖动 resize（事件驱动 + 轮询兜底）
+    // 主路径与浮窗移动（BalancePanelView.mouseDown）同一套 nextEvent 事件跟踪：
+    // mouseDown 送达后，后续 dragged/up 事件由窗口持有（隐式鼠标抓取），逐事件
+    // 驱动 setFrame，跟手无量化卡顿。
+    // 兜底：nonactivating 面板在个别激活状态下 dragged 事件可能被路由给前台
+    // App——100ms 无事件时读全局鼠标位置补帧，左键松开即结束。
+    override func mouseDown(with event: NSEvent) {
+        guard let window = self.window else {
+            super.mouseDown(with: event)
+            return
+        }
+        let startMouse = NSEvent.mouseLocation
+        let startFrame = window.frame
+        let startMaxY = startFrame.maxY
+        // 高度上限：屏幕可见高度与「顶边到屏幕底」取小——固定左上角拖高时
+        // 底缘最多贴到屏幕可见区底边，不越出屏幕
+        let maxH = window.screen
+            .map { min($0.visibleFrame.height, startMaxY - $0.visibleFrame.minY) } ?? 1000
+        Logger.log(.refresh, "[ResizeHandle] drag start frame=\(Int(startFrame.width))x\(Int(startFrame.height))")
+
+        // 仅高度可调：宽度恒定（不响应水平拖拽），向下拖增高（屏幕 y 向下减小），
+        // 高度 clamp 在 [minHeight, maxH]，左上角恒定
+        func applyDrag(_ cur: NSPoint) {
+            let w = startFrame.width
+            let h = min(max(startFrame.height - (cur.y - startMouse.y), Self.minHeight), maxH)
+            guard abs(window.frame.height - h) > 0.5 else { return }
+            window.setFrame(NSRect(x: startFrame.minX, y: startMaxY - h,
+                                   width: w, height: h), display: true)
+        }
+
+        while true {
+            if let ev = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp],
+                                         until: Date(timeIntervalSinceNow: 0.1),
+                                         inMode: .default, dequeue: true) {
+                if ev.type == .leftMouseUp { break }
+                applyDrag(NSEvent.mouseLocation)
+            } else {
+                // 超时无事件：左键已松开（事件流丢失兜底）→ 结束；否则按全局位置补帧
+                if NSEvent.pressedMouseButtons & 1 == 0 { break }
+                applyDrag(NSEvent.mouseLocation)
+            }
+        }
+        let sz = window.frame.size
+        Logger.log(.refresh, "[ResizeHandle] drag end frame=\(Int(sz.width))x\(Int(sz.height))")
+        if sz != startFrame.size { onResizeEnded?(sz) }
+    }
+}
+
 /// 面板内容控制器：把 BalancePanelView 挂进 popover，宽度固定 250，高度受屏幕可用空间限制；
 /// 内容超高时通过纵向滚动查看底部设置、操作和更新时间。
 final class BalancePanelViewController: NSViewController {
@@ -2463,6 +2546,28 @@ final class BalancePanelViewController: NSViewController {
     /// 首次打开归位标记：只在 App 启动后第一次弹出时滚到最上方，
     /// 之后开关面板保留用户上次滚动位置
     private var didScrollToTopOnce = false
+    /// 置顶浮窗模式：窗口宽高由用户 resize 把手控制（240–480 / 220–屏高），
+    /// preferredContentSize 不再驱动窗口尺寸；视口宽高变化同步到 document view
+    var isFloatingWindow = false {
+        didSet {
+            guard oldValue != isFloatingWindow else { return }
+            resizeHandle.isHidden = !isFloatingWindow
+            if isFloatingWindow {
+                // 滚动锚定基准 = 转移时刻的 clip 高度：pin 动画首帧即可正确补偿
+                if isViewLoaded {
+                    lastFloatingClipHeight = scrollView.contentView.bounds.height
+                }
+                contentSizeDirty = true
+                updateContentSize()
+            } else {
+                lastFloatingClipHeight = 0
+            }
+        }
+    }
+    /// 浮窗 resize 拖动结束（尺寸有变化）：上报最终窗口尺寸，AppDelegate 持久化
+    var onFloatingSizeChanged: ((NSSize) -> Void)?
+    /// 右下角 resize 把手：贴容器角落，仅浮窗模式显示（popover 尺寸由内容驱动）
+    private let resizeHandle = PanelResizeHandle()
 
     init(panel: BalancePanelView) {
         self.panel = panel
@@ -2542,6 +2647,10 @@ final class BalancePanelViewController: NSViewController {
         fadeObservers.append(NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main
         ) { [weak self] _ in
+            if let self, UserDefaults.standard.bool(forKey: "IBLayoutAutoTest") {
+                let c = self.scrollView.contentView
+                Logger.log(.layout, "[scroll] origin.y=\(String(format: "%.1f", c.bounds.origin.y)) clipH=\(String(format: "%.1f", c.bounds.height)) docH=\(String(format: "%.1f", self.panel.bounds.height))")
+            }
             self?.updateFadeHint()
             // 滚动后修正各卡片/按钮的 hover 状态（AppKit 不补发 enter/exit 事件）
             self?.syncHoverAfterScroll()
@@ -2549,6 +2658,28 @@ final class BalancePanelViewController: NSViewController {
         fadeObservers.append(NotificationCenter.default.addObserver(
             forName: NSView.frameDidChangeNotification, object: panel, queue: .main
         ) { [weak self] _ in self?.updateFadeHint() })
+        // 浮窗 resize：视口宽高变化同步 document view（宽度自适应 + 高度拉伸防沉底）
+        scrollView.contentView.postsFrameChangedNotifications = true
+        fadeObservers.append(NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification, object: scrollView.contentView, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.isFloatingWindow else { return }
+            self.syncDocumentSizeToViewport()
+        })
+        // resize 把手盖在提示层之上，贴容器右下角；22×22 命中区域（视觉斜线仍贴角落，
+        // 自绘按 bounds.maxX/minY 锚定），拖拽 resize 由把手 mouseDown 驱动
+        resizeHandle.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(resizeHandle)
+        NSLayoutConstraint.activate([
+            resizeHandle.widthAnchor.constraint(equalToConstant: 22),
+            resizeHandle.heightAnchor.constraint(equalToConstant: 22),
+            resizeHandle.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            resizeHandle.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        resizeHandle.isHidden = true
+        resizeHandle.onResizeEnded = { [weak self] size in
+            self?.onFloatingSizeChanged?(size)
+        }
         view = container
         // 渐变开关状态变化（update 同步时触发）：立即刷新遮罩绘制
         panel.onPanelGradientChanged = { [weak self] in
@@ -2560,6 +2691,25 @@ final class BalancePanelViewController: NSViewController {
             self?.invalidateContentSize()
         }
         updateContentSize()
+    }
+
+    /// 解除 popover 遗留在内容视图上的尺寸锁定（pin 转移时同步调用，不得延后）：
+    /// 1) 摘除 'NSViewController.preferredContentSize.*' 宽高约束（优先级 501，
+    ///    高于 windowSizeStayPut=500，可反向驱动窗口尺寸）；
+    /// 2) 清零 preferredContentSize 属性本身——它是独立的尺寸驱动源：即使约束摘光、
+    ///    contentViewController=nil、popover 已释放，只要属性非零，窗口布局时仍会
+    ///    被同步回该尺寸（v2026.8.22.81→.82 最小复现：摘约束不清属性，setFrame 仍
+    ///    被弹回 250x760；且清零必须在转移当次 runloop 内完成，延后经布局后尺寸
+    ///    即被锁死，再清零无效）。
+    /// 无副作用：本 VC 在浮窗生命周期内独占使用（浮窗模式 updateContentSize 不回写
+    /// preferredContentSize），unpin 时随浮窗释放；popover 模式由预建新 VC 承担。
+    func detachPreferredContentSizeConstraints() {
+        preferredContentSize = .zero
+        guard isViewLoaded else { return }
+        let stale = view.constraints.filter {
+            $0.identifier?.hasPrefix("NSViewController.preferredContentSize") == true
+        }
+        if !stale.isEmpty { NSLayoutConstraint.deactivate(stale) }
     }
 
     /// 在面板展示前设置当前屏幕允许的最大高度；超出的内容保留在 document view 中滚动查看。
@@ -2580,16 +2730,82 @@ final class BalancePanelViewController: NSViewController {
     private func updateContentSize() {
         guard contentSizeDirty else { return }
         contentSizeDirty = false
+        if isFloatingWindow {
+            // 浮窗模式先解除 root 底部上限做一次布局，把卡死在旧高度的 root 收回
+            // 内容自然高度（详见 relaxRootToNaturalHeight 注释），否则 root 顶着
+            // ≤ 上限时 .fill 会把多余高度灌进余额卡片组拉高卡片
+            panel.relaxRootToNaturalHeight()
+        }
         panel.layoutSubtreeIfNeeded()
         let contentSize = panel.fittingSize
-        let documentWidth = max(250, contentSize.width)
-        let contentHeight = max(1, contentSize.height)
+        // 浮窗模式宽度跟随视口（用户 resize 结果）；popover 模式按内容固有宽（≥250）
+        let documentWidth = isFloatingWindow
+            ? max(PanelResizeHandle.minWidth, scrollView.contentView.bounds.width)
+            : max(250, contentSize.width)
+        // 浮窗模式视口高于内容时把 document 拉伸到视口高：非翻转文档视图
+        // 底部对齐，不拉伸会内容沉底、顶部空出一块；root 顶锚后底部留玻璃空区
+        let contentHeight = isFloatingWindow
+            ? max(contentSize.height, scrollView.contentView.bounds.height)
+            : max(1, contentSize.height)
         let nextFrame = NSRect(x: 0, y: 0, width: documentWidth, height: contentHeight)
         if panel.frame != nextFrame { panel.frame = nextFrame }
         let viewportHeight = min(contentHeight, maximumHeight)
         // 滚动条始终隐藏（初始化 hasVerticalScroller=false，这里不再动态开启）
         let nextContentSize = NSSize(width: documentWidth, height: viewportHeight)
-        if preferredContentSize != nextContentSize { preferredContentSize = nextContentSize }
+        // 浮窗模式不回写 preferredContentSize：窗口宽高由用户 resize 决定，
+        // 避免内容变化（折叠/行数变化）把浮窗尺寸拉回内容高度
+        if !isFloatingWindow, preferredContentSize != nextContentSize {
+            preferredContentSize = nextContentSize
+        }
+        updateFadeHint()
+        layoutProbe("ucs", force: true)
+    }
+
+    // MARK: - 布局探针（诊断余额卡片被拉伸问题）
+
+    private var lastLayoutProbeAt = Date.distantPast
+
+    func layoutProbe(_ tag: String, force: Bool = false) {
+        guard isViewLoaded else { return }
+        if !force, Date().timeIntervalSince(lastLayoutProbeAt) < 0.3 { return }
+        lastLayoutProbeAt = Date()
+        let winH = view.window.map { String(format: "%.1f", $0.frame.height) } ?? "nil"
+        let clip = scrollView.contentView.bounds
+        Logger.log(.layout, "[\(tag)] win=\(winH) clip=\(String(format: "%.1f@%.1f", clip.height, clip.origin.y)) pref=\(String(format: "%.1f", preferredContentSize.height)) float=\(isFloatingWindow)")
+        panel.layoutProbe(tag)
+    }
+
+    /// 浮窗模式：document view 宽度跟随滚动视口（内容自适应宽度），
+    /// 高度不低于视口（窗口拖高时拉伸 document，防止非翻转视图内容沉底）。
+    /// lastFloatingClipHeight：上次 clip 高度（浮窗 resize 时的滚动锚定基准）
+    private var lastFloatingClipHeight: CGFloat = 0
+
+    private func syncDocumentSizeToViewport() {
+        let clip = scrollView.contentView
+        // 视觉顶部锚定：非翻转文档中 clip 高度变化时，NSScrollView 默认保持
+        // origin 不变（等价文档底部锚定）——pin 转移动画把窗口缩到保存尺寸时，
+        // 顶部内容会被推出视口（内容视觉下滚）。这里补偿 origin.y 使可见区域
+        // 顶边（origin.y + clipH）钉住同一文档位置：clip 变小 origin 增大、
+        // clip 变大 origin 减小，并 clamp 到有效滚动范围。
+        let newClipH = clip.bounds.height
+        if lastFloatingClipHeight > 0.1, abs(newClipH - lastFloatingClipHeight) > 0.1 {
+            let docH = panel.bounds.height
+            if docH > newClipH + 0.5 {  // 仅滚动模式需要校正；全显模式 origin 恒 0
+                let oldOrigin = clip.bounds.origin.y
+                var target = oldOrigin - (newClipH - lastFloatingClipHeight)
+                target = min(max(0, target), max(0, docH - newClipH))
+                if abs(target - oldOrigin) > 0.1 {
+                    clip.scroll(to: NSPoint(x: 0, y: target))
+                    scrollView.reflectScrolledClipView(clip)
+                }
+            }
+        }
+        lastFloatingClipHeight = newClipH
+        var f = panel.frame
+        f.size.width = max(PanelResizeHandle.minWidth, clip.bounds.width)
+        if f.height < clip.bounds.height - 0.5 { f.size.height = clip.bounds.height }
+        guard panel.frame != f else { return }
+        panel.frame = f
         updateFadeHint()
     }
 
@@ -2659,16 +2875,23 @@ final class BalancePanelViewController: NSViewController {
     }
 
     /// 滚动后修正 hover：内容移动后 AppKit 不补发 mouseEntered/mouseExited，
-    /// 遍历面板视图树，让所有可 hover 视图按当前光标位置重算状态。
-    /// ⚠️ 置顶浮窗（NSPanel）中视图坐标换算持续不可靠（鼠标位置被误判进多个
-    /// 按钮，造成全面板假 hover 卡亮），浮窗期间跳过本同步——hover 完全交给
-    /// 系统 tracking 的真实 mouseEntered/mouseExited（一直可靠），
-    /// 换窗残留由按钮 viewDidMoveToWindow 复位兜底
+    /// 用 AppKit hitTest 判定光标当前所在视图（与系统 tracking 同源的命中机制，
+    /// popover 与无边框置顶浮窗中都可靠——各视图自行 convert 判定曾在浮窗中
+    /// 持续误判造成假 hover），遍历面板视图树按判定结果同步：命中者进入、
+    /// 其余（含滚出光标下方的）全部退出
     private func syncHoverAfterScroll() {
-        guard isViewLoaded, view.window != nil else { return }
-        if view.window is NSPanel { return }
+        guard isViewLoaded, let window = view.window else { return }
+        let p = window.convertFromScreen(NSRect(origin: NSEvent.mouseLocation, size: .zero)).origin
+        var node = window.contentView?.hitTest(p)
+        var target: PanelScrollHoverSync?
+        while let v = node {
+            if let s = v as? PanelScrollHoverSync { target = s; break }
+            node = v.superview
+        }
         func walk(_ v: NSView) {
-            if let syncable = v as? PanelScrollHoverSync { syncable.syncHoverForCurrentPointer() }
+            if let syncable = v as? PanelScrollHoverSync {
+                syncable.syncHoverState(syncable === target)
+            }
             for sub in v.subviews { walk(sub) }
         }
         walk(panel)
@@ -2713,6 +2936,7 @@ final class BalancePanelViewController: NSViewController {
         // 背景渐变从面板顶部固定 210pt 开始；布局变化后同步背景状态
         applyGradient()
         updateFadeHint()
+        layoutProbe("didLayout")
     }
 }
 
@@ -2879,10 +3103,8 @@ final class BalancePanelView: NSView {
     var onSetApiKey: (() -> Void)?
     /// 面板渐变背景开关（设置卡片开关触发）
     var onTogglePanelGradient: (() -> Void)?
-    /// Mono 字体开关（设置卡片开关触发：余额卡片与用量列表切换 SF Mono）
+    /// Mono 字体开关（设置卡片开关触发：余额卡片与用量列表切换 DepartureMono）
     var onToggleMonoFont: (() -> Void)?
-    /// 弱化非当前账号开关（设置卡片开关触发：小卡片整卡降透明/恢复）
-    var onToggleSubAccountDim: (() -> Void)?
     /// 调试用量开关（设置卡片开关触发：显示本地生成的七日样例）
     var onToggleDebugUsage: (() -> Void)?
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
@@ -2929,28 +3151,15 @@ final class BalancePanelView: NSView {
     // MARK: - 余额展示控件
 
     private let offlineBanner = NSTextField(labelWithString: "⚠︎ 离线，恢复网络后自动刷新")
-    private let dsValueLabel = NSTextField(labelWithString: "—")
-    private let dsDots = UsageDots()
-    /// DeepSeek 卡片副标题标签（可更新文本，如显示日常额度信息）
-    private let dsInfoLabel = NSTextField(labelWithString: "打开官网 usage 页面")
-    private lazy var dsInfo: NSStackView = {
-        registerFont(dsInfoLabel, size: 9)
-        dsInfoLabel.textColor = .systemGray
-        // 固定行高与 TRAE/WB 签到信息（icon+label 组合）一致：给 stackView 设高度约束，
-        // 并降低 label 垂直拥抱优先级，让约束优先于 intrinsicContentSize（9pt 字体固有行高约 11pt）
-        dsInfoLabel.setContentHuggingPriority(.defaultLow, for: .vertical)
-        dsInfoLabel.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        let stack = NSStackView(views: [dsInfoLabel])
-        stack.orientation = .horizontal
-        stack.spacing = 0
-        stack.heightAnchor.constraint(equalToConstant: 12).isActive = true
-        return stack
-    }()
     // WorkBuddy 多账号卡片容器（动态重建，账号列表变化时刷新）
     private var wbCardsContainer: NSStackView!
     private var wbCardEntries: [CardEntry] = []
     private var wbCardUids: [String] = []  // 当前已渲染卡片的 uid 列表（检测变化）
-    private weak var dsCardRef: NSView?     // DeepSeek 卡片引用，WB 卡片等高用
+    // DeepSeek 单账号卡片容器（走多号卡片管线，与 ZCode/Codex 同构）
+    private var dsCardsContainer: NSStackView!
+    private var dsCardEntries: [CardEntry] = []
+    private var dsCardUids: [String] = []
+    private weak var dsCardRef: NSView?     // DeepSeek 卡片引用，各平台当前账号卡等高基准
 
     /// 单个多号卡片的控件引用（update 时直接赋值，无需重建；WB / TRAE / ZCode 共用）。
     /// 非当前账号的 dots/checkinInfo 为占位实例（未加入视图层级，更新时跳过）。
@@ -2964,6 +3173,7 @@ final class BalancePanelView: NSView {
         let expireIcon: NSImageView?   // 到期行 timer 图标（随 expired 状态变色）
         var checkinKey: String = ""
         let badgeView: NSView          // 签到失败角标（icon 右上角，无签到平台恒隐藏）
+        let iconView: MenuBarFadeIconView  // 平台 icon（未上菜单栏时叠加垂直透明渐变）
     }
 
     /// 各平台卡片差异配置（icon / 标题 / 签到行 / 到期行 / reward 兜底）
@@ -2978,16 +3188,18 @@ final class BalancePanelView: NSView {
         let monoIconSize: CGFloat           // Mono 当前账号标称尺寸
         let monoSecondaryIconSize: CGFloat  // Mono 非当前账号标称尺寸
         let checkin: Bool               // 是否显示签到信息行（WB / TRAE）
-        let showsExpire: Bool           // 是否显示重置/到期倒计时行（ZCode / Codex）
+        let showsExpire: Bool           // 是否显示第二行副标题（ZCode/Codex 到期倒计时、DeepSeek 日常额度）
+        let expireIconSymbol: String?   // 第二行图标（nil = 纯文本行，DeepSeek；ZCode/Codex 为 "timer"）
         let fallbackReward: Int         // reward 为 0 时的兜底值（WB 固定 +100，TRAE 显示 +???）
         let menuBarIdPrefix: String     // 菜单栏 item id 前缀："trae:" / "wb:" / "zcode:"
         // iconSize 为「视觉补偿尺寸」：统一图标列宽后，按各 SVG 图形实测留白
         //（视觉宽占 viewBox 比例：wb 92% / trae 72% / zhipu 86% / codex 满幅 / deepseek 75%）
         // 放大留白多的图标，使「图标视觉右缘 → 标题」的间距各卡一致（≈10-11pt）
-        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 20.47, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: false, fallbackReward: 100, menuBarIdPrefix: "wb:")
-        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", platformID: "trae", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: false, fallbackReward: 0, menuBarIdPrefix: "trae:")
-        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 19, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "zcode:")
-        static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 19.45, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, fallbackReward: 0, menuBarIdPrefix: "codex:")
+        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 20.47, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: false, expireIconSymbol: nil, fallbackReward: 100, menuBarIdPrefix: "wb:")
+        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", platformID: "trae", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: false, expireIconSymbol: nil, fallbackReward: 0, menuBarIdPrefix: "trae:")
+        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 19, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "timer", fallbackReward: 0, menuBarIdPrefix: "zcode:")
+        static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 19.45, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "timer", fallbackReward: 0, menuBarIdPrefix: "codex:")
+        static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: nil, fallbackReward: 0, menuBarIdPrefix: "")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -3095,14 +3307,8 @@ final class BalancePanelView: NSView {
     private let monoSwitch = MiniSwitch()
     /// Mono 字体开关状态（update 同步；变化时对已注册 label 就地切换字体，不重建卡片）
     private(set) var monoFontEnabled = false
-    /// 弱化非当前账号开关（update 时随快照同步状态）
-    private let subDimSwitch = MiniSwitch()
-    /// 弱化非当前账号开关状态（update 同步；变化时对已建小卡片就地调透明度，不重建）
-    private(set) var subAccountDimEnabled = false
-    /// 非当前账号卡片弱引用收集（弱化透明度应用目标；卡片重建后旧引用自动失效）
-    private let subCardViews = NSHashTable<NSView>.weakObjects()
-    /// 弱化目标透明度（0.38–0.5 为「禁用态」惯例区间，取上限保数值可读）
-    private static let subCardDimAlpha: CGFloat = 0.5
+    /// 非当前账号弱化透明度（已固化为默认行为：整卡降透明、悬停复亮）
+    private static let subCardDimAlpha: CGFloat = 0.6
     /// 调试用量开关状态（update 同步）
     private let debugUsageSwitch = MiniSwitch()
     private(set) var debugUsageEnabled = false
@@ -3200,13 +3406,6 @@ final class BalancePanelView: NSView {
             // 用量子弹窗（图表）跟随同一开关：文本和数值切换 Mono 风格
             usageHistoryController?.monoFontEnabled = monoFontEnabled
         }
-        // 弱化非当前账号开关状态同步：变化时就地调整小卡片透明度（不重建卡片）
-        let subDimChanged = s.subAccountDimEnabled != subAccountDimEnabled
-        subAccountDimEnabled = s.subAccountDimEnabled
-        subDimSwitch.state = s.subAccountDimEnabled ? .on : .off
-        if subDimChanged {
-            applySubAccountDimming()
-        }
         debugUsageEnabled = s.debugUsageEnabled
         debugUsageSwitch.state = s.debugUsageEnabled ? .on : .off
         offlineBanner.isHidden = !s.offline
@@ -3245,17 +3444,13 @@ final class BalancePanelView: NSView {
             usageCardRef?.isHidden = true
         }
 
-        dsValueLabel.stringValue = s.ds ?? "—"
-        dsInfoLabel.stringValue = s.dsInfoText ?? "打开官网 usage 页面"
-        if s.dsUsedRatio > 0 {
-            let remainRatio = CGFloat(min(1, max(0, 1 - s.dsUsedRatio)))
-            dsDots.ratio = remainRatio
-            dsDots.isHidden = false
+        // DeepSeek 卡片：走多号卡片管线（uid 恒 "ds"，仅首帧重建，之后就地更新）
+        let newDsUids = s.dsAccounts.map { $0.uid + ($0.isCurrent ? "✓" : "") }
+        if newDsUids != dsCardUids {
+            rebuildDsCards(s.dsAccounts)
         } else {
-            dsDots.ratio = 0
-            dsDots.isHidden = true
+            applyDsCardData(s.dsAccounts)
         }
-        dsDots.pulsing = s.dsPulsing
 
         // ZCode 多账号卡片：uid 或当前账号变化时重建（弱化跟随 isCurrent），否则就地更新数据
         let newZcodeUids = s.zcodeAccounts.map { $0.uid + ($0.isCurrent ? "✓" : "") }
@@ -3677,17 +3872,22 @@ final class BalancePanelView: NSView {
                 label.textColor = .systemGray
                 label.setContentHuggingPriority(.defaultLow, for: .vertical)
                 label.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-                let icon = NSImageView()
-                icon.image = symbolImage("timer", size: 9)
-                icon.contentTintColor = .systemGray
-                icon.imageScaling = .scaleProportionallyUpOrDown
-                let stack = NSStackView(views: [icon, label])
+                // 第二行图标可选：ZCode/Codex 为 timer 倒计时图标，DeepSeek 为纯文本副标题
+                var rowViews: [NSView] = [label]
+                if let symbol = style.expireIconSymbol {
+                    let icon = NSImageView()
+                    icon.image = symbolImage(symbol, size: 9)
+                    icon.contentTintColor = .systemGray
+                    icon.imageScaling = .scaleProportionallyUpOrDown
+                    rowViews.insert(icon, at: 0)
+                    expireIcon = icon
+                }
+                let stack = NSStackView(views: rowViews)
                 stack.orientation = .horizontal
                 stack.alignment = .centerY
                 stack.spacing = 0
                 stack.heightAnchor.constraint(equalToConstant: 12).isActive = true
                 expireLabel = label
-                expireIcon = icon
                 info = stack
             } else if isCurrent && style.checkin {
                 info = checkinInfo
@@ -3712,12 +3912,15 @@ final class BalancePanelView: NSView {
             weak var cardRef: NSView?
             // 签到失败角标（当日失败时显示；无签到平台仅调试模式，apply 阶段控制显隐）
             let badge = makeFailureBadge()
+            // 渐变 icon：未上菜单栏的账号由 apply 阶段开启垂直透明渐变（底部 20% → 顶部 100%）
+            let fadeIcon = MenuBarFadeIconView()
             let card = addCard(rows: [
                 balanceContentRow(icon: style.icon, name: style.name, valueLabel: valueLabel,
                                   info: info, dots: dots, iconSize: style.iconSize, imageSize: imgSize,
                                   monoSize: isCurrent ? style.monoIconSize : style.monoSecondaryIconSize,
                                   iconTopAligned: !isCurrent, iconTint: fgColor, nickLabel: nickLabel,
-                                  titleWeight: .semibold, textColor: fgColor, failureBadge: badge)
+                                  textColor: fgColor, failureBadge: badge,
+                                  premadeIconView: fadeIcon)
             ], to: container, onClick: {
                 if isCurrent || onSwitch == nil {
                     onCurrentClick?()
@@ -3747,22 +3950,34 @@ final class BalancePanelView: NSView {
                 self?.endPlatformDrag()
             } : nil, topPadding: cardPadTop, bottomPadding: cardPadBottom, cardBackground: nil)
             cardRef = card
-            // 弱化非当前账号（开关开启时）：整卡降透明；弱引用收集供开关切换时就地调整
+            // 弱化非当前账号（已固化默认行为）：整卡降透明，悬停复亮
             if !isCurrent {
-                subCardViews.add(card)
-                if subAccountDimEnabled { card.alphaValue = Self.subCardDimAlpha }
+                card.alphaValue = Self.subCardDimAlpha
             }
             // 悬停卡片时昵称淡入、离开淡出（已固化为默认行为）；
-            // 非当前账号卡片同时复亮/回暗（悬停复亮保持「可点击切换账号」的可交互暗示）
+            // 非当前账号卡片同时复亮/回暗（悬停复亮保持「可点击切换账号」的可交互暗示），
+            // 内容前景同步提亮：文字/图标由 dimmed 升至主卡前景色（hover 提亮后模型色已是
+            // kBalanceForeground，匹配两种色态保证可往返）
             if let hc = card as? HoverCard {
-                hc.onHover = { [weak self, weak card, weak label = nickLabel] showing in
-                    guard let self else { return }
+                hc.onHover = { [weak card, weak label = nickLabel] showing in
                     if let label { label.animator().alphaValue = showing ? 1 : 0 }
                     guard let card, !isCurrent else { return }
-                    let target: CGFloat = showing ? 1 : (self.subAccountDimEnabled ? Self.subCardDimAlpha : 1)
+                    let target: CGFloat = showing ? 1 : Self.subCardDimAlpha
+                    let fg: NSColor = showing ? kBalanceForeground : Palette.cardForegroundDimmed
                     NSAnimationContext.runAnimationGroup { ctx in
                         ctx.duration = 0.15
                         card.animator().alphaValue = target
+                        func scan(_ v: NSView) {
+                            if let tf = v as? NSTextField,
+                               tf.textColor == Palette.cardForegroundDimmed || tf.textColor == kBalanceForeground {
+                                tf.animator().textColor = fg
+                            } else if let iv = v as? NSImageView,
+                                      iv.contentTintColor == Palette.cardForegroundDimmed || iv.contentTintColor == kBalanceForeground {
+                                iv.animator().contentTintColor = fg
+                            }
+                            for sub in v.subviews { scan(sub) }
+                        }
+                        scan(card)
                     }
                 }
             }
@@ -3774,21 +3989,11 @@ final class BalancePanelView: NSView {
             entries.append(CardEntry(uid: ac.uid, valueLabel: valueLabel,
                                      dots: dots ?? UsageDots(), checkinInfo: checkinInfo,
                                      nickLabel: nickLabel, infoLabel: expireLabel,
-                                     expireIcon: expireIcon, badgeView: badge))
+                                     expireIcon: expireIcon, badgeView: badge,
+                                     iconView: fadeIcon))
         }
         uids = accounts.map(\.uid)
         applyAccountCardData(accounts, entries: &entries, style: style)
-    }
-
-    /// 开关切换时就地调整已建非当前账号卡片的透明度（0.15s 平滑过渡，不重建卡片）
-    private func applySubAccountDimming() {
-        let target: CGFloat = subAccountDimEnabled ? Self.subCardDimAlpha : 1
-        for card in subCardViews.allObjects {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.15
-                card.animator().alphaValue = target
-            }
-        }
     }
 
     /// 应用多号卡片数据：余额、昵称、点阵、签到信息、到期倒计时（重建后或就地刷新时调用）
@@ -3811,6 +4016,9 @@ final class BalancePanelView: NSView {
             let expireColor: NSColor = ac.expired ? .systemRed : .systemGray
             e.infoLabel?.textColor = expireColor
             e.expireIcon?.contentTintColor = expireColor
+            // 未上菜单栏账号的 icon 叠加垂直透明渐变（底部 20% → 顶部 100% 可见）；
+            // 右键「在菜单栏显示」切换后 syncPanel 就地开/关渐变，无需重建卡片
+            e.iconView.usesMenuBarFade = !ac.inMenuBar
             // 非当前账号卡片无 dots/签到信息（未加入视图层级），跳过更新
             guard ac.isCurrent else { continue }
             // 有余额数据（value 非空）→ 按剩余比例点亮（100% 未用时 usedRatio=0 → 满格绿）；
@@ -3821,6 +4029,8 @@ final class BalancePanelView: NSView {
                 e.dots.ratio = 0
             }
             e.dots.pulsing = ac.pulsing
+            // DeepSeek 未配置日常额度时隐藏点阵（多号平台恒 false 不受影响）
+            e.dots.isHidden = ac.hideDots
             if style.checkin {
                 updateCheckinInfo(e.checkinInfo, cacheKey: &entries[i].checkinKey,
                                   done: ac.checkinDone, failed: ac.checkinFailed,
@@ -3831,6 +4041,20 @@ final class BalancePanelView: NSView {
     }
 
     // MARK: - 三平台卡片入口（薄封装，仅绑定容器/样式/回调）
+
+    private func rebuildDsCards(_ accounts: [AccountCardSnapshot]) {
+        // DS 卡是全平台等高基准：重建期间清空引用避免自锚定，重建后指向新卡；
+        // update() 中 DS 重建先于其他平台，同帧内后续平台的等高约束即锚到新卡
+        dsCardRef = nil
+        rebuildAccountCards(accounts, style: .ds, container: dsCardsContainer,
+                            entries: &dsCardEntries, uids: &dsCardUids,
+                            onCurrentClick: { [weak self] in self?.onClickDeepSeek?() },
+                            onSwitch: nil)
+        dsCardRef = dsCardsContainer.arrangedSubviews.first
+    }
+    private func applyDsCardData(_ accounts: [AccountCardSnapshot]) {
+        applyAccountCardData(accounts, entries: &dsCardEntries, style: .ds)
+    }
 
     private func rebuildZcodeCards(_ accounts: [AccountCardSnapshot]) {
         rebuildAccountCards(accounts, style: .zcode, container: zcodeCardsContainer,
@@ -3918,8 +4142,8 @@ final class BalancePanelView: NSView {
             l.widthAnchor.constraint(equalToConstant: usageColumnWidth).isActive = true
             return l
         }
-        // 左列名「平台」左对齐（与下方 icon 左缘同起点），右两列列名右对齐
-        let platformHeader = NSTextField(labelWithString: "平台")
+        // 左列名「平台(多账号)」左对齐（与下方 icon 左缘同起点），右两列列名右对齐
+        let platformHeader = NSTextField(labelWithString: "平台（多账号）")
         registerFont(platformHeader, size: 10, weight: .semibold)
         platformHeader.textColor = .systemGray
         let row = NSStackView(views: [platformHeader, stretchSpacer(), headerLabel("今日"), headerLabel("本周")])
@@ -4194,10 +4418,64 @@ final class BalancePanelView: NSView {
 
     // MARK: - 布局构建
 
+    // 调试探针：root 引用 + 各折叠区块标题引用（IBLayoutAutoTest 自动复现用）
+    private(set) weak var rootViewRef: NSStackView?
+    private var sectionTitleViews: [String: HoverCard] = [:]
+    /// root 底部上限约束（≤ panel.bottom-41）：仅为 fittingSize 预留 footer 区、
+    /// 防止内容与贴底 footer 重叠服务；日常高度求解不应依赖它
+    private var rootBottomCap: NSLayoutConstraint?
+
+    /// 浮窗模式内容变化后强制 root 回到内容自然高度。
+    /// NSStackView 隐藏 arranged 子视图后，链上留下可伸缩空隙；约束求解器按
+    /// 「最小改动」语义不会主动收缩 root —— root 一旦因 panel 拉高（updateContentSize
+    /// 把 document 撑到视口高）顶到 ≤ 上限，就会卡死在旧高度不再回落，.fill 随即把
+    /// 多余高度灌进余额卡片组，卡片被拉高。这里临时解除上限做一次布局，让内容
+    /// hugging 把 root 收回自然高度，再恢复上限（此时 root ≤ 上限恒成立：
+    /// panel 高度 ≥ fittingSize = 自然内容 + 55）。
+    func relaxRootToNaturalHeight() {
+        guard let cap = rootBottomCap else { return }
+        cap.isActive = false
+        layoutSubtreeIfNeeded()
+        cap.isActive = true
+    }
+
+    /// 布局探针：把面板关键层级高度写入 /tmp/iBalance_layout.log
+    func layoutProbe(_ tag: String) {
+        var parts: [String] = []
+        parts.append("panel=\(String(format: "%.1f", frame.height))")
+        if let r = rootViewRef {
+            parts.append("root=\(String(format: "%.1f", r.frame.height))")
+            let vis = r.arrangedSubviews.filter { !$0.isHidden }
+            parts.append("rootChildren=" + vis.map { String(format: "%.1f", $0.frame.height) }.joined(separator: ","))
+        }
+        if let bgc = balanceGroupContainer {
+            parts.append("bgc=\(String(format: "%.1f", bgc.frame.height))")
+            let containers = platformCards.values
+                .compactMap { $0 as? NSStackView }
+                .sorted { $0.frame.minY < $1.frame.minY }
+            for c in containers {
+                let hs = c.arrangedSubviews.filter { !$0.isHidden }
+                    .map { String(format: "%.1f", $0.frame.height) }
+                if !hs.isEmpty { parts.append("[\(hs.joined(separator: ","))]") }
+            }
+        }
+        Logger.log(.layout, "[\(tag)] \(parts.joined(separator: " "))")
+    }
+
+    /// 自动测试：模拟点击折叠标题（与真实点击同一代码路径）
+    func toggleSectionForAutoTest(_ section: String) {
+        guard let hc = sectionTitleViews[section] else {
+            Logger.log(.layout, "[AutoTest] section '\(section)' not found")
+            return
+        }
+        Logger.log(.layout, "[AutoTest] toggle section '\(section)'")
+        hc.onClick?()
+    }
+
     private func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        // 内在宽度 250：独立（未挂到窗口）时 fittingSize 也能解出正确高度
-        widthAnchor.constraint(equalToConstant: 250).isActive = true
+        // 宽度下限 240（浮窗 resize 最小宽）；独立（未挂到窗口）时 fittingSize 也能解出高度
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -4213,9 +4491,13 @@ final class BalancePanelView: NSView {
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             root.topAnchor.constraint(equalTo: topAnchor, constant: 14),
-            root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
-            root.widthAnchor.constraint(equalToConstant: 250 - 14),
+        // 底部用 ≤：root 顶锚、保持内容自然高度（永不被拉伸）。footer 已移出 root、
+        // 单独贴 panel 底部，故 root 底部预留 footer(20)+底边距(11)+最小间隙(10)=41pt，
+        // 避免与贴底 footer 重叠；浮窗拖高时多出的高度自然成为 root 与 footer 间的空白
         ])
+        rootBottomCap = root.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -41)
+        rootBottomCap?.isActive = true
+        rootViewRef = root
 
         // 底部更新时间标签启用 layer 供脉冲动效使用
         updatedLabel.wantsLayer = true
@@ -4259,23 +4541,18 @@ final class BalancePanelView: NSView {
         root.addArrangedSubview(balanceGroupContainer)
         balanceGroupContainer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        // ── DeepSeek 卡片（中间仅标题）──
-        // iconSize 25.5：鲸鱼图形视觉宽仅 75%（四周留白大），放大让视觉右缘与其他卡一致
-        let dsCard = addCard(rows: [
-            balanceContentRow(icon: "deepseek", name: "DeepSeek", valueLabel: dsValueLabel, info: dsInfo, dots: dsDots, iconSize: 22)
-        ], to: balanceGroupContainer, onClick: { [weak self] in self?.onClickDeepSeek?() }, onRightClick: { [weak self] event in
-            self?.onRightClickCard?("ds", event)
-        }, onDragStarted: { [weak self] point in
-            self?.beginPlatformDrag("ds", locationInWindow: point)
-        }, onDragChanged: { [weak self] point in
-            self?.updatePlatformDrag("ds", locationInWindow: point)
-        }, onDragEnded: { [weak self] in
-            self?.endPlatformDrag()
-        }, topPadding: 4, bottomPadding: 4, cardBackground: nil)
-        dsCardRef = dsCard
-        platformCards[BalancePlatform.deepSeek.rawValue] = dsCard
-        // 平台间间隔 4pt（同平台内 trae/wb 容器内部 spacing=0 不加间隔）
-        balanceGroupContainer.setCustomSpacing(4, after: dsCard)
+        // ── DeepSeek 单账号卡片容器（动态创建，走多号卡片管线；置于余额组首位）──
+        dsCardsContainer = NSStackView(views: [])
+        dsCardsContainer.orientation = .vertical
+        dsCardsContainer.alignment = .leading
+        dsCardsContainer.distribution = .fill
+        dsCardsContainer.spacing = 0
+        dsCardsContainer.translatesAutoresizingMaskIntoConstraints = false
+        balanceGroupContainer.addArrangedSubview(dsCardsContainer)
+        dsCardsContainer.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor).isActive = true
+        platformCards[BalancePlatform.deepSeek.rawValue] = dsCardsContainer
+        // 平台间间隔 4pt（同平台内各容器内部 spacing=0 不加间隔）
+        balanceGroupContainer.setCustomSpacing(4, after: dsCardsContainer)
 
         // ── ZCode 多账号卡片容器（动态创建，账号列表变化时重建；置于 DeepSeek 卡片下方）──
         zcodeCardsContainer = NSStackView(views: [])
@@ -4347,6 +4624,7 @@ final class BalancePanelView: NSView {
         pinFullWidth(usageTitle, in: root)
         root.setCustomSpacing(0, after: usageTitle)
         usageTitleRef = usageTitle
+        sectionTitleViews["usage"] = usageTitle
         usageContentStack.orientation = .vertical
         usageContentStack.alignment = .width
         usageContentStack.distribution = .fill
@@ -4368,8 +4646,6 @@ final class BalancePanelView: NSView {
         gradientSwitch.action = #selector(panelGradientToggled)
         monoSwitch.target = self
         monoSwitch.action = #selector(monoFontToggled)
-        subDimSwitch.target = self
-        subDimSwitch.action = #selector(subDimToggled)
         debugUsageSwitch.target = self
         debugUsageSwitch.action = #selector(debugUsageToggled)
         // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 分段控件
@@ -4464,7 +4740,6 @@ final class BalancePanelView: NSView {
             switchRow(title: "自动签到", sub: autoCheckinSub, sw: autoCheckinSwitch),
             switchRow(title: "面板渐变背景", sub: nil, sw: gradientSwitch),
             switchRow(title: "Mono 风格", sub: nil, sw: monoSwitch),
-            switchRow(title: "弱化非当前账号", sub: nil, sw: subDimSwitch),
             switchRow(title: "调试", sub: nil, sw: debugUsageSwitch),
         ].map {
             let hover = wrapHoverRow($0)
@@ -4480,6 +4755,7 @@ final class BalancePanelView: NSView {
         root.addArrangedSubview(settingTitle)
         pinFullWidth(settingTitle, in: root)
         root.setCustomSpacing(0, after: settingTitle)
+        sectionTitleViews["settings"] = settingTitle
         let settingCard = addCard(rows: settingRows, to: root, spacing: 8)
         // 折叠目标接线 + 初始态（内容隐藏与标题下间距，展开时间距 0 贴卡片）
         settingCollapseTargets = [settingCard]
@@ -4559,6 +4835,7 @@ final class BalancePanelView: NSView {
         root.addArrangedSubview(actionTitle)
         pinFullWidth(actionTitle, in: root)
         root.setCustomSpacing(0, after: actionTitle)
+        sectionTitleViews["actions"] = actionTitle
         // App 宫格样式：行内容器内靠左（不满一行的末行也靠左），整个容器在卡片内水平居中；
         // 左右内边距 0（容器宽 220 ≤ 内容宽 236），行间垂直间距 4pt
         let tilesContainer = NSStackView(views: tileRows)
@@ -4609,12 +4886,17 @@ final class BalancePanelView: NSView {
         quitBtn.translatesAutoresizingMaskIntoConstraints = false
         footer.addSubview(updatedLabel)
         footer.addSubview(quitBtn)
-        root.addArrangedSubview(footer)
-        pinFullWidth(footer, in: root)
+        // footer 移出 root、直接挂 panel 并贴底：root 用 ≤ 底约束保持内容自然高度
+        // （永不被拉伸），浮窗拖高时多出的高度成为 root 与 footer 间的空白，footer 始终贴底。
+        // 宽度与 root 对齐（左右各内缩 7pt），底部留 11pt 边距（与原 root 底边距一致）
+        addSubview(footer)
         // 固定 footer 高度，避免子控件 intrinsicContentSize 变化时重新布局导致错位
         let footerHeight: CGFloat = 20
         NSLayoutConstraint.activate([
             footer.heightAnchor.constraint(equalToConstant: footerHeight),
+            footer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
+            footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
             updatedLabel.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
             updatedLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: footerHeight),
@@ -4775,10 +5057,11 @@ final class BalancePanelView: NSView {
     /// failureBadge：外部创建的签到失败角标视图，叠加在 icon 右上角（显隐由调用方控制）
     /// monoSize：Mono 模式 ASCII icon 标称尺寸（缺省 = imgSize 即不微调场景）。
     /// SVG 微调（imageSize）与 Mono 标称解耦：像素字母各平台等大，SVG 保持视觉微调
-    private func balanceContentRow(icon iconName: String, name: String, valueLabel: NSTextField, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = kBalanceForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, textColor: NSColor = kBalanceForeground, failureBadge: NSView? = nil) -> NSView {
+    private func balanceContentRow(icon iconName: String, name: String, valueLabel: NSTextField, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = kBalanceForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .regular, textColor: NSColor = kBalanceForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil) -> NSView {
         let imgSize = imageSize ?? iconSize
-        // 左：大 icon（固定列宽 = iconSize + 4，image 居中显示，imageSize 可独立缩小）
-        let iconView = NSImageView()
+        // 左：大 icon（固定列宽 = iconSize + 4，image 居中显示，imageSize 可独立缩小）；
+        // premadeIconView 由外部传入（多号卡片用 MenuBarFadeIconView 以支持菜单栏渐变标记）
+        let iconView = premadeIconView ?? NSImageView()
         iconView.image = bundleIcon(iconName, size: imgSize) ?? symbolImage("app.fill", size: imgSize)
         iconView.image?.isTemplate = true
         iconView.contentTintColor = iconTint
@@ -5168,6 +5451,42 @@ final class BalancePanelView: NSView {
         return img
     }
 
+    /// 多号账号卡 icon：未显示在菜单栏的账号叠加垂直透明渐变 mask
+    /// （视觉底部 25% 可见 → 顶部 80% 可见），区别于「已上菜单栏」的完整 icon。
+    /// CA 渐变坐标 y 向上：startPoint y=0 为视觉底部、endPoint y=1 为视觉顶部。
+    private final class MenuBarFadeIconView: NSImageView {
+        private let fadeMask = CAGradientLayer()
+        /// true = 未上菜单栏 → icon 应用渐变；false = 完整显示
+        var usesMenuBarFade = false {
+            didSet {
+                guard oldValue != usesMenuBarFade else { return }
+                applyMask()
+            }
+        }
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+            fadeMask.colors = [NSColor.white.withAlphaComponent(0.25).cgColor,
+                               NSColor.white.withAlphaComponent(0.8).cgColor]
+            fadeMask.startPoint = CGPoint(x: 0.5, y: 0)
+            fadeMask.endPoint = CGPoint(x: 0.5, y: 1)
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        private func applyMask() {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer?.mask = usesMenuBarFade ? fadeMask : nil
+            CATransaction.commit()
+        }
+        override func layout() {
+            super.layout()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fadeMask.frame = bounds
+            CATransaction.commit()
+        }
+    }
+
     // MARK: - 控件回调（转发给 AppDelegate 接线）
 
     @objc private func openCockpitTapped() { onOpenCockpit?() }
@@ -5178,7 +5497,6 @@ final class BalancePanelView: NSView {
     @objc private func addTraeAccountTapped() { onCollectTraeAccount?() }
     @objc private func panelGradientToggled() { onTogglePanelGradient?() }
     @objc private func monoFontToggled() { onToggleMonoFont?() }
-    @objc private func subDimToggled() { onToggleSubAccountDim?() }
     @objc private func debugUsageToggled() { onToggleDebugUsage?() }
 
     /// pin 按钮：切换置顶状态（图标/着色即时反馈），

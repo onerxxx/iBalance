@@ -233,8 +233,11 @@ enum ZcodeService {
     /// 汇总 balances 数组各 entitlement 的 remaining_units / total_units（均为 token 数）。
     /// planEndsAt 为当前生效的免费套餐（Start Plan，plan_id 含 "start"）的到期时间戳（秒），
     /// 无免费套餐时为 0（调用方不显示到期副标题）。
-    static func fetchBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval) {
-        guard let url = URL(string: balanceURL) else { return (0, 0, 0) }
+    /// 返回 nil = 请求层失败（HTTP 非 200 / code != 0 / 网络/解析错误，如 token 失效）；
+    /// 返回 (0, 0, 0) = 查询成功但无有效套餐（全部到期，balances 为空）——对齐 Cockpit：
+    /// code != 0 才算错误，空数据是正常结果，由调用方保留旧缓存展示「套餐已到期」。
+    static func fetchBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
+        guard let url = URL(string: balanceURL) else { return nil }
         let (data, status) = await HTTP.requestWithRetry(
             url: url, method: "GET",
             headers: ["Authorization": "Bearer \(token)", "Accept": "application/json"],
@@ -242,9 +245,9 @@ enum ZcodeService {
         )
         guard status == 200, let data,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (json["code"] as? Int) == 0,
-              let d = json["data"] as? [String: Any],
-              let balances = d["balances"] as? [[String: Any]] else { return (0, 0, 0) }
+              (json["code"] as? Int) == 0 else { return nil }
+        let d = (json["data"] as? [String: Any]) ?? [:]
+        let balances = (d["balances"] as? [[String: Any]]) ?? []
         var remain = 0.0
         var total = 0.0
         for b in balances {

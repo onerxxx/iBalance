@@ -18,6 +18,7 @@ enum Logger {
         case traeCheckin   = "iBalance_trae_checkin"
         case refresh       = "iBalance_refresh"
         case network       = "iBalance_network"
+        case layout        = "iBalance_layout"
     }
 
     /// 追加一行日志到 /tmp/<channel>.log（带时间戳 HH:mm:ss.SSS）。

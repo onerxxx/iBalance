@@ -703,6 +703,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var panelFrameObserver: NSKeyValueObservation?
     /// 置顶浮动窗（pin 开启时承载面板内容，复用实例避免反复建窗）
     private var floatingPanel: NSPanel?
+    /// 浮窗会话期间的 VC 强引用（浮窗用纯 contentView 挂载，不经
+    /// contentViewController，需手动持有防释放；关闭浮窗时置 nil）
+    private var floatingPanelVC: BalancePanelViewController?
     /// pin 时预建的下一轮面板（unpin/重开面板时由 showPanel 恢复为 panelView）
     private var prebuiltPanelView: BalancePanelView?
     /// 内容转移中标志：popover 关闭由 pin 转移引发，popoverDidClose 跳过
@@ -748,20 +751,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var cacheCodexAccounts: [String: (usedPercent: Double, resetAt: TimeInterval)] = [:]
     // 点阵脉冲状态：仅由真实数据刷新（refreshOne*）更新，面板开关 syncPanel 只读不写
     // 规则：usedRatio 上升（额度被消耗）→ pulsing=true；稳定或回升 → pulsing=false
-    private var prevTraeRatio: [String: Double] = [:]
-    private var traePulsing: [String: Bool] = [:]
-    private var prevWbRatio: [String: Double] = [:]
-    private var wbPulsing: [String: Bool] = [:]
-    private var prevZcodeRatio: [String: Double] = [:]
-    private var zcodePulsing: [String: Bool] = [:]
-    private var prevDsRatio: Double = -1   // DeepSeek 已用占比上次值（-1 = 未初始化）
-    private var dsPulsing = false          // 余额被消耗 → 点阵脉冲
+    private var traePulsingTracker = PulsingTracker()
+    private var wbPulsingTracker = PulsingTracker()
+    private var zcodePulsingTracker = PulsingTracker()
+    private var dsPulsingTracker = PulsingTracker()
+    private var codexPulsingTracker = PulsingTracker()
 
-    /// 点阵脉冲核心规则（WB/TRAE/ZCode/DeepSeek 共用）：
-    /// usedRatio 上升 → pulsing=true（被消耗）；稳定或回升 → pulsing=false；首轮（prev<0）不触发。
-    private func updatePulsingState(prevRatio: inout Double, pulsing: inout Bool, newRatio: Double) {
-        if prevRatio >= 0 { pulsing = newRatio > prevRatio }
-        prevRatio = newRatio
+    /// 点阵脉冲状态机（全平台共用）：跟踪 usedRatio 的上次值，上升 → pulsing=true（被消耗），
+    /// 稳定或回升 → pulsing=false；首轮（无 prev 记录）不触发。每平台一个实例，多号平台按 uid 分键。
+    private struct PulsingTracker {
+        private var prev: [String: Double] = [:]   // -1 = 首轮哨兵
+        private var pulsing: [String: Bool] = [:]
+
+        /// 记录新比率并更新脉冲态，返回更新后的 pulsing 值
+        mutating func observe(_ key: String, ratio: Double) -> Bool {
+            let p = prev[key] ?? -1
+            let on = p >= 0 && ratio > p
+            prev[key] = ratio
+            pulsing[key] = on
+            return on
+        }
+
+        /// 当前脉冲态（快照构建时读取）
+        func isPulsing(_ key: String) -> Bool { pulsing[key] ?? false }
+
+        /// 重置单键状态（首轮哨兵 + 停脉冲），如 DS 日常额度清零后
+        mutating func reset(_ key: String = "") {
+            prev[key] = -1
+            pulsing[key] = false
+        }
     }
     // 离线标记：网络不可达时菜单栏显示离线提示并暂停刷新
     private var isOffline = false
@@ -783,6 +801,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // （Cmd+C/V/X/A）会分发给弹窗内 NSTextField 的 field editor，
         // 从而原生支持复制/粘贴/剪切/全选 + 右键菜单。
         setupMainMenu()
+
+        // 布局自动测试：启动后自动弹出面板 → pin 成浮窗 → 拖高窗口 → 折叠/展开各区块，
+        // 每步把层级高度打点到 /tmp/iBalance_layout.log（诊断 pin 态余额卡片被拉伸问题；
+        // 平时不开启无副作用）
+        if UserDefaults.standard.bool(forKey: "IBLayoutAutoTest") {
+            func step(_ s: Double, _ label: String, _ f: @escaping () -> Void) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + s) {
+                    Logger.log(.layout, "═══ [\(label)] ═══")
+                    f()
+                }
+            }
+            step(2.5, "open popover") { self.showPanel() }
+            // 强制滚动场景：保存的浮窗尺寸(650) < 内容自然高(691)，
+            // pin 动画 760→650，验证视觉顶部锚定补偿（origin 应 0→41=顶部）
+            step(4.1, "set small saved size") {
+                self.config.floatingPanelHeight = 650
+                self.config.floatingPanelWidth = 260
+            }
+            step(4.2, "pin") { self.togglePanelPin() }
+            step(4.4, "pin+0.2") { self.floatingPanelVC?.layoutProbe("pin+0.2", force: true) }
+            step(4.8, "pin+0.6") { self.floatingPanelVC?.layoutProbe("pin+0.6", force: true) }
+            step(5.6, "T1 pin settled") { self.floatingPanelVC?.layoutProbe("T1-pin-open", force: true) }
+            // 模拟用户把浮窗再拖矮 40pt（滚动模式连续 resize，验证逐帧校正）
+            step(6.2, "shrink -40") {
+                guard let fp = self.floatingPanel else { return }
+                var f = fp.frame
+                f.size.height -= 40
+                f.origin.y += 40
+                fp.setFrame(f, display: true)
+            }
+            step(6.9, "T1b shrunk") { self.floatingPanelVC?.layoutProbe("T1b-shrunk", force: true) }
+            // 模拟用户把浮窗拖高 220pt（触发 syncDocumentSizeToViewport 拉伸 document）
+            step(7.5, "resize +220") {
+                guard let fp = self.floatingPanel else { return }
+                var f = fp.frame
+                f.origin.y -= 220
+                f.size.height += 220
+                fp.setFrame(f, display: true)
+            }
+            step(8.2, "T2 window tall") { self.floatingPanelVC?.layoutProbe("T2-window-tall", force: true) }
+            step(8.8, "collapse settings") { self.panelView?.toggleSectionForAutoTest("settings") }
+            step(10.4, "T3 after collapse") { self.floatingPanelVC?.layoutProbe("T3-after-collapse", force: true) }
+            step(11.0, "expand settings") { self.panelView?.toggleSectionForAutoTest("settings") }
+            step(12.6, "T4 after expand") { self.floatingPanelVC?.layoutProbe("T4-after-expand", force: true) }
+            step(13.2, "collapse actions") { self.panelView?.toggleSectionForAutoTest("actions") }
+            step(14.8, "T5 after collapse actions") { self.floatingPanelVC?.layoutProbe("T5-after-collapse-actions", force: true) }
+        }
 
         config = ConfigStore.load()
         // Codex 登录态来自本机 auth.json；启动时自动纳入账号列表，按钮仍可手动重新导入/更新凭据。
@@ -1067,6 +1132,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 关闭后归还焦点（同 popoverDidClose）
         if let fp = floatingPanel, fp.isVisible {
             fp.orderOut(nil)
+            fp.contentView = nil
+            floatingPanelVC = nil
             panelView?.resetPin()
             NSApp.hide(nil)
             return
@@ -1109,7 +1176,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
-        panel.onToggleSubAccountDim = { [weak self] in self?.onToggleSubAccountDim() }
         panel.onToggleDebugUsage = { [weak self] in self?.onToggleDebugUsage() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
@@ -1117,19 +1183,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
         panel.onQuit = { [weak self] in self?.onQuit() }
         // 右上角 pin：置顶常驻——内容转移至无边框 NSPanel 浮动窗口（无箭头、
-        // 浮层层级、背景原生拖动）；取消置顶时装回 popover 回到按钮下方
+        // 浮层层级、背景原生拖动）；取消置顶时浮窗直接关闭
         panel.onTogglePin = { [weak self] in self?.togglePanelPin() }
         // 余额卡片点击：DeepSeek 打开浏览器，TRAE / WorkBuddy / ZCode 启动应用
         panel.onClickDeepSeek = {
             NSWorkspace.shared.open(URL(string: "https://platform.deepseek.com/usage")!)
         }
         panel.onClickTrae = { [weak self] in
-            self?.openApp(bundleId: "cn.trae.solo.app", missingTitle: "未找到 TRAE 应用",
-                          missingMsg: "未找到 Bundle ID 为 cn.trae.solo.app 的应用，请确认 TRAE 已安装。")
+            guard let self = self else { return }
+            self.openApp(bundleId: "cn.trae.solo.app", missingTitle: "未找到 TRAE 应用",
+                         missingMsg: "未找到 Bundle ID 为 cn.trae.solo.app 的应用，请确认 TRAE 已安装。")
+            // 打开应用即重读登录态重绘菜单栏：用户可能在平台 App 内自行切过号，
+            // 上轮刷新后菜单栏的「当前账号」可能已过期
+            self.ensureCurrentAccountInMenuBar(prefix: MenuBarPrefix.trae,
+                                               currentUid: TraeService.readAuthInfo(storagePath: self.config.traeStoragePath)?.uid)
+            self.updateTitle(immediate: true, tag: "card-open-trae")
         }
         panel.onClickWorkBuddy = { [weak self] in
-            self?.openApp(bundleId: "com.workbuddy.workbuddy", missingTitle: "未找到 WorkBuddy 应用",
-                          missingMsg: "未找到 Bundle ID 为 com.workbuddy.workbuddy 的应用，请确认 WorkBuddy 已安装。")
+            guard let self = self else { return }
+            self.openApp(bundleId: "com.workbuddy.workbuddy", missingTitle: "未找到 WorkBuddy 应用",
+                         missingMsg: "未找到 Bundle ID 为 com.workbuddy.workbuddy 的应用，请确认 WorkBuddy 已安装。")
+            self.ensureCurrentAccountInMenuBar(prefix: MenuBarPrefix.wb,
+                                               currentUid: WorkBuddyService.authInfo()?.uid)
+            self.updateTitle(immediate: true, tag: "card-open-wb")
         }
         panel.onSwitchWbAccount = { [weak self] uid in
             self?.switchWbAccount(uid: uid)
@@ -1139,12 +1215,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.switchTraeAccount(uid: uid)
         }
         panel.onClickZcode = { [weak self] in
-            self?.openApp(bundleId: "dev.zcode.app", missingTitle: "未找到 ZCode 应用",
-                          missingMsg: "未找到 Bundle ID 为 dev.zcode.app 的应用，请确认 ZCode 已安装。")
+            guard let self = self else { return }
+            self.openApp(bundleId: "dev.zcode.app", missingTitle: "未找到 ZCode 应用",
+                         missingMsg: "未找到 Bundle ID 为 dev.zcode.app 的应用，请确认 ZCode 已安装。")
+            self.ensureCurrentAccountInMenuBar(prefix: MenuBarPrefix.zcode,
+                                               currentUid: ZcodeService.currentUid())
+            self.updateTitle(immediate: true, tag: "card-open-zcode")
         }
         panel.onClickCodex = { [weak self] in
-            self?.openApp(bundleId: "com.openai.codex", missingTitle: "未找到 Codex 应用",
-                          missingMsg: "未找到 Codex 应用，请确认 ChatGPT/Codex 已安装。")
+            guard let self = self else { return }
+            self.openApp(bundleId: "com.openai.codex", missingTitle: "未找到 Codex 应用",
+                         missingMsg: "未找到 Codex 应用，请确认 ChatGPT/Codex 已安装。")
+            self.ensureCurrentAccountInMenuBar(prefix: MenuBarPrefix.codex,
+                                               currentUid: CodexService.currentUid())
+            self.updateTitle(immediate: true, tag: "card-open-codex")
         }
         panel.onSwitchCodexAccount = { [weak self] uid in
             self?.switchCodexAccount(uid: uid)
@@ -1169,6 +1253,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 但该模式会放大 AppKit resize 的重新锚定噪声（折叠/展开时面板左右抖动），已回滚。
         let panelVC = BalancePanelViewController(panel: panel)
         panelVC.fadeHintParams = Self.fadeHintParams(from: config)
+        // 浮窗 resize 拖动结束：持久化尺寸到 config.json，下次 pin 时恢复
+        panelVC.onFloatingSizeChanged = { [weak self] size in
+            guard let self else { return }
+            self.config.floatingPanelWidth = size.width
+            self.config.floatingPanelHeight = size.height
+            ConfigStore.save(self.config)
+        }
         popover.contentViewController = panelVC
         // 面板自带 320 内在宽度，直接按约束解出真实高度，避免零尺寸 popover
         popover.contentSize = panel.fittingSize
@@ -1240,14 +1331,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// - 置顶：popover 内容（contentViewController）转移至 NSPanel——无边框窗口
     ///   天然无箭头，浮层层级 + 背景原生拖动；面板背景为 TintedVisualEffectView
     ///   （毛玻璃 + 圆角 + 裁剪），透明窗口承载后外观与 popover 无缝。
-    /// - 取消：浮窗退场，showPanel 把同一 VC 装回 popover，回到按钮下方。
+    /// - 取消：浮窗直接关闭（不弹回菜单栏下方），归还焦点；
+    ///   预建 popover/面板保留，下次点击菜单栏图标时由 showPanel 零构建弹出。
     private func togglePanelPin() {
-        // 取消置顶：浮窗退场，弹出预建的 popover（pin 时已 buildPanelOnce）零构建等待
+        // 取消置顶：浮窗直接关闭，语义与「点击图标关闭浮窗」一致
         if let fp = floatingPanel, fp.isVisible {
             fp.orderOut(nil)
-            fp.contentViewController = nil
-            // popoverController == nil 的兜底（预建异常时现场重建）仍由 showPanel 处理
-            showPanel()
+            fp.contentView = nil
+            floatingPanelVC = nil
+            NSApp.hide(nil)
             return
         }
         guard let popover = popoverController, popover.isShown,
@@ -1256,22 +1348,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 用内容视图自身的屏幕位置定位浮窗：popover 窗口 frame 含箭头/阴影边距，
         // 直接套用会向左上偏移；无边框浮窗内容铺满窗口，与原内容像素级重合
         let viewFrame = popWindow.convertToScreen(vc.view.convert(vc.view.bounds, to: nil))
+        let targetScreen = popWindow.screen ?? NSScreen.main
+        // 恢复上次保存的浮窗尺寸（未记录时用面板当前尺寸），clamp 到上下限与屏幕
+        let savedSize = restoredFloatingPanelSize(default: viewFrame.size, screen: targetScreen)
+        // 目标位置：面板当前所在屏幕可见区右上角（留 8pt 边距）
+        var targetFrame = viewFrame
+        targetFrame.size = savedSize
+        if let screen = targetScreen {
+            let visible = screen.visibleFrame
+            targetFrame.origin = NSPoint(x: visible.maxX - savedSize.width - 8,
+                                         y: visible.maxY - savedSize.height - 8)
+        }
         let fp = floatingPanel ?? makeFloatingPanel()
         floatingPanel = fp
         // 转移标志：popover 关闭回调跳过「记录点击时间戳 + NSApp.hide」
         //（hide 会隐藏包括新浮窗在内的全部窗口）
         isTransferringPanel = true
         // 先挂载（窗口按 preferredContentSize 自动定形），再 setFrame 覆盖为
-        // 内容视图的实际屏幕位置——顺序颠倒会被挂载时的自动 resize 带偏
-        fp.contentViewController = vc
+        // 内容视图的实际屏幕位置——顺序颠倒会被挂载时的自动 resize 带偏。
+        // ⚠️ 必须在转移当次 runloop 内解除 popover 遗留的尺寸锁定（摘 501 优先级
+        // 约束 + 清零 preferredContentSize 属性）——否则窗口尺寸被同步回 popover
+        // 尺寸，拖拽 resize 的 setFrame 全被弹回（v2026.8.22.81 实测只摘约束不清
+        // 属性无效；延后清零也无效——经一次布局后尺寸即被锁死）。
+        if let panelVC = vc as? BalancePanelViewController {
+            panelVC.isFloatingWindow = true
+            panelVC.detachPreferredContentSizeConstraints()
+            Logger.log(.refresh, "[Pin] transferred to floating panel, pcs lock detached, preferredContentSize=\(panelVC.preferredContentSize)")
+        }
+        floatingPanelVC = vc as? BalancePanelViewController
+        fp.contentView = vc.view
         fp.setFrame(viewFrame, display: false)
         popWindow.orderOut(nil)
         popover.close()
         isTransferringPanel = false
         fp.orderFrontRegardless()
-        // 预建下一轮 popover：unpin / 点击菜单栏重开面板时零构建等待。
-        // 面板重建是百毫秒级主线程工作，放在 pin 之后执行——浮窗刚显示、用户
-        // 尚未开始拖动，卡顿感知极弱；旧 popover（含转移过的 VC）在此整体释放。
+        // 预建下一轮 popover：unpin 关闭浮窗后、点击菜单栏图标重开面板时零构建等待。
+        // 面板重建是百毫秒级主线程工作，放在滑动动画发起之前——动画期间主线程
+        // 空闲才能流畅播放；旧 popover（含转移过的 VC）在此整体释放。
         // ⚠️ 置顶期间 panelView 必须继续指向浮窗中的面板（数据刷新目标），
         // 预建面板单独存放，showPanel 时恢复
         let pinnedPanel = panelView
@@ -1279,6 +1392,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         buildPanelOnce()
         prebuiltPanelView = panelView
         panelView = pinnedPanel
+        // 浮窗可见后再滑向右上角。frame 动画必须走 animator() 代理：
+        // NSAnimationContext 的 duration 只作用于 animator 调用，
+        // 直接 setFrame 不吃 duration、是瞬时跳变
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.current.duration = 0.25
+        NSAnimationContext.current.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        fp.animator().setFrame(targetFrame, display: true)
+        NSAnimationContext.endGrouping()
     }
 
     /// 置顶浮动窗：无边框 + 不激活（点击面板不抢 App 焦点，与 popover 行为一致）、
@@ -1288,6 +1409,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 鼠标事件（「余额」标题行的 pin 按钮在 titlebar 区收不到点击，无法解除置顶）。
     /// 拖动改由面板视图自绘（BalancePanelView.mouseDown）
     private func makeFloatingPanel() -> NSPanel {
+        // 注意：不要加 .resizable——实测 macOS 26 下 borderless + nonactivating 面板
+        // 加了也不出现系统边缘 resize 热区/光标，反而引入 borderless+resizable 的
+        // 空闲 CPU 飙高系统 bug 风险。resize 走自绘把手（轮询拖拽），
+        // min/maxSize 作为 setFrame 的系统级钳制兜底。
         let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 400),
                         styleMask: [.nonactivatingPanel, .borderless],
                         backing: .buffered, defer: false)
@@ -1297,7 +1422,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         p.hasShadow = true
         p.collectionBehavior = [.canJoinAllSpaces]
         p.hidesOnDeactivate = false
+        p.minSize = NSSize(width: PanelResizeHandle.minWidth, height: PanelResizeHandle.minHeight)
+        p.maxSize = NSSize(width: PanelResizeHandle.maxWidth,
+                           height: NSScreen.main?.visibleFrame.height ?? 4096)
         return p
+    }
+
+    /// 恢复浮窗尺寸：优先 config 持久化值（resize 把手拖动结束时写入），
+    /// 未记录（0）时用面板当前尺寸；宽 clamp 到 [240, 480]、高 ≥ 220 且不超屏幕可见高
+    /// （换小屏后恢复时收缩到屏内）
+    private func restoredFloatingPanelSize(default def: NSSize, screen: NSScreen?) -> NSSize {
+        let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let w = config.floatingPanelWidth > 0 ? config.floatingPanelWidth : def.width
+        let h = config.floatingPanelHeight > 0 ? config.floatingPanelHeight : def.height
+        return NSSize(width: min(max(w, PanelResizeHandle.minWidth), PanelResizeHandle.maxWidth),
+                      height: min(max(h, PanelResizeHandle.minHeight), visible.height))
     }
 
     /// 计算 status item 下方到屏幕可见区域底部的高度，popover 超出后由内容滚动承载。
@@ -1376,17 +1516,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let names = order.filter { failedServices.contains($0) }
             if !names.isEmpty { s.failedText = names.joined(separator: "、") + " 刷新失败" }
         }
+        // DeepSeek 卡片：多号管线单元素（uid 恒 "ds"，无昵称/签到）
+        var dsSnap = AccountCardSnapshot(uid: "ds", nickname: "", isCurrent: true)
         if let ds = cacheDs {
-            s.ds = "\(ds.symbol)\u{2009}\(fmtAmountRaw(ds.totalRaw))"
+            dsSnap.value = "\(ds.symbol)\u{2009}\(fmtAmountRaw(ds.totalRaw))"
             if config.deepseekCommonQuota > 0 {
                 let used = max(0, config.deepseekCommonQuota - ds.total)
-                s.dsUsedRatio = min(1, used / config.deepseekCommonQuota)
+                dsSnap.usedRatio = min(1, used / config.deepseekCommonQuota)
             }
-            s.dsPulsing = dsPulsing
+            dsSnap.pulsing = dsPulsingTracker.isPulsing("main")
+            // 与 orderedMenuBarEntries 同口径：有缓存数据且未被右键隐藏 → 菜单栏有条目
+            dsSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.ds, isCurrent: true)
         }
-        if config.deepseekCommonQuota > 0 {
-            s.dsInfoText = "日常额度 ¥\(Int(config.deepseekCommonQuota))"
-        }
+        // 未配置日常额度（usedRatio=0）时隐藏点阵
+        dsSnap.hideDots = dsSnap.usedRatio <= 0
+        // 复用 expireText 作为第二行纯文本副标题（无图标）
+        dsSnap.expireText = config.deepseekCommonQuota > 0
+            ? "日常额度 ¥\(Int(config.deepseekCommonQuota))"
+            : "打开官网 usage 页面"
+        s.dsAccounts = [dsSnap]
         let today = Self.todayString()
         // TRAE 多账号余额卡片：当前账号排最上
         let traeMainUid = TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? ""
@@ -1404,6 +1552,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 if c.limit > 0 {
                     snap.usedRatio = c.used / c.limit
                 }
+                // 与 orderedMenuBarEntries 同口径：有缓存数据且未被右键隐藏 → 菜单栏有条目
+                snap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.trae + ac.uid, isCurrent: isCurrent)
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: UDKey.traeCheckinDate(ac.uid)) == today
             // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）；
@@ -1414,7 +1564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.checkinRisk = config.traeAutoCheckin && traeRiskToday
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
-            snap.pulsing = traePulsing[ac.uid] ?? false
+            snap.pulsing = traePulsingTracker.isPulsing(ac.uid)
             s.traeAccounts.append(snap)
         }
         // WorkBuddy 多账号余额卡片：当前账号排最上
@@ -1433,6 +1583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 if c.total > 0 {
                     snap.usedRatio = (c.total - c.remain) / c.total
                 }
+                snap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.wb + ac.uid, isCurrent: isCurrent)
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: UDKey.wbCheckinDate(ac.uid)) == today
             // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）
@@ -1440,7 +1591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 && UserDefaults.standard.string(forKey: UDKey.wbCheckinFailDate(ac.uid)) == today
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
-            snap.pulsing = wbPulsing[ac.uid] ?? false
+            snap.pulsing = wbPulsingTracker.isPulsing(ac.uid)
             s.wbAccounts.append(snap)
         }
         // ZCode 多账号余额卡片：当前登录账号（config.json token 对应 uid）排最上
@@ -1457,19 +1608,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let c = cached, c.total > 0 {
                 snap.value = fmtAmountCommas(c.remain / c.total * 100, decimals: 1) + "%"
                 snap.usedRatio = (c.total - c.remain) / c.total
+                snap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.zcode + ac.uid, isCurrent: isCurrent)
                 // 到期副标题：仅当前账号 + 有免费套餐（Start Plan）时显示，剩余时长 HH:mm（小时可超 24）
                 if isCurrent, c.planEndsAt > 0 {
-                    let remainSec = c.planEndsAt - Date().timeIntervalSince1970
-                    if remainSec > 0 {
-                        let total = Int(remainSec)
-                        let days = total / 86400
-                        let h = (total % 86400) / 3600
-                        let m = (total % 3600) / 60
-                        if days > 0 {
-                            snap.expireText = String(format: "\u{2009}%d天 %02d:%02d\u{2009}后到期", days, h, m)
-                        } else {
-                            snap.expireText = String(format: "\u{2009}%02d:%02d\u{2009}后到期", h, m)
-                        }
+                    if let text = Self.expireCountdownText(endsAt: c.planEndsAt) {
+                        snap.expireText = text
                     } else {
                         // Start Plan 已到期：卡片显示"套餐已到期"红色提示，且不再参与定时刷新
                         snap.expired = true
@@ -1477,7 +1620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                 }
             }
-            snap.pulsing = zcodePulsing[ac.uid] ?? false
+            snap.pulsing = zcodePulsingTracker.isPulsing(ac.uid)
             s.zcodeAccounts.append(snap)
         }
         // Codex 多账号 usage 卡片：当前 auth.json 对应账号排首位，昵称固定显示邮箱。
@@ -1494,36 +1637,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if let c = cached {
                 snap.value = fmtAmountCommas(100 - c.usedPercent, decimals: 0) + "%"
                 snap.usedRatio = c.usedPercent / 100
+                snap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.codex + ac.uid, isCurrent: isCurrent)
                 // 到期副标题：仅当前账号显示，剩余时长格式同 ZCode（HH:mm，小时可超 24）
                 if isCurrent, c.resetAt > 0 {
-                    let remainSec = c.resetAt - Date().timeIntervalSince1970
-                    if remainSec > 0 {
-                        let total = Int(remainSec)
-                        let days = total / 86400
-                        let h = (total % 86400) / 3600
-                        let m = (total % 3600) / 60
-                        if days > 0 {
-                            snap.expireText = String(format: "\u{2009}%d天 %02d:%02d\u{2009}后到期", days, h, m)
-                        } else {
-                            snap.expireText = String(format: "\u{2009}%02d:%02d\u{2009}后到期", h, m)
-                        }
-                    } else {
-                        snap.expireText = "已到期"
-                    }
+                    snap.expireText = Self.expireCountdownText(endsAt: c.resetAt) ?? "已到期"
                 }
             }
+            snap.pulsing = codexPulsingTracker.isPulsing(ac.uid)
             s.codexAccounts.append(snap)
         }
-        // ── 日/周用量（本地差值基线，见 UsageStore；仅当前账号）──
+        // ── 日/周用量（本地差值基线，见 UsageStore；平台行 = 全部账号用量加总）──
         func fmtUsage(_ v: Double, percent: Bool, decimals: Int) -> String {
             percent ? String(format: "%.1f%%", v) : fmtAmountCommas(v, decimals: decimals)
         }
-        func usageRow(icon: String, name: String, platform: String, uid: String,
-                      current: Double?, increasing: Bool, decimals: Int,
+        func usageRow(icon: String, name: String, platform: String,
+                      accounts: [(uid: String, current: Double)], increasing: Bool, decimals: Int,
                       percent: Bool, prefix: String = "") -> UsageRowSnapshot? {
-            guard !uid.isEmpty, let cur = current,
-                  let u = UsageStore.usage(platform: platform, uid: uid, current: cur, increasing: increasing) else { return nil }
-            let daily = UsageStore.weeklyUsage(platform: platform, uid: uid)
+            guard let u = UsageStore.usage(platform: platform, accounts: accounts, increasing: increasing) else { return nil }
+            let daily = UsageStore.weeklyUsage(platform: platform, uids: accounts.map(\.uid))
             return UsageRowSnapshot(platform: platform, icon: icon, name: name,
                                     todayText: prefix + fmtUsage(u.today, percent: percent, decimals: decimals),
                                     weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals),
@@ -1531,29 +1662,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                     dailyUsageTexts: daily.map { prefix + fmtUsage($0, percent: percent, decimals: decimals) })
         }
         if let ds = cacheDs,
-           let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds", uid: "main",
-                              current: ds.total, increasing: false, decimals: 2, percent: false, prefix: ds.symbol) {
+           let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds",
+                              accounts: [(uid: "main", current: ds.total)], increasing: false,
+                              decimals: 2, percent: false, prefix: ds.symbol) {
             s.usageRows.append(row)
         }
-        if let row = usageRow(icon: "workbuddy", name: "WorkBuddy", platform: "wb", uid: mainUid,
-                              current: cacheWbAccounts[mainUid]?.remain, increasing: false,
-                              decimals: config.workbuddyDecimals, percent: false) {
+        if let row = usageRow(icon: "workbuddy", name: "WorkBuddy", platform: "wb",
+                              accounts: cacheWbAccounts.map { (uid: $0.key, current: $0.value.remain) },
+                              increasing: false, decimals: config.workbuddyDecimals, percent: false) {
             s.usageRows.append(row)
         }
-        if let row = usageRow(icon: "trae-color", name: "TRAE", platform: "trae", uid: traeMainUid,
-                              current: cacheTraeAccounts[traeMainUid]?.used, increasing: true,
-                              decimals: config.traeDecimals, percent: false) {
+        if let row = usageRow(icon: "trae-color", name: "TRAE", platform: "trae",
+                              accounts: cacheTraeAccounts.map { (uid: $0.key, current: $0.value.used) },
+                              increasing: true, decimals: config.traeDecimals, percent: false) {
             s.usageRows.append(row)
         }
-        if let zc = cacheZcodeAccounts[zcodeMainUid], zc.total > 0,
-           let row = usageRow(icon: "zhipu", name: "ZCode", platform: "zcode", uid: zcodeMainUid,
-                              current: zc.remain / zc.total * 100, increasing: false,
-                              decimals: 1, percent: true) {
+        if let row = usageRow(icon: "zhipu", name: "ZCode", platform: "zcode",
+                              accounts: cacheZcodeAccounts.compactMap {
+                                  $0.value.total > 0 ? (uid: $0.key, current: $0.value.remain / $0.value.total * 100) : nil
+                              },
+                              increasing: false, decimals: 1, percent: true) {
             s.usageRows.append(row)
         }
-        if let row = usageRow(icon: "codex", name: "Codex", platform: "codex", uid: codexMainUid,
-                              current: cacheCodexAccounts[codexMainUid]?.usedPercent, increasing: true,
-                              decimals: 1, percent: true) {
+        if let row = usageRow(icon: "codex", name: "Codex", platform: "codex",
+                              accounts: cacheCodexAccounts.map { (uid: $0.key, current: $0.value.usedPercent) },
+                              increasing: true, decimals: 1, percent: true) {
             s.usageRows.append(row)
         }
         // 调试模式始终提供完整的七日样例，即使本机尚未配置任何平台账号，方便直接观察面积图。
@@ -1592,7 +1725,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.refreshIntervalSeconds = Int(config.refreshInterval)
         s.panelGradientEnabled = config.panelGradientEnabled
         s.monoFontEnabled = config.monoFontEnabled
-        s.subAccountDimEnabled = config.subAccountDimEnabled
         return s
     }
 
@@ -1721,17 +1853,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// Mono 字体：余额卡片与用量列表切换 SF Mono（中文回退系统字体），
+    /// Mono 字体：余额卡片与用量列表切换 DepartureMono（中文回退系统字体），
     /// 保存后经快照同步，面板对已注册 label 就地换字体（不重建卡片）
     @objc private func onToggleMonoFont() {
         config.monoFontEnabled = !config.monoFontEnabled
-        ConfigStore.save(config)
-        syncPanel()
-    }
-
-    /// 弱化非当前账号：切换小卡片整卡降透明（悬停复亮）的新设计
-    @objc private func onToggleSubAccountDim() {
-        config.subAccountDimEnabled = !config.subAccountDimEnabled
         ConfigStore.save(config)
         syncPanel()
     }
@@ -1857,6 +1982,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 用户主动操作：立即渲染并立即应用位图（菜单栏瞬间反馈），面板由 KVO 钉住
         updateTitle(immediate: true)
         syncPanel()
+    }
+
+    /// 打开当前账号卡片（启动平台 App）时确保该平台当前账号在菜单栏显示：
+    /// 用户可能在平台 App 内自行切号，新当前账号可能带有历史右键隐藏记录
+    /// （ZCode/Codex 当前账号还默认隐藏），这里追加为可见，其余条目显隐不变。
+    private func ensureCurrentAccountInMenuBar(prefix: String, currentUid: String?) {
+        guard let uid = currentUid, !uid.isEmpty else { return }
+        let itemId = prefix + uid
+        guard !isMenuBarVisible(id: itemId, isCurrent: true) else { return }
+        config.menuBarVisible[itemId] = true
+        ConfigStore.save(config)
     }
 
     /// 读取面板保存的平台顺序；未知/新增平台自动追加到末尾。
@@ -2187,11 +2323,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             UsageStore.observe(platform: "ds", uid: "main", value: totalNum, increasing: false)
             if config.deepseekCommonQuota > 0 {
                 let used = max(0, config.deepseekCommonQuota - totalNum)
-                updatePulsingState(prevRatio: &prevDsRatio, pulsing: &dsPulsing,
-                                   newRatio: min(1, used / config.deepseekCommonQuota))
+                _ = dsPulsingTracker.observe("main", ratio: min(1, used / config.deepseekCommonQuota))
             } else {
-                prevDsRatio = -1
-                dsPulsing = false
+                dsPulsingTracker.reset("main")
             }
             failedServices.remove("DeepSeek")
             Logger.log(.refresh, "[\(seq)] DeepSeek: OK value=\(bal.totalRaw) (elapsed=\(Int(Date().timeIntervalSince(t0)*1000))ms)")
@@ -2294,12 +2428,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// WB 脉冲计算：usedRatio = (total-remain)/total，上升 → pulsing=true（被消耗）；稳定/回升 → false
     private func updatePulsingForWb(uid: String, remain: Double, total: Double) {
-        var prev = prevWbRatio[uid] ?? -1
-        var pulsing = wbPulsing[uid] ?? false
-        updatePulsingState(prevRatio: &prev, pulsing: &pulsing,
-                           newRatio: total > 0 ? (total - remain) / total : 0)
-        prevWbRatio[uid] = prev
-        wbPulsing[uid] = pulsing
+        _ = wbPulsingTracker.observe(uid, ratio: total > 0 ? (total - remain) / total : 0)
     }
 
     // MARK: - ZCode（智谱 Coding Plan）余额刷新
@@ -2326,13 +2455,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 config.zcodeAccounts[idx].nickname = nick
                 ConfigStore.save(config)
             }
-            // Start Plan 已到期（缓存 planEndsAt > 0 且已过期）→ 不再刷新该账号，
-            // 保留卡片"套餐已到期"提示，避免无效请求与误判失败
-            if let cached = cacheZcodeAccounts[ac.uid],
-               cached.planEndsAt > 0, cached.planEndsAt <= Date().timeIntervalSince1970 {
-                Logger.log(.refresh, "\(acctag): plan expired at \(cached.planEndsAt), skip fetch")
-                continue
-            }
+            // 到期跳过已移除（对齐 Cockpit）：套餐到期是服务端事实，本地缓存判定会在
+            // 用户领取新套餐后永远卡在「已到期」（旧 planEndsAt 挡住新请求）；
+            // 每轮真实请求，到期展示交给快照层按最新 planEndsAt 判断
             let r = await Logger.measure("\(acctag).fetchBalance") {
                 await ZcodeService.fetchBalance(token: ac.token)
             }
@@ -2340,21 +2465,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
                 return
             }
+            guard let r = r else {
+                zcodeFailed = true  // 请求层失败（token 失效或网络错误）
+                Logger.log(.refresh, "\(acctag): request failed, marked failed")
+                continue
+            }
             guard r.total > 0 else {
-                zcodeFailed = true  // 该号获取失败（token 失效或网络错误）
-                Logger.log(.refresh, "\(acctag): total<=0, marked failed")
+                // 查询成功但无有效套餐（全部到期）：不判失败，保留旧缓存继续展示「套餐已到期」
+                Logger.log(.refresh, "\(acctag): no active quota, keep last cache")
+                zcodePulsingTracker.reset(ac.uid)
                 continue
             }
             cacheZcodeAccounts[ac.uid] = r
-            if r.total > 0 {
-                UsageStore.observe(platform: "zcode", uid: ac.uid, value: r.remain / r.total * 100, increasing: false)
-            }
-            var prev = prevZcodeRatio[ac.uid] ?? -1
-            var pulsing = zcodePulsing[ac.uid] ?? false
-            updatePulsingState(prevRatio: &prev, pulsing: &pulsing,
-                               newRatio: r.total > 0 ? (r.total - r.remain) / r.total : 0)
-            prevZcodeRatio[ac.uid] = prev
-            zcodePulsing[ac.uid] = pulsing
+            UsageStore.observe(platform: "zcode", uid: ac.uid, value: r.remain / r.total * 100, increasing: false)
+            _ = zcodePulsingTracker.observe(ac.uid, ratio: (r.total - r.remain) / r.total)
             Logger.log(.refresh, "\(acctag): OK remain=\(r.remain) total=\(r.total)")
             // ZCode 没有主账号单独刷新路径，每个账号写入后立即更新菜单栏。
             updateTitle(tag: "zcode-\(i)-\(seq)")
@@ -2431,6 +2555,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             cacheCodexAccounts[account.uid] = (usage.usedPercent, usage.resetAt)
             UsageStore.observe(platform: "codex", uid: account.uid, value: usage.usedPercent, increasing: true)
+            // usedPercent 上升（额度被消耗）→ 点阵脉冲，规则同其他四平台
+            _ = codexPulsingTracker.observe(account.uid, ratio: usage.usedPercent)
             Logger.log(.refresh, "\(acctag): OK used=\(usage.usedPercent)%")
             updateTitle(tag: "codex-\(i)-\(seq)")
         }
@@ -2522,14 +2648,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Logger.log(.refresh, "[\(seq)] TRAE.checkinStatusFill done in \(Int(Date().timeIntervalSince(cs0)*1000))ms")
     }
 
-    /// TRAE 脉冲计算：usedRatio 上升 → pulsing=true（被消耗）；稳定/回升 → false
+    /// TRAE 脉冲计算：usedRatio = used/limit，上升 → pulsing=true（被消耗）；稳定/回升 → false
     private func updatePulsingForTrae(uid: String, limit: Double, used: Double) {
-        var prev = prevTraeRatio[uid] ?? -1
-        var pulsing = traePulsing[uid] ?? false
-        updatePulsingState(prevRatio: &prev, pulsing: &pulsing,
-                           newRatio: limit > 0 ? used / limit : 0)
-        prevTraeRatio[uid] = prev
-        traePulsing[uid] = pulsing
+        _ = traePulsingTracker.observe(uid, ratio: limit > 0 ? used / limit : 0)
     }
 
     /// 收集 TRAE 待查询账号：config 预存账号 + 当前登录账号（uid 去重）
@@ -3586,7 +3707,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let account = config.traeAccounts.first(where: { $0.uid == uid }) else { return }
         let storagePath = config.traeStoragePath
         performAccountSwitch(serviceName: "TRAE",
-                             failureMessage: "写入 storage.json 未成功，已重启恢复原账号") {
+                             failureMessage: "写入 storage.json 未成功，已重启恢复原账号",
+                             itemId: MenuBarPrefix.trae + account.uid) {
             TraeService.switchAccount(account: TraeAccountInfo(
                 uid: account.uid,
                 username: account.username,
@@ -3621,6 +3743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 各平台只提供 action，避免重复实现相同的线程切换、失败提示和收尾逻辑。
     private func performAccountSwitch(serviceName: String,
                                       failureMessage: String,
+                                      itemId: String,
                                       action: @escaping () -> Bool) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard self != nil else { return }
@@ -3630,6 +3753,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 if !ok {
                     self.notify("\(serviceName) 切号失败", failureMessage)
                 } else {
+                    // 清除新当前账号的菜单栏显隐记录：历史右键留下的隐藏记录会压过
+                    // 「当前账号默认显示」规则，导致切换后菜单栏仍显示旧账号条目
+                    if self.config.menuBarVisible.removeValue(forKey: itemId) != nil {
+                        ConfigStore.save(self.config)
+                    }
+                    // 切号成功即重排菜单栏：凭据文件已写入，当前账号判定立即生效
+                    //（新当前号排最前 + 按默认规则显示），数值沿用缓存，
+                    // 不等网络刷新回填（onRefresh 完成后再修正数值）
+                    self.updateTitle(immediate: true, tag: "account-switch")
                     self.syncPanel()
                     self.onRefresh()
                 }
@@ -3652,7 +3784,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Logger.log(.switchAccount, "[iBalance] found account: \(account.nickname)")
         // 直接用 config 中的 token 切换，WorkBuddy Desktop 启动后会自行刷新 token
         performAccountSwitch(serviceName: "WorkBuddy",
-                             failureMessage: "写入认证文件未成功，已重启恢复原账号") {
+                             failureMessage: "写入认证文件未成功，已重启恢复原账号",
+                             itemId: MenuBarPrefix.wb + account.uid) {
             WorkBuddyService.switchAccount(account)
         }
     }
@@ -3666,7 +3799,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         performAccountSwitch(serviceName: "ZCode",
-                             failureMessage: "写入凭据文件未成功，已重启恢复原账号") {
+                             failureMessage: "写入凭据文件未成功，已重启恢复原账号",
+                             itemId: MenuBarPrefix.zcode + account.uid) {
             ZcodeService.switchAccount(account)
         }
     }
@@ -3680,7 +3814,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         performAccountSwitch(serviceName: "Codex",
-                             failureMessage: "写入 ~/.codex/auth.json 未成功，已重启恢复原账号") {
+                             failureMessage: "写入 ~/.codex/auth.json 未成功，已重启恢复原账号",
+                             itemId: MenuBarPrefix.codex + account.uid) {
             CodexService.switchAccount(account)
         }
     }
@@ -3820,6 +3955,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if diff == 1 { return prevStreak + 1 }
         if diff == 0 { return max(prevStreak, 1) }
         return 1
+    }
+
+    /// 到期倒计时文案（ZCode/Codex 共用）：剩余 > 0 → "x天 HH:mm 后到期" / "HH:mm 后到期"（天与数字间细空格）；
+    /// 已到期 → nil（由调用方给各自的红色提示文案）
+    private static func expireCountdownText(endsAt: TimeInterval) -> String? {
+        let remainSec = endsAt - Date().timeIntervalSince1970
+        guard remainSec > 0 else { return nil }
+        let total = Int(remainSec)
+        let days = total / 86400
+        let h = (total % 86400) / 3600
+        let m = (total % 3600) / 60
+        if days > 0 {
+            return String(format: "\u{2009}%d天 %02d:%02d\u{2009}后到期", days, h, m)
+        }
+        return String(format: "\u{2009}%02d:%02d\u{2009}后到期", h, m)
     }
 
     // MARK: - 签到历史记录

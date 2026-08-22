@@ -141,11 +141,14 @@ fi
 # 导致"完全磁盘访问"等授权每次重建都被重置；
 # 用固定自签证书签名后，重建不再要求重新授权。
 SIGN_IDENTITY="iBalance Local Sign"
+BUNDLE_ID="com.local.ibalance"
 if security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
-    echo "==> 代码签名（${SIGN_IDENTITY}）"
-    codesign --force --sign "$SIGN_IDENTITY" "$APP_DIR"
+    echo "==> 代码签名（${SIGN_IDENTITY}，identifier=${BUNDLE_ID}）"
+    codesign --force --identifier "$BUNDLE_ID" --sign "$SIGN_IDENTITY" "$APP_DIR"
 else
-    echo "!! 未找到签名证书 '$SIGN_IDENTITY'，保留 linker ad-hoc 签名（重建后可能需重新授权磁盘访问）"
+    echo "!! 未找到签名证书 '$SIGN_IDENTITY'，回退 ad-hoc 签名（identifier 仍固定）"
+    codesign --force --identifier "$BUNDLE_ID" --sign - "$APP_DIR" || \
+        echo "!! ad-hoc 签名失败，保留 linker 签名"
 fi
 
 echo "==> 完成"
