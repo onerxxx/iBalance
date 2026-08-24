@@ -1,0 +1,857 @@
+// UsagePanel.swift — iBalance
+// 用量板块:UsageRowSnapshot / 一周趋势图与子弹窗 / UsageDots / 面板用量行构建
+// (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
+
+import Cocoa
+import CoreImage
+
+/// 1小时/日/周用量行快照：icon + 平台名 + 已格式化的近1小时/今日/本周用量文本 + 本周每日用量。
+struct UsageRowSnapshot: Equatable {
+    var platform: String
+    var icon: String
+    var name: String
+    var hourText: String = ""
+    var todayText: String
+    var weekText: String
+    /// 本周一至周日的数值，用于 hover 右侧面积图。
+    var dailyUsage: [Double] = []
+    /// 与 dailyUsage 对应的已格式化文本，避免图表重复猜测货币/百分比格式。
+    var dailyUsageTexts: [String] = []
+}
+
+/// 用量行右侧趋势图：使用 AppKit 原生 NSView + NSBezierPath 绘制一周面积图。
+/// 视图本身承担 hover 追踪，保证鼠标从用量行移动到 popover 时不会立即关闭。
+final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
+    var row: UsageRowSnapshot? {
+        didSet { needsDisplay = true }
+    }
+    var onHoverChanged: ((Bool) -> Void)?
+    /// Mono 字体开关：开启时图表内所有文本（标题/刻度/数值/日期）用 JetBrainsMono
+    var monoFontEnabled = false {
+        didSet { needsDisplay = true }
+    }
+    /// Inter 字体开关：开启时图表内文本用 Inter（优先级 Mono > Inter）
+    var interFontEnabled = false {
+        didSet { needsDisplay = true }
+    }
+    private var trackingArea: NSTrackingArea?
+    /// 当日圆点 Pulse Dot 相位（0~1 线性周期位置）：驱动光环扩散进度
+    private var blinkPhase: CGFloat = 0
+    /// 闪烁驱动：NSView.displayLink（macOS 15+），随屏幕刷新出帧；
+    /// 视图移出 window（子弹窗关闭）时暂停，重新出现时复用。
+    private weak var blinkLink: CADisplayLink?
+
+    /// 按当前字体开关取字体（优先级：Mono 风格 > Inter > 系统字体，与面板 uiFont 同策略）
+    private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+        if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
+        if interFontEnabled { return InterFontProvider.font(size: size, weight: weight) }
+        return .systemFont(ofSize: size, weight: weight)
+    }
+
+    override var isFlipped: Bool { true }
+    // 面积图保持紧凑，同时保留两行表头（平台名 + 本周用量两行标签、大号右对齐数值）、
+    // 坐标日期和底部留白。2026-08-21 表头改两行结构，高度 158 → 172；
+    // 2026-08-23 图表区高度降 15%（~86pt → ~73pt），总高 172 → 159（表头与底部 36pt 日期轴不动）；
+    // 同日宽度降 10%（232 → 209），图表绘图区随宽度自适应收窄
+    override var intrinsicContentSize: NSSize { NSSize(width: 209, height: 159) }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = trackingArea { removeTrackingArea(ta) }
+        let ta = NSTrackingArea(rect: .zero,
+                                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        trackingArea = ta
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onHoverChanged?(false)
+    }
+
+    func syncHoverState(_ inside: Bool) {
+        onHoverChanged?(inside)
+    }
+
+    // MARK: - 当日圆点 Pulse Dot（1.8s 周期：中心点常亮 + 光环向外扩散淡出，前 70% 扩散后 30% 停顿）
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { startBlink() } else { stopBlink() }
+    }
+
+    private func startBlink() {
+        if let link = blinkLink {
+            link.isPaused = false
+            return
+        }
+        let link = displayLink(target: self, selector: #selector(onBlinkTick(_:)))
+        link.add(to: .main, forMode: .common)
+        blinkLink = link
+    }
+
+    private func stopBlink() {
+        blinkLink?.isPaused = true
+    }
+
+    @objc private func onBlinkTick(_ link: CADisplayLink) {
+        // Pulse Dot 周期 1.8s；相位量化到 1/60 步长，120Hz 屏也不全速重绘
+        let cycle: Double = 1.8
+        let phase = (link.targetTimestamp.truncatingRemainder(dividingBy: cycle)) / cycle
+        let q = (phase * 60).rounded() / 60
+        if abs(q - blinkPhase) > 0.0001 {
+            blinkPhase = q
+            needsDisplay = true
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let row else { return }
+
+        let titleFont = monoFontEnabled
+            ? MonoFontProvider.font(size: 9)
+            : (interFontEnabled
+                ? InterFontProvider.font(size: 9)
+                : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular))
+        let detailFont = uiFont(size: 10)
+        let axisFont = titleFont
+        let titleColor = Palette.cardForeground
+        let secondaryColor = NSColor.secondaryLabelColor
+        let plotInset: CGFloat = 16
+        let yAxisLabelWidth: CGFloat = 30
+        let yAxisGap: CGFloat = 5
+        let yAxisRightInset: CGFloat = 4
+        let graphLineColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
+        let headerY: CGFloat = 12
+
+        // 表头两行式（相对图表 plot 区域）：第一行平台名（左对齐），
+        // 第二行「本周用量」标签（左对齐）；周用量数值右对齐、加大字号，
+        // 垂直居中跨占两行高度。
+        let plotFullWidth = max(1, bounds.width - plotInset - yAxisGap
+                                - yAxisLabelWidth - yAxisRightInset)
+        let valueFont = monoFontEnabled
+            ? MonoFontProvider.font(size: 17, weight: .semibold)
+            : (interFontEnabled
+                ? InterFontProvider.font(size: 17, weight: .semibold)
+                : NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold))
+        let headerLineHeight = "Ag".size(withAttributes: [.font: titleFont]).height
+        let headerLineGap: CGFloat = 2
+        let headerBlockHeight = headerLineHeight * 2 + headerLineGap
+        drawText(row.name, at: NSPoint(x: plotInset, y: headerY),
+                 font: titleFont, color: titleColor)
+        drawText("本周累计用量", at: NSPoint(x: plotInset, y: headerY + headerLineHeight + headerLineGap),
+                 font: titleFont, color: titleColor)
+        let weekSize = row.weekText.size(withAttributes: [.font: valueFont])
+        drawText(row.weekText,
+                 at: NSPoint(x: plotInset + plotFullWidth - weekSize.width,
+                             y: headerY + (headerBlockHeight - weekSize.height) / 2),
+                 font: valueFont, color: titleColor)
+
+        // 表头块下保留 4pt 基础间距，随后将面积图、数值和日期轴整体下移 10pt。
+        let headerHeight = headerBlockHeight
+        let graphOffsetY: CGFloat = 10
+        let plotTop = headerY + headerHeight + 4 + graphOffsetY
+        // 底部固定 36pt 给 45° 旋转日期轴（高度改由 intrinsicContentSize 决定后按需留白）
+        let plotBottom = bounds.height - 36
+        let plot = NSRect(x: plotInset, y: plotTop,
+                          width: max(1, bounds.width - plotInset - yAxisGap
+                                     - yAxisLabelWidth - yAxisRightInset),
+                          height: max(1, plotBottom - plotTop))
+        // 曲线顶部预留数值标签空间，避免最高点和数值文字互相覆盖。
+        let graphTopPadding: CGFloat = 14
+        let graphHeight = max(1, plot.height - graphTopPadding)
+        let values = Array(row.dailyUsage.prefix(7)) + Array(repeating: 0, count: max(0, 7 - row.dailyUsage.count))
+        let texts = Array(row.dailyUsageTexts.prefix(7)) + Array(repeating: "—", count: max(0, 7 - row.dailyUsageTexts.count))
+        let maxValue = values.max() ?? 0
+        // 今天在周内第几个位置（周一=0）：按系统日期从本周一推算。
+        // 不能用 dailyUsage.count-1——weeklyUsage 返回固定 7 元素（未来天填 0），count 恒为 7。
+        var weekCal = Calendar.current
+        weekCal.firstWeekday = 2
+        let weekStart = weekCal.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
+        let todayIndex = min(6, max(0, weekCal.dateComponents([.day], from: weekStart, to: Date()).day ?? 0))
+        // 纵轴顶端取本周峰值向上取整，底端固定为 0；曲线按轴顶端归一化，给顶部留出真实余量。
+        let axisMaxValue = max(1, ceil(maxValue))
+        let axisSampleText = texts.first(where: { $0 != "—" }) ?? row.todayText
+
+        // 网格线分两层：基线（0 位）更实，为面积提供「地面」；其余网格线更虚，纯读数辅助。
+        let grid = NSBezierPath()
+        let baseline = NSBezierPath()
+        for ratio in [CGFloat(0), CGFloat(0.5), CGFloat(1)] {
+            let y = plot.maxY - plot.height * ratio
+            let path = ratio == 0 ? baseline : grid
+            path.move(to: NSPoint(x: plot.minX, y: y))
+            path.line(to: NSPoint(x: plot.maxX, y: y))
+        }
+        NSColor.secondaryLabelColor.withAlphaComponent(0.20).setStroke()
+        grid.lineWidth = 0.5
+        grid.stroke()
+        NSColor.secondaryLabelColor.withAlphaComponent(0.38).setStroke()
+        baseline.lineWidth = 0.5
+        baseline.stroke()
+
+        // 右侧纵轴：顶端为向上取整后的本周最高值，中点辅助读数，底端为 0。
+        // 轴线与最后一个数据点共用同一条竖线，避免图表和坐标轴出现 1 个间距的错位。
+        let axisX = plot.maxX
+        let axis = NSBezierPath()
+        axis.move(to: NSPoint(x: axisX, y: plot.minY))
+        axis.line(to: NSPoint(x: axisX, y: plot.maxY))
+        NSColor.secondaryLabelColor.withAlphaComponent(0.42).setStroke()
+        axis.lineWidth = 0.5
+        axis.stroke()
+        let axisTicks: [(value: Double, ratio: CGFloat)] = [
+            (axisMaxValue, 0),
+            (axisMaxValue / 2, 0.5),
+            (0, 1),
+        ]
+        for tick in axisTicks {
+            let y = plot.minY + plot.height * tick.ratio
+            let label = axisValueText(tick.value, sample: axisSampleText,
+                                      preserveFraction: tick.value != tick.value.rounded())
+            let labelHeight = label.size(withAttributes: [.font: axisFont]).height
+            drawText(label,
+                     // 纵坐标文本统一左对齐，所有刻度从轴线右侧同一个 x 起笔。
+                     at: NSPoint(x: axisX + yAxisGap,
+                                 y: y - labelHeight / 2),
+                     font: axisFont, color: NSColor.systemGray)
+        }
+
+        if maxValue > 0.000001 {
+            let points = values.enumerated().map { index, value in
+                NSPoint(x: plot.minX + plot.width * CGFloat(index) / 6,
+                        y: plot.maxY - graphHeight * CGFloat(value / axisMaxValue))
+            }
+            let area = NSBezierPath()
+            area.move(to: NSPoint(x: points[0].x, y: plot.maxY))
+            appendSmoothSegments(points, to: area)
+            area.line(to: NSPoint(x: points[6].x, y: plot.maxY))
+            area.close()
+            // 渐变锚点固定在绘图区上下边界，不随曲线最高点变化：顶部最实、向下渐隐。
+            fillAreaGradient(area, in: plot)
+
+            let line = NSBezierPath()
+            appendSmoothSegments(points, to: line, movesToFirst: true)
+            graphLineColor.setStroke()
+            line.lineWidth = 2.2
+            line.lineCapStyle = .round
+            line.stroke()
+
+            // 圆点尺寸按数值相对比例：本周最大值 8.2pt，最小 3.2pt，
+            // 其余在区间内按 value/maxValue 线性映射；只画到今天为止（未来占位天不画）。
+            // 当日圆点为 Pulse Dot：中心实心点常亮（#E9E9E9 区分于其余灰点），
+            // 光环按 blinkPhase 相位向外扩散并淡出（雷达 ping，1.8s 周期）。
+            let dotMaxSize: CGFloat = 8.2
+            let dotMinSize: CGFloat = 3.2
+            let scale = maxValue > 0.000001 ? (dotMaxSize - dotMinSize) / maxValue : 0
+            let dotBaseWhite: CGFloat = 0.75
+            let dotPeakWhite: CGFloat = 0xE9 / 255.0
+            for (index, point) in points.enumerated() where index <= todayIndex {
+                let size = dotMinSize + values[index] * scale
+                let radius = size / 2
+                // 圆点必须以数据点为中心，保持与平滑曲线使用同一组坐标。
+                let dot = NSBezierPath(ovalIn: NSRect(x: point.x - radius, y: point.y - radius,
+                                                       width: size, height: size))
+                NSColor(calibratedWhite: index == todayIndex ? dotPeakWhite : dotBaseWhite,
+                        alpha: 1.0).setFill()
+                dot.fill()
+                // 当日 Pulse 光环：前 70% 相位 ease-out 扩散到 ~2.4x 并淡出，后 30% 停顿（alpha=0 天然隐形）
+                if index == todayIndex {
+                    let ping = min(blinkPhase / 0.7, 1)
+                    let ease = 1 - (1 - ping) * (1 - ping)
+                    let ringRadius = radius * (1 + 1.4 * ease)
+                    let ringAlpha = 0.65 * pow(1 - ping, 1.5)
+                    let ring = NSBezierPath(ovalIn: NSRect(x: point.x - ringRadius,
+                                                           y: point.y - ringRadius,
+                                                           width: ringRadius * 2,
+                                                           height: ringRadius * 2))
+                    NSColor(calibratedWhite: dotPeakWhite, alpha: ringAlpha).setStroke()
+                    ring.lineWidth = max(0.8, 2.6 * (1 - ping))
+                    ring.stroke()
+                }
+            }
+
+            // 数值标注：只显示当日数值（与高亮日期同一列），其余天不标
+            if todayIndex >= 0 {
+                let valueText = texts[todayIndex]
+                if valueText != "—" {
+                    let valueWidth = valueText.size(withAttributes: [.font: axisFont]).width
+                    let x = min(max(plot.minX, points[todayIndex].x - valueWidth / 2),
+                                plot.maxX - valueWidth)
+                    let y = max(26, points[todayIndex].y - 17)
+                    drawText(valueText, at: NSPoint(x: x, y: y), font: axisFont,
+                             color: NSColor(calibratedWhite: 0.72, alpha: 1.0))
+                }
+            }
+        } else {
+            let empty = "本周暂无历史用量"
+            let emptyWidth = empty.size(withAttributes: [.font: detailFont]).width
+            drawText(empty, at: NSPoint(x: plot.midX - emptyWidth / 2, y: plot.midY - 6),
+                     font: detailFont, color: secondaryColor)
+        }
+
+        var calendar = Calendar.current
+        calendar.firstWeekday = 2
+        let start = calendar.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateFormat = "M/d"
+        for index in 0..<7 {
+            guard let date = calendar.date(byAdding: .day, value: index, to: start) else { continue }
+            let label = formatter.string(from: date)
+            let width = label.size(withAttributes: [.font: axisFont]).width
+            // 日期逆时针旋转 45°：先沿文本方向平移 -width/2 让文字光学中心对准贯穿线
+            let anchorX = plot.minX + plot.width * CGFloat(index) / 6
+            let anchorY = plot.maxY + 10
+            let labelColor: NSColor = index == todayIndex
+                ? Palette.cardForeground
+                : .systemGray
+            let ctx = NSGraphicsContext.current?.cgContext
+            ctx?.saveGState()
+            ctx?.translateBy(x: anchorX, y: anchorY)
+            // AppKit 视图坐标 y 向上、文本绘制方向向右，逆时针 = 负角度旋转
+            ctx?.rotate(by: -.pi / 4)
+            drawText(label, at: NSPoint(x: -width / 2, y: 0), font: axisFont, color: labelColor)
+            ctx?.restoreGState()
+        }
+    }
+
+    private func drawText(_ text: String, at point: NSPoint, font: NSFont, color: NSColor) {
+        text.draw(at: point, withAttributes: [
+            .font: font,
+            .foregroundColor: color,
+        ])
+    }
+
+    /// 品牌图标的前景色单色版本（与用量行 icon 同款配色，保证深色 popover 上可见）。
+    /// 用 sourceAtop 把原始形状着色，不改变 alpha 通道。
+    private func tintedIcon(_ icon: NSImage, color: NSColor, size: NSSize) -> NSImage {
+        NSImage(size: size, flipped: false) { rect in
+            icon.draw(in: rect, from: .zero, operation: .sourceOver,
+                      fraction: 1, respectFlipped: false, hints: nil)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+    }
+
+    /// 在面积路径内绘制固定锚点的白→白透明垂直渐变（顶部 40% 白向下渐变到 2% 白）。
+    private func fillAreaGradient(_ area: NSBezierPath, in plot: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let colors = [
+            NSColor.white.withAlphaComponent(0.40).cgColor,
+            NSColor.white.withAlphaComponent(0.02).cgColor,
+        ] as CFArray
+        guard let gradient = CGGradient(colorsSpace: colorSpace, colors: colors,
+                                        locations: [0, 1]) else { return }
+        context.saveGState()
+        area.addClip()
+        context.drawLinearGradient(gradient,
+                                   start: CGPoint(x: plot.midX, y: plot.minY),
+                                   end: CGPoint(x: plot.midX, y: plot.maxY),
+                                   options: [])
+        context.restoreGState()
+    }
+
+    /// 根据已有数据文本保留货币前缀、百分号和小数位，格式化纵轴刻度。
+    private func axisValueText(_ value: Double, sample: String, preserveFraction: Bool) -> String {
+        let trimmed = sample.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let firstNumber = trimmed.firstIndex(where: { $0.isNumber || $0 == "." || $0 == "-" }),
+              let lastNumber = trimmed.lastIndex(where: { $0.isNumber }) else {
+            return String(format: "%.0f", value)
+        }
+
+        let prefix = String(trimmed[..<firstNumber])
+        let suffix = String(trimmed[trimmed.index(after: lastNumber)...])
+        let numericSample = String(trimmed[firstNumber...lastNumber])
+        let sampleDecimals: Int
+        if let decimalIndex = numericSample.lastIndex(of: ".") {
+            sampleDecimals = numericSample[numericSample.index(after: decimalIndex)...].count
+        } else {
+            sampleDecimals = 0
+        }
+        let decimals = max(sampleDecimals, preserveFraction ? 1 : 0)
+        let formatter = NumberFormatter()
+        formatter.locale = Locale.current
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = decimals
+        formatter.maximumFractionDigits = decimals
+        let fallback = decimals == 0 ? String(Int(value.rounded())) : String(value)
+        let number = formatter.string(from: NSNumber(value: value)) ?? fallback
+        return prefix + number + suffix
+    }
+
+    /// 用分段三次 Bézier 曲线连接数据点：曲线经过每个数据点，且相邻段在点位处保持连续切线。
+    /// smoothness 控制弯曲强度：0 = 直线折线，1 = 完全平滑（控制点拉到相邻段中点）。
+    private func appendSmoothSegments(_ points: [NSPoint], to path: NSBezierPath,
+                                      movesToFirst: Bool = false) {
+        guard let first = points.first else { return }
+        if movesToFirst {
+            path.move(to: first)
+        } else {
+            path.line(to: first)
+        }
+        guard points.count > 1 else { return }
+
+        let smoothness: CGFloat = 0.6
+        for index in 0..<(points.count - 1) {
+            let start = points[index]
+            let end = points[index + 1]
+            let middleX = (start.x + end.x) / 2
+            // 控制点在中点与端点之间按 smoothness 插值：值越小曲线越贴近直线
+            let cp1X = middleX + (start.x - middleX) * (1 - smoothness)
+            let cp2X = middleX + (end.x - middleX) * (1 - smoothness)
+            path.curve(to: end,
+                       controlPoint1: NSPoint(x: cp1X, y: start.y),
+                       controlPoint2: NSPoint(x: cp2X, y: end.y))
+        }
+    }
+}
+
+/// 一周用量面积图的原生 popover 控制器。
+final class UsageHistoryPopoverController: NSViewController {
+    private let chartView = UsageHistoryChartView()
+    private let backgroundView = TintedVisualEffectView(frame: .zero)
+    /// 子面板内容左右各留 2pt，避免图表贴边，同时保持高度和箭头定位不变。
+    private let horizontalContentInset: CGFloat = 2
+    /// 左侧额外缩进：在基础 inset 上再内推 4pt，让标题/图表更远离容器左缘。
+    private let leadingExtraInset: CGFloat = 4
+    var onHoverChanged: ((Bool) -> Void)?
+    var panelGradientEnabled = true {
+        didSet { applyPanelBackground() }
+    }
+    /// Mono 字体开关：图表内文本（标题/刻度/日期）与数值随开关切换字体
+    var monoFontEnabled = false {
+        didSet { chartView.monoFontEnabled = monoFontEnabled }
+    }
+    /// Inter 字体开关：图表内文本随开关切换（优先级 Mono > Inter）
+    var interFontEnabled = false {
+        didSet { chartView.interFontEnabled = interFontEnabled }
+    }
+
+    override func loadView() {
+        backgroundView.material = .menu
+        backgroundView.blendingMode = .behindWindow
+        backgroundView.state = .active
+        backgroundView.isEmphasized = false
+        backgroundView.appearance = NSAppearance(named: .darkAqua)
+        backgroundView.tintColor = Palette.containerTint
+        backgroundView.tintBottomColor = panelGradientEnabled ? Palette.containerTintBottom : nil
+        backgroundView.wantsLayer = true
+        backgroundView.layer?.cornerRadius = Palette.cardCornerRadius
+        backgroundView.layer?.cornerCurve = .continuous
+        backgroundView.layer?.masksToBounds = true
+
+        chartView.onHoverChanged = { [weak self] inside in
+            self?.onHoverChanged?(inside)
+        }
+        chartView.translatesAutoresizingMaskIntoConstraints = false
+        backgroundView.addSubview(chartView)
+        NSLayoutConstraint.activate([
+            // macOS 14+ 的 hasFullSizeContent 会把背景延伸到箭头区域，
+            // 图表本身留在 safe area 内，避免内容被箭头区域改变尺寸。
+            chartView.leadingAnchor.constraint(equalTo: backgroundView.safeAreaLayoutGuide.leadingAnchor,
+                                               constant: horizontalContentInset + leadingExtraInset),
+            chartView.trailingAnchor.constraint(equalTo: backgroundView.safeAreaLayoutGuide.trailingAnchor,
+                                                constant: -horizontalContentInset),
+            chartView.topAnchor.constraint(equalTo: backgroundView.safeAreaLayoutGuide.topAnchor),
+            chartView.bottomAnchor.constraint(equalTo: backgroundView.safeAreaLayoutGuide.bottomAnchor),
+        ])
+        let chartSize = chartView.intrinsicContentSize
+        preferredContentSize = NSSize(width: chartSize.width + horizontalContentInset * 2 + leadingExtraInset,
+                                      height: chartSize.height)
+        view = backgroundView
+    }
+
+    func update(row: UsageRowSnapshot) {
+        chartView.row = row
+    }
+
+    private func applyPanelBackground() {
+        guard isViewLoaded else { return }
+        backgroundView.tintBottomColor = panelGradientEnabled ? Palette.containerTintBottom : nil
+    }
+}
+
+/// 用于 NSPopover 的透明定位点：避免把超出标题 bounds 的 positioningRect 直接交给 AppKit，
+/// 在部分 macOS 版本上会导致 popover 不展示。
+final class UsageHistoryPopoverAnchorView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// 点阵进度：9 个方块横排，已用部分着色，剩余灰色。ratio 表示剩余比例。
+/// pulsing=true 时最右的亮点阵以 2s 周期脉冲闪烁（透明度 0.55 ↔ 1.0 + 峰值白色闪烁，点大小不变），示意额度正在被消耗。
+/// 脉冲状态由外部（makePanelSnapshot）传入，UsageDots 不自行比较，避免被面板操作重置。
+final class UsageDots: NSView {
+    var ratio: CGFloat = 0 { didSet { updateDots() } }
+    var pulsing: Bool = false {
+        didSet {
+            guard oldValue != pulsing else { return }
+            updatePulse()
+        }
+    }
+    /// 点亮N个点时的颜色：9个点从红→橙红→橙→黄→黄绿→绿算术平均渐变（HSB空间线性插值）
+    /// levelColors[0]=红(1个点亮)，levelColors[8]=绿(9个点亮)
+    private let levelColors: [NSColor] = generateLevelColors()
+    private static func generateLevelColors() -> [NSColor] {
+        let count = 9
+        var colors: [NSColor] = []
+        for i in 0..<count {
+            let t = CGFloat(i) / CGFloat(count - 1) // 0=红, 1=绿
+            let h = t * 0.333 // 红(H:0) → 绿(H:120°=0.333)
+            let s: CGFloat = 0.80
+            let b: CGFloat = 0.92
+            colors.append(NSColor(calibratedHue: h, saturation: s, brightness: b, alpha: 1.0))
+        }
+        return colors
+    }
+    private let dotCount = 9
+    private let dotWidth: CGFloat = 5.06  // 正方形宽高（4.6 × 1.1 ≈ 5.06）
+    private let dotGap: CGFloat = 0.0     // 点间距
+    private let dotRadius: CGFloat = 0.0  // 圆角 0（直角方块）
+    /// 未点亮点的颜色：不透明石墨灰
+    private static let dotDimColor = NSColor(calibratedWhite: 0.32, alpha: 1.0)
+    private var dotLayers: [CALayer] = []
+    private var lastActiveCount: Int = -1   // 上次亮起点数，-1 = 未初始化
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        commonInit()
+    }
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        commonInit()
+    }
+    private func commonInit() {
+        wantsLayer = true
+        setupDotLayersIfNeeded()
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        setupDotLayersIfNeeded()
+    }
+    private func setupDotLayersIfNeeded() {
+        guard dotLayers.isEmpty, let rootLayer = layer else { return }
+        for _ in 0..<dotCount {
+            let l = CALayer()
+            l.cornerRadius = dotRadius
+            l.backgroundColor = Self.dotDimColor.cgColor
+            rootLayer.addSublayer(l)
+            dotLayers.append(l)
+        }
+        layoutDots()
+        updateDots()
+    }
+    override func layout() {
+        super.layout()
+        layoutDots()
+    }
+    private func layoutDots() {
+        guard !dotLayers.isEmpty else { return }
+        let totalWidth = CGFloat(dotCount) * dotWidth + CGFloat(dotCount - 1) * dotGap
+        let startX = (bounds.width - totalWidth) / 2
+        // 正方形：高度 = 宽度，垂直居中
+        let dotHeight = dotWidth
+        let startY = (bounds.height - dotHeight) / 2
+        let step = dotWidth + dotGap
+        for (i, l) in dotLayers.enumerated() {
+            let x = startX + CGFloat(i) * step
+            // 宽度多 0.25pt 产生微小重叠，消除亚像素抗锯齿导致的视觉缝隙
+            // （非整数像素位置边缘抗锯齿会产生半透明间隙）
+            l.frame = CGRect(x: x, y: startY, width: dotWidth + 0.25, height: dotHeight)
+        }
+    }
+    private func updateDots() {
+        guard !dotLayers.isEmpty else { return }
+        let activeCount = ratio > 0 ? Int(ceil(CGFloat(dotCount) * ratio)) : 0
+        // 点亮的点统一着色：activeCount 对应 levelColors[activeCount-1]
+        let activeColor: NSColor? = activeCount > 0 ? levelColors[activeCount - 1] : nil
+        for (i, l) in dotLayers.enumerated() {
+            l.backgroundColor = (i < activeCount ? activeColor : Self.dotDimColor)?.cgColor
+        }
+        // 仅在亮起点数变化时才重设脉冲目标，避免 ratio 微调（activeCount 不变）重置动画周期
+        if lastActiveCount != activeCount {
+            lastActiveCount = activeCount
+            updatePulse()
+        }
+    }
+    private func updatePulse() {
+        for l in dotLayers {
+            l.removeAnimation(forKey: "pulseGroup")
+            // 重置为正常状态
+            l.opacity = 1.0
+        }
+        guard pulsing, !dotLayers.isEmpty else { return }
+        let activeCount = ratio > 0 ? Int(ceil(CGFloat(dotCount) * ratio)) : 0
+        guard activeCount > 0 else { return }
+        // 最右亮点阵脉冲：2s 周期，透明度呼吸 + 峰值白色闪烁
+        let target = dotLayers[activeCount - 1]
+        let baseColor = target.backgroundColor ?? NSColor.systemGreen.cgColor
+        let whiteColor = NSColor.white.cgColor
+
+        let opacityAnim = CAKeyframeAnimation(keyPath: "opacity")
+        opacityAnim.values = [0.55, 1.0, 0.55]
+        opacityAnim.keyTimes = [0, 0.5, 1.0]
+
+        let colorAnim = CAKeyframeAnimation(keyPath: "backgroundColor")
+        colorAnim.values = [baseColor, whiteColor, baseColor]
+        colorAnim.keyTimes = [0, 0.5, 1.0]
+
+        let group = CAAnimationGroup()
+        group.animations = [opacityAnim, colorAnim]
+        group.duration = 2.0
+        group.repeatCount = .infinity
+        group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        target.add(group, forKey: "pulseGroup")
+    }
+    override var intrinsicContentSize: NSSize {
+        let w = CGFloat(dotCount) * dotWidth + CGFloat(dotCount - 1) * dotGap
+        // 高度默认返回 7.0pt，实际由外部 heightAnchor 约束决定
+        return NSSize(width: w, height: 7.0)
+    }
+}
+
+// MARK: - BalancePanelView 用量扩展
+
+extension BalancePanelView {
+
+    /// 用量表头行：「1小时 / 今日 / 本周」列名，右对齐固定列宽，与下方数值上下对齐
+    func makeUsageHeaderRow() -> NSView {
+        func headerLabel(_ text: String, width: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            registerFont(l, size: 10, weight: .semibold)
+            l.textColor = .systemGray
+            l.alignment = .right
+            l.translatesAutoresizingMaskIntoConstraints = false
+            l.widthAnchor.constraint(equalToConstant: width).isActive = true
+            return l
+        }
+        // 左列名「平台」左对齐（与下方 icon 左缘同起点），右侧三列列名右对齐
+        let platformHeader = NSTextField(labelWithString: "平台")
+        registerFont(platformHeader, size: 10, weight: .semibold)
+        platformHeader.textColor = .systemGray
+        let row = NSStackView(views: [platformHeader, stretchSpacer(),
+                                      headerLabel("1H", width: usageColWidths.hour),
+                                      headerLabel("1D", width: usageColWidths.today),
+                                      headerLabel("1W", width: usageColWidths.week)])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = usageColumnSpacing
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: usageHorizontalInset),
+            row.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -usageHorizontalInset),
+            row.topAnchor.constraint(equalTo: container.topAnchor, constant: usageRowTopInset),
+            row.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -usageRowBottomInset),
+        ])
+        return container
+    }
+
+    /// 1小时/日/周用量行：品牌 icon + 平台名 + 右侧三列数值（固定列宽右对齐，对齐表头）
+    func makeUsageRow(_ row: UsageRowSnapshot) -> NSView {
+        let usageIconSize: CGFloat = 13
+        let iconView = NSImageView()
+        iconView.image = bundleIcon(row.icon, size: usageIconSize) ?? symbolImage("app.fill", size: usageIconSize)
+        iconView.image?.isTemplate = true
+        iconView.contentTintColor = Palette.cardForeground
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        let nameLabel = NSTextField(labelWithString: row.name)
+        registerFont(nameLabel, size: 10, weight: .medium)
+        nameLabel.textColor = Palette.cardForeground
+        func valueLabel(_ text: String, width: CGFloat) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            registerFont(l, size: 10, weight: .medium, monoDigits: true)
+            l.textColor = Palette.cardForeground
+            l.alignment = .right
+            l.translatesAutoresizingMaskIntoConstraints = false
+            l.widthAnchor.constraint(equalToConstant: width).isActive = true
+            return l
+        }
+        let rowStack = NSStackView(views: [iconView, nameLabel, stretchSpacer(),
+                                           valueLabel(row.hourText, width: usageColWidths.hour),
+                                           valueLabel(row.todayText, width: usageColWidths.today),
+                                           valueLabel(row.weekText, width: usageColWidths.week)])
+        rowStack.orientation = .horizontal
+        rowStack.alignment = .centerY
+        rowStack.spacing = usageColumnSpacing
+        // icon↔标题 4pt、标题↔数值区 6pt（平台列整体收紧）；
+        // 数值三列之间保持 8pt 列距节奏，表头右缘与数值列右缘锚 trailing 对齐不受影响
+        rowStack.setCustomSpacing(4, after: iconView)
+        rowStack.setCustomSpacing(6, after: nameLabel)
+        rowStack.translatesAutoresizingMaskIntoConstraints = false
+        // 位移动画需要 layer-backed
+        rowStack.wantsLayer = true
+        // 用量条目 hover：不做文本提亮，改为整行渐变背景（与余额卡片/磁贴/折叠标题条同一套 Palette）
+        let hoverRow = wrapHoverRow(rowStack, hoverTextColor: Palette.cardForeground,
+                                    horizontalPadding: usageHorizontalInset,
+                                    topInset: usageRowTopInset,
+                                    bottomInset: usageRowBottomInset)
+        hoverRow.hoverGradientColors = Palette.hoverGradient
+        // 行内容常态即 cardForeground（不再做 hover 提亮，与表头灰字区分层级）
+        hoverRow.enablesTextBrightening = false
+        // 发丝边框：与余额卡片 HoverCard 同款（白@20%→白@35%，0.8pt，0.22s）
+        hoverRow.enablesHoverBorder = true
+        hoverRow.wantsLayer = true
+        hoverRow.onHoverChanged = { [weak self, weak hoverRow] inside in
+            guard let self else { return }
+            if inside {
+                self.showUsageHistory(row: row, from: hoverRow)
+            } else {
+                self.usageHistoryRowHovered = false
+                self.scheduleUsageHistoryClose()
+            }
+        }
+        return hoverRow
+    }
+
+    private func showUsageHistory(row: UsageRowSnapshot, from anchor: NSView?) {
+        guard let anchor, anchor.window != nil else { return }
+        // 标题尚未完成挂窗或正在重建时先回退到当前行，避免 hover 事件被直接吞掉。
+        // 正常状态始终使用标题作为固定定位锚点。
+        let fixedAnchor: NSView
+        if let title = usageTitleRef, title.window != nil, !title.isHidden {
+            fixedAnchor = title
+        } else {
+            fixedAnchor = anchor
+        }
+        usageHistoryCloseTask?.cancel()
+        usageHistoryRowHovered = true
+        // 锚定行锁定 hover 高亮：子面板打开期间行保持高亮（跨行切换时旧行解锁、新行锁定）
+        if usageHistoryAnchorRow !== anchor {
+            usageHistoryAnchorRow?.setHoverLocked(false)
+            (anchor as? HoverRowView)?.setHoverLocked(true)
+            usageHistoryAnchorRow = anchor as? HoverRowView
+        }
+
+        if usageHistoryPopover == nil {
+            let controller = UsageHistoryPopoverController()
+            controller.onHoverChanged = { [weak self] inside in
+                guard let self else { return }
+                self.usageHistoryChartHovered = inside
+                if inside {
+                    self.usageHistoryCloseTask?.cancel()
+                } else {
+                    self.scheduleUsageHistoryClose()
+                }
+            }
+            let popover = NSPopover()
+            popover.behavior = .applicationDefined
+            // 三角箭头由 NSPopover 窗口本身绘制，显式继承主面板的深色外观，
+            // 避免内容区域已变暗但箭头仍按系统浅色外观渲染。
+            popover.appearance = NSAppearance(named: .darkAqua)
+            // 让内容背景延伸覆盖系统三角箭头区域，箭头与主面板背景保持一致。
+            popover.hasFullSizeContent = true
+            // hover 反馈需要即时出现；跨行切换时也不让系统 popover 动画制造延迟感。
+            popover.animates = false
+            popover.contentViewController = controller
+            _ = controller.view // 兼容 macOS 12：访问 view 会触发一次懒加载
+            // 自定义背景容器没有可靠的 intrinsicContentSize，显式设置避免 popover 变成零尺寸。
+            popover.contentSize = controller.preferredContentSize
+            usageHistoryController = controller
+            usageHistoryPopover = popover
+        }
+
+        let anchorChanged = usageHistoryAnchor !== fixedAnchor
+        usageHistoryAnchor = fixedAnchor
+        usageHistoryController?.panelGradientEnabled = panelGradientEnabled
+        // Mono 开关在面板打开期间切换时，子弹窗是懒创建的——每次 show 前同步当前状态
+        usageHistoryController?.monoFontEnabled = monoFontEnabled
+        // Inter 字体开关同样在各次 show 前同步（优先级 Mono > Inter）
+        usageHistoryController?.interFontEnabled = interFontEnabled
+        let wasShown = usageHistoryPopover?.isShown == true
+        usageHistoryController?.update(row: row)
+        usageHistoryChartHovered = false
+        if !wasShown || anchorChanged {
+            if wasShown { usageHistoryPopover?.close() }
+            // 在主面板内部放置一个有效定位点：popover 默认以定位点中心对齐，
+            // 将定位点放在标题顶边下方半个图表高度处，即可让子面板顶边与标题顶边同高。
+            let chartSize = usageHistoryController?.preferredContentSize
+                ?? NSSize(width: 240, height: 158)
+            let titleRect = fixedAnchor.convert(fixedAnchor.bounds, to: self)
+            let anchorCenterY = titleRect.maxY - chartSize.height / 2
+            // 弹出方向：默认锚点在面板内容右缘、向右弹出（preferredEdge .maxX）；
+            // 面板贴近屏幕右缘、右侧剩余空间不足一个弹窗宽度时，锚点移到面板左缘、
+            // 翻转为向左弹出，避免 NSPopover 被屏幕边缘 clamp 后与面板重叠。
+            var edge: NSRectEdge = .maxX
+            var anchorX = min(max(self.bounds.minX + 1, titleRect.maxX - 2), self.bounds.maxX - 1)
+            if let visible = self.window?.screen?.visibleFrame,
+               let window = self.window,
+               visible.maxX - window.frame.maxX < chartSize.width + 16 {
+                edge = .minX
+                anchorX = min(max(self.bounds.minX + 1, titleRect.minX + 1), self.bounds.maxX - 1)
+            }
+            // 位置点必须留在文档视图 bounds 内，落到 scroll view 裁剪边界外时
+            // NSPopover 会静默不展示。
+            let anchorY = min(max(self.bounds.minY + 1, anchorCenterY), self.bounds.maxY - 1)
+            usageHistoryPositionAnchor.frame = NSRect(x: anchorX,
+                                                       y: anchorY - 0.5,
+                                                       width: 1, height: 1)
+            usageHistoryPositionAnchor.isHidden = false
+            usageHistoryPositionAnchor.superview?.layoutSubtreeIfNeeded()
+
+            let presentPopover: () -> Void = { [weak self, weak fixedAnchor, edge] in
+                guard let self, let historyPopover = self.usageHistoryPopover else { return }
+                if self.usageHistoryPositionAnchor.window != nil {
+                    historyPopover.show(relativeTo: self.usageHistoryPositionAnchor.bounds,
+                                        of: self.usageHistoryPositionAnchor, preferredEdge: edge)
+                } else if let fixedAnchor {
+                    // 布局切换的瞬间定位点可能尚未挂窗；使用标题自身 bounds 内的 1pt
+                    // 定位矩形兜底，避免 hover 时整次弹出被吞掉。
+                    let titleBounds = fixedAnchor.bounds
+                    let fallbackX = edge == .minX ? titleBounds.minX : max(titleBounds.minX, titleBounds.maxX - 1)
+                    let fallbackRect = NSRect(x: fallbackX,
+                                               y: titleBounds.midY,
+                                               width: 1, height: 1)
+                    historyPopover.show(relativeTo: fallbackRect,
+                                        of: fixedAnchor, preferredEdge: edge)
+                }
+            }
+            presentPopover()
+            // mouseEntered 可能与主面板重排处于同一事件周期；如果 AppKit 首次调用
+            // 没有创建窗口，下一轮立即重试，不引入可感知的 hover 延迟。
+            if usageHistoryPopover?.isShown != true {
+                DispatchQueue.main.async { [weak self] in
+                    guard self?.usageHistoryRowHovered == true else { return }
+                    presentPopover()
+                }
+            }
+        }
+    }
+
+    private func scheduleUsageHistoryClose() {
+        usageHistoryCloseTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.usageHistoryRowHovered,
+                  !self.usageHistoryChartHovered else { return }
+            self.dismissUsageHistoryPopover()
+        }
+        usageHistoryCloseTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: task)
+    }
+
+    /// 面板内容重建或 popover 关闭时清理趋势图窗口与 hover 状态。
+    func dismissUsageHistoryPopover() {
+        usageHistoryCloseTask?.cancel()
+        usageHistoryCloseTask = nil
+        usageHistoryPopover?.close()
+        usageHistoryRowHovered = false
+        usageHistoryChartHovered = false
+        usageHistoryAnchor = nil
+        // 解除锚定行的 hover 锁定（子面板消失，行高亮随之退出）
+        usageHistoryAnchorRow?.setHoverLocked(false)
+        usageHistoryAnchorRow = nil
+    }
+
+}

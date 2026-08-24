@@ -41,3 +41,9 @@ swift/.build/
 
 # Reasonix 本地工作状态（话题/剪贴板附件，不入库）
 .reasonix/
+
+# ZCode 本地会话计划（工具状态，不入库）
+.zcode/
+
+# Inter 字体发行包（完整 152 文件 / 59MB 分发版；app 仅用 swift/fonts/ 下精简子集，不入库）
+Inter-4.1/

@@ -244,6 +244,84 @@ enum WorkBuddyService {
         let data: Layer1?
     }
 
+    // MARK: 用户资源（裂变包重置日，口径参照 cockpit-tools）
+
+    /// 拉取用户资源包列表：ProductCode p_tcaca、Status[0,3]（在期/已用尽）、
+    /// PackageEndTimeRange 从现在到 +101 年取全量。失败返回 nil。
+    static func fetchUserResources(token: String, uid: String, domain: String) async -> [[String: Any]]? {
+        guard let url = URL(string: "https://\(domain)/v2/billing/meter/get-user-resource") else { return nil }
+        let headers = [
+            "Authorization": "Bearer \(token)",
+            "Content-Type": "application/json",
+            "X-User-Id": uid,
+        ]
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let now = Date()
+        let body: [String: Any] = [
+            "PageNumber": 1,
+            "PageSize": 100,
+            "ProductCode": "p_tcaca",
+            "Status": [0, 3],
+            "PackageEndTimeRangeBegin": df.string(from: now),
+            "PackageEndTimeRangeEnd": df.string(from: now.addingTimeInterval(3600.0 * 24 * 365 * 101)),
+        ]
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        let (data, status) = await HTTP.request(url: url, method: "POST", headers: headers, body: payload, timeout: 10)
+        guard status == 200, let data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let inner = nestedDict(json, keys: ["data", "Response", "Data"]) ?? [:]
+        return inner["Accounts"] as? [[String: Any]]
+    }
+
+    /// 裂变包重置日：PackageName 含「裂变」优先，兜底 gift（code_006）/ activity
+    /// （code_007 活动赠送包）。日期口径与官方一致 = 到期时间：
+    /// DeductionEndTime（毫秒时间戳）→ ExpiredTime → CycleEndTime 兜底，
+    /// 字符串兼容「2026/09/23 00:02:52」「2026-09-23T00:02:52」两种分隔。
+    /// 多个命中取最早的。
+    static func fetchFissionReset(token: String, uid: String, domain: String) async -> Date? {
+        guard let resources = await fetchUserResources(token: token, uid: uid, domain: domain) else { return nil }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        func parseDate(_ r: [String: Any]) -> Date? {
+            // 实测（2026-08-23）：官方「到期时间」展示的是在期包的 CycleEndTime；
+            // DeductionEndTime 是滚动扣费窗口（≈当下），不能用作重置日
+            for key in ["CycleEndTime", "ExpiredTime"] {
+                guard let s = r[key] as? String, !s.isEmpty else { continue }
+                let normalized = s.replacingOccurrences(of: "T", with: " ")
+                    .replacingOccurrences(of: "/", with: "-")
+                if let d = df.date(from: normalized) { return d }
+            }
+            if let ms = r["DeductionEndTime"] as? Double, ms > 0 {
+                return Date(timeIntervalSince1970: ms / 1000)
+            }
+            return nil
+        }
+        // 名称含「裂变」优先（实测包名「CodeBuddy个人版国内运营裂变包」，同账号可有
+        // 多条：已用尽 Status=3 是历史记录，在期 Status=0 才是官方展示口径），
+        // 无名称命中退 gift/activity code。两级都只取未来日期，在期包优先。
+        let now = Date()
+        func pick(_ predicate: ([String: Any]) -> Bool) -> Date? {
+            let matched = resources.filter(predicate)
+            for wantActive in [true, false] {
+                var best: Date?
+                for r in matched {
+                    let active = (r["Status"] as? Int) == 0
+                    guard active == wantActive, let d = parseDate(r), d > now,
+                          best == nil || d < best! else { continue }
+                    best = d
+                }
+                if let best { return best }
+            }
+            return nil
+        }
+        return pick { (($0["PackageName"] as? String) ?? "").contains("裂变") }
+            ?? pick { let c = ($0["PackageCode"] as? String) ?? ""
+                return c == "TCACA_code_006_DbXS0lrypC" || c == "TCACA_code_007_nzdH5h4Nl0" }
+    }
+
     // MARK: 签到状态 / 领取
 
     /// 查询签到状态：直接调用 daily-checkin（幂等，已签时返回非 0 bizCode + 状态信息）。

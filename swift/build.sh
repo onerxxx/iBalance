@@ -19,8 +19,9 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/iBalance"
 
 # 收集 swift/ 下所有 .swift（含 Services/ 子目录）作为编译输入
+# 排除 scratch_ 前缀的临时测试文件（top-level statements 在非 main.swift 中非法）
 SOURCES=()
-while IFS= read -r f; do SOURCES+=("$f"); done < <(find "$SCRIPT_DIR" -maxdepth 2 -name "*.swift" | sort)
+while IFS= read -r f; do SOURCES+=("$f"); done < <(find "$SCRIPT_DIR" -maxdepth 2 -name "*.swift" ! -name "scratch_*" | sort)
 
 # 编译优化级别：默认 -Onone（快速编译，适合日常小修改迭代，实测比 -O 快 ~3.7 倍）；
 # 传 --release 参数时用 -O（优化构建，用于正式分发）。
@@ -130,7 +131,7 @@ cp "$SCRIPT_DIR/icons/"*.png "$RESOURCES_DIR/" 2>/dev/null || true
 # 拷贝 PDF 图标（菜单栏平台图标矢量版，优先于同名 SVG 加载）
 cp "$SCRIPT_DIR/icons/"*.pdf "$RESOURCES_DIR/" 2>/dev/null || true
 
-# 拷贝字体（Mono 开关：DepartureMono，运行时按进程注册）
+# 拷贝字体（Mono 开关：JetBrainsMonoNL-SemiBold，运行时按进程注册）
 if [[ -d "$SCRIPT_DIR/fonts" ]]; then
     cp "$SCRIPT_DIR/fonts/"*.otf "$RESOURCES_DIR/" 2>/dev/null || true
     cp "$SCRIPT_DIR/fonts/"*.ttf "$RESOURCES_DIR/" 2>/dev/null || true

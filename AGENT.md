@@ -36,8 +36,16 @@
 ├── docs/                    # 补充文档（card-drag-framework.md、menubar-template-pitfalls.md、
 │                            #   native-segmented-control-guide.md、iBalance-已损坏说明.html 等）
 ├── swift/
-│   ├── main.swift           # 入口 + AppDelegate（菜单栏 UI / 定时器 / 面板与签到编排，~3000 行）
-│   ├── Panel.swift          # 详情面板：NSPopover + 全部自定义控件 + 卡片拖拽排序（~2800 行）
+│   ├── main.swift           # 入口 + AppDelegate（菜单栏 UI / 定时器 / 刷新与菜单编排，~2200 行）
+│   ├── Panel.swift          # 详情面板：快照类型 + BalancePanelView 主体（存储属性/字体/数据更新）+ VC（~1850 行）
+│   ├── Dialogs.swift        # 弹窗统一封装：DialogShell / InputDialog / 各业务弹窗（~640 行）
+│   ├── CheckinManager.swift # 签到域（AppDelegate 扩展）：错峰自动签到 / 手动签到 / 签到历史 / 定时器（~820 行）
+│   ├── AccountSwitcher.swift# 多账号采集与切换（AppDelegate 扩展）：WB OAuth / TRAE·Codex·ZCode 导入 / performAccountSwitch（~380 行）
+│   ├── PinWindow.swift      # 面板置顶浮窗（AppDelegate 扩展）：popover ↔ 无边框 NSPanel 内容转移（~120 行）
+│   ├── Controls.swift       # 自绘控件：MiniSwitch / HoverCard / ActionTileButton / QuietScrollView 等（~1900 行）
+│   ├── UsagePanel.swift     # 用量板块：UsageRowSnapshot / 趋势图与子弹窗 / UsageDots + BalancePanelView 用量扩展（~860 行）
+│   ├── PanelDrag.swift      # 卡片拖拽排序（BalancePanelView 扩展）：拖动状态机 / 幽灵卡片 / 重排动画（~290 行）
+│   ├── PanelLayout.swift    # 布局构建（BalancePanelView 扩展）：build() 主装配 + 各类行构建器（~1150 行）
 │   ├── Config.swift         # AppConfig（Codable）+ AppDataStore（Application Support 持久化/迁移）+ 余额缓存
 │   ├── Network.swift        # async HTTP + 重试 + 离线感知（NWPathMonitor）+ JSON 工具
 │   ├── Crypto.swift         # SHA-512 / AES-CBC / PBKDF2
@@ -124,6 +132,7 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | `workbuddy_accounts`                                      | 预存签到账号列表：`[{uid, token, domain, nickname, refresh_token?, expires_at?}]`  |
 | `hide_wb_nickname`                                        | 面板/菜单中隐藏 WorkBuddy 账号昵称（默认 true）                                        |
 | `panel_gradient_enabled`                                  | 面板背景渐变开关                                                                  |
+| `panel_usage_visible`                                     | 面板用量行显隐表：`{平台id: bool}`（平台开关弹窗「用量」列持久化，未记录默认显示）          |
 | `trae_accounts`                                           | TRAE 多号账号列表：`[{uid, username, auth_info}]`（auth_info 为原始加密块，切换时写回 storage.json） |
 | `trae_storage_path`                                       | TRAE SOLO CN 的 storage.json 路径（留空自动探测）                                    |
 | `zcode_accounts`                                          | ZCode 多号账号列表：`[{uid, token, nickname}]`（JSON 导入）                          |
@@ -137,8 +146,16 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 
 | 文件                                | 职责                                                                 |
 | ---------------------------------- | ------------------------------------------------------------------ |
-| `main.swift`                       | `@NSApplicationMain` 入口 + `@MainActor AppDelegate`：菜单栏 UI、面板生命周期、菜单构建与回调、刷新/签到定时器、各平台切号编排（统一走 `performAccountSwitch`：后台执行 → 回主线程刷新 → 延迟关面板）、签到历史记录、**App 级 Accent Color**（ObjC runtime swizzle `+[NSColor controlAccentColor]`，UserDefaults 持久化） |
-| `Panel.swift`                      | 详情面板全部 UI：`PanelSnapshot` 数据快照、余额卡片（多账号）、设置/操作卡片、**卡片拖拽排序**（幽灵卡片 + Y 轴位移动画，顺序存 `panel_balance_platform_order`）、自定义控件（`HoverCard` / `HoverRowView` / `ActionTileButton` / `UsageBar` / `UsageRing` / `UsageDots` / `TintedVisualEffectView` / `CenteredSpinButton` 等） |
+| `main.swift`                       | `@NSApplicationMain` 入口 + `@MainActor AppDelegate`：菜单栏 UI、面板生命周期、菜单构建与回调、刷新定时器与四服务并行刷新、`PanelSnapshot` 组装、标题位图渲染、通用工具（DateFormatter / 通知） |
+| `Panel.swift`                      | 详情面板主体：`PanelSnapshot` / `AccountCardSnapshot` 快照类型、`Motion` / `Palette` 设计 token、字体 provider、`BalancePanelView` 类体（回调 / 存储属性 / 字体策略 / 数据更新 / 多号卡片通用实现）、`BalancePanelViewController` |
+| `Dialogs.swift`                    | 弹窗统一封装（自 main.swift 拆出）：`DialogShell` 布局系统、`InputDialog`、DeepSeek 设置、平台自动化开关等业务弹窗 |
+| `CheckinManager.swift`             | 签到域（AppDelegate 扩展）：WB/TRAE 错峰自动签到（60s 轮询 + 每号随机就绪时刻）、手动签到编排、签到结果/历史弹窗、签到定时器、`CheckinRecord` 落库 |
+| `AccountSwitcher.swift`            | 多账号采集与切换（AppDelegate 扩展）：WB OAuth 采集与轮询、TRAE storage 采集、Codex/ZCode JSON 导入、`performAccountSwitch` 统一切号编排 + 四平台切号入口 |
+| `PinWindow.swift`                  | 面板置顶浮窗（AppDelegate 扩展）：pin 时 popover 内容转移至无边框 NSPanel、浮窗尺寸恢复、unpin 预建下一轮 popover |
+| `Controls.swift`                   | 自绘控件（自 Panel.swift 拆出）：`MiniSwitch` / `MonoCharSwitch` / `MonoSegmentedControl` / `HoverRowView` / `HoverIconButton` / `RefreshIconButton` / `HoverCard` / `ActionTileButton` / `TintedVisualEffectView` / `QuietScrollView` / `ScrollFadeHint` / `PanelResizeHandle` 等 |
+| `UsagePanel.swift`                 | 用量板块（自 Panel.swift 拆出）：`UsageRowSnapshot`、`UsageHistoryChartView` 一周趋势图 + 子弹窗控制器、`UsageDots` 点阵、`BalancePanelView` 用量扩展（表头/行构建、子弹窗开关） |
+| `PanelDrag.swift`                  | 卡片拖拽排序（`BalancePanelView` 扩展）：拖动状态机、幽灵卡片快照、兄弟卡让位、drop highlight、重排动画 |
+| `PanelLayout.swift`                | 布局构建（`BalancePanelView` 扩展）：`build()` 主装配、`addCard` / `balanceContentRow` / `collapsibleSectionTitle` / `switchRow` 等行构建器、字符模糊过渡 |
 | `Config.swift`                     | `AppConfig` / `WBAccount` / `TraeAccount` / `ZCodeAccount` / `CodexAccount`（Codable）+ `AppDataStore`（Application Support 路径 / 0700-0600 权限 / 旧版迁移）+ `ConfigStore` / `BalanceCacheStore` / `UsageStore`（日/周用量本地差值基线，usage.json）+ `UDKey` |
 | `Network.swift`                    | `HTTP.request/requestWithRetry`（async）、`NetworkMonitor`（NWPathMonitor 离线感知）、JSON 工具 |
 | `Crypto.swift`                     | SHA-512 / AES-128-CBC / PBKDF2-HMAC-SHA1                              |

@@ -148,9 +148,12 @@ struct AppConfig: Codable {
     var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
     /// 面板背景渐变开关：true = 顶部暗 → 底部中灰纵向渐变；false = 恢复单色近黑遮罩
     var panelGradientEnabled: Bool = true
-    /// Mono 字体开关：true = 余额卡片与用量列表使用 DepartureMono（拉丁字符），
+    /// Mono 字体开关：true = 余额卡片与用量列表使用 JetBrainsMono（拉丁字符），
     /// 缺字（中文等）通过 cascade 级联回退系统字体
     var monoFontEnabled: Bool = false
+    /// Inter 字体开关：true = 面板文本使用 Inter（Inter Variable 可变字体），
+    /// 中文缺字通过 cascade 级联回退系统字体；优先级 Mono 风格 > Inter
+    var interFontEnabled: Bool = false
     /// 调试用量开关：开启后用量区显示本地生成的七日样例数据，不读取真实用量。
     var debugUsageEnabled: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
@@ -172,6 +175,10 @@ struct AppConfig: Codable {
     /// value=true 显示、false 隐藏；未记录的平台默认显示（true）。
     /// 空账号组（如 ZCode 未导入）即使设为 true 也维持隐藏，不产生空白占位。
     var panelCardVisible: [String: Bool] = [:]
+    /// 面板用量行可见性：key = 平台 ID（"ds" / "zcode" / "codex" / "trae" / "wb"），
+    /// value=true 显示、false 隐藏；未记录的平台默认显示（true）。
+    /// 无观测记录的平台即使设为 true 也自然不生成用量行（usageRow 返回 nil）。
+    var panelUsageVisible: [String: Bool] = [:]
     /// 置顶浮窗尺寸（用户 resize 把手结果，跨 pin 会话/重启保留；
     /// 0 = 未记录，pin 时按面板当前尺寸）
     var floatingPanelWidth: Double = 0
@@ -193,6 +200,7 @@ struct AppConfig: Codable {
         case hideWbNickname = "hide_wb_nickname"
         case panelGradientEnabled = "panel_gradient_enabled"
         case monoFontEnabled = "mono_font_enabled"
+        case interFontEnabled = "inter_font_enabled"
         case debugUsageEnabled = "debug_usage_enabled"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
@@ -207,6 +215,7 @@ struct AppConfig: Codable {
         case codexAccounts = "codex_accounts"
         case menuBarVisible = "menubar_visible"
         case panelCardVisible = "panel_card_visible"
+        case panelUsageVisible = "panel_usage_visible"
         case floatingPanelWidth = "floating_panel_width"
         case floatingPanelHeight = "floating_panel_height"
     }
@@ -237,6 +246,7 @@ struct AppConfig: Codable {
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? false
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
+        interFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .interFontEnabled) ?? false
         debugUsageEnabled = try c.decodeIfPresent(Bool.self, forKey: .debugUsageEnabled) ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
@@ -261,6 +271,8 @@ struct AppConfig: Codable {
         menuBarVisible = try c.decodeIfPresent([String: Bool].self, forKey: .menuBarVisible) ?? [:]
         // 面板余额卡片可见性（缺省为空字典，未记录的平台默认显示）
         panelCardVisible = try c.decodeIfPresent([String: Bool].self, forKey: .panelCardVisible) ?? [:]
+        // 面板用量行可见性（缺省为空字典，未记录的平台默认显示）
+        panelUsageVisible = try c.decodeIfPresent([String: Bool].self, forKey: .panelUsageVisible) ?? [:]
         floatingPanelWidth = try c.decodeIfPresent(Double.self, forKey: .floatingPanelWidth) ?? 0
         floatingPanelHeight = try c.decodeIfPresent(Double.self, forKey: .floatingPanelHeight) ?? 0
     }
@@ -483,15 +495,22 @@ enum BalanceCacheStore {
 /// increasing=true：数值随消耗上升（已用，如 TRAE used / Codex usedPercent）。
 struct UsageBaselines: Codable {
     struct Entry: Codable {
+        /// 近 1 小时滚动窗口内的观测点（时间戳 + 数值），用于「1小时」列差值
+        struct Sample: Codable {
+            var ts: Double
+            var value: Double
+        }
         var dayKey: String
         var dayBase: Double
         var weekKey: String
         var weekBase: Double
         /// 当天累计用量快照：yyyy-MM-dd → 用量；保留最近 60 天用于趋势统计。
         var dailyUsage: [String: Double]
+        /// 近 1 小时观测点（滚动裁剪：窗口内全保留 + 窗口外留 1 个锚点）
+        var samples: [Sample] = []
 
         private enum CodingKeys: String, CodingKey {
-            case dayKey, dayBase, weekKey, weekBase, dailyUsage
+            case dayKey, dayBase, weekKey, weekBase, dailyUsage, samples
         }
 
         init(dayKey: String, dayBase: Double, weekKey: String, weekBase: Double) {
@@ -510,6 +529,7 @@ struct UsageBaselines: Codable {
             weekKey = try c.decode(String.self, forKey: .weekKey)
             weekBase = try c.decode(Double.self, forKey: .weekBase)
             dailyUsage = try c.decodeIfPresent([String: Double].self, forKey: .dailyUsage) ?? [:]
+            samples = try c.decodeIfPresent([Sample].self, forKey: .samples) ?? []
         }
     }
     var entries: [String: Entry] = [:]
@@ -574,6 +594,17 @@ enum UsageStore {
         }
         if e.weekKey != wk { e.weekKey = wk; e.weekBase = value; changed = true }
         else if increasing ? value < e.weekBase : value > e.weekBase { e.weekBase = value; changed = true }
+        // 近 1 小时滚动窗口：每次观测追加一个点；断档超过 1 小时（休眠/长期未刷新）
+        // 视为窗口重开，丢弃旧点——否则跨越空窗的差值会把 >1 小时的用量算进「近 1 小时」
+        let nowTs = now.timeIntervalSince1970
+        if let last = e.samples.last, nowTs - last.ts > 3600 { e.samples = [] }
+        e.samples.append(UsageBaselines.Entry.Sample(ts: nowTs, value: value))
+        // 裁剪：保留窗口内全部点 + 窗口外最近 1 个锚点（供查询取 ≤1 小时前的基准值）
+        if let firstIn = e.samples.firstIndex(where: { $0.ts >= nowTs - 3600 }) {
+            let keepFrom = max(0, firstIn - 1)
+            if keepFrom > 0 { e.samples.removeFirst(keepFrom) }
+        }
+        changed = true
         // 控制 usage.json 体积；保留最近 60 天的各平台/账号用量历史。
         let cutoff = Calendar.current.date(byAdding: .day, value: -60, to: now) ?? now
         let cutoffKey = dayFormatter.string(from: cutoff)
@@ -633,6 +664,27 @@ enum UsageStore {
             week += u.week
         }
         return any ? (today, week) : nil
+    }
+
+    /// 近 1 小时用量：取 ≤1 小时前最新的观测点做锚点（窗口内无更早点时用最早的点），
+    /// 与当前值求差并 clamp ≥ 0；余额充值等反向变动与「今日」同口径（差值归零重新累计）。
+    static func hourlyUsage(platform: String, uid: String, current: Double, increasing: Bool) -> Double? {
+        guard let e = memory.entries["\(platform):\(uid)"] else { return nil }
+        let cutoff = Date().timeIntervalSince1970 - 3600
+        guard let anchor = e.samples.last(where: { $0.ts <= cutoff }) ?? e.samples.first else { return nil }
+        return increasing ? max(0, current - anchor.value) : max(0, anchor.value - current)
+    }
+
+    /// 平台级汇总：全部账号近 1 小时用量相加（无观测记录的账号贡献 0，升级后首小时从此起算）
+    static func hourlyUsage(platform: String, accounts: [(uid: String, current: Double)],
+                            increasing: Bool) -> Double {
+        var sum: Double = 0
+        for a in accounts where !a.uid.isEmpty {
+            if let h = hourlyUsage(platform: platform, uid: a.uid, current: a.current, increasing: increasing) {
+                sum += h
+            }
+        }
+        return sum
     }
 
     /// 平台级汇总：全部账号本周每日用量对应相加，无记录账号贡献 0
