@@ -119,8 +119,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var failedServices: Set<String> = []
 
     var config = AppConfig()
-    /// 调试用量样例缓存：开启时只在切换开关时重新随机，避免面板普通刷新时图表跳动。
-    private var debugUsageRows: [UsageRowSnapshot] = []
     // 缓存原始数据，切换小数位时即时重绘（仅在主线程变更）
     private var cacheDs: (symbol: String, totalRaw: String, total: Double)?
     var cacheWb: (remain: Double, total: Double)?
@@ -564,7 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
         panel.onToggleInterFont = { [weak self] in self?.onToggleInterFont() }
-        panel.onToggleDebugUsage = { [weak self] in self?.onToggleDebugUsage() }
+        panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
@@ -575,7 +573,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onTogglePin = { [weak self] in self?.togglePanelPin() }
         // 余额卡片点击：DeepSeek 打开浏览器，TRAE / WorkBuddy / ZCode 启动应用
         panel.onClickDeepSeek = {
-            NSWorkspace.shared.open(URL(string: "https://platform.deepseek.com/usage")!)
+            NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!)
         }
         panel.onClickTrae = { [weak self] in
             guard let self = self else { return }
@@ -972,12 +970,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                               increasing: true, decimals: 1, percent: true) {
             s.usageRows.append(row)
         }
-        // 调试模式始终提供完整的七日样例，即使本机尚未配置任何平台账号，方便直接观察面积图。
-        s.debugUsageEnabled = config.debugUsageEnabled
-        if config.debugUsageEnabled {
-            if debugUsageRows.isEmpty { debugUsageRows = makeDebugUsageRows() }
-            s.usageRows = debugUsageRows
-        }
+        // 数值滚动预览开关状态（设置卡片开关：余额数值周期随机变化演示滚动）
+        s.valueScrollPreviewEnabled = config.valueScrollPreviewEnabled
         // 平台开关「用量」列：用户可单独隐藏某平台的用量行（未记录的平台默认显示）。
         // 无观测记录的平台本就无行（usageRow 返回 nil），此过滤只对已有行裁剪。
         s.usageRows = s.usageRows.filter { config.panelUsageVisible[$0.platform] ?? true }
@@ -1013,51 +1007,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.monoFontEnabled = config.monoFontEnabled
         s.interFontEnabled = config.interFontEnabled
         return s
-    }
-
-    /// 生成调试用量：七天随机样例只保存在内存，不写入 UsageStore / usage.json。
-    /// 非百分比平台的「本周」为七日合计；百分比平台取本周峰值，避免合计超过 100%。
-    private func makeDebugUsageRows() -> [UsageRowSnapshot] {
-        let definitions: [(platform: String, icon: String, name: String,
-                           percent: Bool, prefix: String, decimals: Int,
-                           lower: Double, upper: Double)] = [
-            ("ds", "deepseek", "DeepSeek", false, "¥", 2, 0.08, 3.80),
-            ("wb", "workbuddy", "WorkBuddy", false, "", config.workbuddyDecimals, 30, 480),
-            ("trae", "trae-color", "TRAE", false, "", config.traeDecimals, 8, 120),
-            ("zcode", "zhipu", "ZCode", true, "", 1, 8, 92),
-            ("codex", "codex", "Codex", true, "", 1, 12, 96),
-        ]
-
-        return definitions.map { item in
-            var daily = (0..<7).map { _ in
-                Double.random(in: item.lower...item.upper)
-            }
-            // 给图表制造一个清晰的局部峰值，让面积图的平滑转角更容易观察。
-            if let peakIndex = daily.indices.randomElement() {
-                daily[peakIndex] = min(item.upper, daily[peakIndex] * (item.percent ? 1.12 : 1.45))
-            }
-            let dailyTexts = daily.map {
-                item.percent
-                    ? String(format: "%.1f%%", $0)
-                    : item.prefix + fmtAmountCommas($0, decimals: item.decimals)
-            }
-            let today = daily.last ?? 0
-            let week = item.percent ? (daily.max() ?? 0) : daily.reduce(0, +)
-            // 近 1 小时样例：今日值的 1/4 上下随机，量级贴近真实小时消耗
-            let hour = today * Double.random(in: 0.1...0.4)
-            let hourText = item.percent
-                ? String(format: "%.1f%%", hour)
-                : item.prefix + fmtAmountCommas(hour, decimals: item.decimals)
-            let todayText = item.percent
-                ? String(format: "%.1f%%", today)
-                : item.prefix + fmtAmountCommas(today, decimals: item.decimals)
-            let weekText = item.percent
-                ? String(format: "%.1f%%", week)
-                : item.prefix + fmtAmountCommas(week, decimals: item.decimals)
-            return UsageRowSnapshot(platform: item.platform, icon: item.icon, name: item.name,
-                                    hourText: hourText, todayText: todayText, weekText: weekText,
-                                    dailyUsage: daily, dailyUsageTexts: dailyTexts)
-        }
     }
 
     /// 判断当前 seq 是否"拥有"写 UI 权限：未被取消 + 仍是最新 seq。
@@ -1161,10 +1110,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// 调试用量：切换开启时生成一组新的随机七日样例，关闭后恢复真实用量。
-    @objc private func onToggleDebugUsage() {
-        config.debugUsageEnabled.toggle()
-        debugUsageRows = config.debugUsageEnabled ? makeDebugUsageRows() : []
+    /// 数值滚动预览：切换开关（余额数值周期随机变化演示滚动；关闭恢复真实数值）。
+    @objc private func onToggleValueScrollPreview() {
+        config.valueScrollPreviewEnabled.toggle()
         ConfigStore.save(config)
         syncPanel()
     }

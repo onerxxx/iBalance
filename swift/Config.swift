@@ -154,8 +154,9 @@ struct AppConfig: Codable {
     /// Inter 字体开关：true = 面板文本使用 Inter（Inter Variable 可变字体），
     /// 中文缺字通过 cascade 级联回退系统字体；优先级 Mono 风格 > Inter
     var interFontEnabled: Bool = false
-    /// 调试用量开关：开启后用量区显示本地生成的七日样例数据，不读取真实用量。
-    var debugUsageEnabled: Bool = false
+    /// 数值滚动预览开关：true = 余额卡片数值周期随机变化，演示逐位滚动动画
+    ///（替换原「调试用量样例数据」功能；关闭后恢复真实数值）
+    var valueScrollPreviewEnabled: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
     var fadeHintBandHeight: Double = 54
     var fadeHintHighlightAlpha: Double = -0.6
@@ -201,7 +202,7 @@ struct AppConfig: Codable {
         case panelGradientEnabled = "panel_gradient_enabled"
         case monoFontEnabled = "mono_font_enabled"
         case interFontEnabled = "inter_font_enabled"
-        case debugUsageEnabled = "debug_usage_enabled"
+        case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
         case fadeHintMaskMidAlpha = "fade_hint_mask_mid_alpha"
@@ -247,7 +248,7 @@ struct AppConfig: Codable {
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
         interFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .interFontEnabled) ?? false
-        debugUsageEnabled = try c.decodeIfPresent(Bool.self, forKey: .debugUsageEnabled) ?? false
+        valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
         fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55

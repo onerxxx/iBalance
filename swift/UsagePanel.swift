@@ -140,12 +140,15 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             : (interFontEnabled
                 ? InterFontProvider.font(size: 17, weight: .semibold)
                 : NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold))
+        // 平台名标题字体与用量表格行一致：10pt medium
+        let platformNameFont = uiFont(size: 10, weight: .medium)
         let headerLineHeight = "Ag".size(withAttributes: [.font: titleFont]).height
+        let titleLineHeight = "Ag".size(withAttributes: [.font: platformNameFont]).height
         let headerLineGap: CGFloat = 2
-        let headerBlockHeight = headerLineHeight * 2 + headerLineGap
+        let headerBlockHeight = titleLineHeight + headerLineGap + headerLineHeight
         drawText(row.name, at: NSPoint(x: plotInset, y: headerY),
-                 font: titleFont, color: titleColor)
-        drawText("本周累计用量", at: NSPoint(x: plotInset, y: headerY + headerLineHeight + headerLineGap),
+                 font: platformNameFont, color: titleColor)
+        drawText("本周累计用量", at: NSPoint(x: plotInset, y: headerY + titleLineHeight + headerLineGap),
                  font: titleFont, color: titleColor)
         let weekSize = row.weekText.size(withAttributes: [.font: valueFont])
         drawText(row.weekText,
@@ -375,7 +378,13 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         } else {
             sampleDecimals = 0
         }
-        let decimals = max(sampleDecimals, preserveFraction ? 1 : 0)
+        let decimals: Int
+        if suffix.contains("%") {
+            // 百分比纵坐标不显示小数
+            decimals = 0
+        } else {
+            decimals = max(sampleDecimals, preserveFraction ? 1 : 0)
+        }
         let formatter = NumberFormatter()
         formatter.locale = Locale.current
         formatter.numberStyle = .decimal

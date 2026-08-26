@@ -232,8 +232,8 @@ extension BalancePanelView {
         monoSwitch.action = #selector(monoFontToggled)
         interSwitch.target = self
         interSwitch.action = #selector(interFontToggled)
-        debugUsageSwitch.target = self
-        debugUsageSwitch.action = #selector(debugUsageToggled)
+        valuePreviewSwitch.target = self
+        valuePreviewSwitch.action = #selector(valueScrollPreviewToggled)
         // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 分段控件
         intervalSegment.target = self
         intervalSegment.action = #selector(intervalChanged)
@@ -327,7 +327,7 @@ extension BalancePanelView {
             switchRow(title: "面板渐变背景", sub: nil, sw: gradientSwitch),
             switchRow(title: "Mono 风格", sub: nil, sw: monoSwitch),
             switchRow(title: "Inter 字体", sub: nil, sw: interSwitch),
-            switchRow(title: "调试", sub: nil, sw: debugUsageSwitch),
+            switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),
         ].map {
             let hover = wrapHoverRow($0)
             // 行 hover 不提亮小字与图标 tint：小字保持常态颜色，
@@ -335,6 +335,8 @@ extension BalancePanelView {
             hover.enablesTextBrightening = false
             return hover
         }
+        // 副标题默认隐藏（switchRow 内统一设置），静态文案行直接显示
+        valuePreviewSub.isHidden = false
         // 「设置」标题：可折叠标题条（hover 余额卡片样式，点击折叠整个设置卡片）
         var settingCollapseTargets: [NSView] = []
         let settingTitle = collapsibleSectionTitle(name: "设置", key: UDKey.settingsSectionCollapsed,
@@ -640,7 +642,7 @@ extension BalancePanelView {
     /// failureBadge：外部创建的签到失败角标视图，叠加在 icon 右上角（显隐由调用方控制）
     /// monoSize：Mono 模式 ASCII icon 标称尺寸（缺省 = imgSize 即不微调场景）。
     /// SVG 微调（imageSize）与 Mono 标称解耦：像素字母各平台等大，SVG 保持视觉微调
-    func balanceContentRow(icon iconName: String, name: String, valueLabel: NSTextField, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, titleLabelRef: ((NSTextField) -> Void)? = nil) -> NSView {
+    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, titleLabelRef: ((NSTextField) -> Void)? = nil) -> NSView {
         var imgSize = imageSize ?? iconSize
         // 左：大 icon（固定列宽 = iconSize + 4，image 居中显示，imageSize 可独立缩小）；
         // premadeIconView 由外部传入（多号卡片用 MenuBarFadeIconView 以支持菜单栏渐变标记）
@@ -724,31 +726,28 @@ extension BalancePanelView {
         titleRow.setContentHuggingPriority(.defaultLow, for: .horizontal)
         titleRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        // 额度值（右对齐，13.5pt semibold；宽度随字号等比放宽避免截断），
-        // 与标题冲突时数值优先（required），标题尾部省略
-        registerFont(valueLabel, size: 13, weight: valueWeight, monoDigits: true)
-        valueLabel.textColor = textColor
-        valueLabel.alignment = .right
-        valueLabel.lineBreakMode = .byClipping
-        valueLabel.maximumNumberOfLines = 1
-        valueLabel.cell?.truncatesLastVisibleLine = true
-        valueLabel.setContentHuggingPriority(.required, for: .horizontal)
-        valueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        valueLabel.translatesAutoresizingMaskIntoConstraints = false
-        valueLabel.widthAnchor.constraint(equalToConstant: 65).isActive = true
+        // 额度值（右对齐，13pt semibold；逐位数字垂直滚动 RollingNumberView），
+        // 与标题冲突时数值优先（required），标题尾部省略；
+        // 基线对齐用视图内置探针（同字体隐藏 label 的 firstBaselineAnchor）
+        registerRollingNumber(valueView, size: 13, weight: valueWeight)
+        valueView.setTextColor(textColor)
+        valueView.setContentHuggingPriority(.required, for: .horizontal)
+        valueView.setContentCompressionResistancePriority(.required, for: .horizontal)
+        valueView.translatesAutoresizingMaskIntoConstraints = false
+        valueView.widthAnchor.constraint(equalToConstant: 65).isActive = true
 
         // 第一行：标题（左）+ 数值（右）同一行
         // 用普通 NSView + 显式约束，避免 NSStackView gravity 分布歧义
         let row1 = NSView()
         row1.translatesAutoresizingMaskIntoConstraints = false
         row1.addSubview(titleRow)
-        row1.addSubview(valueLabel)
+        row1.addSubview(valueView)
         NSLayoutConstraint.activate([
             titleRow.leadingAnchor.constraint(equalTo: row1.leadingAnchor),
-            titleRow.firstBaselineAnchor.constraint(equalTo: valueLabel.firstBaselineAnchor),
-            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: valueLabel.leadingAnchor, constant: -4),
-            valueLabel.trailingAnchor.constraint(equalTo: row1.trailingAnchor),
-            valueLabel.centerYAnchor.constraint(equalTo: row1.centerYAnchor),
+            titleRow.firstBaselineAnchor.constraint(equalTo: valueView.baselineAnchor),
+            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: valueView.leadingAnchor, constant: -4),
+            valueView.trailingAnchor.constraint(equalTo: row1.trailingAnchor),
+            valueView.centerYAnchor.constraint(equalTo: row1.centerYAnchor),
             row1.heightAnchor.constraint(equalToConstant: 16),
         ])
 

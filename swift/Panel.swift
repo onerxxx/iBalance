@@ -52,8 +52,8 @@ struct PanelSnapshot: Equatable {
     var monoFontEnabled = false
     /// Inter 字体开关（同步自配置；面板文本 Inter ↔ 系统字体，优先级 Mono > Inter）
     var interFontEnabled = false
-    /// 调试用量开关（开启后显示本地生成的七日样例数据）
-    var debugUsageEnabled = false
+    /// 数值滚动预览开关（开启后余额卡片周期随机变化，演示逐位滚动动画）
+    var valueScrollPreviewEnabled = false
 }
 
 struct AccountCardSnapshot: Equatable {
@@ -90,6 +90,9 @@ enum Motion {
     static let reveal: CFTimeInterval = 0.24
     /// 强调动效硬顶：一切 UI 动画 ≤ 0.40
     static let emphasis: CFTimeInterval = 0.40
+    /// 余额数字滚动（Number Rolling）：数据变化反馈类动效，非 UI 状态切换，
+    /// 用户指定加长时长，不适用 0.40 硬顶
+    static let roll: CFTimeInterval = 2.0
 
     /// 强 ease-out（等价 cubic-bezier(0.23,1,0.32,1)）：入场/反馈用，
     /// 起手快收尾长，比系统 easeOut 更有意图
@@ -730,8 +733,8 @@ final class BalancePanelView: NSView {
     var onToggleMonoFont: (() -> Void)?
     /// Inter 字体开关（设置卡片开关触发：面板文本切换 Inter，优先级 Mono > Inter）
     var onToggleInterFont: (() -> Void)?
-    /// 调试用量开关（设置卡片开关触发：显示本地生成的七日样例）
-    var onToggleDebugUsage: (() -> Void)?
+    /// 数值滚动预览开关（设置卡片开关触发：余额数值周期随机变化演示滚动）
+    var onToggleValueScrollPreview: (() -> Void)?
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
     var onPanelGradientChanged: (() -> Void)?
     var onAbout: (() -> Void)?
@@ -793,7 +796,7 @@ final class BalancePanelView: NSView {
     /// 非当前账号的 dots/checkinInfo 为占位实例（未加入视图层级，更新时跳过）。
     private struct CardEntry {
         let uid: String
-        let valueLabel: NSTextField
+        let valueView: RollingNumberView   // 余额数值（逐位垂直滚动）
         let dots: UsageDots
         let checkinInfo: NSStackView   // 副标题信息行容器（签到文字条目已移除，暂时留空）
         let nickLabel: NSTextField
@@ -802,6 +805,8 @@ final class BalancePanelView: NSView {
         let badgeView: NSView          // 签到失败角标（icon 右上角，无签到平台恒隐藏）
         let iconView: MenuBarFadeIconView  // 平台 icon（未上菜单栏时叠加垂直透明渐变）
         var nickKey: String = ""       // 昵称+签到状态组合缓存 key（附件重建判据）
+        var lastValue: String = ""     // 上次应用的余额文本（数字滚动判据；空 = 首次赋值直接显示）
+        var roller: NumberRollAnimator?  // 数字滚动驱动器（引用类型，结构体拷贝共享同一动画）
     }
 
     /// 各平台卡片差异配置（icon / 标题 / 签到行 / 到期行 / reward 兜底）
@@ -981,9 +986,11 @@ final class BalancePanelView: NSView {
     private(set) var interFontEnabled = false
     /// 非当前账号弱化透明度（已固化为默认行为：整卡降透明、悬停复亮）
     private static let subCardDimAlpha: CGFloat = 0.6
-    /// 调试用量开关状态（update 同步）
-    let debugUsageSwitch = MiniSwitch()
-    private(set) var debugUsageEnabled = false
+    /// 数值滚动预览开关状态（update 同步；开启后周期随机变动余额演示滚动）
+    let valuePreviewSwitch = MiniSwitch()
+    /// 「滚动预览」行副标题（静态文案；switchRow 默认隐藏，build 中统一显示）
+    let valuePreviewSub = NSTextField(labelWithString: "余额数值周期随机变化")
+    private(set) var valueScrollPreviewEnabled = false
     /// 设置卡片各开关行注册表（Mono 模式切换时统一显隐原生/字符开关）。
     /// handler 必须一并强持有：NSClickGestureRecognizer 的 target 是弱引用，
     /// 不持有则手势触发时 target 已释放，整行点击失效。
@@ -1031,6 +1038,19 @@ final class BalancePanelView: NSView {
         label.font = uiFont(size: size, weight: weight, monoDigits: monoDigits)
         fontTargets.append(FontTarget(label: label, size: size, weight: weight, monoDigits: monoDigits))
         if fontTargets.count % 32 == 0 { fontTargets.removeAll { $0.label == nil } }
+    }
+
+    /// 余额滚动数值视图注册表（weak：卡片重建后自动失效）。
+    /// RollingNumberView 非 NSTextField、不进 fontTargets，Mono/Inter 开关切换时单独就地刷字体
+    private let rollingTargets = NSHashTable<RollingNumberView>()
+
+    /// 注册余额滚动数值视图并注入字体策略（uiFont：Mono/Inter/系统 + 等宽数字）
+    func registerRollingNumber(_ v: RollingNumberView, size: CGFloat, weight: NSFont.Weight) {
+        v.configure(size: size, weight: weight, fontProvider: { [weak self] s, w, mono in
+            guard let self else { return .monospacedDigitSystemFont(ofSize: s, weight: w) }
+            return self.uiFont(size: s, weight: w, monoDigits: mono)
+        })
+        rollingTargets.add(v)
     }
 
     // MARK: - 标题 hover 字重动画（Inter：500↔800，1s 平滑）
@@ -1122,11 +1142,12 @@ final class BalancePanelView: NSView {
         for t in fontTargets {
             guard let label = t.label else { continue }
             label.font = uiFont(size: t.size, weight: t.weight, monoDigits: t.monoDigits)
-            // 富文本余额（货币符号小字号）不受 .font 属性控制，须按新字体重建
-            let s = label.attributedStringValue.string
-            if let c = s.first, c == "¥" || c == "$" { applyValueText(label, s) }
         }
         fontTargets.removeAll { $0.label == nil }
+        // 余额滚动数值（非 NSTextField）：单独就地刷新字体，滚动状态保留
+        for v in rollingTargets.allObjects {
+            v.refreshFont()
+        }
         // 用量列宽按字体度量自动分配：清空行缓存，本次 update 随即按新字体重建重算
         renderedUsageRows = []
     }
@@ -1179,8 +1200,10 @@ final class BalancePanelView: NSView {
             applyFontPolicy()
             usageHistoryController?.interFontEnabled = interFontEnabled
         }
-        debugUsageEnabled = s.debugUsageEnabled
-        debugUsageSwitch.state = s.debugUsageEnabled ? .on : .off
+        valueScrollPreviewEnabled = s.valueScrollPreviewEnabled
+        valuePreviewSwitch.state = s.valueScrollPreviewEnabled ? .on : .off
+        // 预览定时器状态与配置保持一致（幂等：无变化不动）
+        setValueScrollPreview(s.valueScrollPreviewEnabled)
         offlineBanner.isHidden = !s.offline
 
         // 行序跟随平台卡片顺序（拖拽排序持久化于 platformOrder）
@@ -1398,7 +1421,7 @@ final class BalancePanelView: NSView {
         entries.removeAll()
         // 创建新卡片
         for ac in accounts {
-            let valueLabel = NSTextField(labelWithString: "—")
+            let valueView = RollingNumberView()   // 初始 "—" 占位（init 内置）
             let isCurrent = ac.isCurrent
             let dots: UsageDots? = isCurrent ? UsageDots() : nil
             let checkinInfo = NSStackView()
@@ -1458,7 +1481,7 @@ final class BalancePanelView: NSView {
             // 标题 label 引用：供 hover 字重动画逐帧驱动（weak 在卡片重建后自动失效）
             weak var capturedTitle: NSTextField?
             let card = addCard(rows: [
-                balanceContentRow(icon: style.icon, name: style.name, valueLabel: valueLabel,
+                balanceContentRow(icon: style.icon, name: style.name, valueView: valueView,
                                   info: info, dots: dots, iconSize: style.iconSize, imageSize: imgSize,
                                   monoSize: isCurrent ? style.monoIconSize : style.monoSecondaryIconSize,
                                   iconTopAligned: !isCurrent, iconTint: fgColor, nickLabel: nickLabel,
@@ -1548,13 +1571,16 @@ final class BalancePanelView: NSView {
                 card.heightAnchor.constraint(equalTo: ds.heightAnchor).isActive = true
             }
             // 非当前账号无 dots/checkinInfo（未加入视图层级），用占位保持 entry 结构一致
-            entries.append(CardEntry(uid: ac.uid, valueLabel: valueLabel,
+            entries.append(CardEntry(uid: ac.uid, valueView: valueView,
                                      dots: dots ?? UsageDots(), checkinInfo: checkinInfo,
                                      nickLabel: nickLabel, infoLabel: expireLabel,
                                      expireIcon: expireIcon, badgeView: badge,
                                      iconView: fadeIcon))
         }
-        uids = accounts.map(\.uid)
+        // ⚠️ 必须与 update() 的检测口径一致（uid + isCurrent ✓ 后缀）：
+        // 旧实现只存裸 uid，导致每轮刷新都误判「uid 变化」→ 全量重建卡片，
+        // 就地更新路径（数字滚动动效等）永远走不到
+        uids = accounts.map { $0.uid + ($0.isCurrent ? "✓" : "") }
         applyAccountCardData(accounts, entries: &entries, style: style)
     }
 
@@ -1593,24 +1619,190 @@ final class BalancePanelView: NSView {
         return mas
     }
 
-    /// 余额数值带货币符号前缀（DeepSeek ¥/$）时：符号按 60% 字号与数值同基线渲染
-    /// （去除符号后间隔）；其余文本照常整体 stringValue
-    private func applyValueText(_ label: NSTextField, _ text: String) {
-        guard let first = text.first, first == "¥" || first == "$",
-              text.count > 1, let numFont = label.font else {
-            label.stringValue = text
-            return
+    /// 余额数字滚动动效（Number Rolling）：面板打开期间余额更新时，数值从旧值
+    /// 平滑滚动到新值（ease-out，时长 Motion.roll）。中间帧沿用目标值的小数位与
+    /// 千分位格式，逐帧交给 RollingNumberView——数字位车轮平滑追赶目标数字
+    ///（垂直滚动），货币符号/千分位/小数点等静态位随文本就地更新。
+    /// 覆盖格式：可选前缀（¥/$）+ 千分位数字（可选小数）+ 可选后缀（%）。
+    /// 驱动：CADisplayLink 每显示帧回调，步进用真实时间戳 dt —— 速率自动跟随
+    /// 屏幕刷新率（ProMotion 120Hz 跑 120、普通屏 60，不空转、无漂移）。
+    /// 120Hz 可行的前提：DigitWheelView 字形已缓存（滚动 draw 无分配），
+    /// 单帧成本足够低；若后续再卡，回落 60Hz 即可。
+    private final class NumberRollAnimator {
+        private weak var view: RollingNumberView?
+        private var timer: Timer?
+        private var lastTS: CFTimeInterval = 0
+        private var prefix = ""
+        private var suffix = ""
+        private var decimals = 0
+        private var start: Double = 0
+        private var end: Double = 0
+        private var duration: CFTimeInterval = Motion.roll
+        private var elapsed: CFTimeInterval = 0
+
+        /// 千分位格式化器（复用实例，每帧按 decimals 配置；仅主线程调用）
+        private static let formatter: NumberFormatter = {
+            let f = NumberFormatter()
+            f.numberStyle = .decimal
+            f.groupingSeparator = ","
+            f.decimalSeparator = "."
+            f.usesGroupingSeparator = true
+            return f
+        }()
+
+        /// 解析可滚动数值文本：前缀（¥/$）+ 数值 + 小数位 + 后缀（%）；不可解析返回 nil
+        static func parse(_ text: String) -> (prefix: String, value: Double, decimals: Int, suffix: String)? {
+            var s = text.trimmingCharacters(in: .whitespaces)
+            var prefix = ""
+            if let f = s.first, f == "¥" || f == "$" {
+                prefix = String(f)
+                s.removeFirst()
+            }
+            var suffix = ""
+            if s.hasSuffix("%") {
+                suffix = "%"
+                s.removeLast()
+            }
+            let core = s.replacingOccurrences(of: ",", with: "")
+            guard !core.isEmpty, core.contains(where: { $0.isNumber }),
+                  let v = Double(core) else { return nil }
+            let parts = core.split(separator: ".", omittingEmptySubsequences: false)
+            let decimals = parts.count == 2 ? parts[1].count : 0
+            return (prefix, v, decimals, suffix)
         }
-        let symFont = uiFont(size: numFont.pointSize * 0.6, weight: .semibold)
-        let attr = NSMutableAttributedString(string: String(first), attributes: [.font: symFont])
-        attr.append(NSAttributedString(string: String(text.dropFirst()), attributes: [.font: numFont]))
-        // attributedValue 不带段落样式时 cell 会回退默认对齐（右对齐失效），
-        // 对齐/截断从 label 自身取值随字符串带上
-        let para = NSMutableParagraphStyle()
-        para.alignment = label.alignment
-        para.lineBreakMode = label.lineBreakMode
-        attr.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: attr.length))
-        label.attributedStringValue = attr
+
+        /// 启动（或接续）滚动：from/to 为旧/新余额文本。解析失败 → 直接落值不滚动。
+        func start(view: RollingNumberView, from oldValue: String, to newValue: String,
+                   duration: CFTimeInterval) {
+            guard let old = Self.parse(oldValue), let new = Self.parse(newValue) else {
+                stop()
+                view.setText(newValue, animated: false)
+                return
+            }
+            stop()
+            self.view = view
+            self.duration = duration
+            prefix = new.prefix
+            suffix = new.suffix
+            decimals = new.decimals
+            end = new.value
+            // 起点取旧值；若上一轮滚动未完成被新数据打断，从当前屏显值续滚避免跳变
+            var from = old.value
+            if let showing = Self.parse(view.currentText) {
+                from = showing.value
+            }
+            start = from
+            elapsed = 0
+            // 60Hz 计数（z 定稿基线：实测流畅稳定）。高于此的频率（120/屏刷新对齐）
+            // 均实测卡顿，不再调整。
+            let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                self?.tick()
+            }
+            // .common：滚动期间面板处于 event tracking（如菜单/popover 交互）也不停帧
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+            lastTS = 0
+            Logger.log(.layout, "[Roll] start uid≈\(String(newValue.suffix(8))) \(start)→\(end) dur=\(duration)")
+        }
+
+        private func tick() {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            defer {
+                Self.perfFrames += 1
+                if Self.perfFrames <= 90 {
+                    Self.perfCosts.append(CFAbsoluteTimeGetCurrent() - t0)
+                    if Self.perfFrames == 90 {
+                        let avg = Self.perfCosts.reduce(0, +) / 90
+                        let mx = Self.perfCosts.max() ?? 0
+                        Logger.log(.layout, String(format: "[RollPerf] animatorTick 90帧: 回调avg=%.2fms max=%.2fms", avg * 1000, mx * 1000))
+                    }
+                }
+            }
+            guard let view else { stop(); return }
+            // ⚠️ 面板不可见（popover 关闭/隐藏，view 脱离 window）时**跳过本帧**——
+            // 此前这里直接 stop + 落终值，导致预览滚动秒瞬跳（无动效根因）；
+            // 跳过则动画冻结于隐藏期，面板打开后从当前进度续滚。
+            guard view.window != nil else {
+                if Self.windowNilLogs < 5 {
+                    Self.windowNilLogs += 1
+                    Logger.log(.layout, "[RollDbg] skip: window nil (面板不可见时滚动挂起)")
+                }
+                return
+            }
+            // ⚠️ 墙钟计时（非 l.timestamp）：低刷新率屏上 display link 同帧重复回调
+            // 时间戳不变，用 timestamp 累计 elapsed 会导致动画拖不动（卡顿根因）。
+            let now = CACurrentMediaTime()
+            if lastTS == 0 { lastTS = now }
+            let dt = max(0, now - lastTS)
+            lastTS = now
+            elapsed += dt
+            let p = min(1, elapsed / duration)
+            // TODO(性能诊断): 进度里程碑（首个滚动）——验证滚动在可见时真实推进
+            if Self.milestone < 3 {
+                let thresholds: [Double] = [0.1, 0.5, 0.9]
+                if p >= thresholds[Self.milestone] {
+                    Self.milestone += 1
+                    Logger.log(.layout, String(format: "[RollDbg] 里程碑 p=%.2f text='%@'", p, prefix + formatted(end) + suffix))
+                }
+            }
+            // ease-out cubic：起手快、收尾缓，余额「落到新值」的观感
+            let eased = 1 - pow(1 - p, 3)
+            if p >= 1 {
+                stop()
+                view.setText(prefix + formatted(end) + suffix, animated: false)
+                return
+            }
+            let v = start + (end - start) * eased
+            // TODO(性能诊断): 前 10 帧逐步文本（判断动画是否产出中间帧/是否触发重建）
+            if Self.logCount < 10 {
+                Self.logCount += 1
+                Logger.log(.layout, "[RollDbg] cb#\(Self.logCount) p=\(String(format: "%.3f", p)) text='\(prefix + formatted(v) + suffix)'")
+            }
+            view.setText(prefix + formatted(v) + suffix, animated: true)
+        }
+
+        private func formatted(_ v: Double) -> String {
+            // 快路径：整数千分位 + 固定小数位（NumberFormatter 每帧调用开销大，
+            // 是滚动动画的主线程大头之一；见 Apple「keep display link callbacks short」）
+            let scale = pow(10.0, Double(decimals))
+            var scaled = Int64((v * scale).rounded())
+            var sign = ""
+            if scaled < 0 { sign = "-"; scaled = -scaled }
+            let div = Int64(scale)
+            let intPart = scaled / div
+            var digits = String(intPart)
+            if digits.count > 3 {
+                var out = ""
+                var c = 0
+                for ch in digits.reversed() {
+                    out.insert(ch, at: out.startIndex)
+                    c += 1
+                    if c % 3 == 0 && c < digits.count { out.insert(",", at: out.startIndex) }
+                }
+                digits = out
+            }
+            var result = sign + digits
+            if decimals > 0 {
+                let frac = scaled % div
+                result += "." + String(format: "%0\(decimals)lld", frac)
+            }
+            return result
+        }
+
+        private func stop() {
+            timer?.invalidate()
+            timer = nil
+            lastTS = 0
+        }
+
+        deinit { stop() }
+
+        // TODO(性能诊断): 首批滚动 90 帧的耗时统计（定位卡顿来源，确认后移除）
+        private static var perfFrames = 0
+        private static var perfCosts: [CFTimeInterval] = []
+        private static var logCount = 0
+        private static var windowNilLogs = 0
+        private static var milestone = 0
     }
 
     /// 应用多号卡片数据：余额、昵称、点阵、签到信息、到期倒计时（重建后或就地刷新时调用）
@@ -1619,7 +1811,30 @@ final class BalancePanelView: NSView {
                                       style: CardStyle) {
         for (i, ac) in accounts.enumerated() where i < entries.count {
             let e = entries[i]
-            applyValueText(e.valueLabel, ac.value ?? "—")
+            // 余额数值：就地更新且数值变化 → 数字滚动动效（Number Rolling，逐位车轮垂直滚动）。
+            // 首次赋值（重建后 lastValue 为空）/ 面板不可见 / 减弱动态 / 非数值（—）→ 直接落值。
+            let oldValue = entries[i].lastValue
+            let newValue = ac.value ?? "—"
+            entries[i].lastValue = newValue
+            if oldValue != newValue {
+                if valueScrollPreviewEnabled {
+                    // 数值滚动预览模式：显示由预览定时器接管（周期随机值 + 2s 滚动），
+                    // 这里只维护真实 lastValue，供关闭预览时恢复。roller 保留（预览滚动用）。
+                } else {
+                    let rollable = !oldValue.isEmpty && oldValue != "—" && newValue != "—"
+                        && NumberRollAnimator.parse(oldValue) != nil
+                        && NumberRollAnimator.parse(newValue) != nil
+                    Logger.log(.layout, "[Roll] \(style.platformID) uid=\(ac.uid.suffix(6)) old=\(oldValue) new=\(newValue) win=\(e.valueView.window != nil) rollable=\(rollable) motion=\(!shouldReduceMotion)")
+                    if rollable, !shouldReduceMotion, e.valueView.window != nil {
+                        if entries[i].roller == nil { entries[i].roller = NumberRollAnimator() }
+                        entries[i].roller?.start(view: e.valueView, from: oldValue, to: newValue,
+                                                 duration: Motion.roll)
+                    } else {
+                        entries[i].roller = nil   // 打断未完成的滚动，直接落终值
+                        e.valueView.setText(newValue, animated: false)
+                    }
+                }
+            }
             // 就地更新昵称显示（用户在平台内改昵称后无需 rebuild 卡片）。
             // TRAE/WB：昵称尾部内联签到状态 icon（NSTextAttachment，与文字同行同基线、
             // hover 随昵称整体淡入——附件是文本字形，天然同容器；绿=已签/红=失败/橙=风控
@@ -1785,7 +2000,87 @@ final class BalancePanelView: NSView {
     @objc func panelGradientToggled() { onTogglePanelGradient?() }
     @objc func monoFontToggled() { onToggleMonoFont?() }
     @objc func interFontToggled() { onToggleInterFont?() }
-    @objc func debugUsageToggled() { onToggleDebugUsage?() }
+    @objc func valueScrollPreviewToggled() { onToggleValueScrollPreview?() }
+
+    // MARK: - 数值滚动预览（保留设置卡片原「调试」开关，功能替换为演示滚动动画）
+
+    private var valuePreviewTimer: Timer?
+
+    /// 预览滚动动画器（key = 视图标识；CardEntry 是结构体，不能原地改 roller 字段）
+    private var previewRollers: [ObjectIdentifier: NumberRollAnimator] = [:]
+
+    /// 与配置同步（幂等）：开启后周期随机变动各卡片余额数值（保持与真实数值相同的
+    /// 前缀/后缀/小数位/整数位数 → 结构不变，逐位垂直滚动）；关闭后恢复真实数值
+    /// （lastValue 始终由 applyAccountCardData 维护真实值）。
+    func setValueScrollPreview(_ on: Bool) {
+        let running = valuePreviewTimer != nil
+        guard on != running else { return }   // 定时器状态已与目标一致（幂等）
+        if on {
+            previewTick()   // 立即演示一次
+            let t = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+                self?.previewTick()
+            }
+            RunLoop.main.add(t, forMode: .common)   // 面板交互（菜单/弹窗）期间也持续
+            valuePreviewTimer = t
+        } else {
+            valuePreviewTimer?.invalidate()
+            valuePreviewTimer = nil
+            previewRollers = [:]   // 释放动画器 → 定时器停止
+            for e in allCardEntries() {
+                e.valueView.setText(e.lastValue, animated: false)   // 恢复真实数值
+            }
+        }
+    }
+
+    /// 各平台卡片条目汇总（预览遍历用；值对象为类引用，结构体拷贝共享同一视图）
+    private func allCardEntries() -> [CardEntry] {
+        dsCardEntries + zcodeCardEntries + codexCardEntries + traeCardEntries + wbCardEntries
+    }
+
+    /// 预览节拍：按每张卡片真实数值的格式（前缀/后缀/小数位/整数位数）生成
+    /// 随机新值，结构一致 → 数字位逐位滚动。
+    /// 与真实刷新同路径：走 NumberRollAnimator（2.0s ease-out 计数），
+    /// 预览节奏与真实滚动完全一致（直接 setText 只有 ~0.3s 车轮追位，观感偏快）。
+    /// 当前一轮未滚完被新预览值打断时，动画器从屏显值续滚，天然衔接。
+    private func previewTick() {
+        guard valuePreviewTimer != nil || valueScrollPreviewEnabled else { return }
+        // 卡片重建后清理已失效视图的动画器
+        let live = Set(allCardEntries().map { ObjectIdentifier($0.valueView) })
+        previewRollers = previewRollers.filter { live.contains($0.key) }
+        for e in allCardEntries() {
+            guard let parsed = NumberRollAnimator.parse(e.lastValue) else { continue }
+            let intDigits = max(Self.countIntegerDigits(parsed.value), 1)
+            let magnitude = pow(10.0, Double(intDigits))
+            let scale = pow(10.0, Double(parsed.decimals))
+            // [10^(n-1), 10^n) 同整数位数的随机新值（与真实值位数一致 → 结构不变）
+            let v = (Double.random(in: (magnitude / 10)...magnitude) * scale).rounded() / scale
+            let text = parsed.prefix + Self.previewFormat(v, decimals: parsed.decimals) + parsed.suffix
+            if e.valueView.window != nil {
+                let key = ObjectIdentifier(e.valueView)
+                if previewRollers[key] == nil { previewRollers[key] = NumberRollAnimator() }
+                previewRollers[key]?.start(view: e.valueView, from: e.valueView.currentText,
+                                           to: text, duration: Motion.roll)
+            }
+            // 面板不可见：不落值不启动（动画挂起，打开后由下个节拍续播）
+        }
+    }
+
+    /// 整数位数（如 0.08 → 1 位；12.34 → 2 位；876.5 → 3 位）
+    private static func countIntegerDigits(_ v: Double) -> Int {
+        let a = abs(v)
+        guard a >= 1 else { return 1 }
+        return Int(floor(log10(a))) + 1
+    }
+
+    /// 千分位格式化（与 NumberRollAnimator.formatted 同口径）
+    private static func previewFormat(_ v: Double, decimals: Int) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.groupingSeparator = ","
+        f.minimumFractionDigits = decimals
+        f.maximumFractionDigits = decimals
+        return f.string(from: NSNumber(value: v)) ?? String(format: "%.\(decimals)f", v)
+    }
 
     /// pin 按钮：切换置顶状态（图标/着色即时反馈），
     /// 窗口转移（popover ↔ 无边框 NSPanel 浮动窗）由 AppDelegate 处理
