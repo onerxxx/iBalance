@@ -160,6 +160,8 @@ struct AppConfig: Codable {
     /// 数值滚动预览开关：true = 余额卡片数值周期随机变化，演示逐位滚动动画
     ///（替换原「调试用量样例数据」功能；关闭后恢复真实数值）
     var valueScrollPreviewEnabled: Bool = false
+    /// 自动检查更新（GitHub Releases 启动静默检查；手动「检查更新」磁贴不受此开关限制）
+    var updateAutoCheck: Bool = true
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
     var fadeHintBandHeight: Double = 54
     var fadeHintHighlightAlpha: Double = -0.6
@@ -208,6 +210,7 @@ struct AppConfig: Codable {
         case monoFontEnabled = "mono_font_enabled"
         case interFontEnabled = "inter_font_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
+        case updateAutoCheck = "update_auto_check"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
         case fadeHintMaskMidAlpha = "fade_hint_mask_mid_alpha"
@@ -256,6 +259,7 @@ struct AppConfig: Codable {
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
         interFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .interFontEnabled) ?? false
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
+        updateAutoCheck = try c.decodeIfPresent(Bool.self, forKey: .updateAutoCheck) ?? true
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
         fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55
@@ -453,6 +457,10 @@ enum UDKey {
     static var usageSectionCollapsed: String { "panel_usage_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
+
+    // App 自更新（GitHub Releases）：静默检查节流与「暂不」提醒抑制
+    static var updateLastCheckDate: String { "update_last_check_date" }
+    static var updateSnoozeDate: String { "update_snooze_date" }
 }
 
 /// 余额数值快照的磁盘缓存（cache-then-refresh）：启动时先显示上次数值再等网络刷新。

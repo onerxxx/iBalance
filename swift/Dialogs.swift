@@ -145,6 +145,13 @@ final class DialogShell {
         }
 
         NSApp.activate(ignoringOtherApps: true)
+        // ⚠️ 强制窗口先行上屏再进模态循环：自更新等后台 Task 冷启动场景下，
+        // activate 尚未完成时直接 runModal 存在竞态——模态窗口从未被 WindowServer
+        // 登记显示（CGWindowList 里不存在），主线程却吊死在 modal loop 等输入，
+        // 表现为「弹窗闪没/无任何界面可点、进程假死」。访问 alert.window 会强制
+        // 实例化 NSAlert 的私有 panel，orderFrontRegardless 不依赖 app active 态。
+        let modalWindow = alert.window
+        modalWindow.orderFrontRegardless()
         // NSAlert 视图树在 runModal 后才完成真实布局，图标/标题居中需在模态运行中微调
         DispatchQueue.main.async { [weak self] in
             self?.centerIconAndTitle()

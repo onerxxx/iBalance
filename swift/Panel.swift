@@ -56,6 +56,8 @@ struct PanelSnapshot: Equatable {
     var interFontEnabled = false
     /// 数值滚动预览开关（开启后余额卡片周期随机变化，演示逐位滚动动画）
     var valueScrollPreviewEnabled = false
+    /// 自动检查更新开关（GitHub Releases 启动静默检查）
+    var updateAutoCheckEnabled = true
 }
 
 struct AccountCardSnapshot: Equatable {
@@ -804,6 +806,10 @@ final class BalancePanelView: NSView {
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
     var onPanelGradientChanged: (() -> Void)?
     var onAbout: (() -> Void)?
+    /// 手动检查更新（操作磁贴触发：GitHub Releases 检查 + 可选下载替换）
+    var onCheckForUpdate: (() -> Void)?
+    /// 自动检查更新开关（设置卡片开关触发）
+    var onToggleUpdateAutoCheck: (() -> Void)?
     /// 管理各平台刷新、自动签到、卡片与用量显示开关
     var onManagePlatformToggles: (() -> Void)?
     var onManualCheckin: (() -> Void)?
@@ -1046,6 +1052,8 @@ final class BalancePanelView: NSView {
     let monoSegmentBox = NSView()
     /// 面板渐变背景开关（update 时随快照同步状态）
     let gradientSwitch = MiniSwitch()
+    /// 自动检查更新开关（update 时随快照同步状态）
+    let updateAutoSwitch = MiniSwitch()
     /// 渐变开关状态（update 同步；VC 读取决定遮罩渐变/单色）
     private(set) var panelGradientEnabled = true
     /// Mono 字体开关（update 时随快照同步状态）
@@ -1404,6 +1412,7 @@ final class BalancePanelView: NSView {
         // ── 设置/操作状态（代码设置 state 不会触发 action，安全）──
         let autoOn = s.traeAutoCheckin || s.wbAutoCheckin
         autoCheckinSwitch.state = autoOn ? .on : .off
+        updateAutoSwitch.state = s.updateAutoCheckEnabled ? .on : .off
         // sub 显示统一签到时间（取 TRAE / WB 最近一次签到的最晚时间，格式 M-d HH:mm）
         autoCheckinSub.stringValue = s.lastCheckinTime ?? ""
         autoCheckinSub.isHidden = autoCheckinSub.stringValue.isEmpty
@@ -1943,6 +1952,8 @@ final class BalancePanelView: NSView {
     @objc func monoFontToggled() { onToggleMonoFont?() }
     @objc func interFontToggled() { onToggleInterFont?() }
     @objc func valueScrollPreviewToggled() { onToggleValueScrollPreview?() }
+    @objc func checkUpdateTapped() { onCheckForUpdate?() }
+    @objc func updateAutoCheckToggled() { onToggleUpdateAutoCheck?() }
 
     // MARK: - 数值滚动预览（保留设置卡片原「调试」开关，功能替换为演示滚动动画）
 

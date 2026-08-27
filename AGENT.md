@@ -1,11 +1,13 @@
 # AGENT.md — iBalance 项目指南
 
 本文件面向在本仓库中工作的 AI Agent / 开发者，介绍项目结构、构建流程与关键注意事项。
-（2026-08-20 更新：根目录 `config.json` 已移除，用户配置唯一权威来源为 `~/Library/Application Support/com.local.ibalance/`；2026-08-19 千问平台已下线，ZCode / Codex 已接入，配置迁移 Application Support，签名证书已重建。）
+（2026-08-20 更新：根目录 `config.json` 已移除，用户配置唯一权威来源为 `~/Library/Application Support/com.local.ibalance/`；2026-08-19 千问平台已下线，ZCode / Codex 已接入，配置迁移 Application Support，签名证书已重建。
+2026-08-27 更新：App 内自动更新上线（GitHub Releases 匿名拉取），新增根目录 `release.sh` 发版脚本与 `swift/UpdateService.swift`；仓库已转公开；端到端更新链路真机验证通过；明确「日常迭代禁发 Release」铁律。）
 
 ## ⚠️ Agent 工作流铁律
 
 - **每次改完 Swift 代码必须编译并重启 App**：`cd swift && ./build.sh` 一条命令完成（编译 + 打包 + 签名 + 自动停旧进程并重启）。仅 `swiftc -typecheck` 通过不算交付——改动要重启后才能在真实 App 里验证与观感确认。
+- **日常代码修改严禁跑 `release.sh` / 不要上传 GitHub Release**：日常迭代验证一律只跑 `build.sh`（fast 模式）编译重启即可。`release.sh` 仅在「真正需要向他人分发新版本」时由用户主动要求执行——它会产生 `-O` 慢编译、消费版本号计数器并向公开仓库发布正式 Release（对外可见、且会触发所有用户 App 的更新提示）。没有用户的明确发版指令就不要碰它。
 
 ## 项目概述
 
@@ -23,25 +25,35 @@
 
 交互方式：**左键**点菜单栏图标弹出详情面板（NSPopover，余额卡片 + 日/周用量 + 设置 + 操作）；**右键**弹出传统 NSMenu（兜底入口，选项与面板同步）。余额卡片支持**拖拽排序**（平台组顺序持久化，菜单栏条目顺序与面板共用同一份 UserDefaults）。
 
-应用为纯菜单栏应用（`LSUIElement = true`，无 Dock 图标），最低支持 macOS 12（Apple Silicon, arm64）。
+应用为纯菜单栏应用（`LSUIElement = true`，无 Dock 图标，也因此不出现在 ⌘⌥Esc「强制退出」面板——系统机制使然，已拍板保持此形态），编译目标 `arm64-apple-macos26`（macOS 26+ Liquid Glass 适配基线）。
+
+### App 内自动更新（2026-08-27 上线）
+
+- **检查入口**：操作区「检查更新」磁贴（手动）+ 设置卡「自动检查更新」开关（默认开；启动 20s 后静默检查，每自然日至多一次，「稍后再说」当日 snooze 不再打扰）。
+- **更新链路**（`swift/UpdateService.swift`，自研非 Sparkle）：GET `api.github.com/repos/onerxxx/iBalance/releases/latest` → 版本数值逐段比较（tag `v<CFBundleVersion>`）→ URLSession 流式下载 zip → SHA256 校验（asset.digest 优先、正文 `SHA256:` 行兜底，缺失拒装）→ `codesign --verify --deep --strict` → ditto 暂存新 app 到旧 bundle 同卷同级隐藏目录 → spawn 独立 sh（等进程退净 + pkill 兜底防 open 激活旧实例）→ NSApp.terminate 自动重启。
+- **前提**：仓库必须保持**公开**（Releases 匿名可拉）；签名身份必须恒为 `iBalance Local Sign`（TCC 授权/登录项跨版本连续的根），私钥 `.p12` 已知丢失过一次（见陷阱 #2），务必备份。
 
 ## 目录结构
 
 ```
 .
-├── cache.json               # 旧版余额缓存（迁移后保留为副本）
+├── AGENT.md                 # 本文件（项目指南）
+├── README.md                # 仓库说明
+├── release.sh               # 发版脚本：build --release → ditto 打 zip → gh release create（铁律：仅用户要求发版时跑）
 ├── iBalance.app/            # 构建产物（可双击运行的 .app bundle）
-├── IMPROVEMENTS.md          # 改进优化建议清单
-├── PACKAGING.md             # 分发打包流程（zip 排除清单 + 敏感字段泄漏校验）
-├── reasonix.toml            # Reasonix 权限配置
-├── click_ibalance.lua       # Hammerspoon 脚本：模拟点击菜单栏图标弹出面板
-├── macos-panel-ui-guide.md  # macOS 面板 UI 设计参考笔记
-├── backups/                 # 大重构前的完整备份（如 v1.0-menubar-2026-08-12/）
-├── cockpit-tools-main/      # Cockpit Tools 源码（外部项目，仅参考）
-├── docs/                    # 补充文档（card-drag-framework.md、menubar-template-pitfalls.md、
-│                            #   native-segmented-control-guide.md、iBalance-已损坏说明.html 等）
+├── iBalance-<版本>.zip       # 历次 release.sh 打包产物（发版上传的同一文件，可删）
+├── cache.json               # 旧版余额缓存（迁移后保留为副本）
+├── todo.md                  # 开发待办
+├── reasonix.toml            # Reasonix 权限配置（已 gitignore）
+├── backups/                 # 大重构前的完整备份（只读参照，勿改动）
+├── cockpit-tools-1.3.24/    # Cockpit Tools 源码快照（外部项目，仅参考；另有一份主分支副本已删）
+├── docs/                    # 补充文档：PACKAGING.md（zip 分发校验）、IMPROVEMENTS.md、updater-implementation.md、
+│                            #   card-drag-framework.md、menubar-template-pitfalls.md、native-segmented-control-guide.md、
+│                            #   macos-panel-ui-guide.md、macos-26-appkit-migration.md、UIUX-OPTIMIZATION.md、
+│                            #   CheckinResultPanelController.swift、iBalance-已损坏说明.html 等
+├── Inter-4.1/               # Inter Variable 字体源目录
 ├── swift/
-│   ├── main.swift           # 入口 + AppDelegate（菜单栏 UI / 定时器 / 刷新与菜单编排，~2200 行）
+│   ├── main.swift           # 入口 + AppDelegate（菜单栏 UI / 定时器 / 刷新与菜单编排 / App 自更新流程编排，~2500 行）
 │   ├── Panel.swift          # 详情面板：快照类型 + BalancePanelView 主体（存储属性/字体/数据更新）+ VC（~1650 行）
 │   ├── Dialogs.swift        # 弹窗统一封装：DialogShell / InputDialog / 各业务弹窗（~640 行）
 │   ├── CheckinManager.swift # 签到域（AppDelegate 扩展）：错峰自动签到 / 手动签到 / 签到历史 / 定时器（~820 行）
@@ -53,6 +65,7 @@
 │   ├── PanelLayout.swift    # 布局构建（BalancePanelView 扩展）：build() 主装配 + 各类行构建器（~1150 行）
 │   ├── Config.swift         # AppConfig（Codable）+ AppDataStore（Application Support 持久化/迁移）+ 余额缓存
 │   ├── Network.swift        # async HTTP + 重试 + 离线感知（NWPathMonitor）+ JSON 工具
+│   ├── UpdateService.swift  # App 自更新（2026-08-27）：GitHub Releases 检查 / 流式下载 / SHA256+codesign 校验 / 同卷暂存 / spawn sh 互换重启
 │   ├── Crypto.swift         # SHA-512 / AES-CBC / PBKDF2
 │   ├── Logger.swift         # 统一日志（取代各 Service 私有 appendLog）
 │   ├── ProcessUtil.swift    # Electron 应用切号共用进程工具（找主进程/温和杀/强杀/等待退出）
@@ -80,7 +93,7 @@ open iBalance.app             # 运行（或双击）
 ```
 
 - build.sh 自动收集 `swift/` 下所有 `.swift`（含 `Services/` 子目录），无需手动列文件。
-- 编译命令核心：`swiftc -parse-as-library -framework Cocoa -framework UserNotifications -framework Security -framework Network -lsqlite3 -target arm64-apple-macos12 -O *.swift`（`-parse-as-library` 是因为入口用 `@NSApplicationMain` 而非 top-level code）。默认 `-Onone` 快速编译，`./build.sh --release` 用 `-O`。
+- 编译命令核心：`swiftc -parse-as-library -framework Cocoa -framework UserNotifications -framework Security -framework Network -lsqlite3 -target arm64-apple-macos26 *.swift`（`-parse-as-library` 是因为入口用 `@NSApplicationMain` 而非 top-level code）。默认 `-Onone` 快速编译，`./build.sh --release` 用 `-O`。
 - 版本号自动生成：**`YYYY.M.D.N`**（日期 + 当日构建序号），由 `swift/.build_state` 计数器维护，同日递增、跨日重置；构建时由 PlistBuddy 写入 Info.plist（`CFBundleShortVersionString` = 日期、`CFBundleVersion` = 完整号）。
 - `icons/*` 全量拷贝进 Resources：SVG（菜单栏 template 图标 + 面板品牌图标）、PNG（关于弹窗）、PDF（菜单栏平台矢量图标，优先于同名 SVG 加载）。
 - 产物输出到项目根目录 `iBalance.app/`，与源码目录分离。
@@ -88,7 +101,7 @@ open iBalance.app             # 运行（或双击）
 - 打包后用固定自签证书 **`iBalance Local Sign`**（10 年有效，存于登录钥匙串）执行 `codesign --force --sign`。
   **必须保持该签名**：ad-hoc 签名每次编译都变，macOS TCC 按签名识别应用，会导致「完全磁盘访问」等授权每次重建后失效（详见陷阱 #2）。
 - **build.sh 结束时会自动重启 iBalance**（注意：改代码后跑 build 会立即重启正在运行的 App）。
-- 分发打包（zip）流程见 `PACKAGING.md`：排除清单 + zip 内模板 config 敏感字段泄漏校验，zip 文件名带版本号（取自 `swift/Info.plist`，**先 build 再打包**）。
+- **发版（仅用户明确要求时）**：仓库根 `bash release.sh ["更新说明"]` = `build.sh --release` → `ditto -c -k --sequesterRsrc --keepParent` 打 zip → SHA256 写入 Release 正文 → `gh release create v<CFBundleVersion>` 上传。约定：tag 必须为 `v<CFBundleVersion>` 全号；asset 只放一个 zip，文件名 `iBalance-<全版本>.zip`；同日重发需先 `gh release delete <tag> --cleanup-tag -y`。接收方全程无 quarantine（curl/brew/App 内下载均不打标），无需公证即可直接打开。
 
 ## ⚠️ 关键陷阱（必读）
 
@@ -126,6 +139,16 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 2. 首次启动时从旧版 `.app` 同目录迁移的 `config.json`
 3. `iBalance.app/Contents/Resources/config.json`（构建时拷贝的默认 fallback，首次加载后也会落盘到 1）
 
+### 6. DialogShell 模态弹窗三件套（2026-08-27 血泪坑，新弹窗必须遵守）
+
+任何在面板交互链路之外（尤其后台 Task / 定时器）触发 `DialogShell.present()` 的代码，必须同时做到：
+
+1. **`NSApp.activate(ignoringOtherApps: true)`**：accessory app 弹窗前必须自我激活；
+2. **`keepPanelAliveDuring { shell.present() }` 包裹**：裸 present 时若 popover 处于 `.transient`，弹窗上的点击会被判为「面板外」→ popover 关闭 → `popoverDidClose` 的 `NSApp.hide` **连坐把 modal 窗一起藏掉**；
+3. **runModal 前强制窗口上屏**（present() 已内置 `alert.window.orderFrontRegardless()`）：后台 Task 冷启动竞态下 runModal 窗口可能从未被 WindowServer 登记显示——表象是「弹窗闪没 / 无界面可点、进程假死」，主线程吊死在 modal loop。排查手段：`sample <pid> 2 -file` 抓主线程栈看是否停在 `-[NSAlert runModal]`；swift 单文件调 CGWindowList 枚举窗口。
+
+另：自更新下载走专用 URLSession（request 30s / resource 120s 硬顶）——默认配置对 CDN 龟速滴流近乎无限等待。
+
 ## 配置字段（config.json）
 
 | 字段                                                        | 说明                                                                        |
@@ -146,6 +169,7 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | `zcode_accounts`                                          | ZCode 多号账号列表：`[{uid, token, nickname}]`（JSON 导入）                          |
 | `codex_accounts`                                          | Codex 多号账号列表：`[{uid, token, email, refreshToken, idToken}]`（本机 auth.json 导入；旧配置缺 refresh/id token 时兼容仅 access token） |
 | `menubar_visible`                                         | 菜单栏条目显隐表：`{条目id: bool}`（右键卡片「在菜单栏显示」开关持久化）                               |
+| `update_auto_check`                                       | 自动检查更新开关（默认 true；启动 20s 后静默检查 GitHub Releases，每日一次；关闭不影响手动「检查更新」磁贴）      |
 | `cockpit_app_id`                                          | Cockpit Tools 的 Bundle ID                                                 |
 
 > 已弃用并移除：`workbuddy_report_url`、`workbuddy_account`、`cockpit_url`、`deepseek_decimals`、`qianwen_*`、`hide_main_icon`（旧版遗留，新代码不再读写、不再落盘）。
@@ -204,7 +228,10 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 
 ## 安全注意
 
-- ⚠️ **`swift/config.json`（模板）当前仍写有真实 API Key 与 WorkBuddy 账号 token**：它会被 build.sh 拷进 .app 作为内置 fallback，打 zip 时必须靠 `PACKAGING.md` 的泄漏校验清空；条件允许应尽快将模板恢复为空凭据。**运行时真实配置在 `~/Library/Application Support/com.local.ibalance/config.json`，不要把它当成模板改**。
+- ⚠️ **`swift/config.json` 必须保持零凭据**（API Key 留空 `""`、账号数组留空 `[]`）。它会被 build.sh 拷进 .app 作为内置 fallback，且 release.sh 会把整个 bundle 打包上传到**公开** Release。
+  **2026-08-27 泄漏事故**：模板曾带真实 DeepSeek API Key 与 2 个 WorkBuddy 账号 token/refresh_token（JWT 内含手机号），被打进 v2026.8.27.48/.50/.52 三个公开 Release；已删除全部涉事 Release 并清洗模板，重发干净版 .53。**涉事凭据必须轮换（用户人工操作）：DeepSeek 平台作废重建 API Key；CodeBuddy 两账号重新登录刷新 token/refresh_token。**
+  **运行时真实配置在 `~/Library/Application Support/com.local.ibalance/config.json`，不要把它当成模板改，更不要拷回模板位**。
+  `release.sh` 已内置闸门：打包后解压校验 zip 内 config.json 无任何凭据特征（非空 api key / 带 token 的账号 / JWT、sk- 特征串），命中即中止上传。
 - 根目录 `config.json` 已于 2026-08-20 移除（备份至 `backups/config.json.bak-2026-08-20`）；`.gitignore` 仍保留 `/config.json` 规则防止误提交。
 - TRAE storage.json 解密、Codex auth.json / ZCode 凭据读写涉及用户本地凭据，改动需格外谨慎（写文件保持原权限、原子写入、失败恢复原账号）。
-- 打 zip 分发前必须走 `PACKAGING.md` 的泄漏校验（zip 内模板 config 的敏感字段必须为空）。
+- 仓库自 2026-08-27 起为**公开**仓库（App 内自更新依赖 Releases 匿名可拉）：任何被提交/打包的内容都视同公开，敏感文件提交前必须确认 `.gitignore` 覆盖。

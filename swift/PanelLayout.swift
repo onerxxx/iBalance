@@ -246,6 +246,8 @@ extension BalancePanelView {
         interSwitch.action = #selector(interFontToggled)
         valuePreviewSwitch.target = self
         valuePreviewSwitch.action = #selector(valueScrollPreviewToggled)
+        updateAutoSwitch.target = self
+        updateAutoSwitch.action = #selector(updateAutoCheckToggled)
         // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 分段控件
         intervalSegment.target = self
         intervalSegment.action = #selector(intervalChanged)
@@ -340,6 +342,7 @@ extension BalancePanelView {
             switchRow(title: "Mono 风格", sub: nil, sw: monoSwitch),
             switchRow(title: "Inter 字体", sub: nil, sw: interSwitch),
             switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),
+            switchRow(title: "自动检查更新", sub: nil, sw: updateAutoSwitch),
         ].map {
             let hover = wrapHoverRow($0)
             // 行 hover 不提亮小字与图标 tint：小字保持常态颜色，
@@ -383,6 +386,7 @@ extension BalancePanelView {
         let deepSeekSettingsBtn = ActionTileButton(symbol: "key.fill", title: "Key / 额度", target: self, action: #selector(setApiKeyTapped))
         let aboutBtn = ActionTileButton(symbol: "info.circle", title: "关于", target: self, action: #selector(aboutTapped))
         let platformTogglesBtn = ActionTileButton(symbol: "circle.grid.2x2.topleft.checkmark.filled", title: "平台开关", target: self, action: #selector(platformTogglesTapped))
+        let checkUpdateBtn = ActionTileButton(symbol: "arrow.down.circle", title: "检查更新", target: self, action: #selector(checkUpdateTapped))
         let actionTiles = [
             cockpitBtn,
             wbAddBtn,
@@ -393,6 +397,7 @@ extension BalancePanelView {
             checkinBtn,
             ActionTileButton(symbol: "list.bullet.rectangle", title: "签到历史", target: self, action: #selector(checkinHistoryTapped)),
             platformTogglesBtn,
+            checkUpdateBtn,
             aboutBtn,
         ]
         // 各按钮悬停提示（HIG：图标类控件应有 tooltip）
@@ -403,6 +408,7 @@ extension BalancePanelView {
         codexAddBtn.toolTip = "添加 Codex 账号（JSON 导入 ~/.codex/auth.json）"
         deepSeekSettingsBtn.toolTip = "配置 DeepSeek API Key、日常额度与 ZhiPu Token"
         platformTogglesBtn.toolTip = "管理各平台刷新、自动签到、卡片与用量显示开关"
+        checkUpdateBtn.toolTip = "检查 GitHub Releases 上的新版本（发现后可直接更新重启）"
         let buildVer = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         aboutBtn.toolTip = "关于 iBalance（v\(buildVer)）"
         // 按钮间水平间距 4pt（4×52 + 3×4 = 220 ≤ 内容宽 236，整体靠左）

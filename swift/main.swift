@@ -370,6 +370,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if config.workbuddyAutoCheckin {
             Task { await wbAutoCheckinIfNeeded() }
         }
+
+        // App 自更新：启动 20s 后静默检查 GitHub Releases（每日一次；失败静默）
+        scheduleAutoUpdateCheck()
     }
 
     // MARK: - 菜单栏图标/标题渲染（整条标题烘焙为单张位图 template，赋给 button.image）
@@ -566,6 +569,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onToggleInterFont = { [weak self] in self?.onToggleInterFont() }
         panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
         panel.onAbout = { [weak self] in self?.onAbout() }
+        panel.onCheckForUpdate = { [weak self] in self?.onCheckForUpdate() }
+        panel.onToggleUpdateAutoCheck = { [weak self] in self?.onToggleUpdateAutoCheck() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
         panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
@@ -1027,6 +1032,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // 数值滚动预览开关状态（设置卡片开关：余额数值周期随机变化演示滚动）
         s.valueScrollPreviewEnabled = config.valueScrollPreviewEnabled
+        // 自动检查更新开关状态（设置卡片开关：GitHub Releases 启动静默检查）
+        s.updateAutoCheckEnabled = config.updateAutoCheck
         // 平台开关「用量」列：用户可单独隐藏某平台的用量行（未记录的平台默认显示）。
         // 无观测记录的平台本就无行（usageRow 返回 nil），此过滤只对已有行裁剪。
         s.usageRows = s.usageRows.filter { config.panelUsageVisible[$0.platform] ?? true }
@@ -1223,6 +1230,131 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             + "• DeepSeek 余额（API Key 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（JSON 导入，多号切换）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
             + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
+        _ = keepPanelAliveDuring { shell.present() }
+    }
+
+    // MARK: - App 自更新（GitHub Releases）
+
+    @objc private func onToggleUpdateAutoCheck() {
+        config.updateAutoCheck.toggle()
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
+    @objc private func onCheckForUpdate() {
+        Task { await runUpdateFlow(autoCheck: false) }
+    }
+
+    /// 启动 20s 后静默检查（避开启动高峰；失败静默不打扰）
+    private func scheduleAutoUpdateCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            self?.autoUpdateCheckIfNeeded()
+        }
+    }
+
+    /// 静默检查：每日至多一次；开关关闭不查；发现新版且当日未被「稍后再说」抑制才弹窗
+    private func autoUpdateCheckIfNeeded() {
+        guard config.updateAutoCheck else { return }
+        let today = Self.todayString()
+        guard UserDefaults.standard.string(forKey: UDKey.updateLastCheckDate) != today else { return }
+        Task { await runUpdateFlow(autoCheck: true, today: today) }
+    }
+
+    /// 检查 → 确认 → 下载替换完整流程。autoCheck=true 时按静默模式收敛交互：
+    /// 无新版不弹窗、用户点「稍后再说」记 snooze 当日不再打扰；手动检查始终有结果反馈。
+    @MainActor
+    private func runUpdateFlow(autoCheck: Bool, today: String = "") async {
+        do {
+            let rel = try await UpdateService.fetchLatestRelease()
+            if autoCheck {
+                UserDefaults.standard.set(today, forKey: UDKey.updateLastCheckDate)
+            }
+            let current = UpdateService.currentVersion()
+            guard UpdateService.isNewer(rel.version, than: current) else {
+                if !autoCheck {
+                    presentInfoDialog(title: "已是最新版本",
+                                      info: "当前版本 v\(current)，GitHub Releases 上没有更新的发布。",
+                                      button: "好")
+                }
+                return
+            }
+            if autoCheck,
+               UserDefaults.standard.string(forKey: UDKey.updateSnoozeDate) == today { return }
+
+            var notes = rel.notes
+                .split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && !$0.lowercased().contains("sha256") }
+                .joined(separator: "\n")
+            if notes.count > 240 { notes = String(notes.prefix(240)) + "…" }
+            if notes.isEmpty { notes = "（发布说明为空）" }
+
+            // 更新确认弹窗：主按钮「立即更新」在右（present 返回其 index），
+            // Esc/关闭与「稍后再说」同义。
+            // ⚠️ 必须 activate + keepPanelAliveDuring 包裹：
+            //   面板 transient 态会把 runModal 里的点击判为「面板外」→ popover 关闭 →
+            //   popoverDidClose 的 NSApp.hide 连坐把 modal 窗藏掉，主线程吊死在永不返回的
+            //   runModal 上（表象＝弹窗突然消失 + App 无窗口卡死）。
+            NSApp.activate(ignoringOtherApps: true)
+            let shell = DialogShell()
+            shell.addIcon(NSApp.applicationIconImage)
+            shell.addTitle("发现新版本 v\(rel.version)")
+            shell.contentWidth = DialogMetrics.width + 8 + 20
+            shell.addInfo("当前版本 v\(current)。\n\n"
+                + "\(notes)\n\n"
+                + "立即更新将关闭面板并后台下载安装包（约几秒到半分钟），校验通过后自动重启应用。"
+                + "配置保留在 Application Support 目录，不受更新影响。")
+            let idxInstall = shell.addButton("立即更新", keyEquivalent: "\r")
+            shell.addButton("稍后再说")
+            let choice = keepPanelAliveDuring { shell.present() }
+            if choice != idxInstall {
+                if autoCheck { UserDefaults.standard.set(today, forKey: UDKey.updateSnoozeDate) }
+                return
+            }
+            // 确认后先给一句可见的进行中提示再收面板：下载期间 App 无任何窗口的状态
+            // 会被当成「卡死」（下载受网络波动影响，必须让用户知道后台在干活）
+            let busy = DialogShell()
+            busy.addTitle("正在准备更新")
+            busy.addInfo("正在从 GitHub Releases 下载 v\(rel.version)，完成后将自动重启替换为新版。\n\n"
+                + "网络缓慢时可能需要一两分钟；若失败会弹窗告知，当前版本不受任何影响。")
+            busy.addButton("知道了", keyEquivalent: "\r")
+            NSApp.activate(ignoringOtherApps: true)
+            _ = keepPanelAliveDuring { busy.present() }
+            await performInstall(rel)
+        } catch {
+            Logger.log(.refresh, "[update] check failed (auto=\(autoCheck)): \(error.localizedDescription)")
+            guard !autoCheck else { return }   // 静默检查失败不打扰
+            presentInfoDialog(title: "检查更新失败", info: error.localizedDescription, button: "好")
+        }
+    }
+
+    /// 下载 → SHA256/签名校验 → 暂存到应用同级隐藏目录 → spawn 替换脚本 → 自动重启。
+    /// 任一步失败都未做改动（旧 bundle 完整在位），弹窗说明即可。
+    @MainActor
+    private func performInstall(_ rel: ReleaseInfo) async {
+        popoverController?.performClose(nil)
+        floatingPanel?.orderOut(nil)
+        do {
+            let staged = try await UpdateService.prepareAndStage(rel) { frac in
+                Logger.log(.refresh, "[update] progress \(Int(frac * 100))%")
+            }
+            try UpdateService.installAndRestart(stagedURL: staged)   // 成功则内部 terminate 不再返回
+        } catch {
+            Logger.log(.refresh, "[update] install failed: \(error.localizedDescription)")
+            NSApp.activate(ignoringOtherApps: true)
+            presentInfoDialog(title: "更新失败",
+                              info: "下载或校验未完成，本次未做任何改动。\n\n\(error.localizedDescription)",
+                              button: "好")
+        }
+    }
+
+    /// 轻量信息弹窗：更新检查触发时面板可能未打开，需自行激活 App 再跑模态
+    private func presentInfoDialog(title: String, info: String, button: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let shell = DialogShell()
+        shell.addTitle(title)
+        shell.addInfo(info)
+        shell.addButton(button, keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }
     }
 
