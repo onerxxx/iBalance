@@ -37,7 +37,7 @@
 - [ ] **测试补齐**：Service 层（token 解析/刷新/签到判定）目前零测试，抽协议 mock 后可上 XCTest
 
 ## 维护性备忘（不做新功能也要留意）
-- build.sh 打包必须走 `/tmp` 副本替换 config，原项目 config 零修改
+- ~~build.sh 打包必须走 /tmp 副本替换 config~~（已过时：用户配置已迁 Application Support，`swift/config.json` 只是空 Key 模板，直接 `cp` 进 bundle 即可，无泄露风险）
 - `refreshSeq` 版本控制 + `ownsRefresh` 守卫模式是刷新安全的核心，新子任务必须遵守
 - 所有 HTTP 请求走 `Logger.measure` + `/tmp/iBalance_network.log`，排查问题先看日志
 - 约束变更回归用 `IBLayoutAutoTest` 自动设施（25s 一轮迭代）

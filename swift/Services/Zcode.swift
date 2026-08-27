@@ -11,33 +11,59 @@ enum ZcodeImportResult {
 }
 
 enum ZcodeService {
-    /// ZCode Desktop 配置文件（明文存 start-plan JWT apiKey，登录后自动更新）
+    /// ZCode Desktop 配置文件（明文存 start-plan JWT / coding-plan API Key，登录后自动更新）
     private static let configPath = NSHomeDirectory() + "/.zcode/v2/config.json"
-    /// 余额查询端点（Anthropic 兼容网关同域）
+    /// 余额查询端点（zai 渠道 JWT 走此网关；Anthropic 兼容网关同域）
     private static let balanceURL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance"
+    /// bigmodel 渠道付费 Coding Plan（Lite 等档位）的 API Key 用量端点；
+    /// 返回 data.level（套餐档）+ data.limits[]（usage=总额度 currentValue=已用 remaining=剩余，
+    /// nextResetTime=窗口重置毫秒戳；同一套餐有 5 小时窗口与月度窗口两条，额度数值相同）
+    private static let bigModelQuotaURL = "https://open.bigmodel.cn/api/monitor/usage/quota/limit"
 
     // MARK: JSON 导入（当前登录账号）
 
-    /// Start Plan 凭据键有登录渠道之分（bigmodel / zai），按 apiKey 非空优先取
-    private static let startPlanProviderKeys = ["builtin:bigmodel-start-plan", "builtin:zai-start-plan"]
+    /// Coding Plan 凭据键有套餐档位与登录渠道之分：
+    /// coding-plan = 付费套餐（zai 为 JWT；bigmodel 为开放平台 API Key，形如 "id.secret"）
+    /// start-plan = 免费体验档（均为 JWT）
+    /// 导入优先取付费档（apiKey 非空优先），zai 渠道优先于 bigmodel
+    private static let providerKeys = [
+        "builtin:zai-coding-plan", "builtin:bigmodel-coding-plan",
+        "builtin:zai-start-plan", "builtin:bigmodel-start-plan",
+    ]
 
     /// 从 ~/.zcode/v2/config.json 读取当前登录的 Coding Plan 账号。
-    /// 凭据为 provider["builtin:{bigmodel|zai}-start-plan"].options.apiKey（JWT，明文存储），
-    /// 解 JWT payload（不验签）取 user_id 作为账号标识。
+    /// 凭据为 provider 键下 options.apiKey：付费档 API Key（bigmodel）或 JWT（其余），
+    /// JWT 解 payload（不验签）取 user_id 作为账号标识；API Key 无法自解析 uid，
+    /// 取同文件 start-plan JWT 的 user_id（同一 bigmodel 账号两个键并存），
+    /// 均无 JWT 时退回 credentials.json 当前登录账号的 uid。
     static func importCurrentAccount() -> ZcodeImportResult {
         guard FileManager.default.fileExists(atPath: configPath) else {
             return .failure("未找到 ~/.zcode/v2/config.json，请先安装并登录 ZCode")
         }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let provider = json["provider"] as? [String: Any],
-              let apiKey = startPlanProviderKeys
-                  .compactMap({ (provider[$0] as? [String: Any])?["options"] as? [String: Any] })
-                  .compactMap({ $0["apiKey"] as? String })
-                  .first(where: { !$0.isEmpty }) else {
+              let provider = json["provider"] as? [String: Any] else {
             return .failure("ZCode 配置中未找到 Coding Plan 登录信息，请先在 ZCode 中登录")
         }
-        guard let uid = jwtUserId(from: apiKey) else {
+        let keyPairs: [(String, String)] = providerKeys.compactMap { key in
+            guard let opts = (provider[key] as? [String: Any])?["options"] as? [String: Any],
+                  let ak = opts["apiKey"] as? String, !ak.isEmpty else { return nil }
+            return (key, ak)
+        }
+        guard let (_, apiKey) = keyPairs.first else {
+            return .failure("ZCode 配置中未找到 Coding Plan 登录信息，请先在 ZCode 中登录")
+        }
+        // JWT 自解析 uid；API Key（bigmodel 付费档）取同文件 start-plan JWT 的 user_id
+        //（同一 bigmodel 账号两个键并存），均无 JWT 时退回 credentials.json 当前登录账号 uid
+        let uid = jwtUserId(from: apiKey)
+            ?? providerKeys.filter { $0.hasSuffix("start-plan") }
+                .compactMap { key -> String? in
+                    guard let opts = (provider[key] as? [String: Any])?["options"] as? [String: Any],
+                          let ak = opts["apiKey"] as? String, !ak.isEmpty else { return nil }
+                    return jwtUserId(from: ak)
+                }.first
+            ?? currentUserInfo()?.uid
+        guard let uid, !uid.isEmpty else {
             return .failure("无法解析 ZCode 登录令牌")
         }
         // 自动带出昵称（credentials.json user_info；uid 不匹配或解密失败则留空，由调用方兜底）
@@ -172,13 +198,13 @@ enum ZcodeService {
         }
     }
 
-    /// 同步 config.json 当前 start-plan 键（导入来源键）的 apiKey；
+    /// 同步 config.json 当前凭据键（导入来源键）的 apiKey；
     /// ZCode 启动后也会自行同步，此处先行写入让 currentUid 立即指向新号
     private static func syncConfigApiKey(_ token: String) {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               var provider = json["provider"] as? [String: Any] else { return }
-        for key in startPlanProviderKeys {
+        for key in providerKeys {
             guard var plan = provider[key] as? [String: Any],
                   var opts = plan["options"] as? [String: Any],
                   let ak = opts["apiKey"] as? String, !ak.isEmpty else { continue }
@@ -229,14 +255,26 @@ enum ZcodeService {
 
     // MARK: 余额查询
 
-    /// 查询指定账号的 Coding Plan 用量：GET billing/balance，
-    /// 汇总 balances 数组各 entitlement 的 remaining_units / total_units（均为 token 数）。
+    /// 是否 JWT（三段点分 header.payload.signature）；bigmodel 开放平台 API Key 只有一个点
+    private static func isJWT(_ token: String) -> Bool {
+        token.split(separator: ".").count >= 3
+    }
+
+    /// 查询指定账号的 Coding Plan 用量，按凭据形态分流：
+    /// JWT（zai/bigmodel 免费档）→ zcode.z.ai billing/balance；
+    /// API Key（bigmodel 付费档 Lite 等）→ open.bigmodel.cn monitor/usage/quota/limit。
+    /// 返回 nil = 请求层失败（HTTP 非 200 / code 异常 / 网络/解析错误，如 token 失效）；
+    /// 返回 (0, 0, 0) = 查询成功但无有效套餐（全部到期/limits 为空）——对齐 Cockpit：
+    /// code 异常才算错误，空数据是正常结果，由调用方保留旧缓存展示「套餐已到期」。
+    static func fetchBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
+        if isJWT(token) { return await fetchZaiBalance(token: token) }
+        return await fetchBigModelBalance(apiKey: token)
+    }
+
+    /// zai 渠道：汇总 balances 数组各 entitlement 的 remaining_units / total_units（均为 token 数）。
     /// planEndsAt 为当前生效的免费套餐（Start Plan，plan_id 含 "start"）的到期时间戳（秒），
     /// 无免费套餐时为 0（调用方不显示到期副标题）。
-    /// 返回 nil = 请求层失败（HTTP 非 200 / code != 0 / 网络/解析错误，如 token 失效）；
-    /// 返回 (0, 0, 0) = 查询成功但无有效套餐（全部到期，balances 为空）——对齐 Cockpit：
-    /// code != 0 才算错误，空数据是正常结果，由调用方保留旧缓存展示「套餐已到期」。
-    static func fetchBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
+    private static func fetchZaiBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
         guard let url = URL(string: balanceURL) else { return nil }
         let (data, status) = await HTTP.requestWithRetry(
             url: url, method: "GET",
@@ -263,6 +301,44 @@ enum ZcodeService {
                 if let ends = p["ends_at"] as? Double {
                     if planEndsAt == 0 || ends < planEndsAt { planEndsAt = ends }
                 }
+            }
+        }
+        return (remain, total, planEndsAt)
+    }
+
+    /// bigmodel 付费 Coding Plan（Lite 等）：data.limits[] 各窗口的 usage/currentValue/remaining。
+    /// 数值取 remaining 最小的一条（最紧约束）；planEndsAt 取 nextResetTime 最晚的一条
+    ///（月度窗口重置点，语义贴近「到期」副标题；毫秒戳转秒）。
+    private static func fetchBigModelBalance(apiKey: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
+        guard let url = URL(string: bigModelQuotaURL) else { return nil }
+        let (data, status) = await HTTP.requestWithRetry(
+            url: url, method: "GET",
+            headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"],
+            timeout: 15
+        )
+        // bigmodel 开放平台业务码为 200（zai 体系是 0），401/403 = key 失效
+        guard status == 200, let data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (json["code"] as? Int) == 200 else { return nil }
+        let d = (json["data"] as? [String: Any]) ?? [:]
+        let limits = (d["limits"] as? [[String: Any]]) ?? []
+        var remain = 0.0
+        var total = 0.0
+        var tightest = Double.infinity
+        for l in limits {
+            let rem = (l["remaining"] as? Double) ?? 0
+            let tot = (l["usage"] as? Double) ?? 0
+            if rem < tightest {
+                tightest = rem
+                remain = rem
+                total = tot
+            }
+        }
+        var planEndsAt: TimeInterval = 0
+        for l in limits {
+            if let resetMs = l["nextResetTime"] as? Double {
+                let reset = resetMs / 1000
+                if planEndsAt == 0 || reset > planEndsAt { planEndsAt = reset }
             }
         }
         return (remain, total, planEndsAt)

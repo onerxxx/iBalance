@@ -432,6 +432,23 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     /// 鼠标移出仅回调 onHoverChanged(false)（驱动子面板延迟关闭），视觉不退出
     private var hoverLocked = false
 
+    /// 左键点击回调（mouseUp 且仍在行 bounds 内触发；用量行映射到子面板「过去周」）
+    var onLeftClick: (() -> Void)?
+    /// 右键点击回调（rightMouseDown 触发；用量行映射到子面板「回到本周」）
+    var onRightClick: (() -> Void)?
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        guard event.buttonNumber == 0 else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        if bounds.contains(p) { onLeftClick?() }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        // 不调用 super：右键由回调接管，不触发系统上下文菜单
+        onRightClick?()
+    }
+
     /// 设置 hover 锁定（纯视觉操作，不碰事件状态/回调）：
     /// - 锁定：立即点亮高亮（未 hover 时）
     /// - 解锁：无条件熄灭——解锁只发生在子面板关闭/切换到其他平台行时，

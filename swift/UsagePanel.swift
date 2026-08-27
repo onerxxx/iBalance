@@ -5,7 +5,17 @@
 import Cocoa
 import CoreImage
 
-/// 1小时/日/周用量行快照：icon + 平台名 + 已格式化的近1小时/今日/本周用量文本 + 本周每日用量。
+/// 单个周浏览页的数据：图表 7 天数值/文本 + 表头标签与周累计。
+struct UsageWeekData: Equatable {
+    var daily: [Double] = []
+    var dailyTexts: [String] = []
+    /// 表头第二行标签：本周 =「本周累计用量」；历史周 =「8-25~8-31累计用量」
+    var headerLabel: String = ""
+    /// 右上角周累计数值（本周沿用实时差值 weekText，历史周为每日加总）
+    var totalText: String = ""
+}
+
+/// 1小时/日/周用量行快照：icon + 平台名 + 已格式化的近1小时/今日/本周用量文本 + 周历史浏览页。
 struct UsageRowSnapshot: Equatable {
     var platform: String
     var icon: String
@@ -13,18 +23,28 @@ struct UsageRowSnapshot: Equatable {
     var hourText: String = ""
     var todayText: String
     var weekText: String
-    /// 本周一至周日的数值，用于 hover 右侧面积图。
-    var dailyUsage: [Double] = []
-    /// 与 dailyUsage 对应的已格式化文本，避免图表重复猜测货币/百分比格式。
-    var dailyUsageTexts: [String] = []
+    /// 周历史浏览页：index 0 = 本周，1 = 上周……（usage.json 60 天保留窗口内最多 8 页）
+    var historyWeeks: [UsageWeekData] = []
 }
 
 /// 用量行右侧趋势图：使用 AppKit 原生 NSView + NSBezierPath 绘制一周面积图。
 /// 视图本身承担 hover 追踪，保证鼠标从用量行移动到 popover 时不会立即关闭。
 final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     var row: UsageRowSnapshot? {
+        didSet {
+            // 跨行切换（hover 到别的平台）时周浏览页复位到本周
+            if oldValue != row { weekOffset = 0 }
+            needsDisplay = true
+        }
+    }
+    /// 周浏览偏移：0 = 本周（默认），1 = 上周……由右上角箭头切换
+    var weekOffset: Int = 0 {
         didSet { needsDisplay = true }
     }
+    /// 右上角箭头命中区（draw 时更新；单周数据无历史时不显示箭头）
+    private var leftArrowRect = NSRect.zero
+    private var rightArrowRect = NSRect.zero
+    private var cursorPushed = false
     var onHoverChanged: ((Bool) -> Void)?
     /// Mono 字体开关：开启时图表内所有文本（标题/刻度/数值/日期）用 JetBrainsMono
     var monoFontEnabled = false {
@@ -52,14 +72,15 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     // 面积图保持紧凑，同时保留两行表头（平台名 + 本周用量两行标签、大号右对齐数值）、
     // 坐标日期和底部留白。2026-08-21 表头改两行结构，高度 158 → 172；
     // 2026-08-23 图表区高度降 15%（~86pt → ~73pt），总高 172 → 159（表头与底部 36pt 日期轴不动）；
-    // 同日宽度降 10%（232 → 209），图表绘图区随宽度自适应收窄
-    override var intrinsicContentSize: NSSize { NSSize(width: 209, height: 159) }
+    // 同日宽度降 10%（232 → 209），图表绘图区随宽度自适应收窄；
+    // 2026-08-27 图表区高度再降 10%（~73 → ~66pt），总高 159 → 152
+    override var intrinsicContentSize: NSSize { NSSize(width: 209, height: 152) }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let ta = trackingArea { removeTrackingArea(ta) }
         let ta = NSTrackingArea(rect: .zero,
-                                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                                 owner: self, userInfo: nil)
         addTrackingArea(ta)
         trackingArea = ta
@@ -71,8 +92,49 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     }
 
     override func mouseExited(with event: NSEvent) {
+        // 退出图表前若箭头还压着手指光标，先弹出归还
+        if cursorPushed {
+            NSCursor.pop()
+            cursorPushed = false
+        }
         super.mouseExited(with: event)
         onHoverChanged?(false)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        updateArrowCursor(point: convert(event.locationInWindow, from: nil))
+    }
+
+    /// 命中箭头区域时切换手指光标（与余额卡片/磁贴同一交互语言）
+    private func updateArrowCursor(point: NSPoint) {
+        let inArrows = (row?.historyWeeks.count ?? 0) > 1
+            && (arrowHitArea(leftArrowRect).contains(point) || arrowHitArea(rightArrowRect).contains(point))
+        if inArrows, !cursorPushed {
+            NSCursor.pointingHand.push()
+            cursorPushed = true
+        } else if !inArrows, cursorPushed {
+            NSCursor.pop()
+            cursorPushed = false
+        }
+    }
+
+    private func arrowHitArea(_ rect: NSRect) -> NSRect {
+        rect.insetBy(dx: -4, dy: -5)
+    }
+
+    /// 点击右上角箭头切换周浏览页（mouseUp 触发，与 HoverCard onClick 同时机）
+    /// 左箭头 = 去更早的周（offset+1），右箭头 = 回到更新的周（offset-1）
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        guard let row, row.historyWeeks.count > 1 else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        if arrowHitArea(leftArrowRect).contains(p),
+           weekOffset < row.historyWeeks.count - 1 {
+            weekOffset += 1
+        } else if arrowHitArea(rightArrowRect).contains(p), weekOffset > 0 {
+            weekOffset -= 1
+        }
     }
 
     func syncHoverState(_ inside: Bool) {
@@ -146,15 +208,47 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         let titleLineHeight = "Ag".size(withAttributes: [.font: platformNameFont]).height
         let headerLineGap: CGFloat = 2
         let headerBlockHeight = titleLineHeight + headerLineGap + headerLineHeight
+        // 当前浏览的周页（weekOffset 由右上角箭头切换；越界防御性夹取）
+        let pageCount = max(1, row.historyWeeks.count)
+        let safeOffset = min(max(0, weekOffset), pageCount - 1)
+        let week = row.historyWeeks.indices.contains(safeOffset)
+            ? row.historyWeeks[safeOffset]
+            : UsageWeekData(daily: Array(repeating: 0, count: 7),
+                            dailyTexts: Array(repeating: "—", count: 7),
+                            headerLabel: "本周累计用量", totalText: row.weekText)
+        let isCurrentWeek = safeOffset == 0
         drawText(row.name, at: NSPoint(x: plotInset, y: headerY),
                  font: platformNameFont, color: titleColor)
-        drawText("本周累计用量", at: NSPoint(x: plotInset, y: headerY + titleLineHeight + headerLineGap),
+        drawText(week.headerLabel, at: NSPoint(x: plotInset, y: headerY + titleLineHeight + headerLineGap),
                  font: titleFont, color: titleColor)
-        let weekSize = row.weekText.size(withAttributes: [.font: valueFont])
-        drawText(row.weekText,
+        let weekSize = week.totalText.size(withAttributes: [.font: valueFont])
+        drawText(week.totalText,
                  at: NSPoint(x: plotInset + plotFullWidth - weekSize.width,
                              y: headerY + (headerBlockHeight - weekSize.height) / 2),
                  font: valueFont, color: titleColor)
+
+        // 右上角周切换箭头（有历史周才显示）：左=过去周（offset+1），右=回到本周（offset-1）；到边界时置灰
+        if row.historyWeeks.count > 1 {
+            let arrowBox: CGFloat = 13
+            let arrowGap: CGFloat = 6
+            let arrowCenterY = headerY + headerBlockHeight / 2
+            let rightRect = NSRect(x: bounds.maxX - 4 - arrowBox,
+                                   y: arrowCenterY - arrowBox / 2,
+                                   width: arrowBox, height: arrowBox)
+            let leftRect = NSRect(x: rightRect.minX - arrowGap - arrowBox,
+                                  y: rightRect.minY,
+                                  width: arrowBox, height: arrowBox)
+            leftArrowRect = leftRect
+            rightArrowRect = rightRect
+            let disabledColor = NSColor.secondaryLabelColor.withAlphaComponent(0.35)
+            drawChevron(in: leftRect, pointingRight: false,
+                        color: safeOffset < pageCount - 1 ? titleColor : disabledColor)
+            drawChevron(in: rightRect, pointingRight: true,
+                        color: safeOffset > 0 ? titleColor : disabledColor)
+        } else {
+            leftArrowRect = .zero
+            rightArrowRect = .zero
+        }
 
         // 表头块下保留 4pt 基础间距，随后将面积图、数值和日期轴整体下移 10pt。
         let headerHeight = headerBlockHeight
@@ -169,15 +263,18 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         // 曲线顶部预留数值标签空间，避免最高点和数值文字互相覆盖。
         let graphTopPadding: CGFloat = 14
         let graphHeight = max(1, plot.height - graphTopPadding)
-        let values = Array(row.dailyUsage.prefix(7)) + Array(repeating: 0, count: max(0, 7 - row.dailyUsage.count))
-        let texts = Array(row.dailyUsageTexts.prefix(7)) + Array(repeating: "—", count: max(0, 7 - row.dailyUsageTexts.count))
+        let values = Array(week.daily.prefix(7)) + Array(repeating: 0, count: max(0, 7 - week.daily.count))
+        let texts = Array(week.dailyTexts.prefix(7)) + Array(repeating: "—", count: max(0, 7 - week.dailyTexts.count))
         let maxValue = values.max() ?? 0
-        // 今天在周内第几个位置（周一=0）：按系统日期从本周一推算。
-        // 不能用 dailyUsage.count-1——weeklyUsage 返回固定 7 元素（未来天填 0），count 恒为 7。
+        // 今天在周内第几个位置（周一=0）：按系统日期从本周一推算，仅本周有效；
+        // 历史周是完整 7 天，todayIndex 取 6 让全部圆点/日期参与绘制，
+        // 但不享受「今日高亮 + Pulse 光环 + 今日数值标注」（由 isCurrentWeek 门控）。
         var weekCal = Calendar.current
         weekCal.firstWeekday = 2
-        let weekStart = weekCal.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
-        let todayIndex = min(6, max(0, weekCal.dateComponents([.day], from: weekStart, to: Date()).day ?? 0))
+        let weekStartDate = weekCal.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
+        let todayIndex = isCurrentWeek
+            ? min(6, max(0, weekCal.dateComponents([.day], from: weekStartDate, to: Date()).day ?? 0))
+            : 6
         // 纵轴顶端取本周峰值向上取整，底端固定为 0；曲线按轴顶端归一化，给顶部留出真实余量。
         let axisMaxValue = max(1, ceil(maxValue))
         let axisSampleText = texts.first(where: { $0 != "—" }) ?? row.todayText
@@ -259,11 +356,11 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                 // 圆点必须以数据点为中心，保持与平滑曲线使用同一组坐标。
                 let dot = NSBezierPath(ovalIn: NSRect(x: point.x - radius, y: point.y - radius,
                                                        width: size, height: size))
-                NSColor(calibratedWhite: index == todayIndex ? dotPeakWhite : dotBaseWhite,
+                NSColor(calibratedWhite: index == todayIndex && isCurrentWeek ? dotPeakWhite : dotBaseWhite,
                         alpha: 1.0).setFill()
                 dot.fill()
-                // 当日 Pulse 光环：前 70% 相位 ease-out 扩散到 ~2.4x 并淡出，后 30% 停顿（alpha=0 天然隐形）
-                if index == todayIndex {
+                // 当日 Pulse 光环（仅本周）：前 70% 相位 ease-out 扩散到 ~2.4x 并淡出，后 30% 停顿（alpha=0 天然隐形）
+                if index == todayIndex, isCurrentWeek {
                     let ping = min(blinkPhase / 0.7, 1)
                     let ease = 1 - (1 - ping) * (1 - ping)
                     let ringRadius = radius * (1 + 1.4 * ease)
@@ -278,20 +375,21 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                 }
             }
 
-            // 数值标注：只显示当日数值（与高亮日期同一列），其余天不标
-            if todayIndex >= 0 {
-                let valueText = texts[todayIndex]
+            // 数值标注：本周标当日数值（与高亮日期同一列）；历史周标峰值天数值，其余天不标
+            let annotateIndex = isCurrentWeek ? todayIndex : (values.firstIndex(of: maxValue) ?? -1)
+            if annotateIndex >= 0 {
+                let valueText = texts[annotateIndex]
                 if valueText != "—" {
                     let valueWidth = valueText.size(withAttributes: [.font: axisFont]).width
-                    let x = min(max(plot.minX, points[todayIndex].x - valueWidth / 2),
+                    let x = min(max(plot.minX, points[annotateIndex].x - valueWidth / 2),
                                 plot.maxX - valueWidth)
-                    let y = max(26, points[todayIndex].y - 17)
+                    let y = max(26, points[annotateIndex].y - 17)
                     drawText(valueText, at: NSPoint(x: x, y: y), font: axisFont,
                              color: NSColor(calibratedWhite: 0.72, alpha: 1.0))
                 }
             }
         } else {
-            let empty = "本周暂无历史用量"
+            let empty = isCurrentWeek ? "本周暂无历史用量" : "该周暂无用量记录"
             let emptyWidth = empty.size(withAttributes: [.font: detailFont]).width
             drawText(empty, at: NSPoint(x: plot.midX - emptyWidth / 2, y: plot.midY - 6),
                      font: detailFont, color: secondaryColor)
@@ -299,7 +397,9 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
 
         var calendar = Calendar.current
         calendar.firstWeekday = 2
-        let start = calendar.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
+        let currentWeekStart = calendar.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
+        // 日期轴跟随浏览页：历史周从「本周一 - 7×offset」起算
+        let start = calendar.date(byAdding: .day, value: -7 * safeOffset, to: currentWeekStart) ?? currentWeekStart
         let formatter = DateFormatter()
         formatter.locale = Locale.current
         formatter.dateFormat = "M/d"
@@ -310,7 +410,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             // 日期逆时针旋转 45°：先沿文本方向平移 -width/2 让文字光学中心对准贯穿线
             let anchorX = plot.minX + plot.width * CGFloat(index) / 6
             let anchorY = plot.maxY + 10
-            let labelColor: NSColor = index == todayIndex
+            let labelColor: NSColor = index == todayIndex && isCurrentWeek
                 ? Palette.cardForeground
                 : .systemGray
             let ctx = NSGraphicsContext.current?.cgContext
@@ -328,6 +428,29 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             .font: font,
             .foregroundColor: color,
         ])
+    }
+
+    /// 圆头细线书名号箭头（‹ ›）：与表头文本同层级的中性图形，不用位图 icon
+    private func drawChevron(in rect: NSRect, pointingRight: Bool, color: NSColor) {
+        let path = NSBezierPath()
+        let midX = rect.midX
+        let midY = rect.midY
+        let halfH: CGFloat = 4
+        let halfW: CGFloat = 2
+        if pointingRight {
+            path.move(to: NSPoint(x: midX - halfW + 0.5, y: midY - halfH))
+            path.line(to: NSPoint(x: midX + halfW - 0.5, y: midY))
+            path.line(to: NSPoint(x: midX - halfW + 0.5, y: midY + halfH))
+        } else {
+            path.move(to: NSPoint(x: midX + halfW - 0.5, y: midY - halfH))
+            path.line(to: NSPoint(x: midX - halfW + 0.5, y: midY))
+            path.line(to: NSPoint(x: midX + halfW - 0.5, y: midY + halfH))
+        }
+        color.setStroke()
+        path.lineWidth = 1.6
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        path.stroke()
     }
 
     /// 品牌图标的前景色单色版本（与用量行 icon 同款配色，保证深色 popover 上可见）。
@@ -435,6 +558,9 @@ final class UsageHistoryPopoverController: NSViewController {
     var panelGradientEnabled = true {
         didSet { applyPanelBackground() }
     }
+    /// 主面板当前生效的背景遮罩色（含渐变开关状态）：子弹窗继承同一配色
+    var panelTintColor: NSColor? = Palette.containerTint
+    var panelTintBottomColor: NSColor? = Palette.containerTintBottom
     /// Mono 字体开关：图表内文本（标题/刻度/日期）与数值随开关切换字体
     var monoFontEnabled = false {
         didSet { chartView.monoFontEnabled = monoFontEnabled }
@@ -450,8 +576,8 @@ final class UsageHistoryPopoverController: NSViewController {
         backgroundView.state = .active
         backgroundView.isEmphasized = false
         backgroundView.appearance = NSAppearance(named: .darkAqua)
-        backgroundView.tintColor = Palette.containerTint
-        backgroundView.tintBottomColor = panelGradientEnabled ? Palette.containerTintBottom : nil
+        backgroundView.tintColor = panelTintColor
+        backgroundView.tintBottomColor = panelGradientEnabled ? panelTintBottomColor : nil
         backgroundView.wantsLayer = true
         backgroundView.layer?.cornerRadius = Palette.cardCornerRadius
         backgroundView.layer?.cornerCurve = .continuous
@@ -484,7 +610,8 @@ final class UsageHistoryPopoverController: NSViewController {
 
     private func applyPanelBackground() {
         guard isViewLoaded else { return }
-        backgroundView.tintBottomColor = panelGradientEnabled ? Palette.containerTintBottom : nil
+        backgroundView.tintColor = panelTintColor
+        backgroundView.tintBottomColor = panelGradientEnabled ? panelTintBottomColor : nil
     }
 }
 
@@ -667,14 +794,14 @@ extension BalancePanelView {
 
     /// 1小时/日/周用量行：品牌 icon + 平台名 + 右侧三列数值（固定列宽右对齐，对齐表头）
     func makeUsageRow(_ row: UsageRowSnapshot) -> NSView {
-        let usageIconSize: CGFloat = 13
+        let usageIconSize: CGFloat = 10
         let iconView = NSImageView()
-        iconView.image = bundleIcon(row.icon, size: usageIconSize) ?? symbolImage("app.fill", size: usageIconSize)
+        iconView.image = bundleIcon(row.icon, size: usageIconSize) ?? Self.trimmedSymbolImage("app.fill", size: usageIconSize)
         iconView.image?.isTemplate = true
         iconView.contentTintColor = Palette.cardForeground
         iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.widthAnchor.constraint(equalToConstant: 14).isActive = true
-        iconView.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        iconView.widthAnchor.constraint(equalToConstant: 10).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 10).isActive = true
         let nameLabel = NSTextField(labelWithString: row.name)
         registerFont(nameLabel, size: 10, weight: .medium)
         nameLabel.textColor = Palette.cardForeground
@@ -721,7 +848,43 @@ extension BalancePanelView {
                 self.scheduleUsageHistoryClose()
             }
         }
+        // 行内左/右键点击映射到子面板周切换：左键 = 过去周（‹），右键 = 回到本周（›）
+        hoverRow.onLeftClick = { [weak self, weak hoverRow] in
+            self?.shiftUsageHistoryWeek(row: row, from: hoverRow, delta: 1)
+        }
+        hoverRow.onRightClick = { [weak self, weak hoverRow] in
+            self?.shiftUsageHistoryWeek(row: row, from: hoverRow, delta: -1)
+        }
         return hoverRow
+    }
+
+    /// 用量行左右键点击 → 子面板周浏览页步进（delta>0 去过去周，delta<0 回本周）。
+    /// 子面板按 platform 匹配当前锚定行；未打开/平台不符时先弹出该行子面板再切换。
+    private func shiftUsageHistoryWeek(row: UsageRowSnapshot, from anchor: NSView?, delta: Int) {
+        guard let controller = usageHistoryController,
+              let chartView = controller.view.subviews.first(where: { $0 is UsageHistoryChartView })
+                as? UsageHistoryChartView,
+              chartView.row?.platform == row.platform,
+              row.historyWeeks.count > 1 else {
+            // 子面板未打开或已切到其他平台：先按当前行弹出，本周页起步
+            showUsageHistory(row: row, from: anchor)
+            return
+        }
+        let target = chartView.weekOffset + delta
+        if target >= 0, target < row.historyWeeks.count {
+            chartView.weekOffset = target
+        }
+    }
+
+    /// 沿 superview 链向上找主面板的背景容器（TintedVisualEffectView），
+    /// 读取其当前 tintColor/tintBottomColor 供子弹窗继承
+    static func findPanelContainer(from view: NSView) -> TintedVisualEffectView? {
+        var current: NSView? = view
+        while let v = current {
+            if let tinted = v as? TintedVisualEffectView { return tinted }
+            current = v.superview
+        }
+        return nil
     }
 
     private func showUsageHistory(row: UsageRowSnapshot, from anchor: NSView?) {
@@ -774,6 +937,11 @@ extension BalancePanelView {
         let anchorChanged = usageHistoryAnchor !== fixedAnchor
         usageHistoryAnchor = fixedAnchor
         usageHistoryController?.panelGradientEnabled = panelGradientEnabled
+        // 继承主面板容器当前生效的背景遮罩色（含渐变开关两种形态），子弹窗与主面板底色一致
+        if let container = Self.findPanelContainer(from: self) {
+            usageHistoryController?.panelTintColor = container.tintColor
+            usageHistoryController?.panelTintBottomColor = container.tintBottomColor
+        }
         // Mono 开关在面板打开期间切换时，子弹窗是懒创建的——每次 show 前同步当前状态
         usageHistoryController?.monoFontEnabled = monoFontEnabled
         // Inter 字体开关同样在各次 show 前同步（优先级 Mono > Inter）

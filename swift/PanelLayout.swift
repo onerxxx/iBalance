@@ -758,7 +758,11 @@ extension BalancePanelView {
         NSLayoutConstraint.activate([
             titleRow.leadingAnchor.constraint(equalTo: row1.leadingAnchor),
             titleRow.firstBaselineAnchor.constraint(equalTo: valueView.baselineAnchor),
-            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: valueView.leadingAnchor, constant: -4),
+            // 昵称行允许向数值区多占 12pt（-4 → +8）：为昵称尾部签到徽章
+            //（10pt 图标 + 薄空格）预留显示空间；数值右对齐（右锚 bounds-2.5），
+            // 常规数值宽度下左侧有富余，不会与数字字形重叠
+            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: valueView.leadingAnchor,
+                                               constant: nickLabel != nil ? 8 : -4),
             valueView.trailingAnchor.constraint(equalTo: row1.trailingAnchor),
             valueView.centerYAnchor.constraint(equalTo: row1.centerYAnchor),
             row1.heightAnchor.constraint(equalToConstant: 16),
@@ -1038,6 +1042,92 @@ extension BalancePanelView {
         return img.withSymbolConfiguration(.init(pointSize: size, weight: .medium))
     }
 
+    /// 裁掉 SF Symbol 位图四周透明留白：返回墨迹紧贴边缘的 NSImage。
+    /// SF Symbol 的 pointSize 生成的位图自带画布留白（如 pointSize 9 → 12×12，
+    /// 墨迹 9.5×9.5），且各 symbol 墨迹占比不同（timer 106% / checkmark.seal 117%），
+    /// 同 pointSize 视觉大小不一致；裁剪后 image.size = 墨迹实际尺寸，
+    /// 配合固定显示框即可精确控制视觉大小（全卡口径统一）。
+    static func trimmedSymbolImage(_ name: String, size: CGFloat, weight: NSFont.Weight = .medium) -> NSImage? {
+        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: size, weight: weight)) else { return nil }
+        var rect = CGRect(origin: .zero, size: img.size)
+        guard let cg = img.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+              let data = cg.dataProvider?.data, let buf = CFDataGetBytePtr(data) else { return img }
+        let w = cg.width, h = cg.height, bpr = cg.bytesPerRow
+        var minX = w, maxX = -1, minY = h, maxY = -1
+        for y in 0..<h {
+            for x in 0..<w where buf[y * bpr + x * 4 + 3] > 0 {
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                if y > maxY { maxY = y }
+            }
+        }
+        guard maxX >= minX, maxY >= minY,
+              let cropped = cg.cropping(to: CGRect(x: minX, y: minY,
+                                                   width: maxX - minX + 1, height: maxY - minY + 1))
+        else { return img }
+        // cgImage 分辨率可能是 1x/2x，按像素→点换算保持尺寸语义
+        let scale = img.size.width / CGFloat(cg.width)
+        return NSImage(cgImage: cropped,
+                       size: NSSize(width: CGFloat(maxX - minX + 1) * scale,
+                                   height: CGFloat(maxY - minY + 1) * scale))
+    }
+
+    /// 从 bundle 加载 SVG 图标，裁掉四周透明留白后按「墨迹最大边 = size」返回模板图。
+    /// 与 trimmedSymbolImage 同口径：各 SVG viewBox 留白不同（tabler 24×24
+    /// 实际墨迹占比各异），裁剪后 ink 最大边精确 = size，配合固定显示框让不同来源
+    /// 图标视觉大小一致（副标题 timer/calendar/external-link 全卡口径统一）。
+    /// isTemplate=true：调用方用 contentTintColor 统一着色（副标题用 systemGray）。
+    static func trimmedBundleSvgIcon(_ name: String, size: CGFloat) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "svg"),
+              let src = NSImage(contentsOf: url) else { return nil }
+        // 以 2× 光栅化，像素充足；NSBitmapImageRep 绘制保证 SVG 矢量按指定像素落地
+        let scale: CGFloat = 2
+        let px = max(1, Int(ceil(size * scale)))
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else {
+            src.isTemplate = true
+            src.size = NSSize(width: size, height: size)
+            return src
+        }
+        let ctxSize = NSSize(width: px, height: px)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        src.draw(in: NSRect(origin: .zero, size: ctxSize))
+        NSGraphicsContext.restoreGraphicsState()
+        guard let cg = rep.cgImage,
+              let data = cg.dataProvider?.data, let buf = CFDataGetBytePtr(data) else {
+            src.isTemplate = true
+            src.size = NSSize(width: size, height: size)
+            return src
+        }
+        let w = cg.width, h = cg.height, bpr = cg.bytesPerRow
+        var minX = w, maxX = -1, minY = h, maxY = -1
+        for y in 0..<h {
+            for x in 0..<w where buf[y * bpr + x * 4 + 3] > 0 {
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                if y > maxY { maxY = y }
+            }
+        }
+        guard maxX >= minX, maxY >= minY,
+              let cropped = cg.cropping(to: CGRect(x: minX, y: minY,
+                                                   width: maxX - minX + 1, height: maxY - minY + 1))
+        else { return nil }
+        // 像素 → 点：以墨迹最大边对齐 size（保持长宽比；tabler 图标近正方形 → ≈ size×size）
+        let inkW = CGFloat(maxX - minX + 1), inkH = CGFloat(maxY - minY + 1)
+        let maxDim = max(inkW, inkH)
+        let out = NSImage(cgImage: cropped,
+                          size: NSSize(width: inkW / maxDim * size,
+                                       height: inkH / maxDim * size))
+        out.isTemplate = true
+        return out
+    }
+
     /// 签到失败角标：exclamationmark.message.fill（普通失败系统红色 / 风控橙黄色，无底框），叠加在卡片 icon 右上角。
     /// 默认隐藏，由 apply*CardData 按当日签到失败/风控状态显隐与变色。
     func makeFailureBadge() -> NSView {
@@ -1049,14 +1139,15 @@ extension BalancePanelView {
     }
 
     /// 多号账号卡 icon：未显示在菜单栏的账号叠加垂直透明渐变 mask
-    /// （视觉底部 25% 可见 → 顶部 80% 可见），区别于「已上菜单栏」的完整 icon。
+    /// （视觉底部 80% 可见 → 顶部 25% 可见，从下到上由亮到暗），区别于「已上菜单栏」的完整 icon。
     /// CA 渐变坐标 y 向上：startPoint y=0 为视觉底部、endPoint y=1 为视觉顶部。
+    /// v2（锚点动画）：mask 恒铺满 icon（frame == bounds，不平移），colors/locations
+    /// 固定不变，显隐切换只动画渐变锚点对 (startPoint, endPoint)（带长恒 3）——
+    /// 开 = startPoint.y -1（中段渐变对齐 icon）；关 = 0（上段纯白对齐，渐变带
+    /// 移出 icon 上方）。锚点平移即「半透明从 icon 底部往上移入/移出」（1s easeInEaseOut）。
     final class MenuBarFadeIconView: NSImageView {
-        /// 三段式蒙版（高 3×bounds）：上段纯白（icon 完整显示）、中段 0.25→0.8 渐变、
-        /// 下段纯白。通过垂直平移切换「中段/纯白段」与 icon 的对齐关系，
-        /// 位移动画即「半透明遮罩从下往上移入/移出」（0.6s easeInEaseOut）。
         private let fadeMask = CAGradientLayer()
-        private let maskSlideDuration: CFTimeInterval = 0.6
+        private let maskAnchorDuration: CFTimeInterval = 0.25
         /// true = 未上菜单栏 → icon 应用渐变；false = 完整显示
         var usesMenuBarFade = false {
             didSet {
@@ -1068,40 +1159,42 @@ extension BalancePanelView {
         override init(frame frameRect: NSRect) {
             super.init(frame: frameRect)
             wantsLayer = true
-            // 上段纯白 / 中段渐变（底部 0.25 → 顶部 0.8，与旧版方向一致）/ 下段纯白；
-            // 同 location 双停靠点形成硬边界
+            // 上段纯白 / 中段渐变（底部 0.8 → 顶部 0.25，从下到上由亮到暗，过渡更平滑）/
+            // 下段纯白；同 location 双停靠点形成硬边界
             fadeMask.colors = [
                 NSColor.white.cgColor,
                 NSColor.white.cgColor,
-                NSColor.white.withAlphaComponent(0.25).cgColor,
                 NSColor.white.withAlphaComponent(0.8).cgColor,
+                NSColor.white.withAlphaComponent(0.25).cgColor,
                 NSColor.white.cgColor,
                 NSColor.white.cgColor,
             ]
             let third = NSNumber(value: 1.0 / 3.0)
             let twoThirds = NSNumber(value: 2.0 / 3.0)
             fadeMask.locations = [NSNumber(value: 0), third, third, twoThirds, twoThirds, NSNumber(value: 1)]
-            fadeMask.startPoint = CGPoint(x: 0.5, y: 0)
-            fadeMask.endPoint = CGPoint(x: 0.5, y: 1)
         }
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-        /// 蒙版三个对齐位（frame.minY，蒙版高 3h）：
-        /// 渐变位 -h（中段对齐 icon）；上方纯白位 0（上段对齐，关动画终点）；
-        /// 下方纯白位 -2h（下段对齐，开动画起点）——两个纯白位视觉等价（icon 完整）
-        private var gradientY: CGFloat { -bounds.height }
+        /// 蒙版三个锚点对齐位（startPoint.y，带长恒 3 = bounds 高度 ×3）：
+        /// 渐变位 -1（中段对齐 icon）；上方纯白位 0（上段对齐，关动画终点）；
+        /// 下方纯白位 -2（下段对齐，开动画起点）——两个纯白位视觉等价（icon 完整）
+        private var gradientY: CGFloat { -1 }
         private var fullAboveY: CGFloat { 0 }
-        private var fullBelowY: CGFloat { -bounds.height * 2 }
-        private func maskFrame(y: CGFloat) -> NSRect {
-            NSRect(x: 0, y: y, width: bounds.width, height: bounds.height * 3)
+        private var fullBelowY: CGFloat { -2 }
+        /// 带长恒 3（endPoint = startPoint + 3），锚点平移过程中带宽不变（纯滑移无拉伸）
+        private func applyAnchor(y: CGFloat) {
+            fadeMask.startPoint = CGPoint(x: 0.5, y: y)
+            fadeMask.endPoint = CGPoint(x: 0.5, y: y + 3)
         }
         private func transitionMask(animated: Bool) {
             guard bounds.height > 0 else { return }   // 布局未定时由 layout() 首挂
+            let targetY = usesMenuBarFade ? gradientY : fullAboveY
             if !maskInstalled {
                 // 首次挂载（rebuild 后 apply 阶段）：直接就位，不播动画
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 layer?.mask = fadeMask
-                fadeMask.frame = maskFrame(y: usesMenuBarFade ? gradientY : fullAboveY)
+                fadeMask.frame = bounds
+                applyAnchor(y: targetY)
                 CATransaction.commit()
                 maskInstalled = true
                 return
@@ -1109,41 +1202,49 @@ extension BalancePanelView {
             if !animated {
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
-                fadeMask.removeAnimation(forKey: "maskSlide")
-                fadeMask.frame = maskFrame(y: usesMenuBarFade ? gradientY : fullAboveY)
+                fadeMask.removeAnimation(forKey: "maskAnchorStart")
+                fadeMask.removeAnimation(forKey: "maskAnchorEnd")
+                applyAnchor(y: targetY)
                 CATransaction.commit()
                 return
             }
             if usesMenuBarFade {
                 // 开：先无动画瞬移到下方纯白位（与任意完整态视觉等价，无跳变），
-                // 再下滑进入渐变位——半透明从 icon 底部往上移入
+                // 再上滑进入渐变位——半透明从 icon 底部往上移入
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
-                fadeMask.removeAnimation(forKey: "maskSlide")
-                fadeMask.frame = maskFrame(y: fullBelowY)
+                fadeMask.removeAnimation(forKey: "maskAnchorStart")
+                fadeMask.removeAnimation(forKey: "maskAnchorEnd")
+                applyAnchor(y: fullBelowY)
                 CATransaction.commit()
-                slideMask(to: gradientY)
+                slideAnchor(to: gradientY)
             } else {
-                // 关：从渐变位下滑到上方纯白位——恢复同样从 icon 底部往上移入
-                slideMask(to: fullAboveY)
+                // 关：从渐变位上滑到上方纯白位——恢复同样从 icon 底部往上移入
+                slideAnchor(to: fullAboveY)
             }
         }
-        /// 显式位移动画（position.y）：起点取当前呈现位置，快速反复切换不跳变；
-        /// model 直达目标（disableActions），呈现由动画驱动
-        private func slideMask(to targetY: CGFloat) {
-            let maskH = bounds.height * 3
-            let fromY = fadeMask.presentation()?.frame.minY ?? fadeMask.frame.minY
-            let anim = CABasicAnimation(keyPath: "position.y")
-            anim.fromValue = fromY + maskH / 2
-            anim.toValue = targetY + maskH / 2
-            anim.duration = maskSlideDuration
-            anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            anim.isRemovedOnCompletion = true
+        /// 显式锚点平移动画（startPoint/endPoint 同步）：起点取当前呈现位置，
+        /// 快速反复切换不跳变；model 直达目标（disableActions），呈现由动画驱动
+        private func slideAnchor(to targetY: CGFloat) {
+            let fromY = fadeMask.presentation()?.startPoint.y ?? fadeMask.startPoint.y
+            guard fromY != targetY else { return }
+            let startAnim = CABasicAnimation(keyPath: "startPoint")
+            startAnim.fromValue = NSValue(point: CGPoint(x: 0.5, y: fromY))
+            startAnim.toValue = NSValue(point: CGPoint(x: 0.5, y: targetY))
+            let endAnim = CABasicAnimation(keyPath: "endPoint")
+            endAnim.fromValue = NSValue(point: CGPoint(x: 0.5, y: fromY + 3))
+            endAnim.toValue = NSValue(point: CGPoint(x: 0.5, y: targetY + 3))
+            for anim in [startAnim, endAnim] {
+                anim.duration = maskAnchorDuration
+                anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                anim.isRemovedOnCompletion = true
+            }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            fadeMask.frame = maskFrame(y: targetY)
+            applyAnchor(y: targetY)
             CATransaction.commit()
-            fadeMask.add(anim, forKey: "maskSlide")
+            fadeMask.add(startAnim, forKey: "maskAnchorStart")
+            fadeMask.add(endAnim, forKey: "maskAnchorEnd")
         }
         override func layout() {
             super.layout()
@@ -1153,11 +1254,11 @@ extension BalancePanelView {
             if !maskInstalled {
                 // 首次挂载兜底（apply 阶段 bounds 未定时的路径）
                 layer?.mask = fadeMask
-                fadeMask.frame = maskFrame(y: usesMenuBarFade ? gradientY : fullAboveY)
+                applyAnchor(y: usesMenuBarFade ? gradientY : fullAboveY)
                 maskInstalled = true
-            } else {
-                fadeMask.frame = maskFrame(y: usesMenuBarFade ? gradientY : fullAboveY)
             }
+            // 蒙版恒铺满 icon（不随锚点移动），仅尺寸变化时同步
+            fadeMask.frame = bounds
             CATransaction.commit()
         }
     }

@@ -76,6 +76,59 @@ struct AccountCardSnapshot: Equatable {
     var hideDots: Bool = false      // 隐藏点阵（DeepSeek 未配置日常额度时；多号平台恒 false）
 }
 
+/// 昵称 label（多号卡片标题行）：尾部省略时保留行内签到徽章。
+/// 系统 byTruncatingTail 会把昵称末尾的 NSTextAttachment 徽章一并裁掉；
+/// 此子类在 layout 后测量实际可用宽度：超宽时手动收缩昵称文本（尾补 …），
+/// 恒保留「薄空格 + 徽章」两段后缀；空间恢复（改短昵称等）时还原全文。
+final class NickBadgeTextField: NSTextField {
+    private var fullString: NSAttributedString?
+    private var applying = false           // 内部回写不污染 fullString 缓存
+    private var memoWidth: CGFloat = -1    // 同宽跳过重复测量（内容变化经 didSet 失效）
+
+    override var attributedStringValue: NSAttributedString {
+        didSet {
+            guard !applying else { return }
+            fullString = attributedStringValue
+            memoWidth = -1
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        guard let full = fullString, full.length > 2, bounds.width > 1 else { return }
+        // 仅处理「昵称文本 + 薄空格 + 徽章附件」结构（末字符为附件才走手动截断）
+        guard full.attribute(.attachment, at: full.length - 1, effectiveRange: nil) != nil else { return }
+        if memoWidth == bounds.width { return }
+        memoWidth = bounds.width
+        if full.size().width <= bounds.width {
+            if attributedStringValue != full { apply(full) }
+            return
+        }
+        // 尾部两段（薄空格 + 徽章）恒保留，只收缩昵称文本
+        let suffixLen = 2
+        let textPart = full.attributedSubstring(from: NSRange(location: 0, length: full.length - suffixLen))
+        let badgePart = full.attributedSubstring(from: NSRange(location: full.length - suffixLen, length: suffixLen))
+        let ellipsis = NSAttributedString(string: "\u{2026}",
+                                          attributes: textPart.attributes(at: 0, effectiveRange: nil))
+        let ellipsisW = ellipsis.size().width
+        let badgeW = badgePart.size().width
+        var cut = textPart
+        while cut.length > 1, cut.size().width + ellipsisW + badgeW > bounds.width {
+            cut = cut.attributedSubstring(from: NSRange(location: 0, length: cut.length - 1))
+        }
+        let truncated = NSMutableAttributedString(attributedString: cut)
+        truncated.append(ellipsis)
+        truncated.append(badgePart)
+        apply(truncated)
+    }
+
+    private func apply(_ s: NSAttributedString) {
+        applying = true
+        attributedStringValue = s
+        applying = false
+    }
+}
+
 /// 动效统一取值表（UIUX-OPTIMIZATION.md §1）：时长与曲线只允许从这里取，
 /// 新增动效不得再引入裸字面量。脉冲循环（0.5/0.55/0.6）与签名动效
 /// （字重渐变 1s、字符模糊切换 0.35、刷新按钮旋转 0.45）保留自有参数不进表。
@@ -807,7 +860,7 @@ final class BalancePanelView: NSView {
         let checkinInfo: NSStackView   // 副标题信息行容器（签到文字条目已移除，暂时留空）
         let nickLabel: NSTextField
         let infoLabel: NSTextField?    // 到期倒计时副标题（仅 ZCode 当前账号卡片有）
-        let expireIcon: NSImageView?   // 到期行 timer 图标（随 expired 状态变色）
+        let expireIcon: NSImageView?   // 到期行倒计时图标 clock-stop（随 expired 状态变色，2026-08-27 起统一 systemGray）
         let badgeView: NSView          // 签到失败角标（icon 右上角，无签到平台恒隐藏）
         let iconView: MenuBarFadeIconView  // 平台 icon（未上菜单栏时叠加垂直透明渐变）
         var nickKey: String = ""       // 昵称+签到状态组合缓存 key（附件重建判据）
@@ -827,18 +880,18 @@ final class BalancePanelView: NSView {
         let monoSecondaryIconSize: CGFloat  // Mono 非当前账号标称尺寸
         let checkin: Bool               // 是否显示签到信息行（WB / TRAE）
         let showsExpire: Bool           // 是否显示第二行副标题（ZCode/Codex 到期倒计时、DeepSeek 日常额度）
-        let expireIconSymbol: String?   // 第二行图标（nil = 纯文本行，DeepSeek；ZCode/Codex 为 "timer"）
+        let expireIconSymbol: String?   // 第二行图标（nil = 纯文本行；ZCode/Codex/WB 为 "clock-stop"，DS/ZhiPu 为 "external-link"，均 bundle SVG）
         let menuBarIdPrefix: String     // 菜单栏 item id 前缀："trae:" / "wb:" / "zcode:"
         // iconSize 为「视觉补偿尺寸」：统一图标列宽后，按各 SVG 图形实测留白
         //（视觉宽占 viewBox 比例：wb 92% / trae 72% / zhipu 86% / codex 满幅 / deepseek 75%）
         // 放大留白多的图标，使「图标视觉右缘 → 标题」的间距各卡一致（≈10-11pt）
-        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 20.47, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: true, expireIconSymbol: "timer", menuBarIdPrefix: "wb:")
+        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 20.47, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "wb:")
         static let trae  = CardStyle(icon: "trae-color", name: "TRAE", platformID: "trae", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: false, expireIconSymbol: nil, menuBarIdPrefix: "trae:")
-        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 19, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "timer", menuBarIdPrefix: "zcode:")
-        static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 19.45, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "timer", menuBarIdPrefix: "codex:")
-        static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: nil, menuBarIdPrefix: "")
-        // ZhiPu：与 ds 同构的单账号卡（uid 恒 "zhipu" 无前缀，右键菜单 id 恰为 MenuBarPrefix.zhipu）；副标题纯文本无图标
-        static let zhipu = CardStyle(icon: "zhipu", name: "ZhiPu", platformID: "zhipu", iconSize: 19, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: nil, menuBarIdPrefix: "")
+        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 19, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "zcode:")
+        static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 19.45, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "codex:")
+        static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
+        // ZhiPu：与 ds 同构的单账号卡（uid 恒 "zhipu" 无前缀，右键菜单 id 恰为 MenuBarPrefix.zhipu）；副标题带 external-link 图标
+        static let zhipu = CardStyle(icon: "zhipu", name: "ZhiPu", platformID: "zhipu", iconSize: 19, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -1442,7 +1495,7 @@ final class BalancePanelView: NSView {
             let isCurrent = ac.isCurrent
             let dots: UsageDots? = isCurrent ? UsageDots() : nil
             let checkinInfo = NSStackView()
-            // 第二行信息：ZCode 当前账号为到期倒计时（timer 图标 + 文本，10pt systemGray 行高 12），
+            // 第二行信息：ZCode 当前账号为到期倒计时（clock-stop 图标 + 文本，10pt systemGray 行高 12），
             // WB/TRAE 当前账号为签到信息行（空容器，由 updateCheckinInfo 填充）；非当前账号无第二行
             var expireLabel: NSTextField? = nil
             var expireIcon: NSImageView? = nil
@@ -1453,20 +1506,26 @@ final class BalancePanelView: NSView {
                 label.textColor = .systemGray
                 label.setContentHuggingPriority(.defaultLow, for: .vertical)
                 label.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-                // 第二行图标可选：ZCode/Codex 为 timer 倒计时图标，DeepSeek 为纯文本副标题
+                // 第二行图标可选：ZCode/Codex/WB 为 clock-stop 倒计时图标，DS/ZhiPu 为 external-link 打开页面图标
                 var rowViews: [NSView] = [label]
                 if let symbol = style.expireIconSymbol {
                     let icon = NSImageView()
-                    icon.image = symbolImage(symbol, size: 10)
+                    // trimmed SVG：裁掉 viewBox 留白，墨迹最大边精确 10pt（与旧 SF Symbol 口径一致）；
+                    // isTemplate=true → contentTintColor 着色 systemGray，与副标题文字统一
+                    icon.image = Self.trimmedBundleSvgIcon(symbol, size: 10)
+                    icon.image?.isTemplate = true   // 兜底：SVG 路径已置 isTemplate，显式再置一次防裁剪回退分支丢失
                     icon.contentTintColor = .systemGray
                     icon.imageScaling = .scaleProportionallyUpOrDown
+                    icon.widthAnchor.constraint(equalToConstant: 10).isActive = true
+                    icon.heightAnchor.constraint(equalToConstant: 10).isActive = true
                     rowViews.insert(icon, at: 0)
                     expireIcon = icon
                 }
                 let stack = NSStackView(views: rowViews)
                 stack.orientation = .horizontal
                 stack.alignment = .centerY
-                stack.spacing = 0
+                // 图标↔文本 3pt 间距（ZCode/Codex/WB clock-stop 行沿用同款间距，签到行 icon↔文本 6pt）
+                stack.spacing = expireIcon == nil ? 0 : 3
                 stack.heightAnchor.constraint(equalToConstant: 12).isActive = true
                 expireLabel = label
                 info = stack
@@ -1478,7 +1537,7 @@ final class BalancePanelView: NSView {
             // 昵称 label：始终创建，alpha=0 保留占位（避免切换时标题位置跳动）；
             // 悬停卡片时淡入显示，离开淡出（已固化为默认行为，不再有开关控制）
             let nickLabel: NSTextField = {
-                let nl = NSTextField(labelWithString: ac.nickname)
+                let nl = NickBadgeTextField(labelWithString: ac.nickname)
                 nl.textColor = isCurrent ? .systemGray : Palette.cardForegroundDimmed
                 nl.alphaValue = 0
                 return nl
@@ -1614,8 +1673,9 @@ final class BalancePanelView: NSView {
             : (ac.checkinRisk ? NSColor(calibratedRed: 1, green: 0.78, blue: 0, alpha: 1)
                : (ac.checkinFailed ? .systemRed : nil))
         if let tint,
-           let base = NSImage(systemSymbolName: "checkmark.seal", accessibilityDescription: nil)?
-               .withSymbolConfiguration(.init(pointSize: 10, weight: .medium)) {
+           // trimmed：裁掉 SF Symbol 留白，墨迹随 bounds 10×10 精确拉伸（与
+           // 副标题 timer 同口径）；状态色（绿/红/橙）为功能色保留
+           let base = Self.trimmedSymbolImage("checkmark.seal", size: 10) {
             // NSImage 无 withTintColor：源图 sourceAtop 叠色（保留 alpha 形状）
             let colored = NSImage(size: base.size, flipped: false) { rect in
                 base.draw(in: rect)

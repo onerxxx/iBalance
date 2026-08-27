@@ -674,22 +674,35 @@ enum UsageStore {
         return (today, week)
     }
 
-    /// 返回本周一至周日的每日用量；尚未观测的日期用 0 填充，兼容旧版无历史记录的数据。
-    static func weeklyUsage(platform: String, uid: String) -> [Double] {
-        guard let e = memory.entries["\(platform):\(uid)"] else {
-            return Array(repeating: 0, count: 7)
-        }
-        let now = Date()
-        guard e.weekKey == weekKey(for: now) else {
-            return Array(repeating: 0, count: 7)
-        }
+    /// 返回指定周（0 = 本周，1 = 上周……）周一至周日的每日用量；无记录日期填 0。
+    /// 历史周直接按日期读 dailyUsage 快照，不做 weekKey 校验——weekKey 只反映
+    /// 「最近一次观测所在周」，历史周数据照样可读。
+    static func weeklyUsage(platform: String, uid: String, weekOffset: Int) -> [Double] {
         var cal = Calendar.current
         cal.firstWeekday = 2
-        let start = cal.dateInterval(of: .weekOfYear, for: now)?.start ?? now
+        let now = Date()
+        let currentStart = cal.dateInterval(of: .weekOfYear, for: now)?.start ?? now
+        guard let start = cal.date(byAdding: .day, value: -7 * max(0, weekOffset), to: currentStart),
+              let e = memory.entries["\(platform):\(uid)"] else {
+            return Array(repeating: 0, count: 7)
+        }
         return (0..<7).map { offset in
             guard let date = cal.date(byAdding: .day, value: offset, to: start) else { return 0 }
             return e.dailyUsage[dayFormatter.string(from: date)] ?? 0
         }
+    }
+
+    /// 指定平台/账号下最早有用量快照的日期（周历史浏览深度依据）；无记录返回 nil
+    static func earliestUsageDate(platform: String, uids: [String]) -> Date? {
+        var earliest: Date?
+        for uid in uids where !uid.isEmpty {
+            guard let e = memory.entries["\(platform):\(uid)"] else { continue }
+            for key in e.dailyUsage.keys {
+                guard let d = dayFormatter.date(from: key) else { continue }
+                if earliest == nil || d < earliest! { earliest = d }
+            }
+        }
+        return earliest
     }
 
     /// 平台级汇总：全部账号的今日/本周用量对应相加（差值按账号独立计算后求和，
@@ -729,11 +742,11 @@ enum UsageStore {
         return sum
     }
 
-    /// 平台级汇总：全部账号本周每日用量对应相加，无记录账号贡献 0
-    static func weeklyUsage(platform: String, uids: [String]) -> [Double] {
+    /// 平台级汇总：全部账号指定周每日用量对应相加，无记录账号贡献 0
+    static func weeklyUsage(platform: String, uids: [String], weekOffset: Int) -> [Double] {
         var sum = Array(repeating: Double.zero, count: 7)
         for uid in uids where !uid.isEmpty {
-            let daily = weeklyUsage(platform: platform, uid: uid)
+            let daily = weeklyUsage(platform: platform, uid: uid, weekOffset: weekOffset)
             for i in 0..<7 where i < daily.count { sum[i] += daily[i] }
         }
         return sum

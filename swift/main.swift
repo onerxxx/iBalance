@@ -811,10 +811,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // 未配置日常额度（usedRatio=0）时隐藏点阵
         dsSnap.hideDots = dsSnap.usedRatio <= 0
-        // 复用 expireText 作为第二行纯文本副标题（无图标）
-        dsSnap.expireText = config.deepseekCommonQuota > 0
-            ? "日常额度 ¥\(Int(config.deepseekCommonQuota))"
-            : "打开官网 usage 页面"
+        // 复用 expireText 作为第二行副标题（external-link 图标 + 文本）；
+        // 日常额度不再显示，恒为引导文案
+        dsSnap.expireText = "打开Harness"
         s.dsAccounts = [dsSnap]
         // ZhiPu 卡片：智谱 BigModel 可用余额（同多号管线单元素，uid 恒 "zhipu"，
         // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.zhipu）
@@ -829,7 +828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             zpSnap.pulsing = zhipuPulsingTracker.isPulsing("main")
             zpSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.zhipu, isCurrent: true)
         }
-        zpSnap.expireText = "打开财务中心页面"
+        zpSnap.expireText = "打开财务中心"
         s.zhipuAccounts = [zpSnap]
         let today = Self.todayString()
         // TRAE 多账号余额卡片：当前账号排最上
@@ -954,14 +953,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                       accounts: [(uid: String, current: Double)], increasing: Bool, decimals: Int,
                       percent: Bool, prefix: String = "") -> UsageRowSnapshot? {
             guard let u = UsageStore.usage(platform: platform, accounts: accounts, increasing: increasing) else { return nil }
-            let daily = UsageStore.weeklyUsage(platform: platform, uids: accounts.map(\.uid))
+            let uids = accounts.map(\.uid)
             let hour = UsageStore.hourlyUsage(platform: platform, accounts: accounts, increasing: increasing)
+            // 周历史页：从本周回溯到该平台最早有记录的周（usage.json 保留 60 天 ≈ 最多 8 页）
+            var cal = Calendar.current
+            cal.firstWeekday = 2
+            let currentWeekStart = cal.dateInterval(of: .weekOfYear, for: Date())?.start ?? Date()
+            var maxOffset = 0
+            if let earliest = UsageStore.earliestUsageDate(platform: platform, uids: uids) {
+                let firstWeekStart = cal.dateInterval(of: .weekOfYear, for: earliest)?.start ?? earliest
+                let dayDiff = cal.dateComponents([.day], from: firstWeekStart, to: currentWeekStart).day ?? 0
+                if dayDiff > 0 { maxOffset = min(8, Int(ceil(Double(dayDiff) / 7))) }
+            }
+            let rangeFmt = DateFormatter()
+            rangeFmt.locale = Locale.current
+            rangeFmt.dateFormat = "M/d"
+            var weeks: [UsageWeekData] = []
+            for offset in 0...maxOffset {
+                let daily = UsageStore.weeklyUsage(platform: platform, uids: uids, weekOffset: offset)
+                let texts = daily.map { prefix + fmtUsage($0, percent: percent, decimals: decimals) }
+                if offset == 0 {
+                    weeks.append(UsageWeekData(daily: daily, dailyTexts: texts,
+                                               headerLabel: "本周累计用量",
+                                               totalText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals)))
+                } else if let weekStart = cal.date(byAdding: .day, value: -7 * offset, to: currentWeekStart),
+                          let weekEnd = cal.date(byAdding: .day, value: 6, to: weekStart) {
+                    // 历史周：右上角数值 = 每日快照加总，表头标签 =「8-25~8-31累计用量」
+                    let total = daily.reduce(0, +)
+                    weeks.append(UsageWeekData(daily: daily, dailyTexts: texts,
+                                               headerLabel: "\(rangeFmt.string(from: weekStart))~\(rangeFmt.string(from: weekEnd))累计用量",
+                                               totalText: prefix + fmtUsage(total, percent: percent, decimals: decimals)))
+                }
+            }
             return UsageRowSnapshot(platform: platform, icon: icon, name: name,
                                     hourText: prefix + fmtUsage(hour, percent: percent, decimals: decimals),
                                     todayText: prefix + fmtUsage(u.today, percent: percent, decimals: decimals),
                                     weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals),
-                                    dailyUsage: daily,
-                                    dailyUsageTexts: daily.map { prefix + fmtUsage($0, percent: percent, decimals: decimals) })
+                                    historyWeeks: weeks)
         }
         if let ds = cacheDs,
            let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds",
