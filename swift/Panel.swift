@@ -586,7 +586,8 @@ final class BalancePanelViewController: NSViewController {
     }
 
     /// 浮窗模式：document view 宽度跟随滚动视口（内容自适应宽度），
-    /// 高度不低于视口（窗口拖高时拉伸 document，防止非翻转视图内容沉底）。
+    /// 高度不低于视口（窗口拖高时拉伸 document，防止非翻转视图内容沉底），
+    /// 拖矮时只要视口仍装得下自然内容就跟随缩矮（先吃掉 footer 上方弹性空白）。
     /// lastFloatingClipHeight：上次 clip 高度（浮窗 resize 时的滚动锚定基准）
     private var lastFloatingClipHeight: CGFloat = 0
 
@@ -613,7 +614,18 @@ final class BalancePanelViewController: NSViewController {
         lastFloatingClipHeight = newClipH
         var f = panel.frame
         f.size.width = max(PanelResizeHandle.minWidth, clip.bounds.width)
-        if f.height < clip.bounds.height - 0.5 { f.size.height = clip.bounds.height }
+        if f.height < clip.bounds.height - 0.5 {
+            f.size.height = clip.bounds.height
+        } else if let rootH = panel.rootViewRef?.frame.height,
+                  f.height > clip.bounds.height + 0.5,
+                  clip.bounds.height >= 14 + rootH + 41 {
+            // 拖矮方向：视口仍装得下自然内容（root 自然高 + 顶距 14 + footer
+            // 预留 41，与 build() 的 rootTop/底部 cap 常量同源；root 未被拉伸、
+            // frame 高即自然高）时，document 跟随视口缩矮——优先收缩 root 与
+            // footer 之间的弹性空白、全程保持全显；空白耗尽才走上方校正的
+            // 顶部锚定滚动裁切
+            f.size.height = clip.bounds.height
+        }
         guard panel.frame != f else { return }
         panel.frame = f
         updateFadeHint()

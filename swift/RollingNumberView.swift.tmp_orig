@@ -1,0 +1,468 @@
+// RollingNumberView.swift — 余额数值「逐位数字垂直滚动」视图（里程表 / odometer 效果）
+//
+// 结构：
+//   RollingNumberView（数值容器，右对齐逐字符槽位）
+//     ├─ DigitWheelView × N   数字位：0-9 垂直排成一条 strip，裁剪出单格高，
+//     │                        目标数字变化时 strip 上下平移 → 该位数字垂直滚动
+//     └─ NSTextField × M      静态位：¥/$ 前缀（60% 字号）、千分位逗号、小数点、% 后缀、占位 —
+//
+// 水平对齐口径（与原单 label 右对齐连续排版像素级一致）：
+//   - 所有槽宽取字形精确 advance（不 ceil）——逐槽连续排布 == 连续文本排版，
+//     消除逐槽取整累积出的额外字距（实测 "1,234.56" Inter 13pt：精确 54.5pt vs 逐槽 ceil 60pt）；
+//   - 数字位槽宽 = **当前显示数字的真实 advance**（非 tabular 统一位宽）：
+//     比例数字字体（Inter 默认数字 "1"=5.5 vs "0"=8.58）下静止排版与单 label 完全一致；
+//     滚动时槽宽与车轮位置**同参数指数趋近**目标数字的 advance——右缘固定、
+//     左缘随宽度变化平移，非等宽字体滚动自然不抖不跳；等宽/monospacedDigit 字体下
+//     各数字 advance 相等，槽宽恒定，行为与 tabular 方案零差异；
+//   - 数字轮 cell 字形贴槽左（kern=0 自然定位），右对齐时数值右边缘 =
+//     最后一位 advance 边界，整齐。
+// 垂直对齐口径：货币前缀小字与主数字**基线对齐**——静态槽高度 = 自身字体行高，
+//   y = 主字体 ascender − 前缀 ascender（label 无论贴顶/垂直居中，高度=自身行高时两者等价）。
+//
+// 与 NumberRollAnimator（Panel.swift）配合：animator 每 60fps 产出格式化中间值文本，
+// 本视图结构不变时就地更新各位车轮目标（位置 + 槽宽）；车轮用「帧率无关指数趋近」
+// 平滑追赶，天然支持中途改目标续滚。滚动期间每帧重排 slots（数字右缘固定、
+// 左缘随槽宽插值平移——比例数字字体下的自然滚动观感）。
+// 位数变化（如 99.9 → 100.1 跨位数）时结构不匹配 → 整组重建直接落值（单帧，可接受）。
+
+import Cocoa
+
+/// 字形精确 advance 宽度（fileprivate：DigitWheelView / RollingNumberView 共用）
+private func textWidth(_ s: String, font: NSFont) -> CGFloat {
+    (s as NSString).size(withAttributes: [.font: font]).width
+}
+
+// MARK: - DigitWheelView（单个数字位的车轮）
+
+/// 数字轮：0-9 十个数字垂直排列，首尾各补一格（顶部 9 / 底部 0）支持跨 0 环绕的
+/// 最短路径滚动；视图裁剪出单格高度窗口，滚动 = 平移 strip。
+final class DigitWheelView: NSView {
+
+    /// 主字体（与数值整体字体一致；变化时重建单元格并保持当前数字与连续位置）
+    var font: NSFont = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold) {
+        didSet { guard font != oldValue else { return }; rebuildCells() }
+    }
+    /// 数字颜色（hover 提亮时由外部整体设置）
+    var textColor: NSColor = Palette.cardForeground {
+        didSet {
+            guard textColor != oldValue else { return }
+            for (i, c) in cells.enumerated() {
+                c.attributedStringValue = Self.cellString(digit: ((i - 1) % 10 + 10) % 10,
+                                                          font: font, color: textColor)
+            }
+        }
+    }
+
+    /// 单格行高（滚动步长 = 一格）：ascender - descender + leading
+    private var cellH: CGFloat { ceil(font.ascender - font.descender + font.leading) }
+    private let strip = NSView()
+    private var cells: [NSTextField] = []
+
+    /// strip 内 cell 统一宽度 = 0-9 最大 advance（字符贴左，槽宽小于此值时
+    /// 右侧空白只是不绘制区，字形墨迹在 advance 内不受裁剪影响）
+    private var tabWidth: CGFloat = 0
+
+    /// 当前槽宽（= 显示数字的真实 advance；滚动时向目标数字 advance 插值）。
+    /// 容器排布每帧读取此值，静止落定时与单 label 连续排版像素级一致。
+    private(set) var currentWidth: CGFloat = 0
+    private var targetWidth: CGFloat = 0
+
+    override var isFlipped: Bool { true }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = true   // 只露出单格高度窗口
+        addSubview(strip)
+        rebuildCells()
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 0-9 最大 advance：strip 内 cell 统一宽度（槽宽动态化后仅作 cell 排布宽度）
+    static func tabularWidth(_ font: NSFont) -> CGFloat {
+        let widths = (0...9).map { textWidth(String($0), font: font) }
+        return widths.max() ?? textWidth("0", font: font)
+    }
+
+    /// 单格 attributed 串：kern=0 自然定位（槽宽=字形 advance，无需补齐；
+    /// 等宽字体下与 tabular 排版行为一致）
+    static func cellString(digit: Int, font: NSFont, color: NSColor) -> NSAttributedString {
+        NSAttributedString(string: String(digit), attributes: [
+            .font: font,
+            .foregroundColor: color,
+        ])
+    }
+
+    /// 12 格：i=0 → "9"（顶部环绕）、i=1...10 → "0"..."9"、i=11 → "0"（底部环绕）
+    private func rebuildCells() {
+        tabWidth = Self.tabularWidth(font)
+        for c in cells { c.removeFromSuperview() }
+        cells.removeAll()
+        for i in 0..<12 {
+            let d = ((i - 1) % 10 + 10) % 10
+            let l = NSTextField(labelWithString: "")
+            l.attributedStringValue = Self.cellString(digit: d, font: font, color: textColor)
+            l.frame = NSRect(x: 0, y: CGFloat(i) * cellH, width: tabWidth, height: cellH)
+            strip.addSubview(l)
+            cells.append(l)
+        }
+        strip.frame = NSRect(x: 0, y: CGFloat(-pos) * cellH,
+                             width: tabWidth, height: cellH * 12)
+        // 字体变化：槽宽按当前显示/目标数字重算落位（不做宽度动画）
+        let cur = ((Int(pos.rounded()) % 10) + 10) % 10
+        let tgt = ((Int(targetPos.rounded()) % 10) + 10) % 10
+        currentWidth = textWidth(String(cur), font: font)
+        targetWidth = textWidth(String(tgt), font: font)
+    }
+
+    override func layout() {
+        super.layout()
+        // cell/strip 尺寸在 rebuildCells 固定（tabWidth），此处仅同步滚动位置
+        applyStripOrigin()
+    }
+
+    /// 设置目标数字。animated=false 直接落位（含槽宽）；true 只更新目标
+    /// （位置与槽宽），由外部 ticker 调 advance() 平滑滚动。
+    /// 目标位置在环绕缓冲区内取「距当前位置最近」的等价位置（如 9→0 走 1 格而不是 9 格）。
+    func setDigit(_ d: Int, animated: Bool) {
+        let db = Double(d)
+        var best = db
+        var bestDist = abs(db - pos)
+        for delta in [-10.0, 10.0] {
+            let cand = db + delta
+            if cand >= -1.0 && cand <= 10.0 {
+                let dist = abs(cand - pos)
+                if dist < bestDist { best = cand; bestDist = dist }
+            }
+        }
+        let w = textWidth(String(d), font: font)
+        if animated {
+            targetPos = best
+            targetWidth = w
+        } else {
+            pos = best
+            targetPos = best
+            currentWidth = w
+            targetWidth = w
+            applyStripOrigin()
+        }
+    }
+
+    /// 帧推进（由 RollingNumberView 的 displayLink 驱动）：位置与槽宽同参数
+    /// 指数趋近各自目标，返回是否仍在运动。
+    /// 帧率无关：alpha = 1 - e^(-dt/τ)，时间常数 80ms（起速快收尾缓，兼顾跟手与惯性观感）。
+    /// 落定阈值：位置 0.01 格（≈0.08pt）/ 槽宽 0.05pt，肉眼不可见：收尾干脆不拖尾。
+    func advance(dt: CFTimeInterval) -> Bool {
+        let diff = targetPos - pos
+        let wDiff = targetWidth - currentWidth
+        if abs(diff) < 0.01 && abs(wDiff) < 0.05 {
+            if pos != targetPos || currentWidth != targetWidth {
+                pos = targetPos
+                currentWidth = targetWidth
+                normalize()
+                applyStripOrigin()
+            }
+            return false
+        }
+        let alpha = 1 - exp(-max(0, dt) / 0.08)
+        pos += diff * alpha
+        currentWidth += wDiff * alpha
+        applyStripOrigin()
+        return true
+    }
+
+    /// 落定后把位置归一回 [0,10)，避免多轮滚动后向缓冲区漂移
+    private func normalize() {
+        guard pos < 0 || pos >= 10 else { return }
+        var p = pos.truncatingRemainder(dividingBy: 10)
+        if p < 0 { p += 10 }
+        pos = p
+        targetPos = p
+    }
+
+    /// 连续位置（单位=格）：0...9 对应数字 0...9，[-1,10] 为环绕缓冲区；
+    /// 动画期间取中间值实现平滑滚动
+    private var pos: Double = 0
+    private var targetPos: Double = 0
+
+    private func applyStripOrigin() {
+        strip.frame.origin.y = CGFloat(-pos) * cellH
+    }
+}
+
+// MARK: - RollingNumberView（数值容器）
+
+/// 余额数值逐位滚动视图：文本拆成逐字符槽位，数字位是车轮、其余是静态 label。
+/// 对外行为对齐原右对齐 NSTextField：固定外部宽度内右对齐排布（超宽左溢裁掉）、
+/// 暴露 baselineAnchor（内部隐藏同字体探针 label）供标题基线对齐。
+final class RollingNumberView: NSView {
+
+    typealias FontProvider = (CGFloat, NSFont.Weight, Bool) -> NSFont
+
+    // —— 字体策略（由面板注入；Mono/Inter/系统开关切换时 refreshFont() 就地更新）——
+    private var specSize: CGFloat = 13
+    private var specWeight: NSFont.Weight = .semibold
+    private var fontProvider: FontProvider = { size, weight, _ in
+        .monospacedDigitSystemFont(ofSize: size, weight: weight)
+    }
+
+    private(set) var currentText: String = "—"   // 最近一次应用的文本（滚动续接/判据用）
+
+    private var mainFont: NSFont = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+    private var prefixFont: NSFont = .monospacedDigitSystemFont(ofSize: 7.8, weight: .semibold)
+    private var lineH: CGFloat = 16
+    private var prefixLineH: CGFloat = 10
+    private var digitWidth: CGFloat = 8   // 仅诊断日志用（字体等宽性验证）
+    private var textColor: NSColor = Palette.cardForeground
+
+    private enum SlotKind { case digit, prefix, plain }
+    private struct Slot {
+        let view: NSView
+        let kind: SlotKind
+        var width: CGFloat   // 静态槽：精确 advance（不取整）；数字槽：初始值，排布时读 wheel.currentWidth
+        var yOff: CGFloat    // 静态槽基线对齐偏移（flipped 坐标，y 向下）
+        var height: CGFloat  // 槽高：digit/plain=主行高，prefix=自身行高（基线对齐口径）
+    }
+    private var slots: [Slot] = []
+
+    /// 基线探针：隐藏 label 与主数字同字体，firstBaselineAnchor 供外部基线约束
+    private let baselineProbe = NSTextField(labelWithString: "0")
+    private var probeHeightC: NSLayoutConstraint?
+
+    var baselineAnchor: NSLayoutYAxisAnchor { baselineProbe.firstBaselineAnchor }
+
+    override var isFlipped: Bool { true }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: slots.reduce(0) { $0 + slotWidth($1) }, height: lineH)
+    }
+
+    init() {
+        super.init(frame: .zero)
+        // 左溢裁剪：复刻原右对齐 label 超宽时裁掉左侧（数值尾部优先可见）的边界行为
+        wantsLayer = true
+        layer?.masksToBounds = true
+        baselineProbe.isHidden = true
+        baselineProbe.font = mainFont
+        baselineProbe.cell?.wraps = false
+        baselineProbe.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(baselineProbe)
+        NSLayoutConstraint.activate([
+            baselineProbe.leadingAnchor.constraint(equalTo: leadingAnchor),
+            baselineProbe.trailingAnchor.constraint(equalTo: trailingAnchor),
+            baselineProbe.topAnchor.constraint(equalTo: topAnchor),
+        ])
+        setText("—", animated: false)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 面板注入字体规格与提供器（uiFont：Mono/Inter/系统 + 等宽数字策略）
+    func configure(size: CGFloat, weight: NSFont.Weight, fontProvider: @escaping FontProvider) {
+        specSize = size
+        specWeight = weight
+        self.fontProvider = fontProvider
+        refreshFont()
+        // 字体与数字等宽性 dump（比例数字字体下槽宽动态方案的关键判据）
+        let dw = (0...9).map { String(format: "%.2f", textWidth(String($0), font: mainFont)) }
+        Logger.log(.layout, "[RollDiag] font=\(mainFont.fontName) size=\(mainFont.pointSize) digits=[\(dw.joined(separator: ","))] tabW=\(digitWidth)")
+    }
+
+    /// Mono/Inter 开关切换后就地刷新字体（不重建槽位，滚动状态保留）。
+    /// 数字槽宽由 wheel 按新字体重算（rebuildCells 内落位）。
+    func refreshFont() {
+        mainFont = fontProvider(specSize, specWeight, true)
+        // ¥/$ 前缀：60% 字号 semibold（对齐原 applyValueText 富文本策略，不用等宽数字）
+        prefixFont = fontProvider(specSize * 0.6, .semibold, false)
+        lineH = ceil(mainFont.ascender - mainFont.descender + mainFont.leading)
+        prefixLineH = ceil(prefixFont.ascender - prefixFont.descender + prefixFont.leading)
+        digitWidth = DigitWheelView.tabularWidth(mainFont)
+        baselineProbe.font = mainFont
+        probeHeightC?.isActive = false
+        let hc = baselineProbe.heightAnchor.constraint(equalToConstant: lineH)
+        hc.isActive = true
+        probeHeightC = hc
+        for i in slots.indices {
+            let s = slots[i]
+            if let w = s.view as? DigitWheelView {
+                w.font = mainFont   // didSet → rebuildCells 按新字体落位槽宽
+            } else if let l = s.view as? NSTextField {
+                let f = (s.kind == .prefix) ? prefixFont : mainFont
+                l.font = f
+                slots[i].width = textWidth(l.stringValue, font: f)
+                slots[i].yOff = mainFont.ascender - f.ascender
+                slots[i].height = (s.kind == .prefix) ? prefixLineH : lineH
+            }
+        }
+        needsLayout = true
+        invalidateIntrinsicContentSize()
+    }
+
+    /// 设置数值文本。结构不变（数字位/静态位一一对应）→ 就地滚动各位数字；
+    /// 结构变化（位数增减、— ↔ 数值等）→ 整组重建直接落值。
+    func setText(_ text: String, animated: Bool) {
+        let structureChanged: Bool
+        let chars = Array(text)
+        let isDigit = chars.map { $0.isASCII && $0.isNumber }
+        if chars.count == slots.count,
+           zip(isDigit, slots).allSatisfy({ $0.0 == ($0.1.kind == .digit) }) {
+            for (i, ch) in chars.enumerated() {
+                if isDigit[i], let w = slots[i].view as? DigitWheelView, let d = ch.wholeNumberValue {
+                    w.setDigit(d, animated: animated)
+                } else if let l = slots[i].view as? NSTextField {
+                    if l.stringValue != String(ch) {
+                        l.stringValue = String(ch)
+                        // 静态字符变化同步槽宽（如 ¥ ↔ $、千分位变化）
+                        let f = (slots[i].kind == .prefix) ? prefixFont : mainFont
+                        slots[i].width = textWidth(String(ch), font: f)
+                    }
+                }
+            }
+            if animated {
+                startTicker()
+            } else {
+                // 非动画落位（数字槽宽/静态字符宽度已同步更新），重排一次
+                relayoutSlots()
+                invalidateIntrinsicContentSize()
+            }
+            structureChanged = false
+        } else {
+            rebuild(chars)
+            structureChanged = true
+        }
+        currentText = text
+        if structureChanged {
+            // 结构变化触发布局/固有尺寸重算
+            needsLayout = true
+            invalidateIntrinsicContentSize()
+        }
+    }
+
+    /// 设置整组前景色（hover 提亮/回暗；逐槽传播）
+    func setTextColor(_ c: NSColor) {
+        textColor = c
+        for s in slots {
+            if let w = s.view as? DigitWheelView { w.textColor = c }
+            else if let l = s.view as? NSTextField { l.textColor = c }
+        }
+    }
+
+    // —— 内部 ——
+
+    private func rebuild(_ chars: [Character]) {
+        for s in slots { s.view.removeFromSuperview() }
+        slots.removeAll()
+        for (i, ch) in chars.enumerated() {
+            if ch.isASCII, ch.isNumber, let d = ch.wholeNumberValue {
+                let w = DigitWheelView()
+                w.font = mainFont
+                w.textColor = textColor
+                w.setDigit(d, animated: false)
+                addSubview(w)
+                slots.append(Slot(view: w, kind: .digit, width: w.currentWidth,
+                                  yOff: 0, height: lineH))
+            } else {
+                // 首字符 ¥/$ 且后面还有内容 → 货币符号小字号槽（对齐原 applyValueText 判定）
+                let isPrefixSymbol = i == 0 && (ch == "¥" || ch == "$") && chars.count > 1
+                let kind: SlotKind = isPrefixSymbol ? .prefix : .plain
+                let f = isPrefixSymbol ? prefixFont : mainFont
+                let l = NSTextField(labelWithString: String(ch))
+                l.font = f
+                l.textColor = textColor
+                addSubview(l)
+                slots.append(Slot(view: l, kind: kind,
+                                  width: textWidth(String(ch), font: f),
+                                  yOff: mainFont.ascender - f.ascender,
+                                  height: isPrefixSymbol ? prefixLineH : lineH))
+            }
+        }
+    }
+
+    /// 槽位当前宽度：数字槽读 wheel.currentWidth（滚动时逐帧变化），静态槽用记录值
+    private func slotWidth(_ s: Slot) -> CGFloat {
+        (s.view as? DigitWheelView)?.currentWidth ?? s.width
+    }
+
+    /// 右对齐排布 slots（与原右对齐 label 一致；总宽超出外部宽度时左溢裁掉）。
+    /// 滚动期间每帧调用（槽宽插值），静止时随 layout()/setText 调用。
+    private func relayoutSlots() {
+        var x = bounds.width
+        for s in slots.reversed() {
+            let w = slotWidth(s)
+            x -= w
+            s.view.frame = NSRect(x: x, y: s.yOff, width: w, height: s.height)
+        }
+        // TODO(诊断): 槽位坐标 dump（限前 24 次），定位偏右；确认后移除
+        Self.posDiagCount += 1
+        if Self.posDiagCount <= 24 {
+            let parts = slots.map { s in
+                String(format: "%.2f@%.2f", slotWidth(s), s.view.frame.origin.x)
+            }.joined(separator: " ")
+            Logger.log(.layout, "[RollPos] '\(currentText)' boundsW=\(String(format: "%.1f", bounds.width)) [\(parts)]")
+        }
+    }
+    private static var posDiagCount = 0
+
+    override func layout() {
+        super.layout()
+        relayoutSlots()
+        // TODO(诊断): 上游几何 dump（限前 8 次），定位偏右；确认后移除
+        if Self.posDiagCount <= 8, let row1 = superview {
+            var chain = "value=\(String(format: "%.1f,%.1f %.1fx%.1f", frame.origin.x, frame.origin.y, frame.width, frame.height))"
+            var v: NSView? = row1
+            var depth = 0
+            while let cur = v, depth < 5 {
+                let f = cur.frame
+                chain += " L\(depth)[\(String(describing: type(of: cur))) \(String(format: "%.1f,%.1f %.1fx%.1f", f.origin.x, f.origin.y, f.width, f.height))]"
+                v = cur.superview
+                depth += 1
+            }
+            // 找同级 row2 里的点阵（content stack 的第二个 arranged view）
+            if let content = row1.superview, content.subviews.count > 1,
+               let row2 = content.subviews[1] as? NSView {
+                for sub in row2.subviews {
+                    let f = sub.frame
+                    chain += " row2sub[\(String(describing: type(of: sub))) \(String(format: "%.1f,%.1f %.1fx%.1f", f.origin.x, f.origin.y, f.width, f.height))]"
+                }
+            }
+            Logger.log(.layout, "[RollGeo] '\(currentText)' \(chain)")
+        }
+    }
+
+    // —— 滚动驱动（单视图一个 displayLink，静止即暂停；NSView.displayLink macOS 15+）——
+
+    private var link: CADisplayLink?
+    private var lastTS: CFTimeInterval = 0
+
+    private func startTicker() {
+        if link == nil {
+            let l = displayLink(target: self, selector: #selector(onTick(_:)))
+            // .common：滚动期间面板处于 event tracking（菜单/popover 交互）也不停帧
+            l.add(to: .main, forMode: .common)
+            link = l
+        }
+        lastTS = 0
+        link?.isPaused = false
+    }
+
+    @objc private func onTick(_ l: CADisplayLink) {
+        if lastTS == 0 { lastTS = l.timestamp }
+        let dt = max(0, l.timestamp - lastTS)
+        lastTS = l.timestamp
+        var moving = false
+        for s in slots {
+            if let w = s.view as? DigitWheelView, w.advance(dt: dt) { moving = true }
+        }
+        // 槽宽随滚动插值：每帧重排（数字右缘固定、左缘随宽度平移）
+        relayoutSlots()
+        if !moving {
+            l.isPaused = true
+            lastTS = 0
+            // 落定：最终槽宽 = 各数字真实 advance，固有尺寸收敛
+            invalidateIntrinsicContentSize()
+        }
+    }
+
+    deinit {
+        if let l = link { l.remove(from: .main, forMode: .common) }
+    }
+}
