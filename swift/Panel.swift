@@ -864,12 +864,12 @@ final class BalancePanelView: NSView {
     private var zhipuCardUids: [String] = []
 
     /// 单个多号卡片的控件引用（update 时直接赋值，无需重建；WB / TRAE / ZCode 共用）。
-    /// 非当前账号的 dots/checkinInfo 为占位实例（未加入视图层级，更新时跳过）。
+    /// 非当前账号的 dots 为占位实例（未加入视图层级，更新时跳过）。
     private struct CardEntry {
         let uid: String
         let valueView: RollingNumberView   // 余额数值（逐位垂直滚动）
+        let titleLabel: FadeableTextField  // 平台名主标题（菜单栏渐变标记与 icon 同步）
         let dots: UsageDots
-        let checkinInfo: NSStackView   // 副标题信息行容器（签到文字条目已移除，暂时留空）
         let nickLabel: NSTextField
         let infoLabel: NSTextField?    // 到期倒计时副标题（仅 ZCode 当前账号卡片有）
         let expireIcon: NSImageView?   // 到期行倒计时图标 clock-stop（随 expired 状态变色，2026-08-27 起统一 systemGray）
@@ -1506,9 +1506,9 @@ final class BalancePanelView: NSView {
             let valueView = RollingNumberView()   // 初始 "—" 占位（init 内置）
             let isCurrent = ac.isCurrent
             let dots: UsageDots? = isCurrent ? UsageDots() : nil
-            let checkinInfo = NSStackView()
-            // 第二行信息：ZCode 当前账号为到期倒计时（clock-stop 图标 + 文本，10pt systemGray 行高 12），
-            // WB/TRAE 当前账号为签到信息行（空容器，由 updateCheckinInfo 填充）；非当前账号无第二行
+            // 第二行信息：ZCode 当前账号为到期倒计时（clock-stop 图标 + 文本，10pt systemGray 行高 12）。
+            // TRAE 原签到信息行是恒空的占位容器（文字条目已移除）——已废弃：
+            // info=nil 走单行模式（标题行相对整卡垂直居中 + 点阵贴底右角）；非当前账号无第二行
             var expireLabel: NSTextField? = nil
             var expireIcon: NSImageView? = nil
             let info: NSStackView?
@@ -1541,8 +1541,6 @@ final class BalancePanelView: NSView {
                 stack.heightAnchor.constraint(equalToConstant: 12).isActive = true
                 expireLabel = label
                 info = stack
-            } else if isCurrent && style.checkin {
-                info = checkinInfo
             } else {
                 info = nil
             }
@@ -1567,7 +1565,7 @@ final class BalancePanelView: NSView {
             // 渐变 icon：未上菜单栏的账号由 apply 阶段开启垂直透明渐变（底部 20% → 顶部 100%）
             let fadeIcon = MenuBarFadeIconView()
             // 标题 label 引用：供 hover 字重动画逐帧驱动（weak 在卡片重建后自动失效）
-            weak var capturedTitle: NSTextField?
+            weak var capturedTitle: FadeableTextField?
             let card = addCard(rows: [
                 balanceContentRow(icon: style.icon, name: style.name, valueView: valueView,
                                   info: info, dots: dots, iconSize: style.iconSize, imageSize: imgSize,
@@ -1660,7 +1658,8 @@ final class BalancePanelView: NSView {
             }
             // 非当前账号无 dots/checkinInfo（未加入视图层级），用占位保持 entry 结构一致
             entries.append(CardEntry(uid: ac.uid, valueView: valueView,
-                                     dots: dots ?? UsageDots(), checkinInfo: checkinInfo,
+                                     titleLabel: capturedTitle ?? FadeableTextField(labelWithString: ""),
+                                     dots: dots ?? UsageDots(),
                                      nickLabel: nickLabel, infoLabel: expireLabel,
                                      expireIcon: expireIcon, badgeView: badge,
                                      iconView: fadeIcon))
@@ -1787,9 +1786,13 @@ final class BalancePanelView: NSView {
             e.infoLabel?.stringValue = ac.expireText ?? ""
             e.infoLabel?.textColor = .systemGray
             e.expireIcon?.contentTintColor = .systemGray
-            // 未上菜单栏账号的 icon 叠加垂直透明渐变（底部 20% → 顶部 100% 可见）；
+            // 未上菜单栏账号：icon、主标题、积分数值叠加同一套垂直透明渐变
+            // （底部 20% → 顶部 100% 可见；三处共用 MenuBarFadeMask 同参数蒙版）；
             // 右键「在菜单栏显示」切换后 syncPanel 就地开/关渐变，无需重建卡片
-            e.iconView.usesMenuBarFade = !ac.inMenuBar
+            let menuBarFade = !ac.inMenuBar
+            e.iconView.usesMenuBarFade = menuBarFade
+            e.titleLabel.usesMenuBarFade = menuBarFade
+            e.valueView.usesMenuBarFade = menuBarFade
             // 非当前账号卡片无 dots/签到信息（未加入视图层级），跳过更新
             guard ac.isCurrent else { continue }
             // 有余额数据（value 非空）→ 按剩余比例点亮（100% 未用时 usedRatio=0 → 满格绿）；

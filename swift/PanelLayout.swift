@@ -655,7 +655,7 @@ extension BalancePanelView {
     /// failureBadge：外部创建的签到失败角标视图，叠加在 icon 右上角（显隐由调用方控制）
     /// monoSize：Mono 模式 ASCII icon 标称尺寸（缺省 = imgSize 即不微调场景）。
     /// SVG 微调（imageSize）与 Mono 标称解耦：像素字母各平台等大，SVG 保持视觉微调
-    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, titleLabelRef: ((NSTextField) -> Void)? = nil) -> NSView {
+    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil) -> NSView {
         var imgSize = imageSize ?? iconSize
         // 左：大 icon（固定列宽 = iconSize + 4，image 居中显示，imageSize 可独立缩小）；
         // premadeIconView 由外部传入（多号卡片用 MenuBarFadeIconView 以支持菜单栏渐变标记）
@@ -700,7 +700,8 @@ extension BalancePanelView {
         }
 
         // 标题行：nameLabel（平台名，Palette.cardForeground）+ 可选 nickLabel（昵称，systemGray 石墨灰）
-        let nameLabel = NSTextField(labelWithString: name)
+        // FadeableTextField：支持菜单栏显隐渐变标记（与 icon 同一套蒙版参数）
+        let nameLabel = FadeableTextField(labelWithString: name)
         registerFont(nameLabel, size: 13, weight: titleWeight)
         nameLabel.textColor = textColor
         // 暴露 nameLabel 给调用方（如 hover 字重动画驱动）
@@ -801,35 +802,54 @@ extension BalancePanelView {
             row2.heightAnchor.constraint(equalToConstant: 12).isActive = true
         }
 
-        // 内容纵向 stack：[row1, row2]（row2 有内容才加入）
-        var contentViews: [NSView] = [row1]
-        if row2HasContent {
-            contentViews.append(row2)
-        }
-        let content = NSStackView(views: contentViews)
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 2
-        content.distribution = .fill
-        content.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        content.setContentHuggingPriority(.defaultLow, for: .vertical)
-        content.translatesAutoresizingMaskIntoConstraints = false
-        // 让两行撑满 content 宽度：这样行内 .trailing gravity 的元素（数值/点阵）才会贴右对齐
-        for v in contentViews {
-            v.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        }
-
-        // 容器包裹 content：撑满 row 高度，内容垂直居中
+        // 「副标题是否有内容」分流：有文字副标题（到期/额度行）走纵向 stack 居中；
+        // 无文字副标题但有点阵时（TRAE：签到行占位已移除），点阵视作独立的用量
+        // 可视化而非副标题——退出纵向流、贴底右角，标题行独占垂直中心。
+        // （组合块居中会把标题顶离卡心，与恒居中的 icon 列产生视觉错位）
         let contentContainer = NSView()
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
-        contentContainer.addSubview(content)
-        NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-            content.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
-            content.topAnchor.constraint(greaterThanOrEqualTo: contentContainer.topAnchor),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: contentContainer.bottomAnchor),
-        ])
+        if let dots = dots, info == nil {
+            // ── 单行模式：row1 垂直居中 + 点阵浮底 ──
+            // centerY 上抬 1pt 与浮底点阵相切不重叠；依赖外部等高约束撑高容器
+            // （仅当前账号进入本模式，恒绑定 DS 等高基准）
+            contentContainer.addSubview(row1)
+            contentContainer.addSubview(dots)
+            NSLayoutConstraint.activate([
+                row1.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+                row1.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+                row1.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor, constant: -1),
+                dots.leadingAnchor.constraint(greaterThanOrEqualTo: contentContainer.leadingAnchor),
+                dots.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+                dots.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor, constant: -1),
+                row1.topAnchor.constraint(greaterThanOrEqualTo: contentContainer.topAnchor),
+            ])
+        } else {
+            // ── 原两行（或单行）模式 ──
+            var contentViews: [NSView] = [row1]
+            if row2HasContent {
+                contentViews.append(row2)
+            }
+            let content = NSStackView(views: contentViews)
+            content.orientation = .vertical
+            content.alignment = .leading
+            content.spacing = 2
+            content.distribution = .fill
+            content.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            content.setContentHuggingPriority(.defaultLow, for: .vertical)
+            content.translatesAutoresizingMaskIntoConstraints = false
+            // 让两行撑满 content 宽度：这样行内 .trailing gravity 的元素（数值/点阵）才会贴右对齐
+            for v in contentViews {
+                v.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+            }
+            contentContainer.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+                content.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
+                content.topAnchor.constraint(greaterThanOrEqualTo: contentContainer.topAnchor),
+                content.bottomAnchor.constraint(lessThanOrEqualTo: contentContainer.bottomAnchor),
+            ])
+        }
 
         let row = NSStackView(views: [iconContainer, contentContainer])
         row.orientation = .horizontal
@@ -1140,127 +1160,218 @@ extension BalancePanelView {
 
     /// 多号账号卡 icon：未显示在菜单栏的账号叠加垂直透明渐变 mask
     /// （视觉底部 80% 可见 → 顶部 25% 可见，从下到上由亮到暗），区别于「已上菜单栏」的完整 icon。
-    /// CA 渐变坐标 y 向上：startPoint y=0 为视觉底部、endPoint y=1 为视觉顶部。
-    /// v2（锚点动画）：mask 恒铺满 icon（frame == bounds，不平移），colors/locations
-    /// 固定不变，显隐切换只动画渐变锚点对 (startPoint, endPoint)（带长恒 3）——
-    /// 开 = startPoint.y -1（中段渐变对齐 icon）；关 = 0（上段纯白对齐，渐变带
-    /// 移出 icon 上方）。锚点平移即「半透明从 icon 底部往上移入/移出」（1s easeInEaseOut）。
+    /// 蒙版逻辑在 MenuBarFadeMask（与卡片主标题/积分数值共用同一套渐变参数），本类只是薄壳。
     final class MenuBarFadeIconView: NSImageView {
-        private let fadeMask = CAGradientLayer()
-        private let maskAnchorDuration: CFTimeInterval = 0.25
+        private lazy var fade = MenuBarFadeMask(host: self)
         /// true = 未上菜单栏 → icon 应用渐变；false = 完整显示
-        var usesMenuBarFade = false {
-            didSet {
-                guard oldValue != usesMenuBarFade else { return }
-                transitionMask(animated: true)
-            }
+        var usesMenuBarFade: Bool {
+            get { fade.usesFade }
+            set { fade.usesFade = newValue }
         }
-        private var maskInstalled = false
         override init(frame frameRect: NSRect) {
             super.init(frame: frameRect)
             wantsLayer = true
-            // 上段纯白 / 中段渐变（底部 0.8 → 顶部 0.25，从下到上由亮到暗，过渡更平滑）/
-            // 下段纯白；同 location 双停靠点形成硬边界
-            fadeMask.colors = [
-                NSColor.white.cgColor,
-                NSColor.white.cgColor,
-                NSColor.white.withAlphaComponent(0.8).cgColor,
-                NSColor.white.withAlphaComponent(0.25).cgColor,
-                NSColor.white.cgColor,
-                NSColor.white.cgColor,
-            ]
-            let third = NSNumber(value: 1.0 / 3.0)
-            let twoThirds = NSNumber(value: 2.0 / 3.0)
-            fadeMask.locations = [NSNumber(value: 0), third, third, twoThirds, twoThirds, NSNumber(value: 1)]
         }
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-        /// 蒙版三个锚点对齐位（startPoint.y，带长恒 3 = bounds 高度 ×3）：
-        /// 渐变位 -1（中段对齐 icon）；上方纯白位 0（上段对齐，关动画终点）；
-        /// 下方纯白位 -2（下段对齐，开动画起点）——两个纯白位视觉等价（icon 完整）
-        private var gradientY: CGFloat { -1 }
-        private var fullAboveY: CGFloat { 0 }
-        private var fullBelowY: CGFloat { -2 }
-        /// 带长恒 3（endPoint = startPoint + 3），锚点平移过程中带宽不变（纯滑移无拉伸）
-        private func applyAnchor(y: CGFloat) {
-            fadeMask.startPoint = CGPoint(x: 0.5, y: y)
-            fadeMask.endPoint = CGPoint(x: 0.5, y: y + 3)
-        }
-        private func transitionMask(animated: Bool) {
-            guard bounds.height > 0 else { return }   // 布局未定时由 layout() 首挂
-            let targetY = usesMenuBarFade ? gradientY : fullAboveY
-            if !maskInstalled {
-                // 首次挂载（rebuild 后 apply 阶段）：直接就位，不播动画
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                layer?.mask = fadeMask
-                fadeMask.frame = bounds
-                applyAnchor(y: targetY)
-                CATransaction.commit()
-                maskInstalled = true
-                return
-            }
-            if !animated {
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                fadeMask.removeAnimation(forKey: "maskAnchorStart")
-                fadeMask.removeAnimation(forKey: "maskAnchorEnd")
-                applyAnchor(y: targetY)
-                CATransaction.commit()
-                return
-            }
-            if usesMenuBarFade {
-                // 开：先无动画瞬移到下方纯白位（与任意完整态视觉等价，无跳变），
-                // 再上滑进入渐变位——半透明从 icon 底部往上移入
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                fadeMask.removeAnimation(forKey: "maskAnchorStart")
-                fadeMask.removeAnimation(forKey: "maskAnchorEnd")
-                applyAnchor(y: fullBelowY)
-                CATransaction.commit()
-                slideAnchor(to: gradientY)
-            } else {
-                // 关：从渐变位上滑到上方纯白位——恢复同样从 icon 底部往上移入
-                slideAnchor(to: fullAboveY)
-            }
-        }
-        /// 显式锚点平移动画（startPoint/endPoint 同步）：起点取当前呈现位置，
-        /// 快速反复切换不跳变；model 直达目标（disableActions），呈现由动画驱动
-        private func slideAnchor(to targetY: CGFloat) {
-            let fromY = fadeMask.presentation()?.startPoint.y ?? fadeMask.startPoint.y
-            guard fromY != targetY else { return }
-            let startAnim = CABasicAnimation(keyPath: "startPoint")
-            startAnim.fromValue = NSValue(point: CGPoint(x: 0.5, y: fromY))
-            startAnim.toValue = NSValue(point: CGPoint(x: 0.5, y: targetY))
-            let endAnim = CABasicAnimation(keyPath: "endPoint")
-            endAnim.fromValue = NSValue(point: CGPoint(x: 0.5, y: fromY + 3))
-            endAnim.toValue = NSValue(point: CGPoint(x: 0.5, y: targetY + 3))
-            for anim in [startAnim, endAnim] {
-                anim.duration = maskAnchorDuration
-                anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                anim.isRemovedOnCompletion = true
-            }
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            applyAnchor(y: targetY)
-            CATransaction.commit()
-            fadeMask.add(startAnim, forKey: "maskAnchorStart")
-            fadeMask.add(endAnim, forKey: "maskAnchorEnd")
-        }
         override func layout() {
             super.layout()
-            guard bounds.height > 0 else { return }
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            if !maskInstalled {
-                // 首次挂载兜底（apply 阶段 bounds 未定时的路径）
-                layer?.mask = fadeMask
-                applyAnchor(y: usesMenuBarFade ? gradientY : fullAboveY)
-                maskInstalled = true
-            }
-            // 蒙版恒铺满 icon（不随锚点移动），仅尺寸变化时同步
-            fadeMask.frame = bounds
-            CATransaction.commit()
+            fade.syncLayout()
         }
     }
 
+    /// 支持同一菜单栏渐变标记的文本 label（余额卡片主标题）：wantsLayer + 挂 MenuBarFadeMask，
+    /// 接口与 icon 一致（usesMenuBarFade）。行框高 16pt 由外部约束固定，hover 字重动画
+    /// 只改字形宽度不改行框。墨迹区间由官方基线读数推导（见 updateInkRange）。
+    final class FadeableTextField: NSTextField {
+        private lazy var fade = MenuBarFadeMask(host: self)
+        var usesMenuBarFade: Bool {
+            get { fade.usesFade }
+            set { fade.usesFade = newValue }
+        }
+        private var lastInkFontKey = ""
+        /// 墨迹区间 = 官方基线读数（baselineOffsetFromBottom，AppKit cell 排版的唯一权威，
+        /// 对 linebox 超出 bounds 的裁剪场景依然正确）+ 字体度量：
+        /// low 含 descender、high 取 ascender——宁多盖 1pt 渐变淡尾也不在字形顶部露白条。
+        private func updateInkRange() {
+            guard let f = font, bounds.height > 0 else { return }
+            let key = "\(f.fontName)|\(Int(f.pointSize))"
+            guard lastInkFontKey != key else { return }
+            lastInkFontKey = key
+            let base = baselineOffsetFromBottom
+            fade.inkRange = (base + f.descender, base + f.ascender)
+            fade.refreshAnchors()
+        }
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        override func layout() {
+            super.layout()
+            fade.syncLayout()
+            updateInkRange()
+        }
+    }
+
+}
+
+/// 菜单栏显隐标记蒙版（右键卡片「在菜单栏显示」切换的视觉载体）：垂直透明渐变裁剪层，
+/// 自下而上由亮到暗（底部 80% → 顶部 25% 可见），把「未上菜单栏」渲染成半褪视觉。
+/// 余额卡片的 icon、主标题、积分数值三处共用同一套渐变色参数；mask 恒铺满宿主 bounds
+/// 且锚点全是相对单位，随各自内容高度自适应（icon 22pt 方形 / 标题数值 16pt 行框节奏一致）。
+/// v2 锚点动画（自 MenuBarFadeIconView 平移）：colors/locations 固定不变，显隐切换只动画
+/// 渐变锚点对 (startPoint, endPoint)（带长恒 3 = bounds 高度 ×3）——
+/// 开 = startPoint.y -1（中段渐变对齐内容）；关 = 0（上段纯白对齐，渐变带移出上方）。
+/// 锚点平移即「半透明从内容底部往上移入/移出」（0.25s easeInEaseOut）。
+final class MenuBarFadeMask {
+    private let fadeLayer = CAGradientLayer()
+    private unowned var host: NSView?
+    private var installed = false
+    private let anchorDuration: CFTimeInterval = 0.25
+    /// true = 未上菜单栏 → 应用渐变；false = 完整显示
+    var usesFade = false {
+        didSet {
+            guard oldValue != usesFade else { return }
+            transition(animated: true)
+        }
+    }
+    init(host: NSView) {
+        self.host = host
+        // 六段色标：上段纯白 / 中段渐变（底部 0.8 → 顶部 0.25）/ 下段纯白；
+        // 同 location 双停靠点形成硬边界
+        fadeLayer.colors = [
+            NSColor.white.cgColor,
+            NSColor.white.cgColor,
+            NSColor.white.withAlphaComponent(0.8).cgColor,
+            NSColor.white.withAlphaComponent(0.25).cgColor,
+            NSColor.white.cgColor,
+            NSColor.white.cgColor,
+        ]
+        let third = NSNumber(value: 1.0 / 3.0)
+        let twoThirds = NSNumber(value: 2.0 / 3.0)
+        fadeLayer.locations = [NSNumber(value: 0), third, third, twoThirds, twoThirds, NSNumber(value: 1)]
+    }
+    /// 墨迹区间（pt，自宿主 bounds 底部向上计；nil = 跟随整个 bounds，icon 场景）。
+    /// 渐变段（locations 1/3–2/3，0.8→0.25）将精确映射到 [low, high]，字形外的
+    /// 行框留白自动落在两端纯白段。由文本宿主以基线读数 + 字体度量推导填入
+    /// （见 InkRangeMetrics）——离屏快照实测证明各字体行盒差异大且 cell 会裁剪，
+    /// 静态猜数必错（曾测出 WorkBuddy 墨迹仅 6.5pt 的假象）。
+    var inkRange: (low: CGFloat, high: CGFloat)?
+    /// inkRange 更新后按当前开关状态重新落锚（目标未变则为空操作；有变化平滑滑动）
+    func refreshAnchors() {
+        guard installed else { return }   // 未挂载时首次挂载自然使用最新值
+        let s = anchorSlots()
+        slideAnchor(to: usesFade ? s.grad : s.above, s.k)
+    }
+    /// 按 inkRange 解锚点槽位（单位 = bounds 高度）。几何推导：
+    /// 轴长 3k（k = high−low）、t=1/3 ↦ lo、t=2/3 ↦ hi ⇒ grad = lo−k；
+    /// 关终点 = max(hi, 1−k)（保证白色硬边界不出窗）；开起点 = lo−3k（带沉到墨迹底下之外）
+    private func anchorSlots() -> (grad: CGFloat, above: CGFloat, below: CGFloat, k: CGFloat) {
+        let B = host?.bounds.height ?? 0
+        guard B > 0 else { return (-1, 1, -3, 1) }
+        if let r = inkRange {
+            let lo = min(max(r.low / B, 0), 0.95)
+            let hi = min(max(r.high / B, lo + 0.05), 1)
+            let k = hi - lo
+            return (lo - k, max(hi, 1 - k), lo - 3 * k, k)
+        }
+        return (-1, 1, -3, 1)   // icon：全高 = 墨迹（k=1），与原版完全一致
+    }
+    /// 锚点几何（slot 标量 + 单位 k → CA 两点）。宿主 layer 坐标经 AppKit 翻转
+    /// 补偿跟随 view.isFlipped：非翻转宿主（icon/主标题）layer y 向上；翻转宿主
+    /// （RollingNumberView isFlipped）layer y 向下——后者必须换算否则渐变与
+    /// 滑动方向整体上下颠倒。等效换算（对任意 k 成立）：start = (0.5, 1-s)、
+    /// end = start − 3k（轴反向自下而上），可逐 t 推导证明与正向配置视觉逐点相等。
+    private func anchorPoints(_ s: CGFloat, _ k: CGFloat) -> (CGPoint, CGPoint) {
+        if let host, host.isFlipped {
+            let sy = 1 - s
+            return (CGPoint(x: 0.5, y: sy), CGPoint(x: 0.5, y: sy - 3 * k))
+        }
+        return (CGPoint(x: 0.5, y: s), CGPoint(x: 0.5, y: s + 3 * k))
+    }
+    private func applyAnchor(_ s: CGFloat, _ k: CGFloat) {
+        let pts = anchorPoints(s, k)
+        fadeLayer.startPoint = pts.0
+        fadeLayer.endPoint = pts.1
+    }
+    /// 宿主 layout 时调用：首次挂载 + 尺寸同步（mask 恒铺满 bounds，仅尺寸变化时更新）
+    func syncLayout() {
+        guard let host, host.bounds.height > 0 else { return }
+        let s = anchorSlots()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if !installed {
+            host.layer?.mask = fadeLayer
+            applyAnchor(usesFade ? s.grad : s.above, s.k)
+            installed = true
+        }
+        fadeLayer.frame = host.bounds
+        CATransaction.commit()
+    }
+    private func transition(animated: Bool) {
+        guard let host, host.bounds.height > 0 else { return }   // 布局未定时由宿主 layout() 首挂
+        let s = anchorSlots()
+        if !installed {
+            // 首次挂载（rebuild 后 apply 阶段）：直接就位，不播动画
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            host.layer?.mask = fadeLayer
+            fadeLayer.frame = host.bounds
+            applyAnchor(usesFade ? s.grad : s.above, s.k)
+            CATransaction.commit()
+            installed = true
+            return
+        }
+        if !animated {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fadeLayer.removeAnimation(forKey: "maskAnchorStart")
+            fadeLayer.removeAnimation(forKey: "maskAnchorEnd")
+            applyAnchor(usesFade ? s.grad : s.above, s.k)
+            CATransaction.commit()
+            return
+        }
+        if usesFade {
+            // 开：先无动画瞬移到下方纯白位（与任意完整态视觉等价，无跳变），
+            // 再上滑进入渐变位——半透明从内容底部往上移入
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fadeLayer.removeAnimation(forKey: "maskAnchorStart")
+            fadeLayer.removeAnimation(forKey: "maskAnchorEnd")
+            applyAnchor(s.below, s.k)
+            CATransaction.commit()
+            slideAnchor(to: s.grad, s.k)
+        } else {
+            // 关：从渐变位上滑到上方纯白位——恢复同样从内容底部往上移入
+            slideAnchor(to: s.above, s.k)
+        }
+    }
+    /// 显式锚点平移动画（startPoint/endPoint 同步）：起点取当前呈现位置，
+    /// 快速反复切换不跳变；model 直达目标（disableActions），呈现由动画驱动。
+    /// 端点一律经 anchorPoints 换算，翻转宿主上滑动方向才与非翻转宿主一致
+    private func slideAnchor(to s: CGFloat, _ k: CGFloat) {
+        let fromStartY = fadeLayer.presentation()?.startPoint.y ?? fadeLayer.startPoint.y
+        // 呈现值回到 slot 标量：按宿主取向反解（flipped: start.y = 1 - slot）
+        let fromSlot = (host?.isFlipped == true) ? 1 - fromStartY : fromStartY
+        guard fromSlot != s else { return }
+        let fromPts = anchorPoints(fromSlot, k)
+        let toPts = anchorPoints(s, k)
+        let startAnim = CABasicAnimation(keyPath: "startPoint")
+        startAnim.fromValue = NSValue(point: fromPts.0)
+        startAnim.toValue = NSValue(point: toPts.0)
+        let endAnim = CABasicAnimation(keyPath: "endPoint")
+        endAnim.fromValue = NSValue(point: fromPts.1)
+        endAnim.toValue = NSValue(point: toPts.1)
+        for anim in [startAnim, endAnim] {
+            anim.duration = anchorDuration
+            anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            anim.isRemovedOnCompletion = true
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        applyAnchor(s, k)
+        CATransaction.commit()
+        fadeLayer.add(startAnim, forKey: "maskAnchorStart")
+        fadeLayer.add(endAnim, forKey: "maskAnchorEnd")
+    }
 }

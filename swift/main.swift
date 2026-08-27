@@ -1253,7 +1253,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 判断某条目在菜单栏是否可见
     /// 显式配置优先；无记录时使用默认值：DS/Trae主/Wb主 默认可见；ZCode主默认隐藏（保持旧版行为）；非主账号默认隐藏
+    /// 菜单栏条目余额是否已用尽（按平台各自的缓存剩余值 ≤0 判定：TRAE 积分 /
+    /// WB·ZCode 剩余额度 / Codex 剩余百分比 / DS·ZhiPu 余额）。
+    /// 数据缺失（未拉到/缓存空）不算零——避免误禁；充值后自动解除。
+    /// DS/ZhiPu 为单账号条目，id 即前缀本身。
+    private func menuItemExhausted(_ itemId: String) -> Bool {
+        func acUid(_ prefix: String) -> String { String(itemId.dropFirst(prefix.count)) }
+        switch itemId {
+        case MenuBarPrefix.ds:
+            return (Double(cacheDs?.totalRaw ?? "") ?? 0) <= 0
+        case MenuBarPrefix.zhipu:
+            return (cacheBigModelBalance ?? 0) <= 0
+        default:
+            break
+        }
+        if itemId.hasPrefix(MenuBarPrefix.trae) {
+            guard let c = cacheTraeAccounts[acUid(MenuBarPrefix.trae)], c.limit > 0 else { return false }
+            return c.limit - c.used <= 0
+        }
+        if itemId.hasPrefix(MenuBarPrefix.wb) {
+            guard let c = cacheWbAccounts[acUid(MenuBarPrefix.wb)] else { return false }
+            return c.remain <= 0
+        }
+        if itemId.hasPrefix(MenuBarPrefix.zcode) {
+            // total>0 过滤与 orderedMenuBarEntries 口径一致（0 额度账号本就不入列）
+            guard let c = cacheZcodeAccounts[acUid(MenuBarPrefix.zcode)], c.total > 0 else { return false }
+            return c.remain <= 0
+        }
+        if itemId.hasPrefix(MenuBarPrefix.codex) {
+            guard let c = cacheCodexAccounts[acUid(MenuBarPrefix.codex)] else { return false }
+            return c.usedPercent >= 100
+        }
+        return false
+    }
+
     private func isMenuBarVisible(id: String, isCurrent: Bool) -> Bool {
+        // 余额用尽的账号无条件隐藏（无视用户历史记录与默认值）
+        if menuItemExhausted(id) { return false }
         if let v = config.menuBarVisible[id] { return v }
         // 默认值
         if id == MenuBarPrefix.ds || id == MenuBarPrefix.zhipu { return true }
@@ -1267,6 +1303,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 右键点击余额卡片时直接切换该条目在菜单栏的显示/隐藏
     private func toggleMenuBarVisibility(itemId: String, event: NSEvent) {
+        // 余额用尽的账号：菜单栏强制隐藏，右键切换不可用（静默忽略；充值后自动恢复）
+        if menuItemExhausted(itemId) {
+            Logger.log(.refresh, "[MenuBar] \(itemId) exhausted, visibility toggle disabled")
+            return
+        }
         // 判断是否为当前账号（用于默认值判定）
         var isCurrent = false
         var entryFound = false
@@ -1294,9 +1335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 打开当前账号卡片（启动平台 App）时确保该平台当前账号在菜单栏显示：
     /// 用户可能在平台 App 内自行切号，新当前账号可能带有历史右键隐藏记录
     /// （ZCode/Codex 当前账号还默认隐藏），这里追加为可见，其余条目显隐不变。
+    /// 余额已用尽的条目一律跳过（保持强制隐藏）。
     private func ensureCurrentAccountInMenuBar(prefix: String, currentUid: String?) {
         guard let uid = currentUid, !uid.isEmpty else { return }
         let itemId = prefix + uid
+        if menuItemExhausted(itemId) { return }
         guard !isMenuBarVisible(id: itemId, isCurrent: true) else { return }
         config.menuBarVisible[itemId] = true
         ConfigStore.save(config)

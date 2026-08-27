@@ -340,6 +340,27 @@ final class RollingNumberView: NSView {
 
     override var isFlipped: Bool { true }
 
+    // —— 菜单栏显隐渐变标记：与平台 icon / 卡片主标题同一套 MenuBarFadeMask 参数，
+    //    蒙版相对单位随 bounds 高度自适应，mask 与左溢裁剪（masksToBounds）互不影响 ——
+    private lazy var menuBarFade = MenuBarFadeMask(host: self)
+    var usesMenuBarFade: Bool {
+        get { menuBarFade.usesFade }
+        set { menuBarFade.usesFade = newValue }
+    }
+    /// 墨迹区间：以内部同字体基线探针的官方读数（baselineOffsetFromBottom）+
+    /// 字体度量推导——探针恒挂 self.top（flipped），主行槽与车轮同一排版口径
+    private var lastInkFontKey = ""
+    private func updateInkRange() {
+        guard bounds.height > 0 else { return }
+        let key = "\(mainFont.fontName)|\(Int(mainFont.pointSize))"
+        guard lastInkFontKey != key else { return }
+        lastInkFontKey = key
+        let pf = baselineProbe.frame                       // flipped：minY = 自顶距离
+        let base = bounds.height - (pf.minY + pf.height - baselineProbe.baselineOffsetFromBottom)
+        menuBarFade.inkRange = (base + mainFont.descender, base + mainFont.ascender)
+        menuBarFade.refreshAnchors()
+    }
+
     override var intrinsicContentSize: NSSize {
         NSSize(width: slots.reduce(0) { $0 + slotWidth($1) }, height: lineH)
     }
@@ -522,6 +543,8 @@ final class RollingNumberView: NSView {
 
     override func layout() {
         super.layout()
+        menuBarFade.syncLayout()
+        updateInkRange()
         relayoutSlots()
         // TODO(诊断): 上游几何 dump（限前 8 次），定位偏右；确认后移除
         if Self.posDiagCount <= 8, let row1 = superview {
