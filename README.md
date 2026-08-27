@@ -9,6 +9,7 @@ macOS 菜单栏常驻应用（NSStatusItem），实时聚合显示多个 AI 服�
 | 平台 | 能力 |
 | --- | --- |
 | **DeepSeek** | API 余额查询，设置常用充值额度后面板显示用量进度 |
+| **Zhipu** | 智谱 BigModel 可用余额（浏览器登录态自动采集，支持手填 token 覆盖） |
 | **WorkBuddy** | CodeBuddy API 积分查询，多账号卡片、多号签到、OAuth 账号采集、token 自动刷新、多号切换 |
 | **TRAE** | 读取本地 storage.json（byteCrypto 解密）查询积分，多账号采集 / 切换 / 自动签到 |
 | **ZCode** | 读取本机 JWT 查询额度百分比与重置倒计时，JSON 导入多账号、多号切换 |

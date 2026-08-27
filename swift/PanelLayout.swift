@@ -138,6 +138,18 @@ extension BalancePanelView {
         // 平台间间隔 4pt（同平台内各容器内部 spacing=0 不加间隔）
         balanceGroupContainer.setCustomSpacing(4, after: dsCardsContainer)
 
+        // ── ZhiPu 单账号卡片容器（智谱 BigModel，同 DS 管线；置于 DeepSeek 卡片下方）──
+        zhipuCardsContainer = NSStackView(views: [])
+        zhipuCardsContainer.orientation = .vertical
+        zhipuCardsContainer.alignment = .leading
+        zhipuCardsContainer.distribution = .fill
+        zhipuCardsContainer.spacing = 0
+        zhipuCardsContainer.translatesAutoresizingMaskIntoConstraints = false
+        balanceGroupContainer.addArrangedSubview(zhipuCardsContainer)
+        pinPlatformWidth(zhipuCardsContainer)
+        platformCards[BalancePlatform.bigModel.rawValue] = zhipuCardsContainer
+        balanceGroupContainer.setCustomSpacing(4, after: zhipuCardsContainer)
+
         // ── ZCode 多账号卡片容器（动态创建，账号列表变化时重建；置于 DeepSeek 卡片下方）──
         zcodeCardsContainer = NSStackView(views: [])
         zcodeCardsContainer.orientation = .vertical
@@ -367,7 +379,8 @@ extension BalancePanelView {
         checkinBtn.action = #selector(manualCheckinTapped)
 
         let cockpitBtn = ActionTileButton(symbol: "gauge.with.needle", title: "Cockpit", target: self, action: #selector(openCockpitTapped))
-        let deepSeekSettingsBtn = ActionTileButton(bundleIcon: "deepseek", title: "Key / 额度", target: self, action: #selector(setApiKeyTapped))
+        // Key/额度磁贴：DeepSeek + ZhiPu 设置弹窗统一入口，icon 用 SF Symbol 钥匙
+        let deepSeekSettingsBtn = ActionTileButton(symbol: "key.fill", title: "Key / 额度", target: self, action: #selector(setApiKeyTapped))
         let aboutBtn = ActionTileButton(symbol: "info.circle", title: "关于", target: self, action: #selector(aboutTapped))
         let platformTogglesBtn = ActionTileButton(symbol: "circle.grid.2x2.topleft.checkmark.filled", title: "平台开关", target: self, action: #selector(platformTogglesTapped))
         let actionTiles = [
@@ -388,7 +401,7 @@ extension BalancePanelView {
         traeAddBtn.toolTip = "添加 TRAE 账号"
         zcodeAddBtn.toolTip = "添加 ZCode 账号（JSON 导入）"
         codexAddBtn.toolTip = "添加 Codex 账号（JSON 导入 ~/.codex/auth.json）"
-        deepSeekSettingsBtn.toolTip = "配置 DeepSeek API Key 和日常额度"
+        deepSeekSettingsBtn.toolTip = "配置 DeepSeek API Key、日常额度与 ZhiPu Token"
         platformTogglesBtn.toolTip = "管理各平台刷新、自动签到、卡片与用量显示开关"
         let buildVer = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         aboutBtn.toolTip = "关于 iBalance（v\(buildVer)）"

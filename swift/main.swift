@@ -121,6 +121,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var config = AppConfig()
     // 缓存原始数据，切换小数位时即时重绘（仅在主线程变更）
     private var cacheDs: (symbol: String, totalRaw: String, total: Double)?
+    /// ZhiPu（智谱 BigModel）可用余额缓存（元）
+    private var cacheBigModelBalance: Double?
+    /// ZhiPu 周期锚点：上次见到的累计入账（充值+赠送）、本周期开始时的入账与余额；
+    /// 检测到入账跳涨（新充值）即重置锚点 → 点阵回到满格，随本次充值消耗逐步点亮
+    private var cacheBigModelInflow: Double?
+    private var cacheBigModelCycleStartInflow: Double?
+    private var cacheBigModelCycleStartBalance: Double?
+    /// 点阵已用比（-1 = 无数据）
+    private var cacheBigModelUsedRatio: Double = -1
     var cacheWb: (remain: Double, total: Double)?
     /// WorkBuddy 多账号额度缓存：uid → (remain, total)，用于面板显示每号余额卡片
     private var cacheWbAccounts: [String: (remain: Double, total: Double)] = [:]
@@ -140,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var wbPulsingTracker = PulsingTracker()
     private var zcodePulsingTracker = PulsingTracker()
     private var dsPulsingTracker = PulsingTracker()
+    private var zhipuPulsingTracker = PulsingTracker()
     private var codexPulsingTracker = PulsingTracker()
 
     /// 点阵脉冲状态机（全平台共用）：跟踪 usedRatio 的上次值，上升 → pulsing=true（被消耗），
@@ -291,7 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let apiKeyMenuItem = NSMenuItem(title: "DeepSeek 设置…", action: #selector(onSetApiKey), keyEquivalent: "")
+        let apiKeyMenuItem = NSMenuItem(title: "DeepSeek / ZhiPu 设置…", action: #selector(onSetApiKey), keyEquivalent: "")
         apiKeyMenuItem.target = self
         menu.addItem(apiKeyMenuItem)
 
@@ -318,14 +328,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // 启动时预构建详情面板（一次性），高频点击菜单栏时复用，消除每次弹窗的视图重建/SVG 加载延迟
         buildPanelOnce()
-
-        // 首次使用：API Key 为空时弹窗让用户填写
-        if config.deepseekApiKey.isEmpty {
-            if let key = promptForApiKey() {
-                config.deepseekApiKey = key
-                ConfigStore.save(config)
-            }
-        }
 
         // 请求通知权限（失败仍可运行）
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
@@ -575,6 +577,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onClickDeepSeek = {
             NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!)
         }
+        // ZhiPu 卡片点击：打开智谱财务中心（余额页）
+        panel.onClickZhiPu = {
+            NSWorkspace.shared.open(URL(string: "https://bigmodel.cn/finance-center/finance/overview")!)
+        }
         panel.onClickTrae = { [weak self] in
             guard let self = self else { return }
             self.openApp(bundleId: "cn.trae.solo.app", missingTitle: "未找到 TRAE 应用",
@@ -787,7 +793,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.panelUsageVisible = config.panelUsageVisible
         // 刷新失败标记：按固定顺序列出本轮获取失败的服务（footer 展示，成功即自动清除）
         if !failedServices.isEmpty {
-            let order = ["DeepSeek", "WorkBuddy", "TRAE", "ZCode", "Codex"]
+            let order = ["DeepSeek", "ZhiPu", "WorkBuddy", "TRAE", "ZCode", "Codex"]
             let names = order.filter { failedServices.contains($0) }
             if !names.isEmpty { s.failedText = names.joined(separator: "、") + " 刷新失败" }
         }
@@ -810,6 +816,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ? "日常额度 ¥\(Int(config.deepseekCommonQuota))"
             : "打开官网 usage 页面"
         s.dsAccounts = [dsSnap]
+        // ZhiPu 卡片：智谱 BigModel 可用余额（同多号管线单元素，uid 恒 "zhipu"，
+        // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.zhipu）
+        var zpSnap = AccountCardSnapshot(uid: "zhipu", nickname: "", isCurrent: true)
+        // 有已用比（周期或回退口径）且余额在 → 恒显点阵；余额超出周期顶点 → 满格绿
+        zpSnap.hideDots = !(cacheBigModelUsedRatio >= 0 && cacheBigModelBalance != nil)
+        if let bal = cacheBigModelBalance {
+            zpSnap.value = "¥" + fmtAmountCommas(bal, decimals: 2)
+            if cacheBigModelUsedRatio >= 0 {
+                zpSnap.usedRatio = cacheBigModelUsedRatio
+            }
+            zpSnap.pulsing = zhipuPulsingTracker.isPulsing("main")
+            zpSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.zhipu, isCurrent: true)
+        }
+        zpSnap.expireText = "打开财务中心页面"
+        s.zhipuAccounts = [zpSnap]
         let today = Self.todayString()
         // TRAE 多账号余额卡片：当前账号排最上
         let traeMainUid = TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? ""
@@ -893,7 +914,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     if let text = Self.expireCountdownText(endsAt: c.planEndsAt) {
                         snap.expireText = text
                     } else {
-                        // Start Plan 已到期：卡片显示"套餐已到期"红色提示，且不再参与定时刷新
+                        // Start Plan 已到期：卡片显示"套餐已到期"（中性灰，2026-08-27 取消红色提示），且不再参与定时刷新
                         snap.expired = true
                         snap.expireText = "套餐已到期"
                     }
@@ -946,6 +967,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
            let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds",
                               accounts: [(uid: "main", current: ds.total)], increasing: false,
                               decimals: 2, percent: false, prefix: ds.symbol) {
+            s.usageRows.append(row)
+        }
+        if let bal = cacheBigModelBalance,
+           let row = usageRow(icon: "zhipu", name: "ZhiPu", platform: "zhipu",
+                              accounts: [(uid: "zhipu", current: bal)], increasing: false,
+                              decimals: 2, percent: false, prefix: "¥") {
             s.usageRows.append(row)
         }
         if let row = usageRow(icon: "workbuddy", name: "WorkBuddy", platform: "wb",
@@ -1165,7 +1192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 长文阅读类弹窗：内容宽 +8 抵消 sidePadding 增量，再 +20 加宽正文行宽
         shell.contentWidth = DialogMetrics.width + 8 + 20
         shell.addInfo("菜单栏常驻小工具，实时聚合多平台账户余额与积分。\n\n"
-            + "• DeepSeek 余额（API Key 查询）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（JSON 导入，多号切换）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
+            + "• DeepSeek 余额（API Key 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（JSON 导入，多号切换）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
             + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }
@@ -1174,10 +1201,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func onSetApiKey() {
         guard let result = keepPanelAliveDuring({
             DeepSeekSettingsDialog(apiKey: config.deepseekApiKey,
-                                   quota: config.deepseekCommonQuota).present()
+                                   quota: config.deepseekCommonQuota,
+                                   zhipuToken: config.bigmodelTokenOverride).present()
         }) else { return }
         if let apiKey = result.apiKey { config.deepseekApiKey = apiKey }
         config.deepseekCommonQuota = max(0, result.quota)
+        if let zpToken = result.zhipuToken { config.bigmodelTokenOverride = zpToken }
         ConfigStore.save(config)
         onRefresh()
     }
@@ -1187,6 +1216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 菜单栏条目 id 前缀
     enum MenuBarPrefix {
         static let ds = "ds"
+        static let zhipu = "zhipu"
         static let trae = "trae:"
         static let wb = "wb:"
         static let zcode = "zcode:"
@@ -1198,7 +1228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func isMenuBarVisible(id: String, isCurrent: Bool) -> Bool {
         if let v = config.menuBarVisible[id] { return v }
         // 默认值
-        if id == MenuBarPrefix.ds { return true }
+        if id == MenuBarPrefix.ds || id == MenuBarPrefix.zhipu { return true }
         if isCurrent {
             // 主账号：Trae/Wb 默认显示，ZCode 默认隐藏
             if id.hasPrefix(MenuBarPrefix.zcode) || id.hasPrefix(MenuBarPrefix.codex) { return false }
@@ -1218,7 +1248,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             break
         }
         if !entryFound {
-            isCurrent = (itemId == MenuBarPrefix.ds)
+            // DS / ZhiPu 是单账号平台，条目恒为当前账号
+            isCurrent = (itemId == MenuBarPrefix.ds || itemId == MenuBarPrefix.zhipu)
                 || itemId.hasPrefix(MenuBarPrefix.trae) && itemId.hasSuffix(TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? "")
                 || itemId.hasPrefix(MenuBarPrefix.wb) && itemId.hasSuffix(WorkBuddyService.authInfo()?.uid ?? "")
                 || itemId.hasPrefix(MenuBarPrefix.zcode) && itemId.hasSuffix(ZcodeService.currentUid() ?? "")
@@ -1259,6 +1290,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 1. DeepSeek（icon 前缀 + 货币符号 + 金额）
         if let ds = cacheDs {
             entries.append((id: MenuBarPrefix.ds, symbol: ds.symbol, value: fmtAmountRaw(ds.totalRaw), isCurrent: true, icon: "deepseek"))
+        }
+
+        // 1b. ZhiPu（智谱 BigModel；icon 复用 zhipu，货币符号走 DS 同款小字号）
+        if let bal = cacheBigModelBalance {
+            entries.append((id: MenuBarPrefix.zhipu, symbol: "¥", value: fmtAmountCommas(bal, decimals: 2), isCurrent: true, icon: "zhipu"))
         }
 
         // 2. ZCode 账号（当前账号优先）
@@ -1318,6 +1354,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             switch platformID {
             case "ds":
                 return entries.filter { $0.id == MenuBarPrefix.ds }
+            case BalancePlatform.bigModel.rawValue:
+                return entries.filter { $0.id == MenuBarPrefix.zhipu }
             case "zcode":
                 return entries.filter { $0.id.hasPrefix(MenuBarPrefix.zcode) }
             case "codex":
@@ -1423,8 +1461,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let iconSize = menuSize + 3
 
         var hasContent = false
+        var renderedIds: [String] = []
         for entry in orderedMenuBarEntries() {
             guard isMenuBarVisible(id: entry.id, isCurrent: entry.isCurrent) else { continue }
+            renderedIds.append(entry.id)
             if hasContent { append("  \u{2009}") }
 
             // 平台品牌图标（黑形，随整条标题烘焙进 template 位图）；TRAE 缩小 6%，ZCode 缩小 13%
@@ -1455,7 +1495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
         let slow = ms >= 10 ? " SLOW!" : ""
-        Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): call-render=\(updateTitleCallCount)/\(updateTitleRenderCount), attrLen=\(attr.length), \(ms)ms\(slow)")
+        Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): call-render=\(updateTitleCallCount)/\(updateTitleRenderCount), ids=[\(renderedIds.joined(separator: ","))], attrLen=\(attr.length), \(ms)ms\(slow)")
 
         // 面板打开时同步重绘
         syncPanel()
@@ -1508,11 +1548,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         // 服务并行请求，先到先显示：每个服务返回后立即写缓存并重绘标题，互不等待
         async let a: Void = refreshOneDeepSeek(cfg, seq: seq)
+        async let g: Void = refreshOneBigModel(cfg, seq: seq)
         async let b: Void = refreshOneWorkBuddy(cfg, seq: seq)
         async let c: Void = refreshOneTrae(cfg, seq: seq)
         async let e: Void = refreshOneZcode(cfg, seq: seq)
         async let f: Void = refreshOneCodex(cfg, seq: seq)
-        _ = await (a, b, c, e, f)
+        _ = await (a, g, b, c, e, f)
 
         let totalMs = Int(Date().timeIntervalSince(t0) * 1000)
         Logger.log(.refresh, "[\(seq)] performRefresh all children joined in \(totalMs)ms")
@@ -1542,6 +1583,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func restoreBalanceCache() {
         guard let c = BalanceCacheStore.load() else { return }
         if let ds = c.ds { cacheDs = (ds.symbol, ds.totalRaw, ds.total) }
+        cacheBigModelBalance = c.bigmodel
+        cacheBigModelInflow = c.bigmodelInflow
+        cacheBigModelCycleStartInflow = c.bigmodelCycleStartInflow
+        cacheBigModelCycleStartBalance = c.bigmodelCycleStartBalance
+        cacheBigModelUsedRatio = c.bigmodelUsedRatio
         if let wb = c.wb { cacheWb = (wb.remain, wb.total) }
         cacheWbAccounts = c.wbAccounts.mapValues { ($0.remain, $0.total) }
         cacheTraeAccounts = c.traeAccounts.mapValues { ($0.limit, $0.used) }
@@ -1557,6 +1603,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         var c = BalanceCache()
         c.ds = cacheDs.map { .init(symbol: $0.symbol, totalRaw: $0.totalRaw, total: $0.total) }
         c.wb = cacheWb.map { .init(remain: $0.remain, total: $0.total) }
+        c.bigmodel = cacheBigModelBalance
+        c.bigmodelUsedRatio = cacheBigModelUsedRatio
+        c.bigmodelInflow = cacheBigModelInflow
+        c.bigmodelCycleStartInflow = cacheBigModelCycleStartInflow
+        c.bigmodelCycleStartBalance = cacheBigModelCycleStartBalance
         c.wbAccounts = cacheWbAccounts.mapValues { .init(remain: $0.remain, total: $0.total) }
         c.traeAccounts = cacheTraeAccounts.mapValues { .init(limit: $0.limit, used: $0.used) }
         c.zcodeAccounts = cacheZcodeAccounts.mapValues { .init(remain: $0.remain, total: $0.total, planEndsAt: $0.planEndsAt) }
@@ -1601,6 +1652,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             Logger.log(.refresh, "[\(seq)] DeepSeek: ERROR \(ds.error)")
         }
         updateTitle(tag: "ds-\(seq)")
+    }
+
+    /// ZhiPu（智谱 BigModel）余额刷新：手填覆盖 token 优先，否则扫浏览器 Cookies 解密登录态，
+    /// 调财务报告接口取 availableBalance。无凭据静默跳过（对齐 DeepSeek 未配置行为）。
+    private func refreshOneBigModel(_ cfg: AppConfig, seq: Int64) async {
+        let t0 = Date()
+        guard cfg.bigmodelRefreshEnabled else {
+            Logger.log(.refresh, "[\(seq)] ZhiPu: disabled, skipped")
+            if ownsRefresh(seq) { failedServices.remove("ZhiPu") }
+            return
+        }
+        // 鉴权失败自愈：清 token 缓存重新采集再试一轮；仍失败才报错
+        var result = await bigModelFetch(cfg: cfg, seq: seq)
+        if result.authFailed {
+            Logger.log(.refresh, "[\(seq)] ZhiPu: 登录态失效，清缓存重采")
+            BigModelService.clearCachedToken()
+            result = await bigModelFetch(cfg: cfg, seq: seq)
+        }
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] ZhiPu: not owner after fetch (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip writeback")
+            return
+        }
+        if let bal = result.balance {
+            cacheBigModelBalance = bal
+            UsageStore.observe(platform: "zhipu", uid: "zhipu", value: bal, increasing: false)
+
+            // 周期基线：入账 = 累计充值 + 赠送（服务端记账）。
+            // 检测到跳涨（新充值/补赠）→ 重置锚点：本次增量作为分母，当前余额为周期顶点；
+            // 尚未观测到充值的首期 → 回退累计口径（对齐旧行为，点阵仍可用）。
+            let inflow = max(0, result.budget)
+            if cacheBigModelInflow == nil || cacheBigModelCycleStartInflow == nil {
+                cacheBigModelInflow = inflow
+                cacheBigModelCycleStartInflow = inflow
+                cacheBigModelCycleStartBalance = bal
+                Logger.log(.refresh, "[\(seq)] ZhiPu: 周期锚点初始化，inflow=\(inflow)")
+            } else if let seen = cacheBigModelInflow, inflow > seen + 0.005 {
+                Logger.log(.refresh, "[\(seq)] ZhiPu: 检测到新充值 \(seen) → \(inflow)，重置周期锚点")
+                cacheBigModelInflow = inflow
+                cacheBigModelCycleStartInflow = inflow
+                cacheBigModelCycleStartBalance = bal
+            } else {
+                cacheBigModelInflow = inflow
+            }
+            let cycleDenom = inflow - (cacheBigModelCycleStartInflow ?? inflow)
+            let ratio: Double
+            if cycleDenom > 0.005, let startBal = cacheBigModelCycleStartBalance {
+                // 本周期口径：自最近一次充值以来已用 / 本次充值额
+                ratio = min(1, max(0, (startBal - bal) / cycleDenom))
+            } else {
+                // 首期回退：累计消耗 / 累计入账
+                ratio = min(1, max(0, (inflow - bal) / max(inflow, 0.005)))
+            }
+            cacheBigModelUsedRatio = ratio
+            _ = zhipuPulsingTracker.observe("main", ratio: ratio)
+            failedServices.remove("ZhiPu")
+            Logger.log(.refresh, "[\(seq)] ZhiPu: OK value=\(bal) inflow=\(inflow) denom=\(max(0, cycleDenom)) used=\(Int(ratio*100))% (elapsed=\(Int(Date().timeIntervalSince(t0)*1000))ms)")
+        }
+        if !result.error.isEmpty {
+            notify("ZhiPu 余额查询", result.error)
+            failedServices.insert("ZhiPu")
+            Logger.log(.refresh, "[\(seq)] ZhiPu: ERROR \(result.error)")
+        }
+        updateTitle(tag: "zhipu-\(seq)")
+    }
+
+    /// 单轮 ZhiPu 查询：解析 token（手填 > 缓存 > 浏览器采集）后请求报告接口
+    private func bigModelFetch(cfg: AppConfig, seq: Int64) async -> (balance: Double?, budget: Double, authFailed: Bool, error: String) {
+        guard let token = BigModelService.resolveToken(override: cfg.bigmodelTokenOverride), !token.isEmpty else {
+            Logger.log(.refresh, "[\(seq)] ZhiPu: no login cookie found, skipped")
+            if ownsRefresh(seq) { failedServices.remove("ZhiPu") }
+            return (nil, 0, false, "")
+        }
+        return await Logger.measure("[\(seq)] ZhiPu.fetch") {
+            await BigModelService.fetch(token: token)
+        }
     }
 
     func refreshOneWorkBuddy(_ cfg: AppConfig, seq: Int64) async {
@@ -1961,15 +2087,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         editMenuItem.submenu = editMenu
 
         NSApp.mainMenu = mainMenu
-    }
-
-    private func promptForApiKey(prefill: String = "") -> String? {
-        let dialog = InputDialog(title: "请输入 DeepSeek API Key",
-                                 info: "在下方粘贴或输入你的 API Key：\n获取地址：",
-                                 linkText: "platform.deepseek.com/api_keys",
-                                 linkURL: URL(string: "https://platform.deepseek.com/api_keys")!,
-                                 prefill: prefill, icon: makeDsBrandIcon())
-        return dialog.present()
     }
 
     // MARK: - Cockpit

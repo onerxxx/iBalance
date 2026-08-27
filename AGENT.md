@@ -3,11 +3,16 @@
 本文件面向在本仓库中工作的 AI Agent / 开发者，介绍项目结构、构建流程与关键注意事项。
 （2026-08-20 更新：根目录 `config.json` 已移除，用户配置唯一权威来源为 `~/Library/Application Support/com.local.ibalance/`；2026-08-19 千问平台已下线，ZCode / Codex 已接入，配置迁移 Application Support，签名证书已重建。）
 
+## ⚠️ Agent 工作流铁律
+
+- **每次改完 Swift 代码必须编译并重启 App**：`cd swift && ./build.sh` 一条命令完成（编译 + 打包 + 签名 + 自动停旧进程并重启）。仅 `swiftc -typecheck` 通过不算交付——改动要重启后才能在真实 App 里验证与观感确认。
+
 ## 项目概述
 
 **iBalance** 是一个 macOS 菜单栏常驻应用（NSStatusItem），用于在菜单栏实时显示多个 AI 服务的余额 / 额度：
 
 - **DeepSeek**：API 余额查询（`api.deepseek.com/user/balance`），「DeepSeek 设置」弹窗一次性配置 API Key 与「常用充值额度」（`deepseek_common_quota`），设置后在面板显示用量进度
+- **Zhipu**（智谱 BigModel）：自动解密浏览器 Edge/Chrome 系 Cookies 登录态（`bigmodel_token_production` JWT，v10 解密后跳过 App-Bound 32 字节填充——复刻已下线千问 edgeTicket 方案），调财务报告接口查可用余额；手填 token 可覆盖自动采集
 - **WorkBuddy**：直接调用 CodeBuddy API 查询当前账号剩余额度，支持**多账号卡片、多号签到、OAuth 账号采集、token 自动刷新与多号切换**（切换 = 写 WorkBuddy 认证文件 + 杀进程重启）
 - **TRAE 积分**：读取 TRAE SOLO CN 本地 storage.json，自定义 byteCrypto 解密 token 后查询积分，支持**多账号采集 / 切换（写回 storage.json + 杀进程重启 TRAE）与自动签到**
 - **ZCode**（智谱 Coding Plan）：读取本机 `~/.zcode/v2/config.json` 的 JWT 查询额度百分比与重置倒计时，支持**JSON 导入多账号、多号切换**（写凭据文件 + 杀进程重启 ZCode）
@@ -37,7 +42,7 @@
 │                            #   native-segmented-control-guide.md、iBalance-已损坏说明.html 等）
 ├── swift/
 │   ├── main.swift           # 入口 + AppDelegate（菜单栏 UI / 定时器 / 刷新与菜单编排，~2200 行）
-│   ├── Panel.swift          # 详情面板：快照类型 + BalancePanelView 主体（存储属性/字体/数据更新）+ VC（~1850 行）
+│   ├── Panel.swift          # 详情面板：快照类型 + BalancePanelView 主体（存储属性/字体/数据更新）+ VC（~1650 行）
 │   ├── Dialogs.swift        # 弹窗统一封装：DialogShell / InputDialog / 各业务弹窗（~640 行）
 │   ├── CheckinManager.swift # 签到域（AppDelegate 扩展）：错峰自动签到 / 手动签到 / 签到历史 / 定时器（~820 行）
 │   ├── AccountSwitcher.swift# 多账号采集与切换（AppDelegate 扩展）：WB OAuth / TRAE·Codex·ZCode 导入 / performAccountSwitch（~380 行）
@@ -51,8 +56,10 @@
 │   ├── Crypto.swift         # SHA-512 / AES-CBC / PBKDF2
 │   ├── Logger.swift         # 统一日志（取代各 Service 私有 appendLog）
 │   ├── ProcessUtil.swift    # Electron 应用切号共用进程工具（找主进程/温和杀/强杀/等待退出）
+│   ├── RollingNumberView.swift # 余额数值「里程表」逐位滚动视图（数字轮独立 tween 自驱动）
 │   ├── Services/
 │   │   ├── DeepSeek.swift   # DeepSeek 余额查询
+│   │   ├── BigModelService.swift # Zhipu 余额查询（浏览器 Cookie 采集）
 │   │   ├── WorkBuddy.swift  # CodeBuddy 积分 + 多号签到 + OAuth + token 刷新 + 多号切换（写认证文件 + 重启）
 │   │   ├── Trae.swift       # TRAE 积分解密查询 + 多账号采集/切换 + 签到 + 设备指纹请求头
 │   │   ├── Zcode.swift      # ZCode 额度查询 + JSON 导入 + 多号切换（写凭据 + 重启）
@@ -124,6 +131,7 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | 字段                                                        | 说明                                                                        |
 | --------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `deepseek_api_key`                                        | DeepSeek API Key（sk-...），为空则菜单/面板引导输入                                  |
+| `bigmodel_refresh_enabled` / `bigmodel_token_override`    | Zhipu 刷新开关 / 手填 token 覆盖（空 = 自动扫浏览器 Cookies 解密）                 |
 | `deepseek_common_quota`                                   | DeepSeek 常用充值额度（元，0=未设置不显示），设置后面板显示用量进度                     |
 | `refresh_interval`                                        | 刷新间隔（秒），默认 300；面板/菜单「刷新时间」可选 1/3/5 分钟                                |
 | `workbuddy_decimals` / `trae_decimals`                    | 对应服务菜单栏显示的小数位（旧版统一 `decimals` 字段读取时兼容）                                  |
@@ -147,7 +155,8 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | 文件                                | 职责                                                                 |
 | ---------------------------------- | ------------------------------------------------------------------ |
 | `main.swift`                       | `@NSApplicationMain` 入口 + `@MainActor AppDelegate`：菜单栏 UI、面板生命周期、菜单构建与回调、刷新定时器与四服务并行刷新、`PanelSnapshot` 组装、标题位图渲染、通用工具（DateFormatter / 通知） |
-| `Panel.swift`                      | 详情面板主体：`PanelSnapshot` / `AccountCardSnapshot` 快照类型、`Motion` / `Palette` 设计 token、字体 provider、`BalancePanelView` 类体（回调 / 存储属性 / 字体策略 / 数据更新 / 多号卡片通用实现）、`BalancePanelViewController` |
+| `Panel.swift`                      | 详情面板主体：`PanelSnapshot` / `AccountCardSnapshot` 快照类型、`Motion` / `Palette` 设计 token、字体 provider、`BalancePanelView` 类体（回调 / 存储属性 / 字体策略 / 数据更新 / 多号卡片通用实现）、`BalancePanelViewController`、`NumberRollAnimator`（2026-08-27 起仅保留数值文本解析 parse；滚动驱动已移交 RollingNumberView 自驱） |
+| `RollingNumberView.swift`          | 余额数值逐位滚动视图（2026-08-27 重构为自驱动）：`DigitWheelView` 数字轮（12 格预渲染条带图层，每帧仅合成器平移零重绘）+ `TextSlotView` 静态字符槽 + 右对齐槽位排版（非等宽字体按真实 advance 连续插值）。终值一次下发 `setText(animated:rollDuration:)`，各轮独立 tween 到自己的目标数字后停下（异步落定，行进 d 格耗时 = rollDuration × d/10，实例级 ±6% 相位抖动打破同距同步）；displayLink 在面板隐藏时冻结挂起、回窗口续滚 |
 | `Dialogs.swift`                    | 弹窗统一封装（自 main.swift 拆出）：`DialogShell` 布局系统、`InputDialog`、DeepSeek 设置、平台自动化开关等业务弹窗 |
 | `CheckinManager.swift`             | 签到域（AppDelegate 扩展）：WB/TRAE 错峰自动签到（60s 轮询 + 每号随机就绪时刻）、手动签到编排、签到结果/历史弹窗、签到定时器、`CheckinRecord` 落库 |
 | `AccountSwitcher.swift`            | 多账号采集与切换（AppDelegate 扩展）：WB OAuth 采集与轮询、TRAE storage 采集、Codex/ZCode JSON 导入、`performAccountSwitch` 统一切号编排 + 四平台切号入口 |

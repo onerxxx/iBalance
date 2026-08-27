@@ -140,6 +140,9 @@ struct AppConfig: Codable {
     var traeDecimals: Int = 0
     /// 各平台独立刷新开关。WorkBuddy 沿用历史字段 workbuddyEnabled，保持旧配置兼容。
     var deepseekRefreshEnabled: Bool = true
+    /// ZhiPu（智谱 BigModel）余额：各平台独立刷新开关 + 手填 token 覆盖（空 = 自动从浏览器 Cookies 解密）
+    var bigmodelRefreshEnabled: Bool = true
+    var bigmodelTokenOverride: String = ""
     var traeRefreshEnabled: Bool = true
     var zcodeRefreshEnabled: Bool = true
     var codexRefreshEnabled: Bool = true
@@ -193,6 +196,8 @@ struct AppConfig: Codable {
         case traeStoragePath = "trae_storage_path"
         case traeDecimals = "trae_decimals"
         case deepseekRefreshEnabled = "deepseek_refresh_enabled"
+        case bigmodelRefreshEnabled = "bigmodel_refresh_enabled"
+        case bigmodelTokenOverride = "bigmodel_token_override"
         case traeRefreshEnabled = "trae_refresh_enabled"
         case zcodeRefreshEnabled = "zcode_refresh_enabled"
         case codexRefreshEnabled = "codex_refresh_enabled"
@@ -239,6 +244,8 @@ struct AppConfig: Codable {
         traeStoragePath = try c.decodeIfPresent(String.self, forKey: .traeStoragePath) ?? ""
         traeDecimals = try c.decodeIfPresent(Int.self, forKey: .traeDecimals) ?? 0
         deepseekRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .deepseekRefreshEnabled) ?? true
+        bigmodelRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .bigmodelRefreshEnabled) ?? true
+        bigmodelTokenOverride = try c.decodeIfPresent(String.self, forKey: .bigmodelTokenOverride) ?? ""
         traeRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .traeRefreshEnabled) ?? true
         zcodeRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .zcodeRefreshEnabled) ?? true
         codexRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .codexRefreshEnabled) ?? true
@@ -459,6 +466,14 @@ struct BalanceCache: Codable {
 
     var ds: DsAmount?
     var wb: WbAmount?
+    /// ZhiPu（智谱 BigModel）可用余额（元）
+    var bigmodel: Double?
+    /// ZhiPu 点阵已用比：本充值周期口径（-1 = 无数据/未初始化）
+    var bigmodelUsedRatio: Double = -1
+    /// 周期锚点（重启后延续同一周期）：上次见到的累计入账、周期开始时的（入账、余额）
+    var bigmodelInflow: Double?
+    var bigmodelCycleStartInflow: Double?
+    var bigmodelCycleStartBalance: Double?
     var wbAccounts: [String: WbAmount] = [:]
     var traeAccounts: [String: TraeAmount] = [:]
     var zcodeAccounts: [String: ZcodeAmount] = [:]
@@ -569,7 +584,10 @@ enum UsageStore {
         AppDataStore.secureWrite(out, to: AppDataStore.usageURL)
     }
 
-    /// 记录一次观测：跨天/跨周重置基线为当前值；充值（余额型）或重置（已用型）时校准基线，保证用量 ≥ 0。
+    /// 记录一次观测：跨天/跨周重置基线为当前值。
+    /// 充值（余额型上升）或重置（已用型下降）时不重置用量：检测到与上次观测相比
+    /// 的反向跳变 J，将日/周基线与小时窗内样本同步平移 J，差值序列保持「仅反映消耗」
+    /// （今日/本周累计不归零，趋势图快照与近 1 小时列均连续）。
     static func observe(platform: String, uid: String, value: Double, increasing: Bool) {
         let key = "\(platform):\(uid)"
         let now = Date()
@@ -577,24 +595,47 @@ enum UsageStore {
         let wk = weekKey(for: now)
         var e = memory.entries[key] ?? UsageBaselines.Entry(dayKey: dk, dayBase: value, weekKey: wk, weekBase: value)
         var changed = memory.entries[key] == nil
+
+        // 反向跳变检测：余额型（值升高）或已用型（值回落）超过阈值视为充值/重置事件。
+        // 优先用上一观测点对比（覆盖同一刷新周期内多次小额充值的合成）；无样本（旧数据迁移）退回与当日基线比。
+        var carry: Double = 0
+        if let lastVal = e.samples.last?.value {
+            carry = increasing ? lastVal - value : value - lastVal
+        } else if e.dayKey == dk {
+            carry = increasing ? e.dayBase - value : value - e.dayBase
+        }
+        if carry <= 0.01 { carry = 0 }
+
         if e.dayKey != dk {
             e.dayKey = dk
             e.dayBase = value
             changed = true
-        } else {
-            let todayUsage = increasing ? max(0, value - e.dayBase) : max(0, e.dayBase - value)
-            if todayUsage > (e.dailyUsage[dk] ?? 0) {
-                e.dailyUsage[dk] = todayUsage
-                changed = true
-            }
-            // 余额充值/额度重置时校准基线，但保留当天已经记录过的最大用量。
-            if increasing ? value < e.dayBase : value > e.dayBase {
-                e.dayBase = value
-                changed = true
-            }
+        } else if carry > 0 {
+            e.dayBase += carry
+            changed = true
         }
-        if e.weekKey != wk { e.weekKey = wk; e.weekBase = value; changed = true }
-        else if increasing ? value < e.weekBase : value > e.weekBase { e.weekBase = value; changed = true }
+        if e.weekKey != wk {
+            e.weekKey = wk
+            e.weekBase = value
+            changed = true
+        } else if carry > 0 {
+            e.weekBase += carry
+            changed = true
+        }
+        if carry > 0 {
+            // 小时窗内已有锚点同步抬升，近 1 小时差值不被充值事件清零
+            for i in e.samples.indices { e.samples[i].value += carry }
+            Logger.log(.refresh, "[Usage] \(key): 反向跳变 +\(String(format: "%.2f", carry))，基线同步平移（用量不清零）")
+        }
+
+        // 当日用量快照（趋势图）：基于平移后的基线计算，继续只计真实消耗
+        let todayUsage = e.dayKey == dk
+            ? (increasing ? max(0, value - e.dayBase) : max(0, e.dayBase - value))
+            : 0
+        if todayUsage > (e.dailyUsage[dk] ?? 0) {
+            e.dailyUsage[dk] = todayUsage
+            changed = true
+        }
         // 近 1 小时滚动窗口：每次观测追加一个点；断档超过 1 小时（休眠/长期未刷新）
         // 视为窗口重开，丢弃旧点——否则跨越空窗的差值会把 >1 小时的用量算进「近 1 小时」
         let nowTs = now.timeIntervalSince1970

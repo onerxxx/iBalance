@@ -16,6 +16,8 @@ import CoreImage
 struct PanelSnapshot: Equatable {
     /// DeepSeek 卡片数据（单元素，走多号卡片管线；uid 恒 "ds"，无昵称无签到）
     var dsAccounts: [AccountCardSnapshot] = []
+    /// ZhiPu（智谱 BigModel）卡片数据（单元素；uid 恒 "zhipu"）
+    var zhipuAccounts: [AccountCardSnapshot] = []
     /// 面板余额卡片可见性：key = 平台 ID（"ds" / "zcode" / "codex" / "trae" / "wb"），
     /// value=true 显示、false 隐藏；未记录的平台默认 true。
     var panelCardVisible: [String: Bool] = [:]
@@ -64,7 +66,7 @@ struct AccountCardSnapshot: Equatable {
     var isCurrent: Bool = false     // 是否为当前登录账号（主账号 icon 全尺寸，其余缩小）
     var pulsing: Bool = false       // 额度被消耗（usedRatio 上升）→ 最右亮点阵脉冲
     var expireText: String?         // 重置/套餐到期倒计时（Codex / ZCode 当前账号）
-    var expired: Bool = false       // Start Plan 已到期（expireText 显示"套餐已到期"红色警告）
+    var expired: Bool = false       // Start Plan 已到期（expireText 显示"套餐已到期"；2026-08-27 起颜色不再标红，与其他到期文本同用 systemGray）
     var checkinDone: Bool = false   // 今日已签到
     var checkinFailed: Bool = false // 签到失败（按 failed_date==today 口径；风控日也置 true 以显示角标）
     var checkinRisk: Bool = false   // 签到失败为风控（TRAE 返回 9074/操作太频繁）→ 角标橙黄色
@@ -92,7 +94,7 @@ enum Motion {
     static let emphasis: CFTimeInterval = 0.40
     /// 余额数字滚动（Number Rolling）：数据变化反馈类动效，非 UI 状态切换，
     /// 用户指定加长时长，不适用 0.40 硬顶
-    static let roll: CFTimeInterval = 2.0
+    static let roll: CFTimeInterval = 3.0
 
     /// 强 ease-out（等价 cubic-bezier(0.23,1,0.32,1)）：入场/反馈用，
     /// 起手快收尾长，比系统 easeOut 更有意图
@@ -286,7 +288,7 @@ func animateLayerKey(_ layer: CALayer?, keyPath: String, to value: Any?, duratio
 /// 内容超高时通过纵向滚动查看底部设置、操作和更新时间。
 final class BalancePanelViewController: NSViewController {
     private let panel: BalancePanelView
-    private let scrollView = QuietScrollView()
+    private let scrollView = NSScrollView()
     /// 底部「下方还有内容」提示层（磨砂 + 渐变 + 箭头），盖在 scrollView 之上
     private let fadeHint = ScrollFadeHint(edge: .bottom)
     /// 顶部「上方还有内容」提示层，与底缘对称
@@ -672,8 +674,6 @@ final class BalancePanelViewController: NSViewController {
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        // NSScrollView 在内容尺寸更新后可能立即显示 overlay scroller，弹出完成后再明确隐藏一次。
-        scrollView.hideScrollers()
         // 弹出动画可能调整视口尺寸，展示完成后按最终布局刷新一次提示状态
         updateFadeHint()
         // 面板关闭时不保证补发 mouseExited：打开时按光标位置同步，
@@ -701,6 +701,7 @@ final class BalancePanelViewController: NSViewController {
 /// 余额平台标识与默认顺序：面板卡片排序与菜单栏条目共用。
 enum BalancePlatform: String, CaseIterable {
     case deepSeek = "ds"
+    case bigModel = "zhipu"
     case zcode
     case codex
     case trae
@@ -749,8 +750,9 @@ final class BalancePanelView: NSView {
     var onTogglePin: (() -> Void)?
     /// 置顶状态（pin ↔ pin.fill 图标切换）
     private(set) var panelPinned = false
-    // 余额卡片点击回调：DeepSeek 打开网页，TRAE / WorkBuddy / ZCode 启动应用
+    // 余额卡片点击回调：DeepSeek/ZhiPu 打开网页，TRAE / WorkBuddy / ZCode 启动应用
     var onClickDeepSeek: (() -> Void)?
+    var onClickZhiPu: (() -> Void)?
     var onClickTrae: (() -> Void)?
     var onClickWorkBuddy: (() -> Void)?
     /// WorkBuddy 非当前账号卡片点击：传入 uid，触发切号重启
@@ -791,6 +793,10 @@ final class BalancePanelView: NSView {
     private var dsCardEntries: [CardEntry] = []
     private var dsCardUids: [String] = []
     private weak var dsCardRef: NSView?     // DeepSeek 卡片引用，各平台当前账号卡等高基准
+    // ZhiPu 单账号卡片容器（同 DeepSeek 管线，置于其后）
+    var zhipuCardsContainer: NSStackView!
+    private var zhipuCardEntries: [CardEntry] = []
+    private var zhipuCardUids: [String] = []
 
     /// 单个多号卡片的控件引用（update 时直接赋值，无需重建；WB / TRAE / ZCode 共用）。
     /// 非当前账号的 dots/checkinInfo 为占位实例（未加入视图层级，更新时跳过）。
@@ -806,7 +812,6 @@ final class BalancePanelView: NSView {
         let iconView: MenuBarFadeIconView  // 平台 icon（未上菜单栏时叠加垂直透明渐变）
         var nickKey: String = ""       // 昵称+签到状态组合缓存 key（附件重建判据）
         var lastValue: String = ""     // 上次应用的余额文本（数字滚动判据；空 = 首次赋值直接显示）
-        var roller: NumberRollAnimator?  // 数字滚动驱动器（引用类型，结构体拷贝共享同一动画）
     }
 
     /// 各平台卡片差异配置（icon / 标题 / 签到行 / 到期行 / reward 兜底）
@@ -832,6 +837,8 @@ final class BalancePanelView: NSView {
         static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 19, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "timer", menuBarIdPrefix: "zcode:")
         static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 19.45, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "timer", menuBarIdPrefix: "codex:")
         static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: nil, menuBarIdPrefix: "")
+        // ZhiPu：与 ds 同构的单账号卡（uid 恒 "zhipu" 无前缀，右键菜单 id 恰为 MenuBarPrefix.zhipu）；副标题纯文本无图标
+        static let zhipu = CardStyle(icon: "zhipu", name: "ZhiPu", platformID: "zhipu", iconSize: 19, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: nil, menuBarIdPrefix: "")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -1096,7 +1103,7 @@ final class BalancePanelView: NSView {
         if weightAnimLink == nil {
             let link = displayLink(target: self, selector: #selector(onWeightAnimTick(_:)))
             // ⚠️ 必须 add 到 RunLoop mode：否则 CADisplayLink 不派发回调，动画永不渲染
-            //（与 QuietScrollView、UsageHistoryChartView 的 displayLink 用法一致）
+            //（与 UsageHistoryChartView 的 displayLink 用法一致）
             link.add(to: .main, forMode: .common)
             weightAnimLink = link
         }
@@ -1249,6 +1256,14 @@ final class BalancePanelView: NSView {
             applyDsCardData(s.dsAccounts)
         }
 
+        // ZhiPu 卡片：同 DeepSeek 单账号管线（uid 恒 "zhipu"）
+        let newZhiPuUids = s.zhipuAccounts.map { $0.uid + ($0.isCurrent ? "✓" : "") }
+        if newZhiPuUids != zhipuCardUids {
+            rebuildZhiPuCards(s.zhipuAccounts)
+        } else {
+            applyZhiPuCardData(s.zhipuAccounts)
+        }
+
         // ZCode 多账号卡片：uid 或当前账号变化时重建（弱化跟随 isCurrent），否则就地更新数据
         let newZcodeUids = s.zcodeAccounts.map { $0.uid + ($0.isCurrent ? "✓" : "") }
         if newZcodeUids != zcodeCardUids {
@@ -1292,6 +1307,7 @@ final class BalancePanelView: NSView {
         //    用户从关闭→打开时若账号列表未变（不触发 rebuild），isHidden 会卡在上次的 true。
         // DS 是单卡片，永远有内容（标题+value占位），直接按配置切换。
         for pid in [BalancePlatform.deepSeek.rawValue,
+                    BalancePlatform.bigModel.rawValue,
                     BalancePlatform.zcode.rawValue,
                     BalancePlatform.codex.rawValue,
                     BalancePlatform.trae.rawValue,
@@ -1299,7 +1315,8 @@ final class BalancePanelView: NSView {
             guard let view = platformCards[pid] else { continue }
             let userWantsShow = s.panelCardVisible[pid] ?? true
             let shouldHide: Bool
-            if pid == BalancePlatform.deepSeek.rawValue {
+            // DS / ZhiPu 是单卡片，永远有内容（标题+value占位），直接按配置切换
+            if pid == BalancePlatform.deepSeek.rawValue || pid == BalancePlatform.bigModel.rawValue {
                 shouldHide = !userWantsShow
             } else {
                 // 多账号组：空容器（无卡片）即使开关打开也维持隐藏；
@@ -1619,37 +1636,11 @@ final class BalancePanelView: NSView {
         return mas
     }
 
-    /// 余额数字滚动动效（Number Rolling）：面板打开期间余额更新时，数值从旧值
-    /// 平滑滚动到新值（ease-out，时长 Motion.roll）。中间帧沿用目标值的小数位与
-    /// 千分位格式，逐帧交给 RollingNumberView——数字位车轮平滑追赶目标数字
-    ///（垂直滚动），货币符号/千分位/小数点等静态位随文本就地更新。
-    /// 覆盖格式：可选前缀（¥/$）+ 千分位数字（可选小数）+ 可选后缀（%）。
-    /// 驱动：CADisplayLink 每显示帧回调，步进用真实时间戳 dt —— 速率自动跟随
-    /// 屏幕刷新率（ProMotion 120Hz 跑 120、普通屏 60，不空转、无漂移）。
-    /// 120Hz 可行的前提：DigitWheelView 字形已缓存（滚动 draw 无分配），
-    /// 单帧成本足够低；若后续再卡，回落 60Hz 即可。
-    private final class NumberRollAnimator {
-        private weak var view: RollingNumberView?
-        private var timer: Timer?
-        private var lastTS: CFTimeInterval = 0
-        private var prefix = ""
-        private var suffix = ""
-        private var decimals = 0
-        private var start: Double = 0
-        private var end: Double = 0
-        private var duration: CFTimeInterval = Motion.roll
-        private var elapsed: CFTimeInterval = 0
-
-        /// 千分位格式化器（复用实例，每帧按 decimals 配置；仅主线程调用）
-        private static let formatter: NumberFormatter = {
-            let f = NumberFormatter()
-            f.numberStyle = .decimal
-            f.groupingSeparator = ","
-            f.decimalSeparator = "."
-            f.usesGroupingSeparator = true
-            return f
-        }()
-
+    /// 数值滚动动效：终值文本一次下发给 RollingNumberView（setText(animated:true,
+    /// rollDuration:)），各位数字轮各自独立 tween 到自己的目标数字后停下（异步落定，
+    /// 时长按行进格数从 rollDuration 预算分配）。视图自驱动 displayLink，无需外部
+    /// 计数器；本类型只保留文本解析，供「能否滚动」判据与预览格式生成使用。
+    enum NumberRollAnimator {
         /// 解析可滚动数值文本：前缀（¥/$）+ 数值 + 小数位 + 后缀（%）；不可解析返回 nil
         static func parse(_ text: String) -> (prefix: String, value: Double, decimals: Int, suffix: String)? {
             var s = text.trimmingCharacters(in: .whitespaces)
@@ -1670,140 +1661,8 @@ final class BalancePanelView: NSView {
             let decimals = parts.count == 2 ? parts[1].count : 0
             return (prefix, v, decimals, suffix)
         }
-
-        /// 启动（或接续）滚动：from/to 为旧/新余额文本。解析失败 → 直接落值不滚动。
-        func start(view: RollingNumberView, from oldValue: String, to newValue: String,
-                   duration: CFTimeInterval) {
-            guard let old = Self.parse(oldValue), let new = Self.parse(newValue) else {
-                stop()
-                view.setText(newValue, animated: false)
-                return
-            }
-            stop()
-            self.view = view
-            self.duration = duration
-            prefix = new.prefix
-            suffix = new.suffix
-            decimals = new.decimals
-            end = new.value
-            // 起点取旧值；若上一轮滚动未完成被新数据打断，从当前屏显值续滚避免跳变
-            var from = old.value
-            if let showing = Self.parse(view.currentText) {
-                from = showing.value
-            }
-            start = from
-            elapsed = 0
-            // 60Hz 计数（z 定稿基线：实测流畅稳定）。高于此的频率（120/屏刷新对齐）
-            // 均实测卡顿，不再调整。
-            let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-                self?.tick()
-            }
-            // .common：滚动期间面板处于 event tracking（如菜单/popover 交互）也不停帧
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
-            lastTS = 0
-            Logger.log(.layout, "[Roll] start uid≈\(String(newValue.suffix(8))) \(start)→\(end) dur=\(duration)")
-        }
-
-        private func tick() {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            defer {
-                Self.perfFrames += 1
-                if Self.perfFrames <= 90 {
-                    Self.perfCosts.append(CFAbsoluteTimeGetCurrent() - t0)
-                    if Self.perfFrames == 90 {
-                        let avg = Self.perfCosts.reduce(0, +) / 90
-                        let mx = Self.perfCosts.max() ?? 0
-                        Logger.log(.layout, String(format: "[RollPerf] animatorTick 90帧: 回调avg=%.2fms max=%.2fms", avg * 1000, mx * 1000))
-                    }
-                }
-            }
-            guard let view else { stop(); return }
-            // ⚠️ 面板不可见（popover 关闭/隐藏，view 脱离 window）时**跳过本帧**——
-            // 此前这里直接 stop + 落终值，导致预览滚动秒瞬跳（无动效根因）；
-            // 跳过则动画冻结于隐藏期，面板打开后从当前进度续滚。
-            guard view.window != nil else {
-                if Self.windowNilLogs < 5 {
-                    Self.windowNilLogs += 1
-                    Logger.log(.layout, "[RollDbg] skip: window nil (面板不可见时滚动挂起)")
-                }
-                return
-            }
-            // ⚠️ 墙钟计时（非 l.timestamp）：低刷新率屏上 display link 同帧重复回调
-            // 时间戳不变，用 timestamp 累计 elapsed 会导致动画拖不动（卡顿根因）。
-            let now = CACurrentMediaTime()
-            if lastTS == 0 { lastTS = now }
-            let dt = max(0, now - lastTS)
-            lastTS = now
-            elapsed += dt
-            let p = min(1, elapsed / duration)
-            // TODO(性能诊断): 进度里程碑（首个滚动）——验证滚动在可见时真实推进
-            if Self.milestone < 3 {
-                let thresholds: [Double] = [0.1, 0.5, 0.9]
-                if p >= thresholds[Self.milestone] {
-                    Self.milestone += 1
-                    Logger.log(.layout, String(format: "[RollDbg] 里程碑 p=%.2f text='%@'", p, prefix + formatted(end) + suffix))
-                }
-            }
-            // ease-out cubic：起手快、收尾缓，余额「落到新值」的观感
-            let eased = 1 - pow(1 - p, 3)
-            if p >= 1 {
-                stop()
-                view.setText(prefix + formatted(end) + suffix, animated: false)
-                return
-            }
-            let v = start + (end - start) * eased
-            // TODO(性能诊断): 前 10 帧逐步文本（判断动画是否产出中间帧/是否触发重建）
-            if Self.logCount < 10 {
-                Self.logCount += 1
-                Logger.log(.layout, "[RollDbg] cb#\(Self.logCount) p=\(String(format: "%.3f", p)) text='\(prefix + formatted(v) + suffix)'")
-            }
-            view.setText(prefix + formatted(v) + suffix, animated: true)
-        }
-
-        private func formatted(_ v: Double) -> String {
-            // 快路径：整数千分位 + 固定小数位（NumberFormatter 每帧调用开销大，
-            // 是滚动动画的主线程大头之一；见 Apple「keep display link callbacks short」）
-            let scale = pow(10.0, Double(decimals))
-            var scaled = Int64((v * scale).rounded())
-            var sign = ""
-            if scaled < 0 { sign = "-"; scaled = -scaled }
-            let div = Int64(scale)
-            let intPart = scaled / div
-            var digits = String(intPart)
-            if digits.count > 3 {
-                var out = ""
-                var c = 0
-                for ch in digits.reversed() {
-                    out.insert(ch, at: out.startIndex)
-                    c += 1
-                    if c % 3 == 0 && c < digits.count { out.insert(",", at: out.startIndex) }
-                }
-                digits = out
-            }
-            var result = sign + digits
-            if decimals > 0 {
-                let frac = scaled % div
-                result += "." + String(format: "%0\(decimals)lld", frac)
-            }
-            return result
-        }
-
-        private func stop() {
-            timer?.invalidate()
-            timer = nil
-            lastTS = 0
-        }
-
-        deinit { stop() }
-
-        // TODO(性能诊断): 首批滚动 90 帧的耗时统计（定位卡顿来源，确认后移除）
-        private static var perfFrames = 0
-        private static var perfCosts: [CFTimeInterval] = []
-        private static var logCount = 0
-        private static var windowNilLogs = 0
-        private static var milestone = 0
     }
+
 
     /// 应用多号卡片数据：余额、昵称、点阵、签到信息、到期倒计时（重建后或就地刷新时调用）
     private func applyAccountCardData(_ accounts: [AccountCardSnapshot],
@@ -1818,19 +1677,17 @@ final class BalancePanelView: NSView {
             entries[i].lastValue = newValue
             if oldValue != newValue {
                 if valueScrollPreviewEnabled {
-                    // 数值滚动预览模式：显示由预览定时器接管（周期随机值 + 2s 滚动），
-                    // 这里只维护真实 lastValue，供关闭预览时恢复。roller 保留（预览滚动用）。
+                    // 数值滚动预览模式：显示由预览定时器接管（周期随机值 + 滚动），
+                    // 这里只维护真实 lastValue，供关闭预览时恢复。
                 } else {
                     let rollable = !oldValue.isEmpty && oldValue != "—" && newValue != "—"
                         && NumberRollAnimator.parse(oldValue) != nil
                         && NumberRollAnimator.parse(newValue) != nil
                     Logger.log(.layout, "[Roll] \(style.platformID) uid=\(ac.uid.suffix(6)) old=\(oldValue) new=\(newValue) win=\(e.valueView.window != nil) rollable=\(rollable) motion=\(!shouldReduceMotion)")
                     if rollable, !shouldReduceMotion, e.valueView.window != nil {
-                        if entries[i].roller == nil { entries[i].roller = NumberRollAnimator() }
-                        entries[i].roller?.start(view: e.valueView, from: oldValue, to: newValue,
-                                                 duration: Motion.roll)
+                        // 终值一次下发：视图自驱动，各位车轮独立 tween、异步落定
+                        e.valueView.setText(newValue, animated: true, rollDuration: Motion.roll)
                     } else {
-                        entries[i].roller = nil   // 打断未完成的滚动，直接落终值
                         e.valueView.setText(newValue, animated: false)
                     }
                 }
@@ -1853,11 +1710,11 @@ final class BalancePanelView: NSView {
             if let badgeImg = e.badgeView as? NSImageView {
                 badgeImg.contentTintColor = ac.checkinRisk ? NSColor(calibratedRed: 1, green: 0.78, blue: 0, alpha: 1) : .systemRed
             }
-            // 到期倒计时（无值时清空文本，占位保持行高稳定）；套餐已到期 → 文本与图标转红警告
+            // 到期倒计时（无值时清空文本，占位保持行高稳定）；副标题统一中性灰
+            // （2026-08-27：「套餐已到期」取消红色警告，与其他到期文本一致用 systemGray）
             e.infoLabel?.stringValue = ac.expireText ?? ""
-            let expireColor: NSColor = ac.expired ? .systemRed : .systemGray
-            e.infoLabel?.textColor = expireColor
-            e.expireIcon?.contentTintColor = expireColor
+            e.infoLabel?.textColor = .systemGray
+            e.expireIcon?.contentTintColor = .systemGray
             // 未上菜单栏账号的 icon 叠加垂直透明渐变（底部 20% → 顶部 100% 可见）；
             // 右键「在菜单栏显示」切换后 syncPanel 就地开/关渐变，无需重建卡片
             e.iconView.usesMenuBarFade = !ac.inMenuBar
@@ -1890,6 +1747,16 @@ final class BalancePanelView: NSView {
     }
     private func applyDsCardData(_ accounts: [AccountCardSnapshot]) {
         applyAccountCardData(accounts, entries: &dsCardEntries, style: .ds)
+    }
+
+    private func rebuildZhiPuCards(_ accounts: [AccountCardSnapshot]) {
+        rebuildAccountCards(accounts, style: .zhipu, container: zhipuCardsContainer,
+                            entries: &zhipuCardEntries, uids: &zhipuCardUids,
+                            onCurrentClick: { [weak self] in self?.onClickZhiPu?() },
+                            onSwitch: nil)
+    }
+    private func applyZhiPuCardData(_ accounts: [AccountCardSnapshot]) {
+        applyAccountCardData(accounts, entries: &zhipuCardEntries, style: .zhipu)
     }
 
     private func rebuildZcodeCards(_ accounts: [AccountCardSnapshot]) {
@@ -2006,9 +1873,6 @@ final class BalancePanelView: NSView {
 
     private var valuePreviewTimer: Timer?
 
-    /// 预览滚动动画器（key = 视图标识；CardEntry 是结构体，不能原地改 roller 字段）
-    private var previewRollers: [ObjectIdentifier: NumberRollAnimator] = [:]
-
     /// 与配置同步（幂等）：开启后周期随机变动各卡片余额数值（保持与真实数值相同的
     /// 前缀/后缀/小数位/整数位数 → 结构不变，逐位垂直滚动）；关闭后恢复真实数值
     /// （lastValue 始终由 applyAccountCardData 维护真实值）。
@@ -2025,7 +1889,6 @@ final class BalancePanelView: NSView {
         } else {
             valuePreviewTimer?.invalidate()
             valuePreviewTimer = nil
-            previewRollers = [:]   // 释放动画器 → 定时器停止
             for e in allCardEntries() {
                 e.valueView.setText(e.lastValue, animated: false)   // 恢复真实数值
             }
@@ -2039,14 +1902,11 @@ final class BalancePanelView: NSView {
 
     /// 预览节拍：按每张卡片真实数值的格式（前缀/后缀/小数位/整数位数）生成
     /// 随机新值，结构一致 → 数字位逐位滚动。
-    /// 与真实刷新同路径：走 NumberRollAnimator（2.0s ease-out 计数），
-    /// 预览节奏与真实滚动完全一致（直接 setText 只有 ~0.3s 车轮追位，观感偏快）。
-    /// 当前一轮未滚完被新预览值打断时，动画器从屏显值续滚，天然衔接。
+    /// 与真实刷新同路径：终值一次下发 + rollDuration 预算（Motion.roll），
+    /// 各位车轮独立 tween、异步落定，预览节奏与真实滚动完全一致。
+    /// 当前一轮未滚完被新预览值打断时，各位车轮从当前位置重新规划 tween，天然衔接。
     private func previewTick() {
         guard valuePreviewTimer != nil || valueScrollPreviewEnabled else { return }
-        // 卡片重建后清理已失效视图的动画器
-        let live = Set(allCardEntries().map { ObjectIdentifier($0.valueView) })
-        previewRollers = previewRollers.filter { live.contains($0.key) }
         for e in allCardEntries() {
             guard let parsed = NumberRollAnimator.parse(e.lastValue) else { continue }
             let intDigits = max(Self.countIntegerDigits(parsed.value), 1)
@@ -2056,12 +1916,9 @@ final class BalancePanelView: NSView {
             let v = (Double.random(in: (magnitude / 10)...magnitude) * scale).rounded() / scale
             let text = parsed.prefix + Self.previewFormat(v, decimals: parsed.decimals) + parsed.suffix
             if e.valueView.window != nil {
-                let key = ObjectIdentifier(e.valueView)
-                if previewRollers[key] == nil { previewRollers[key] = NumberRollAnimator() }
-                previewRollers[key]?.start(view: e.valueView, from: e.valueView.currentText,
-                                           to: text, duration: Motion.roll)
+                e.valueView.setText(text, animated: !shouldReduceMotion, rollDuration: Motion.roll)
             }
-            // 面板不可见：不落值不启动（动画挂起，打开后由下个节拍续播）
+            // 面板不可见：不落值不启动（打开后由下个节拍续播）
         }
     }
 
@@ -2072,7 +1929,7 @@ final class BalancePanelView: NSView {
         return Int(floor(log10(a))) + 1
     }
 
-    /// 千分位格式化（与 NumberRollAnimator.formatted 同口径）
+    /// 千分位格式化（预览随机值生成用）
     private static func previewFormat(_ v: Double, decimals: Int) -> String {
         let f = NumberFormatter()
         f.numberStyle = .decimal

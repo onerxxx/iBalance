@@ -263,15 +263,6 @@ final class DialogShell {
     }
 }
 
-/// DeepSeek 品牌图标（PNG，保持原色非 template），用于 API Key / 日常额度弹窗
-func makeDsBrandIcon() -> NSImage? {
-    guard let url = Bundle.main.url(forResource: "deepseek", withExtension: "png"),
-          let img = NSImage(contentsOf: url) else { return nil }
-    img.isTemplate = false
-    img.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
-    return img
-}
-
 /// WorkBuddy 品牌图标（PNG，保持原色非 template），用于添加账号选择弹窗
 func makeWbBrandIcon() -> NSImage? {
     guard let url = Bundle.main.url(forResource: "workbuddy", withExtension: "png"),
@@ -281,12 +272,13 @@ func makeWbBrandIcon() -> NSImage? {
     return img
 }
 
-/// DeepSeek 设置弹窗：一次性配置 API Key 和日常充值额度。
+/// DeepSeek 设置弹窗：配置 DeepSeek API Key / 日常充值额度 + ZhiPu Token 覆盖。
 @MainActor
 final class DeepSeekSettingsDialog: NSObject {
     private let apiKeyField = NSTextField()
     private let popup = NSPopUpButton()
     private let customField = NSTextField()
+    private let zhipuTokenField = NSTextField()
     private let presets: [(label: String, value: Double)] = [
         ("未设置", 0),
         ("¥10", 10),
@@ -298,7 +290,8 @@ final class DeepSeekSettingsDialog: NSObject {
     /// - Parameters:
     ///   - apiKey: 当前 DeepSeek API Key
     ///   - quota: 当前已设置的日常充值额度（0 = 未设置）
-    init(apiKey: String, quota: Double) {
+    ///   - zhipuToken: 当前 ZhiPu Token 覆盖（空 = 自动从浏览器登录态读取）
+    init(apiKey: String, quota: Double, zhipuToken: String = "") {
         super.init()
         apiKeyField.isBezeled = true
         apiKeyField.bezelStyle = .roundedBezel
@@ -309,6 +302,16 @@ final class DeepSeekSettingsDialog: NSObject {
         apiKeyField.cell?.isScrollable = true
         apiKeyField.cell?.wraps = false
         apiKeyField.lineBreakMode = .byTruncatingTail
+
+        zhipuTokenField.isBezeled = true
+        zhipuTokenField.bezelStyle = .roundedBezel
+        zhipuTokenField.isEditable = true
+        zhipuTokenField.isSelectable = true
+        zhipuTokenField.font = NSFont.systemFont(ofSize: 12)
+        zhipuTokenField.stringValue = zhipuToken
+        zhipuTokenField.cell?.isScrollable = true
+        zhipuTokenField.cell?.wraps = false
+        zhipuTokenField.lineBreakMode = .byTruncatingTail
 
         for opt in presets { popup.addItem(withTitle: opt.label) }
         popup.menu?.addItem(withTitle: "自定义", action: nil, keyEquivalent: "")
@@ -337,10 +340,14 @@ final class DeepSeekSettingsDialog: NSObject {
         }
     }
 
-    func present() -> (apiKey: String?, quota: Double)? {
+    func present() -> (apiKey: String?, quota: Double, zhipuToken: String?)? {
         let shell = DialogShell()
-        shell.addIcon(makeDsBrandIcon())
-        shell.addTitle("DeepSeek 设置")
+        if let icon = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: DialogMetrics.iconSize, weight: .regular)) {
+            icon.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
+            shell.addIcon(icon)
+        }
+        shell.addTitle("DeepSeek / ZhiPu 设置")
         let infoAttr = NSMutableAttributedString(
             string: "配置 API Key 和日常充值额度。获取 API Key：",
             attributes: [.font: NSFont.systemFont(ofSize: 12),
@@ -354,7 +361,7 @@ final class DeepSeekSettingsDialog: NSObject {
         shell.addInfo(infoAttr)
         shell.contentWidth = DialogMetrics.inputWidth
 
-        // 两行设置共用一个 accessory 容器：文本在上、控件在下，统一左对齐。
+        // 三行设置共用一个 accessory 容器：文本在上、控件在下，统一左对齐。
         let rowWidth = shell.contentWidth - DialogMetrics.sidePadding * 2
         let labelHeight: CGFloat = 18
         let controlHeight: CGFloat = 28
@@ -363,14 +370,16 @@ final class DeepSeekSettingsDialog: NSObject {
         let rowGap: CGFloat = 10
         let content = NSView(frame: NSRect(x: 0, y: 0,
                                            width: rowWidth,
-                                           height: rowHeight * 2 + rowGap))
+                                           height: rowHeight * 3 + rowGap * 2))
+        // 每行结构同构（label 在上偏 +32，控件在下），自底向上逐行叠放：
+        // ZhiPu Token（底）→ 日常额度（中）→ API Key（顶）
         let keyLabel = NSTextField(labelWithString: "API Key")
         keyLabel.font = NSFont.systemFont(ofSize: 12)
         keyLabel.textColor = NSColor.labelColor
         keyLabel.alignment = .left
-        keyLabel.frame = NSRect(x: 0, y: rowHeight + rowGap + controlHeight + labelControlGap,
+        keyLabel.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2 + controlHeight + labelControlGap,
                                 width: rowWidth, height: labelHeight)
-        apiKeyField.frame = NSRect(x: 0, y: rowHeight + rowGap,
+        apiKeyField.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2,
                                    width: rowWidth, height: controlHeight)
         content.addSubview(keyLabel)
         content.addSubview(apiKeyField)
@@ -379,16 +388,27 @@ final class DeepSeekSettingsDialog: NSObject {
         quotaLabel.font = NSFont.systemFont(ofSize: 12)
         quotaLabel.textColor = NSColor.labelColor
         quotaLabel.alignment = .left
-        quotaLabel.frame = NSRect(x: 0, y: controlHeight + labelControlGap,
+        quotaLabel.frame = NSRect(x: 0, y: rowHeight + rowGap + controlHeight + labelControlGap,
                                   width: rowWidth, height: labelHeight)
         let popupWidth: CGFloat = 110
-        popup.frame = NSRect(x: 0, y: 0, width: popupWidth, height: controlHeight)
-        customField.frame = NSRect(x: popupWidth + 8, y: 2,
+        popup.frame = NSRect(x: 0, y: rowHeight + rowGap, width: popupWidth, height: controlHeight)
+        customField.frame = NSRect(x: popupWidth + 8, y: rowHeight + rowGap + 2,
                                    width: rowWidth - popupWidth - 8,
                                    height: 24)
         content.addSubview(quotaLabel)
         content.addSubview(popup)
         content.addSubview(customField)
+
+        let zpLabel = NSTextField(labelWithString: "ZhiPu Token（空 = 自动读取浏览器登录态）")
+        zpLabel.font = NSFont.systemFont(ofSize: 12)
+        zpLabel.textColor = NSColor.labelColor
+        zpLabel.alignment = .left
+        zpLabel.frame = NSRect(x: 0, y: controlHeight + labelControlGap,
+                               width: rowWidth, height: labelHeight)
+        zhipuTokenField.frame = NSRect(x: 0, y: 0,
+                                       width: rowWidth, height: controlHeight)
+        content.addSubview(zpLabel)
+        content.addSubview(zhipuTokenField)
         shell.addContent(content, height: content.frame.height)
         shell.firstResponder = apiKeyField
 
@@ -399,12 +419,13 @@ final class DeepSeekSettingsDialog: NSObject {
         guard clicked == save else { return nil }
 
         let apiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let zpRaw = zhipuTokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if let customVal = Double(customField.stringValue.trimmingCharacters(in: .whitespaces)), customVal > 0 {
-            return (apiKey.isEmpty ? nil : apiKey, customVal)
+            return (apiKey.isEmpty ? nil : apiKey, customVal, zpRaw.isEmpty ? nil : zpRaw)
         }
         let idx = popup.indexOfSelectedItem
         let quota = idx < presets.count ? presets[idx].value : 0
-        return (apiKey.isEmpty ? nil : apiKey, quota)
+        return (apiKey.isEmpty ? nil : apiKey, quota, zpRaw.isEmpty ? nil : zpRaw)
     }
 }
 
@@ -442,6 +463,13 @@ final class PlatformAutomationSettingsDialog: NSObject {
                                    isOn: config.panelCardVisible["ds"] ?? true),
                 usage: makeCheckbox(label: "DeepSeek 用量显示",
                                     isOn: config.panelUsageVisible["ds"] ?? true)),
+            Row(name: "ZhiPu", platformID: "zhipu",
+                refresh: makeCheckbox(label: "ZhiPu 刷新", isOn: config.bigmodelRefreshEnabled),
+                checkin: nil,
+                card: makeCheckbox(label: "ZhiPu 卡片显示",
+                                   isOn: config.panelCardVisible["zhipu"] ?? true),
+                usage: makeCheckbox(label: "ZhiPu 用量显示",
+                                    isOn: config.panelUsageVisible["zhipu"] ?? true)),
             Row(name: "WorkBuddy", platformID: "wb",
                 refresh: makeCheckbox(label: "WorkBuddy 刷新", isOn: config.workbuddyEnabled),
                 checkin: makeCheckbox(label: "WorkBuddy 自动签到", isOn: config.workbuddyAutoCheckin),
@@ -548,12 +576,13 @@ final class PlatformAutomationSettingsDialog: NSObject {
 
         var updatedConfig = initialConfig
         updatedConfig.deepseekRefreshEnabled = rows[0].refresh.state == .on
-        updatedConfig.workbuddyEnabled = rows[1].refresh.state == .on
-        updatedConfig.workbuddyAutoCheckin = rows[1].checkin?.state == .on
-        updatedConfig.traeRefreshEnabled = rows[2].refresh.state == .on
-        updatedConfig.traeAutoCheckin = rows[2].checkin?.state == .on
-        updatedConfig.zcodeRefreshEnabled = rows[3].refresh.state == .on
-        updatedConfig.codexRefreshEnabled = rows[4].refresh.state == .on
+        updatedConfig.bigmodelRefreshEnabled = rows[1].refresh.state == .on
+        updatedConfig.workbuddyEnabled = rows[2].refresh.state == .on
+        updatedConfig.workbuddyAutoCheckin = rows[2].checkin?.state == .on
+        updatedConfig.traeRefreshEnabled = rows[3].refresh.state == .on
+        updatedConfig.traeAutoCheckin = rows[3].checkin?.state == .on
+        updatedConfig.zcodeRefreshEnabled = rows[4].refresh.state == .on
+        updatedConfig.codexRefreshEnabled = rows[5].refresh.state == .on
         for row in rows {
             updatedConfig.panelCardVisible[row.platformID] = (row.card.state == .on)
             updatedConfig.panelUsageVisible[row.platformID] = (row.usage.state == .on)

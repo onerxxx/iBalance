@@ -13,7 +13,7 @@
 //     消除逐槽取整累积出的额外字距（实测 "1,234.56" Inter 13pt：精确 54.5pt vs 逐槽 ceil 60pt）；
 //   - 数字位槽宽 = **当前显示数字的真实 advance**（非 tabular 统一位宽）：
 //     比例数字字体（Inter 默认数字 "1"=5.5 vs "0"=8.58）下静止排版与单 label 完全一致；
-//     滚动时槽宽与车轮位置**同参数指数趋近**目标数字的 advance——右缘固定、
+//     滚动时槽宽由车轮的连续滚动位置推导（与滚动同参数插值）——右缘固定、
 //     左缘随宽度变化平移，非等宽字体滚动自然不抖不跳；等宽/monospacedDigit 字体下
 //     各数字 advance 相等，槽宽恒定，行为与 tabular 方案零差异；
 //   - 数字轮 cell 字形贴槽左（kern=0 自然定位），右对齐时数值右边缘 =
@@ -24,10 +24,15 @@
 // 垂直对齐口径：货币前缀小字与主数字**基线对齐**——静态槽高度 = 自身字体行高，
 //   y = 主字体 ascender − 前缀 ascender（label 无论贴顶/垂直居中，高度=自身行高时两者等价）。
 //
-// 与 NumberRollAnimator（Panel.swift）配合：animator 每 60fps 产出格式化中间值文本，
-// 本视图结构不变时就地更新各位车轮目标（位置 + 槽宽）；车轮用「帧率无关指数趋近」
-// 平滑追赶，天然支持中途改目标续滚。滚动期间每帧重排 slots（数字右缘固定、
-// 左缘随槽宽插值平移——比例数字字体下的自然滚动观感）。
+// 动画模型（自驱动）：终值文本一次下发（setText(animated: true, rollDuration:)），
+// 每个数字轮拿自己的最终目标数字，各自跑一段独立 tween：行进 d 格耗时
+// = rollDuration × d/10 —— 全体车轮共享同一角速度，最长 10 格的行程恰好占满
+// rollDuration 预算；行进距离不同的位到达时刻天然错开（异步落定，里程表观感：
+// 各轮转到自己的数字就停，不等别的轮）。每轮再有 ±6% 确定性相位抖动，
+// 打破「行进距离恰好相同」的车轮之间的同步。
+// 中途改目标（新数据打断未完的滚动）时，从所在的连续位置重新规划 tween，天然续接。
+// 滚动期间每帧重排 slots（数字右缘固定、左缘随槽宽插值平移——比例数字字体下的
+// 自然滚动观感）。面板不可见时冻结进度并挂起 ticker，回窗口后续滚。
 // 位数变化（如 99.9 → 100.1 跨位数）时结构不匹配 → 整组重建直接落值（单帧，可接受）。
 
 import Cocoa
@@ -143,12 +148,12 @@ final class DigitWheelView: NSView {
         applyStripOrigin()
     }
 
-    /// 设置目标数字。animated=false 直接落位（含槽宽）；true 只更新目标
-    /// （位置与槽宽），由外部 ticker 调 advance() 平滑滚动。
+    /// 设置目标数字。animated=false 直接落位（含槽宽）；true 从当前连续位置向
+    /// 目标做一段独立 tween（时长由 rollDuration 按行进格数分配），到点精确停在目标位。
     /// 目标位置在环绕缓冲区内取「距当前位置最近」的等价位置（如 9→0 走 1 格而不是 9 格）。
     /// 只允许 [0, 10] 内的等价位置：顶部缓冲 -1 处 strip 完全不覆盖窗口（渲染空白），
     /// 0→9 改走正面长滚（9 格），9→0 仍走 1 格底缓冲（10）。
-    func setDigit(_ d: Int, animated: Bool) {
+    func setDigit(_ d: Int, animated: Bool, rollDuration: CFTimeInterval = 0.9) {
         let db = Double(d)
         var best = db
         var bestDist = abs(db - pos)
@@ -161,38 +166,64 @@ final class DigitWheelView: NSView {
         }
         if animated {
             targetPos = best
+            beginTween(to: best, rollDuration: rollDuration)
         } else {
             pos = best
             targetPos = best
+            tweenDuration = 0   // 使任何进行中的 tween 失效
             currentWidth = widthForPosition(pos)
             applyStripOrigin()
         }
     }
 
-    /// 帧推进：动画只驱动一个东西——连续的滚动位置。
-    /// 槽宽永远由这个位置推导出来，因此不会出现“位置已经到 8，宽度还在追 8”
-    /// 这种两套状态短暂不同步的问题。
-    /// 每帧只改 strip 图层位置（合成器平移），无任何主线程重绘。
+    /// 规划一段 tween：从当前位置出发到 dest，行进 d 格耗时 = rollDuration × d/10。
+    /// 全体车轮共享同一角速度 → 最长 10 格的车轮恰好占满 rollDuration；
+    /// 行进距离不同的位到达时刻天然错开。±6% 确定性相位抖动消除「同距离
+    /// 车轮完美同步」的机械感。同一格距重复触发（0 格）时 tween 时长为 0 →
+    /// advance 首帧即落定，不产生无谓滚动。
+    private func beginTween(to dest: Double, rollDuration: CFTimeInterval) {
+        tweenStart = pos
+        tweenElapsed = 0
+        let cells = abs(dest - pos)
+        let phase = 0.94 + 0.12 * tweenPhase   // 0.94…1.06，实例级恒定
+        tweenDuration = rollDuration * cells / 10 * phase
+    }
+
+    /// 实例固定相位 0..<1（确定性伪随机：同距离车轮因各自的相位而错峰落定；
+    /// 对单个轮子在其生命周期内恒定，重启 App 变化与否无感知影响）
+    private lazy var tweenPhase: Double = {
+        let m = ObjectIdentifier(self).hashValue.magnitude
+        return Double(m % 997) / 997.0
+    }()
+
+    /// 帧推进：沿本段 tween 时间轴积分（ease-out cubic：起手快、收尾稳，
+    /// 与全 App 动效语言一致），到点后精确落在目标位置——时间轴模型没有
+    /// 指数尾巴，天然不存在亚像素爬行的逐帧微抖。
+    /// 槽宽永远由连续位置推导（单一状态源），每帧只改 strip 图层位置，
+    /// 无任何主线程重绘。返回是否仍在滚动。
     func advance(dt: CFTimeInterval) -> Bool {
-        let diff = targetPos - pos
-        // 落定阈值 0.03 格（16pt 格 ≈ 0.5pt = 一像素）：指数尾巴的亚像素爬行
-        // 会表现为逐像素微跳（视觉抖动），小于一像素直接落定则干净利落。
-        if abs(diff) < 0.03 {
-            pos = targetPos
+        guard tweenDuration > 0 else { return false }   // 无进行中的 tween：已落定
+        tweenElapsed += dt
+        let p = min(1, tweenElapsed / tweenDuration)
+        let eased = 1 - pow(1 - p, 3)
+        pos = tweenStart + (targetPos - tweenStart) * eased
+        currentWidth = widthForPosition(pos)
+        applyStripOrigin()
+        if p >= 1 {
+            pos = targetPos            // 精确落点
             normalize()
+            tweenDuration = 0
             currentWidth = widthForPosition(pos)
             applyStripOrigin()
             return false
         }
-
-        // 追赶时间常数 50ms：车轮贴车跟随 eased 计数（快起慢收）。
-        // 原 80ms 会阻尼起步相位（目标先动、车轮滞后掉头），视觉上无快起感。
-        let alpha = 1 - exp(-max(0, dt) / 0.05)
-        pos += diff * alpha
-        currentWidth = widthForPosition(pos)
-        applyStripOrigin()
         return true
     }
+
+    // —— 独立 tween 状态（每位车轮自己的时间轴；不共享任何全局缓动参数）——
+    private var tweenStart: Double = 0          // 本段动画起点（连续位置）
+    private var tweenElapsed: CFTimeInterval = 0
+    private var tweenDuration: CFTimeInterval = 0   // 0 = 无动画（已落定）
 
     /// 根据连续位置计算当前槽宽。
     /// 例如 1→8 的中间态，宽度在 advance(1) 与 advance(8) 之间连续插值。
@@ -373,9 +404,11 @@ final class RollingNumberView: NSView {
         invalidateIntrinsicContentSize()
     }
 
-    /// 设置数值文本。结构不变（数字位/静态位一一对应）→ 就地滚动各位数字；
+    /// 设置数值文本。结构不变（数字位/静态位一一对应）→ 终值一次下发，各位数字
+    /// 轮独立滚动到自己的目标数字后停下（异步落定）；
     /// 结构变化（位数增减、— ↔ 数值等）→ 整组重建直接落值。
-    func setText(_ text: String, animated: Bool) {
+    /// rollDuration：本次滚动的时长预算（由最远行程的车轮占满），仅 animated=true 时生效。
+    func setText(_ text: String, animated: Bool, rollDuration: CFTimeInterval = 0.9) {
         let structureChanged: Bool
         let chars = Array(text)
         let isDigit = chars.map { $0.isASCII && $0.isNumber }
@@ -383,7 +416,7 @@ final class RollingNumberView: NSView {
            zip(isDigit, slots).allSatisfy({ $0.0 == ($0.1.kind == .digit) }) {
             for (i, ch) in chars.enumerated() {
                 if isDigit[i], let w = slots[i].view as? DigitWheelView, let d = ch.wholeNumberValue {
-                    w.setDigit(d, animated: animated)
+                    w.setDigit(d, animated: animated, rollDuration: rollDuration)
                 } else if let t = slots[i].view as? TextSlotView {
                     if t.text != String(ch) {
                         t.text = String(ch)
@@ -517,6 +550,17 @@ final class RollingNumberView: NSView {
 
     private var link: CADisplayLink?
     private var lastTS: CFTimeInterval = 0
+    /// 因面板不可见而挂起（onTick 里置位；回窗口后续滚）
+    private var tickerSuspended = false
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // 面板重新可见：解冻挂起中的滚动（进度在隐藏期间未被推进）
+        if window != nil && tickerSuspended {
+            tickerSuspended = false
+            startTicker()
+        }
+    }
 
     private func startTicker() {
         if link == nil {
@@ -530,6 +574,14 @@ final class RollingNumberView: NSView {
     }
 
     @objc private func onTick(_ l: CADisplayLink) {
+        // 面板不可见（popover 关闭等）：冻结进度并挂起 ticker（复刻旧计数动画的
+        // 「隐藏期动画挂起」语义），viewDidMoveToWindow 回窗口后续滚。
+        guard window != nil else {
+            lastTS = 0
+            tickerSuspended = true
+            l.isPaused = true
+            return
+        }
         // TODO(性能诊断): 每帧回调耗时/间隔统计（限滚动前 90 帧），定位卡顿来源后移除
         let t0 = CFAbsoluteTimeGetCurrent()
         // ⚠️ 用墙钟（CACurrentMediaTime）计时：实测低刷新率屏上 display link 会在
