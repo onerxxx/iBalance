@@ -253,65 +253,11 @@ extension BalancePanelView {
         valuePreviewSwitch.action = #selector(valueScrollPreviewToggled)
         updateAutoSwitch.target = self
         updateAutoSwitch.action = #selector(updateAutoCheckToggled)
-        // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 分段控件
-        intervalSegment.target = self
-        intervalSegment.action = #selector(intervalChanged)
-        monoSegment.target = self
-        monoSegment.action = #selector(intervalChanged)
-        intervalSegment.setContentHuggingPriority(.required, for: .horizontal)
-        intervalSegment.setContentHuggingPriority(.defaultLow, for: .vertical)
-        intervalSegment.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        // 原生分段 + Mono 字符段同框显隐切换（与设置开关一致）；容器作为 segmentView，
-        // 整行点击排除整个分段区域、交给可见的那个控件处理选择。
-        // Mono 字符段容器：只负责承载控件，控件的视觉右缘直接对齐设置行尾。
-        monoSegmentBox.translatesAutoresizingMaskIntoConstraints = false
-        // 容器填满 intervalSegmentBox（占满刷新按钮后的全部剩余空间），monoSegment 四边贴满容器
-        // → mouseDown 命中区覆盖整段空白。视觉不受影响：draw 内按内容右对齐绘制（紧凑排版）。
-        // ⚠️ monoSegment 必须用 top/bottom（非 centerY）贴满：容器高度无独立约束，
-        //    靠 monoSegment 的 heightAnchor(16) 撑起；centerY 对齐会导致容器高度无解塌缩为 0，
-        //    视觉因 AppKit 不裁剪子视图而「看似正常」，但 hitTest 判定点击在 bounds 外 → 点击失效。
-        monoSegmentBox.setContentHuggingPriority(.required, for: .horizontal)
-        monoSegment.translatesAutoresizingMaskIntoConstraints = false
-        monoSegmentBox.addSubview(monoSegment)
-        NSLayoutConstraint.activate([
-            monoSegment.leadingAnchor.constraint(equalTo: monoSegmentBox.leadingAnchor),
-            monoSegment.trailingAnchor.constraint(equalTo: monoSegmentBox.trailingAnchor),
-            monoSegment.topAnchor.constraint(equalTo: monoSegmentBox.topAnchor),
-            monoSegment.bottomAnchor.constraint(equalTo: monoSegmentBox.bottomAnchor),
-            monoSegment.heightAnchor.constraint(equalToConstant: monoSegment.intrinsicContentSize.height),
-        ])
-        // overlay 容器：占满刷新按钮之后的全部剩余空间（无 stretchSpacer——spacer 会把
-        // 点击切成「整行刷新」区，控件左侧空白的点击会误触刷新）。
-        // 原生分段与 Mono 分段都在容器内 trailing 对齐，视觉位置（行尾）与 spacer 方案一致。
-        let intervalSegmentBox = NSView()
-        intervalSegmentBox.translatesAutoresizingMaskIntoConstraints = false
-        intervalSegmentBox.heightAnchor.constraint(equalToConstant:
-            max(16, intervalSegment.intrinsicContentSize.height,
-                monoSegment.intrinsicContentSize.height)).isActive = true
-        intervalSegment.translatesAutoresizingMaskIntoConstraints = false
-        intervalSegmentBox.addSubview(intervalSegment)
-        intervalSegmentBox.addSubview(monoSegmentBox)
-        NSLayoutConstraint.activate([
-            intervalSegment.trailingAnchor.constraint(equalTo: intervalSegmentBox.trailingAnchor),
-            intervalSegment.centerYAnchor.constraint(equalTo: intervalSegmentBox.centerYAnchor),
-            // Mono 字符段容器填满整个 overlay 容器，扩大命中区；
-            // 视觉由 monoSegment.draw 右对齐保证与原紧凑排版一致。
-            monoSegmentBox.leadingAnchor.constraint(equalTo: intervalSegmentBox.leadingAnchor),
-            monoSegmentBox.trailingAnchor.constraint(equalTo: intervalSegmentBox.trailingAnchor),
-            monoSegmentBox.centerYAnchor.constraint(equalTo: intervalSegmentBox.centerYAnchor),
-        ])
-        // 低拥抱优先级让容器吃掉行内全部剩余空间（替代 stretchSpacer），
-        // 高压缩阻力防止行空间紧张时容器被压窄到 114 以下。
-        intervalSegmentBox.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        intervalSegmentBox.setContentCompressionResistancePriority(.required, for: .horizontal)
-        intervalSegmentBox.setContentHuggingPriority(.defaultLow, for: .vertical)
-        intervalSegmentBox.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        // 钉死分段控件宽度（3 × 38，与 viewDidMoveToWindow 中 setWidth 一致）：
-        // NSSegmentedControl 的 intrinsic 尺寸由 cell 按系统版本计算，setWidth 在
-        // viewDidMoveToWindow 才生效、且未必被 intrinsic 采纳，行内余量会被它吃掉，
-        // 导致低压缩阻力的 label 先被压窄、文字被裁剪。显式约束不受版本/时序影响。
-        // 内边距已由 CompactSegmentedCell 收窄，38pt/段足以容纳「3分钟」@9pt（约 25pt）。
-        intervalSegment.widthAnchor.constraint(equalToConstant: 114).isActive = true
+        // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 原生下拉菜单
+        intervalPopup.target = self
+        intervalPopup.action = #selector(intervalChanged)
+        intervalPopup.setContentHuggingPriority(.required, for: .horizontal)
+        intervalPopup.setContentCompressionResistancePriority(.required, for: .horizontal)
         let intervalLabel = NSTextField(labelWithString: "刷新时间")
         intervalLabel.font = .systemFont(ofSize: 12)
         intervalLabel.textColor = Palette.cardForeground
@@ -335,10 +281,10 @@ extension BalancePanelView {
         let intervalRow = NSStackView()
         intervalRow.orientation = .horizontal
         intervalRow.distribution = .fill
+        intervalRow.alignment = .centerY
         intervalRow.spacing = 6
-        // intervalSegmentBox 占满按钮后的剩余空间（低拥抱），无 stretchSpacer：
-        // 刷新按钮仅自身区域可点（无整行点击），分段控件命中区覆盖全部空白
-        intervalRow.setViews([intervalLabel, manualRefreshBtn, intervalSegmentBox], in: .leading)
+        // spacer 吃掉按钮后的剩余空白，下拉菜单贴行尾（原生控件自身命中区即可）
+        intervalRow.setViews([intervalLabel, manualRefreshBtn, stretchSpacer(), intervalPopup], in: .leading)
 
         let settingRows = [
             intervalRow,
@@ -917,7 +863,7 @@ extension BalancePanelView {
         charSw.setContentCompressionResistancePriority(.required, for: .horizontal)
         charSw.setContentCompressionResistancePriority(.required, for: .vertical)
         // 同框容器：装载原生开关 + 字符开关（Mono 模式显隐切换）。
-        // 容器右缘贴行尾。MonoCharSwitch 与 MonoSegmentedControl 都是全自绘控件，
+        // 容器右缘贴行尾。MonoCharSwitch 是全自绘控件，
         // 把控件 trailing 直接约束到容器 trailing，即可让两者的 `]` 视觉右缘一致。
         // box 宽度固定容纳原生开关（NSSwitch .mini frame 宽约 32pt，留余量到 40）；不跟 charSw
         // intrinsic（自绘后仅 ~25pt，放不下原生开关）。
@@ -961,7 +907,7 @@ extension BalancePanelView {
         return row
     }
 
-    /// 字符化控件（MonoCharSwitch / MonoSegmentedControl）切换时的模糊→清晰过渡，
+    /// 字符化开关（MonoCharSwitch）切换时的模糊→清晰过渡，
     /// 模拟 CSS `filter: blur()` transition：入场/退场时从模糊聚焦成形，仅作用于控件自身。
     /// ⚠️ 只能用 layer.filters（作用于自身内容，macOS 有效）；
     /// backgroundFilters 在 macOS 被渲染服务端忽略（勿再尝试）。
@@ -1044,15 +990,10 @@ extension BalancePanelView {
                       to: useChar ? entry.char : entry.sw,
                       animated: animated)
         }
-        // 刷新时间分段控件：两个控件位于固定宽度 overlay 容器中，切换不触发行宽重排。
-        monoSegment.selectedSegment = intervalSegment.selectedSegment
-        crossfade(useChar ? intervalSegment : monoSegmentBox,
-                  to: useChar ? monoSegmentBox : intervalSegment,
-                  animated: animated)
-        // 切换的两组控件（原生 ↔ 字符化）都叠加模糊→清晰过渡（CSS blur 式）
+        // 切换的两组开关（原生 ↔ 字符化）都叠加模糊→清晰过渡（CSS blur 式）
         if animated {
-            playCharBlurTransition(on: switchRows.map { $0.char } + [monoSegment])
-            playCharBlurTransition(on: switchRows.map { $0.sw } + [intervalSegment])
+            playCharBlurTransition(on: switchRows.map { $0.char })
+            playCharBlurTransition(on: switchRows.map { $0.sw })
         }
     }
 

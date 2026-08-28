@@ -235,23 +235,25 @@ enum Palette {
     static let containerTintLightBottom = NSColor.white.withAlphaComponent(0)
 
     /// 主面板容器背景配色（单一事实源）：applyGradient 与各子弹窗（Token/用量）兜底共用。
-    /// 渐变开 = 深色主题：顶部全透明 → 底部深灰（containerTint）；
-    ///          浅色主题：顶部亮白 → 底部全透明（containerTintLight 两端）；
+    /// 渐变开：深色遮罩（加深黑）= 顶部全透明 → 底部近黑（containerTint 系）；
+    /// 浅色遮罩（提亮白）= 顶部亮白 → 底部全透明（containerTintLight 两端）。
+    /// lightTint 由调用方按「浅色主题开关开或生效外观为浅色」传入——遮罩明暗跟随系统深浅色。
     /// 关 = 无任何遮罩（top/bottom 均 nil，露出原生 Liquid Glass 毛玻璃）。
     /// top/bottom 分别对应 TintedVisualEffectView 的 tintColor / tintBottomColor
     /// （TintOverlayView 对 nil 不绘制）。
-    static func containerColors(lightTheme: Bool, gradientOn: Bool) -> (top: NSColor?, bottom: NSColor?) {
+    static func containerColors(lightTint: Bool, gradientOn: Bool) -> (top: NSColor?, bottom: NSColor?) {
         guard gradientOn else { return (nil, nil) }
-        return lightTheme
+        return lightTint
             ? (containerTintLightTop, containerTintLightBottom)
             : (containerTint.withAlphaComponent(0), containerTint)
     }
     /// 面板外观统一解析（唯一事实源，所有容器/popover/子面板必须走这里，禁止散落三元式）：
-    /// 浅色主题开 = 强制浅色 aqua（即使系统是深色主题）；否则渐变开 = 强制深色 darkAqua；
-    /// 都关 = nil 跟随系统（浅色系统即原生浅色玻璃，动态色自动转黑灰）。
+    /// 浅色主题开 = 强制浅色 aqua（即使系统是深色主题）；其余（含渐变开）= nil 跟随系统
+    /// 深浅色。渐变只控制遮罩配色，遮罩明暗由 containerColors 按生效外观选择。
     static func panelAppearance(lightTheme: Bool, gradientOn: Bool) -> NSAppearance? {
+        _ = gradientOn
         if lightTheme { return NSAppearance(named: .aqua) }
-        return gradientOn ? NSAppearance(named: .darkAqua) : nil
+        return nil
     }
     /// 渐变遮罩是否生效：渐变开关开即生效（浅色主题用亮白→透明遮罩，深色用深灰遮罩）
     static func gradientEffective(lightTheme: Bool, gradientOn: Bool) -> Bool {
@@ -301,19 +303,25 @@ enum Palette {
             ? NSColor(calibratedRed: 0xDF/255.0, green: 0xDF/255.0, blue: 0xDF/255.0, alpha: 1)
             : NSColor(calibratedWhite: 0x26 / 255.0, alpha: 1)
     }
-    /// Token 热力图无用量底点（深 #262626 / 浅 0.87 浅灰）
+    /// Token 热力图无用量底点（深 #262626 / 浅 sRGB 210,210,210 中性浅灰）。
+    /// 浅色值必须用 sRGB 定义：calibratedWhite 是 gamma1.8 校准空间，合成到 sRGB 屏幕时
+    /// 做 gamma 补偿会把 215 渲染成 223（取色实测），sRGB 定义则所见即所得。
     static let heatDotEmpty = NSColor(name: nil) { appearance in
         appearance.isDark
             ? NSColor(calibratedRed: 0x26/255.0, green: 0x26/255.0, blue: 0x26/255.0, alpha: 1)
-            : NSColor(calibratedWhite: 0.87, alpha: 1)
+            : NSColor(srgbRed: 210/255.0, green: 210/255.0, blue: 210/255.0, alpha: 1)
     }
     /// Token 热力图 hover 高亮环（深 白@90% / 浅 黑@70%）
     static let heatDotRing = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor.white.withAlphaComponent(0.9) : NSColor.black.withAlphaComponent(0.7)
     }
-    /// Token 热力图有量级两端（深浅主题同值，集中管理勿散落）：#313d4b → #84c3ff
-    static let heatLevelFrom = (r: 49, g: 61, b: 75)
-    static let heatLevelTo = (r: 132, g: 195, b: 255)
+    /// Token 热力图有量级两端（深浅两套，按生效外观选择，集中管理勿散落）：
+    /// 深色主题 #314b39 → #7cf097（暗底由暗到亮；顶格亮度从满绿 255 压到 240，
+    /// 用户定稿「最高亮度略降」）；浅色主题 #b9eac5 → #2cc859（浅底由浅到深，4 级对比）。
+    /// 色相 = 蓝色基准（≈209°）-75° 移到绿色区间，明度/饱和度与蓝色版一致。
+    static func heatLevels(dark: Bool) -> (from: (r: Int, g: Int, b: Int), to: (r: Int, g: Int, b: Int)) {
+        dark ? ((49, 75, 57), (124, 240, 151)) : ((185, 234, 197), (44, 200, 89))
+    }
     /// 悬浮提示气泡（深 近黑@94% + 白@16% 边 / 浅 近白@95% + 黑@15% 边）
     static let tooltipBackground = NSColor(name: nil) { appearance in
         appearance.isDark
@@ -534,10 +542,11 @@ final class BalancePanelViewController: NSViewController {
         // 浅色 Liquid Glass，文本走 Palette 动态色自动转黑灰）
         container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
                                                        gradientOn: panel.panelGradientEnabled)
-        // 叠加半透明遮罩：深色主题渐变开=顶部透明→底部深灰；浅色主题渐变开=顶部亮白→
-        // 底部透明；关闭时无遮罩（原生玻璃）
-        let initialColors = Palette.containerColors(lightTheme: panel.lightThemeEnabled,
-                                                    gradientOn: panel.panelGradientEnabled)
+        // 叠加半透明遮罩：生效外观深色=顶部透明→底部深灰；浅色=顶部亮白→底部透明；
+        // 关闭时无遮罩（原生玻璃）
+        let initialColors = Palette.containerColors(
+            lightTint: panel.lightThemeEnabled || !NSApp.effectiveAppearance.isDark,
+            gradientOn: panel.panelGradientEnabled)
         container.tintColor = initialColors.top
         container.tintBottomColor = initialColors.bottom
         // 容器圆角与系统 popover 窗口对齐（10pt 连续曲率），裁掉遮罩层直角边缘
@@ -857,15 +866,16 @@ final class BalancePanelViewController: NSViewController {
         walk(panel)
     }
 
-    /// 按当前开关状态刷新背景遮罩与外观：浅色主题强制浅色；渐变生效时
-    /// 顶部全透明 → 底部深灰的纵向渐变；否则无遮罩（原生玻璃）
+    /// 按当前开关与生效外观刷新背景遮罩：浅色主题强制浅色；渐变生效时按生效外观
+    /// 取深灰（深）或亮白（浅）的纵向渐变遮罩；否则无遮罩（原生玻璃）
     private func applyGradient() {
         guard let container = view as? TintedVisualEffectView else { return }
-        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
         container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
                                                        gradientOn: panel.panelGradientEnabled)
-        let colors = Palette.containerColors(lightTheme: panel.lightThemeEnabled,
-                                             gradientOn: panel.panelGradientEnabled)
+        let colors = Palette.containerColors(
+            lightTint: !container.effectiveAppearance.isDark,
+            gradientOn: panel.panelGradientEnabled)
         container.tintColor = colors.top
         container.tintBottomColor = colors.bottom
         container.tintGradientStartY = 0
@@ -1124,9 +1134,11 @@ final class BalancePanelView: NSView {
     var usageHistoryRowHovered = false
     var usageHistoryChartHovered = false
     var usageHistoryCloseTask: DispatchWorkItem?
-    /// ZCode 卡片 hover Token 统计子面板（机制与用量趋势子面板一致：单实例 popover + 面板内定位锚点）
+    /// ZCode / WorkBuddy 卡片 hover Token 统计子面板（机制与用量趋势子面板一致：单实例 popover + 面板内定位锚点）
     var tokensPanelPopover: NSPopover?
     var tokensPanelController: ZcodeTokensPanelController?
+    /// 当前子面板数据源（最近一次 hover 触发的卡片平台；刷新定时器据此取数）
+    var tokensPanelSource: TokensPanelSource = .zcode
     let tokensPanelPositionAnchor = UsageHistoryPopoverAnchorView(frame: .zero)
     var tokensCardHovered = false
     var tokensPanelHovered = false
@@ -1148,7 +1160,11 @@ final class BalancePanelView: NSView {
                 }
             }
             stack.append(contentsOf: v.subviews)
-        }
+        }        // 渐变开时遮罩明暗随生效外观：系统深浅切换重刷遮罩，并同步两个 hover 子面板配色
+        onPanelGradientChanged?()
+        syncTokensPanelBackground()
+        syncUsageHistoryPanelBackground()
+
     }
     /// 用量行最大内容宽度（列宽自动分配的预算上限）
     private let usageMaxRowWidth: CGFloat = 240
@@ -1206,21 +1222,22 @@ final class BalancePanelView: NSView {
     let zcodeAddBtn = ActionTileButton(bundleIcon: "zhipu",
                                                title: "添加账号", target: nil, action: nil,
                                                svgIconSize: 14.45)  // SVG 微调 ≈0.9×基准（16）；Mono 用标称 16
-    // 刷新间隔：MiniSegmentedControl（原生 .mini 尺寸，紧凑稳定）
-    let intervalSegment: MiniSegmentedControl = {
-        let seg = MiniSegmentedControl(labels: ["1分钟", "3分钟", "5分钟"], trackingMode: .selectOne, target: nil, action: nil)
-        seg.selectedSegment = 2
-        return seg
+    // 刷新间隔：原生 NSPopUpButton 下拉菜单（视觉整体缩至 0.8，见 CompactPopUpButton；
+    // 选项 tag 直接携带秒数）
+    let intervalPopup: CompactPopUpButton = {
+        let popup = CompactPopUpButton(frame: .zero, pullsDown: false)
+        popup.controlSize = .small
+        popup.appearance = NSAppearance(named: .darkAqua)
+        for (title, seconds) in [("1分钟", 60), ("3分钟", 180), ("5分钟", 300)] {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.tag = seconds
+            popup.menu?.addItem(item)
+        }
+        // 弹出菜单内容与按钮同步缩小：.small 按钮 11pt × 0.8 ≈ 9pt（原分段控件字号），
+        // NSMenu.font 驱动行高与宽度整体收窄，无法对菜单窗口做 transform
+        popup.menu?.font = NSFont.systemFont(ofSize: 9)
+        return popup
     }()
-    /// 刷新间隔 Mono 字符段（Mono 模式替代原生分段控件，同框显隐切换）
-    let monoSegment: MonoSegmentedControl = {
-        let seg = MonoSegmentedControl(titles: ["1", "3", "5"], target: nil, action: nil)
-        seg.selectedSegment = 2
-        return seg
-    }()
-    /// Mono 字符段容器：控件右缘直接贴设置行尾，控件自身纯内容渲染；
-    /// applySwitchVisuals 通过本容器控制显隐（与原生分段同框切换）
-    let monoSegmentBox = NSView()
     /// 面板渐变背景开关（update 时随快照同步状态）
     let gradientSwitch = MiniSwitch()
     /// 浅色主题开关（update 时随快照同步状态）
@@ -1608,16 +1625,10 @@ final class BalancePanelView: NSView {
         traeAddBtn.setTitle(s.traeCollectInProgress ? "采集中…" : "添加账号")
         traeAddBtn.setInProgress(s.traeCollectInProgress)
 
-        switch s.refreshIntervalSeconds {
-        case 60:
-            intervalSegment.selectedSegment = 0
-            monoSegment.selectedSegment = 0
-        case 180:
-            intervalSegment.selectedSegment = 1
-            monoSegment.selectedSegment = 1
-        default:
-            intervalSegment.selectedSegment = 2
-            monoSegment.selectedSegment = 2
+        // 非 60/180 的存量配置统一回退 5 分钟（与原分段默认段一致）
+        intervalPopup.selectItem(withTag: s.refreshIntervalSeconds)
+        if intervalPopup.selectedItem == nil {
+            intervalPopup.selectItem(withTag: 300)
         }
 
         // Mono 模式切换设置开关外观（字符开关 [×]/[▪] ↔ 原生 NSSwitch）
@@ -1826,9 +1837,10 @@ final class BalancePanelView: NSView {
                             }
                         }
                     }
-                    // ZCode 卡片：hover 弹出 Token 统计子面板（进入延迟弹出/离开延迟收起）
-                    if style.platformID == "zcode" {
-                        self?.zcodeCardHoverTokens(showing, anchorCard: card)
+                    // ZCode / WorkBuddy 卡片：hover 弹出 Token 统计子面板（进入延迟弹出/离开延迟收起）
+                    if style.platformID == "zcode" || style.platformID == "wb" {
+                        self?.cardHoverTokens(showing, anchorCard: card,
+                                              source: style.platformID == "zcode" ? .zcode : .workbuddy)
                     }
                     guard let card, !isCurrent else { return }
                     let target: CGFloat = showing ? 1 : Self.subCardDimAlpha
@@ -2126,7 +2138,7 @@ final class BalancePanelView: NSView {
     /// root 底部上限约束（≤ panel.bottom-41）：仅为 fittingSize 预留 footer 区、
     /// 防止内容与贴底 footer 重叠服务；日常高度求解不应依赖它
     var rootBottomCap: NSLayoutConstraint?
-    /// 字符化控件（MonoCharSwitch / MonoSegmentedControl）切换模糊→清晰过渡的计时器
+    /// 字符化开关（MonoCharSwitch）切换模糊→清晰过渡的计时器
     var charBlurTimer: Timer?
 
     // MARK: - 控件回调（转发给 AppDelegate 接线）
@@ -2145,7 +2157,8 @@ final class BalancePanelView: NSView {
     private func applyControlsTheme() {
         let light = lightThemeEnabled
         for entry in switchRows { entry.sw.applyThemeAppearance(light: light) }
-        intervalSegment.applyThemeAppearance(light: light)
+        // 下拉菜单与开关一样自带 appearance（不继承容器），浅色主题时显式切浅色
+        intervalPopup.appearance = NSAppearance(named: light ? .aqua : .darkAqua)
     }
     @objc func monoFontToggled() { onToggleMonoFont?() }
     @objc func interFontToggled() { onToggleInterFont?() }
@@ -2269,15 +2282,8 @@ final class BalancePanelView: NSView {
     @objc func checkinHistoryTapped() { onShowCheckinHistory?() }
     @objc func quitTapped() { onQuit?() }
     @objc func intervalChanged() {
-        // Mono 模式下只有字符段可见，读可见控件（避免依赖隐藏控件的旧状态）
-        let selected = intervalSegment.isHidden ? monoSegment.selectedSegment : intervalSegment.selectedSegment
-        let seconds: Int
-        switch selected {
-        case 0: seconds = 60
-        case 1: seconds = 180
-        default: seconds = 300
-        }
-        onSetInterval?(seconds)
+        // 选项 tag 即秒数（60/180/300）
+        onSetInterval?(intervalPopup.selectedItem?.tag ?? 300)
     }
     @objc func manualRefreshTapped() { onManualRefresh?() }
 }

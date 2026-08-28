@@ -7,20 +7,82 @@ import SQLite3
 
 // MARK: - 数据
 
+/// Token 数据仓通用缓存壳：首次 fetch 启动后台定时器，每 60s 重建一次缓存；
+/// 之后 fetch 只回缓存（同步、零读取，面板弹出不再触发扫描/查库），首次无缓存时
+/// 挂起回调、构建完成后主线程补发（含构建失败 nil，避免每次弹面板反复重试）。
+final class TokenStoreCache {
+    private let queue: DispatchQueue
+    private let build: () -> ZcodeTokenSummary?
+    private var cached: (summary: ZcodeTokenSummary?, at: Date)?
+    private var pending: [(ZcodeTokenSummary?) -> Void] = []
+    private var timer: DispatchSourceTimer?
+    private let interval: TimeInterval = 60
+
+    init(label: String, build: @escaping () -> ZcodeTokenSummary?) {
+        queue = DispatchQueue(label: label, qos: .userInitiated)
+        self.build = build
+    }
+
+    /// 取汇总：有缓存同步返回（主线程），无缓存挂起待构建完成回调
+    func fetch(completion: @escaping (ZcodeTokenSummary?) -> Void) {
+        if let c = cached {
+            completion(c.summary)
+            return
+        }
+        pending.append(completion)
+        guard timer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: interval)
+        t.setEventHandler { [weak self] in self?.refresh() }
+        t.resume()
+        timer = t
+    }
+
+    /// 后台重建缓存并补发挂起回调（构建失败也落缓存，防反复重扫）
+    private func refresh() {
+        let s = build()
+        cached = (s, Date())
+        guard !pending.isEmpty else { return }
+        let callbacks = pending
+        pending.removeAll()
+        DispatchQueue.main.async {
+            callbacks.forEach { $0(s) }
+        }
+    }
+}
+
+/// Token 子面板数据源分流：ZCode 与 WorkBuddy 共用同一面板视图，仅数据仓/区块标题/行图标不同
+enum TokensPanelSource {
+    case zcode
+    case workbuddy
+
+    /// 面板首行标题 = 平台名
+    var platformName: String { self == .zcode ? "ZCode" : "WorkBuddy" }
+    /// 异步取汇总（各数据仓后台每 60s 重建缓存，fetch 只回缓存，主线程回调）
+    func fetch(completion: @escaping (ZcodeTokenSummary?) -> Void) {
+        switch self {
+        case .zcode: ZcodeTokenStore.fetch(completion: completion)
+        case .workbuddy: WBTokenStore.fetch(completion: completion)
+        }
+    }
+}
+
 /// 单日 token 用量（本地时区当日零点时间戳 + input+output 合计）
 struct ZcodeDayUsage {
     let dayStart: TimeInterval
     let tokens: Int64
 }
 
-/// 本机 ZCode token 用量汇总（按项目分组，降序）
+/// 本机 token 用量汇总（列表行按用量降序；WB 数据源另带模型分组）
 struct ZcodeTokenSummary {
     struct ProjectUsage {
-        let name: String   // 项目名（会话目录末段）
+        let name: String   // 项目名（会话目录末段）/ 模型名
         let tokens: Int64  // input + output
     }
     let totalTokens: Int64
     let projects: [ProjectUsage]
+    /// 按模型分组（仅 WB 数据源填充；ZCode 库无此聚合，空 = 列表不显示「模型」切换）
+    var models: [ProjectUsage] = []
     let requestCount: Int64
     /// 按天用量（词元活动热力图数据源，仅含有用量的天）
     let daily: [ZcodeDayUsage]
@@ -86,6 +148,7 @@ enum ZcodeTokenStore {
     /// 在已打开的连接上跑项目聚合 + 按天聚合两条 SQL
     private static func runAggregates(db: OpaquePointer?) -> ZcodeTokenSummary? {
         var projects: [ZcodeTokenSummary.ProjectUsage] = []
+        var models: [ZcodeTokenSummary.ProjectUsage] = []
         var requests: Int64 = 0
         var daily: [ZcodeDayUsage] = []
 
@@ -107,6 +170,24 @@ enum ZcodeTokenStore {
                 // 项目名 = 目录末段（(未知项目) 原样保留）
                 let name = dir == "(未知项目)" ? dir : (dir as NSString).lastPathComponent
                 projects.append(ZcodeTokenSummary.ProjectUsage(name: name, tokens: tokens))
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        // 按模型聚合（口径与 WB 数据源一致：input + output 降序），供「项目/模型」切换
+        let modelSQL = """
+            SELECT model_id,
+                   SUM(input_tokens) + SUM(output_tokens)
+            FROM model_usage
+            GROUP BY model_id
+            HAVING SUM(input_tokens) + SUM(output_tokens) > 0
+            ORDER BY 2 DESC
+            """
+        if sqlite3_prepare_v2(db, modelSQL, -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let name = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "(未知模型)"
+                let tokens = sqlite3_column_int64(stmt, 1)
+                models.append(ZcodeTokenSummary.ProjectUsage(name: name, tokens: tokens))
             }
         }
         sqlite3_finalize(stmt)
@@ -134,24 +215,14 @@ enum ZcodeTokenStore {
 
         let total = projects.reduce(Int64(0)) { $0 + $1.tokens }
         return projects.isEmpty ? nil : ZcodeTokenSummary(totalTokens: total, projects: projects,
+                                                          models: models,
                                                           requestCount: requests, daily: daily.sorted { $0.dayStart < $1.dayStart })
     }
 
-    private static let queue = DispatchQueue(label: "ibalance.zcodeTokens", qos: .userInitiated)
-    private static var cache: (summary: ZcodeTokenSummary, at: Date)?
-    private static let cacheTTL: TimeInterval = 15
-
-    /// 异步取汇总；缓存 15s 内直接回缓存。completion 恒在主线程回调（可能为 nil）。
+    /// 异步取汇总：后台每 60s 重建缓存，fetch 只回缓存不触发读取
+    private static let cache = TokenStoreCache(label: "ibalance.zcodeTokens") { Self.query() }
     static func fetch(completion: @escaping (ZcodeTokenSummary?) -> Void) {
-        if let c = cache, Date().timeIntervalSince(c.at) < cacheTTL {
-            completion(c.summary)
-            return
-        }
-        queue.async {
-            let s = query()
-            if let s { cache = (s, Date()) }
-            DispatchQueue.main.async { completion(s) }
-        }
+        cache.fetch(completion: completion)
     }
 
     // MARK: 数值格式化
@@ -211,9 +282,35 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     var interFontEnabled = false {
         didSet { totalRollView.refreshFont(); needsDisplay = true }
     }
+    /// 数据源分流（ZCode=项目 / WorkBuddy=模型）：影响区块标题与行图标
+    var source: TokensPanelSource = .zcode {
+        didSet { guard oldValue != source else { return }; needsDisplay = true }
+    }
     private var trackingArea: NSTrackingArea?
     /// 模型行品牌 icon 缓存（bundleIcon 每次读盘，draw 高频不能直呼）
     private var iconCache: [String: NSImage] = [:]
+
+    // MARK: 列表视图（项目/模型切换）
+
+    enum ListMode { case projects, models }
+    var listMode: ListMode = .projects {
+        didSet {
+            guard oldValue != listMode else { return }
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
+            onActivityModeChanged?()   // 复用：切换后同步 popover 尺寸
+        }
+    }
+    /// 列表「项目/模型」切换文案命中区（draw 时更新；无模型数据不绘制不响应）
+    private var projectToggleRect = NSRect.zero
+    private var modelToggleRect = NSRect.zero
+    /// 当前生效的列表是否为模型视图（模型数据为空时回落项目，标题/图标/行数同源）
+    private var activeListIsModels: Bool {
+        listMode == .models && !(summary?.models.isEmpty ?? true)
+    }
+    /// 当前列表行图标符号（项目=文件夹 / 模型=芯片，随切换变化）
+    private var rowIconSymbol: String { activeListIsModels ? "cpu" : "folder" }
+
 
     // MARK: 词元活动状态
 
@@ -240,9 +337,11 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     private var dotStamps: [NSImage?] = []
 
     /// 列表行数上限（超出按用量截断，头部项目已覆盖绝大多数占比）
-    static let maxListRows = 7
+    static let maxListRows = 4
     private static let contentWidth: CGFloat = 240
     private static let rowHeight: CGFloat = 16
+    /// 区块间距（总计词元 / 列表 / 词元活动 统一 20pt）
+    private static let sectionGap: CGFloat = 20
     private let insets = NSEdgeInsets(top: 20, left: 16, bottom: 20, right: 16)
 
     override var isFlipped: Bool { true }
@@ -258,10 +357,40 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    /// 大数字行框：与原 draw 排版同位（y = insets.top + 10 + 4，行带高 32）
+    // MARK: 墨迹几何（区块视觉间距恒 = sectionGap）
+    // 名义行框（标签 10/12、数字带 32、列表行 16 居中）自带行框留白，
+    // 区块锚点全部按字体实际墨迹（boundingRect/ascender）推导，间距不掺留白
+
+    private func makeLabelFont() -> NSFont {
+        monoFontEnabled ? MonoFontProvider.font(size: 9)
+            : (interFontEnabled ? InterFontProvider.font(size: 9)
+                : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular))
+    }
+    /// 标签墨迹高度（9pt 小标签）
+    private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
+    /// 列表行墨迹高度（10pt medium）
+    private var rowInkHeight: CGFloat { ceil(uiFont(size: 10, weight: .medium).boundingRectForFont.height) }
+    /// 大数字字体（与 totalRollView configure 同参；数字轮行带贴顶排版，墨迹底 = 带顶 + ascender）
+    private var numberFont: NSFont { totalFont(size: totalNumberSize, weight: .semibold, monoDigits: true) }
+
+    /// 总计标签顶 = 面板首行（与平台名同行）
+    private var totalLabelTop: CGFloat { insets.top }
+    /// 大数字行带顶（layout 与 draw 共用同一推导，防错位）
+    private var numberRowY: CGFloat { totalLabelTop + labelInkHeight + 4 }
+    /// 列表标签顶 = 数字墨迹底 + 20
+    private var sectionLabelTop: CGFloat { numberRowY + numberFont.ascender + Self.sectionGap }
+    /// 列表首行顶 = 列表标签墨迹底 + 6
+    private var listStartTop: CGFloat { sectionLabelTop + labelInkHeight + 6 }
+    /// 末行墨迹底（行内文字垂直居中；无行时回落列表首行顶）
+    private func rowsInkBottom(rows: Int) -> CGFloat {
+        rows <= 0 ? listStartTop
+            : listStartTop + CGFloat(rows - 1) * Self.rowHeight + Self.rowHeight / 2 + rowInkHeight / 2
+    }
+
+    /// 大数字行框：与原 draw 排版同位（行带高 32）
     override func layout() {
         super.layout()
-        totalRollView.frame = NSRect(x: insets.left, y: insets.top + 14,
+        totalRollView.frame = NSRect(x: insets.left, y: numberRowY,
                                      width: max(0, bounds.width - insets.left - insets.right),
                                      height: 32)
         // 布局就绪后复算缩字号（打开瞬间 summary 落位时 view 可能尚未布局，宽度不可判）
@@ -309,11 +438,9 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         })
     }
 
-    private var activityGridHeight: CGFloat {
-        activityMode == .daily ? 7 * activityPitch : activityPitch
-    }
-    /// 横坐标月份标签区高度（4pt 间距 + 10pt 文本）
-    private var activityAxisHeight: CGFloat { 14 }
+    private var activityGridHeight: CGFloat { 7 * activityPitch }
+    /// 横坐标月份标签区高度（4pt 间距 + 标签墨迹）
+    private var activityAxisHeight: CGFloat { 4 + labelInkHeight }
     /// 热力图列几何：窗口周列数 + 点距（可用宽均分，正圆 = 点距 - 2）。
     /// 窗口 = 最近 5 个整月：firstMonth = 4 个月前当月 1 号，start = 其所在周的周一，末列 = 今天所在周。
     private func activityWindow() -> (start: Date, cols: Int, firstMonth: Date) {
@@ -341,11 +468,19 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     override var intrinsicContentSize: NSSize {
-        let rows = min(summary?.projects.count ?? 0, Self.maxListRows)
-        // 标签(10) + 间距(4) + 大数字(32) + 段间距(14) + 模型标签(10) + 间距(6) + n 行
-        // + 段间距(14) + 活动标签(12) + 间距(6) + 热力图(7行/1行) + 月份轴(14) + 底留白
-        let height: CGFloat = 10 + 4 + 32 + 14 + 10 + 6 + CGFloat(rows) * Self.rowHeight
-            + 14 + 12 + 6 + activityGridHeight + activityAxisHeight + insets.top + insets.bottom
+        // 行数取当前列表视图（模型视图空数据时回落项目，与 draw 的 showModels 逻辑一致）
+        let active = summary.flatMap { s -> [ZcodeTokenSummary.ProjectUsage] in
+            (listMode == .models && !s.models.isEmpty) ? s.models : s.projects
+        } ?? []
+        let rows = min(active.count, Self.maxListRows)
+        // 墨迹推导（与 draw 同一锚点链）：首行(平台名+总计标签) + 4 + 数字墨迹(ascender) + 20
+        // + 列表标签 + 6 + n 行(末行扣行框留白) + 20
+        // + 活动标签 + 6 + 热力图 + 4 + 月份轴标签 + 底留白
+        let height: CGFloat = insets.top
+            + labelInkHeight + 4 + numberFont.ascender + Self.sectionGap
+            + labelInkHeight + 6 + CGFloat(rows) * Self.rowHeight
+                - (Self.rowHeight - rowInkHeight) / 2 + Self.sectionGap
+            + labelInkHeight + 6 + activityGridHeight + activityAxisHeight + insets.bottom
         return NSSize(width: Self.contentWidth, height: height)
     }
 
@@ -394,7 +529,11 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
         let p = convert(event.locationInWindow, from: nil)
-        if dailyToggleRect.insetBy(dx: -3, dy: -3).contains(p) {
+        if modelToggleRect.insetBy(dx: -3, dy: -3).contains(p) {
+            listMode = .models
+        } else if projectToggleRect.insetBy(dx: -3, dy: -3).contains(p) {
+            listMode = .projects
+        } else if dailyToggleRect.insetBy(dx: -3, dy: -3).contains(p) {
             activityMode = .daily
         } else if weeklyToggleRect.insetBy(dx: -3, dy: -3).contains(p) {
             activityMode = .weekly
@@ -409,28 +548,45 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let labelFont = monoFontEnabled
-            ? MonoFontProvider.font(size: 9)
-            : (interFontEnabled
-                ? InterFontProvider.font(size: 9)
-                : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular))
+        let labelFont = makeLabelFont()
         let labelColor = NSColor.secondaryLabelColor
-        let y = insets.top
 
-        // ── 总计词元标签（小号 + 字距）──
-        drawSpacedText("总计词元", at: NSPoint(x: insets.left, y: y),
+        // ── 首行：平台名 + 总计词元（同一行、同字号同色）──
+        drawSpacedText(source.platformName, at: NSPoint(x: insets.left, y: totalLabelTop),
+                       font: labelFont, color: labelColor, kern: 0.8)
+        let nameWidth = (source.platformName as NSString).size(
+            withAttributes: [.font: labelFont, .kern: 0.8]).width
+        drawSpacedText("总计词元", at: NSPoint(x: insets.left + ceil(nameWidth) + 6, y: totalLabelTop),
                        font: labelFont, color: labelColor, kern: 0.8)
 
         // ── 总计大数字：RollingNumberView 子视图渲染（layout() 定位，summary didSet 驱动滚动）──
-        let numberY = y + 10 + 4
 
-        // ── 项目区块头 ──
-        let projects = Array((summary?.projects ?? []).prefix(Self.maxListRows))
-        let sectionY = numberY + 32 + 14
-        drawSpacedText("项目", at: NSPoint(x: insets.left, y: sectionY),
+        // ── 列表区块头 ──（WB 双数据齐备时右上角「项目/模型」切换，样式同词元活动的每日/每周）
+        let allProjects = summary?.projects ?? []
+        let allModels = summary?.models ?? []
+        let showModels = listMode == .models && !allModels.isEmpty
+        let projects = Array((showModels ? allModels : allProjects).prefix(Self.maxListRows))
+        let sectionY = sectionLabelTop
+        drawSpacedText(showModels ? "模型" : "项目", at: NSPoint(x: insets.left, y: sectionY),
                        font: labelFont, color: labelColor, kern: 0.8)
+        projectToggleRect = .zero
+        modelToggleRect = .zero
+        if !allModels.isEmpty {
+            let tFont = labelFont
+            let modelW = "模型".size(withAttributes: [.font: tFont]).width
+            let projW = "项目".size(withAttributes: [.font: tFont]).width
+            let tY = sectionY + (10 - tFont.boundingRectForFont.height) / 2
+            let mX = bounds.width - insets.right - modelW
+            let pX = mX - 6 - projW
+            drawText("模型", at: NSPoint(x: mX, y: tY), font: tFont,
+                     color: showModels ? Palette.cardForeground : labelColor)
+            drawText("项目", at: NSPoint(x: pX, y: tY), font: tFont,
+                     color: showModels ? labelColor : Palette.cardForeground)
+            projectToggleRect = NSRect(x: pX, y: sectionY, width: projW, height: 10)
+            modelToggleRect = NSRect(x: mX, y: sectionY, width: modelW, height: 10)
+        }
 
-        var listEndY = sectionY + 10 + 6
+        var listEndY = listStartTop
         if projects.isEmpty {
             if summary == nil {
                 drawText("读取中…", at: NSPoint(x: insets.left, y: listEndY),
@@ -443,7 +599,9 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
                                        pctFont: uiFont(size: 10))
         }
 
-        drawActivitySection(topY: listEndY + 14, labelFont: labelFont, labelColor: labelColor)
+        // 词元活动顶 = 末行墨迹底 + 20（行框居中留白不计入间距）
+        drawActivitySection(topY: rowsInkBottom(rows: projects.count) + Self.sectionGap,
+                            labelFont: labelFont, labelColor: labelColor)
     }
 
     /// 项目行：文件夹 icon + 项目名（限宽截断）+ token 值 + 百分比；返回行块底部 Y。
@@ -465,7 +623,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         var rowY = topY
         for p in projects {
             let iconRect = NSRect(x: insets.left, y: rowY + (rowH - 10) / 2, width: 10, height: 10)
-            if let img = projectIcon() {
+            if let img = rowIcon() {
                 // respectFlipped:true：isFlipped 视图内保证正立（旧式 draw(in:) 不跟随翻转上下文）
                 img.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1,
                          respectFlipped: true, hints: nil)
@@ -522,7 +680,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         dotCells.removeAll()
         let pitch = activityPitch
         let size = pitch - 2
-        let gridTop = topY + 12 + 6
+        let gridTop = topY + labelInkHeight + 6
         let window = activityWindow()
         let cells = activityCells()
         let maxVal = cells.map(\.tokens).max() ?? 0
@@ -540,7 +698,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         // ── 横坐标月份标签：从网格左缘起，按「网格宽 ÷ 月数」等距分布，文本左对齐 ──
         let monthFmt = DateFormatter()
         monthFmt.dateFormat = "M月"
-        let axisY = gridTop + CGFloat(activityMode == .daily ? 7 : 1) * pitch + 4
+        let axisY = gridTop + 7 * pitch + 4
         let segWidth = (CGFloat(window.cols) * pitch) / CGFloat(Self.activityMonths)
         for offset in 0..<Self.activityMonths {
             guard let mStart = Calendar.current.date(byAdding: .month, value: offset,
@@ -594,13 +752,27 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         } else {
             let rangeFmt = DateFormatter()
             rangeFmt.dateFormat = "M.d"
+            // 每周视图：网格形态与每日一致（7 行 × 周列），不切单行——按周合计点亮列内的点：
+            // 周用量越大，列内点亮的点越多（自下而上，周用量/最大周用量 × 7 行向上取整），
+            // 点亮的点也越亮（tokens 记周合计，绘制端按最大周用量归一到 1-4 级亮度）
+            var weekTotals: [Int: Int64] = [:]
             for col in 0..<window.cols {
-                let weekStart = window.start.addingTimeInterval(TimeInterval(col * 7 * 86400))
-                let weekEnd = weekStart.addingTimeInterval(6 * 86400)
                 var t: Int64 = 0
                 for row in 0..<7 { t += usage[col * 7 + row] ?? 0 }
-                cells.append((col, 0, t,
-                              "\(rangeFmt.string(from: weekStart))–\(rangeFmt.string(from: weekEnd)) \(ZcodeTokenStore.cnCompact(t))"))
+                weekTotals[col] = t
+            }
+            let maxWeek = weekTotals.values.max() ?? 0
+            for col in 0..<window.cols {
+                let t = weekTotals[col] ?? 0
+                let weekStart = window.start.addingTimeInterval(TimeInterval(col * 7 * 86400))
+                let weekEnd = weekStart.addingTimeInterval(6 * 86400)
+                let tip = "\(rangeFmt.string(from: weekStart))–\(rangeFmt.string(from: weekEnd)) \(ZcodeTokenStore.cnCompact(t))"
+                let lit = t <= 0 || maxWeek <= 0 ? 0
+                    : max(1, Int((Double(t) / Double(maxWeek) * 7).rounded(.up)))
+                for row in 0..<7 {
+                    let isLit = row >= 7 - lit
+                    cells.append((col, row, isLit ? t : 0, tip))
+                }
             }
         }
         return cells
@@ -647,7 +819,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             dotStamps.append(contentsOf: Array(repeating: nil, count: level + 1 - dotStamps.count))
         }
         if let cached = dotStamps[level] { return cached }
-        var color = Self.levelColor(level)
+        var color = Self.levelColor(level, dark: effectiveAppearance.isDark)
         effectiveAppearance.performAsCurrentDrawingAppearance {
             color = color.usingColorSpace(.deviceRGB) ?? color
         }
@@ -661,25 +833,35 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         return img
     }
 
-    private static func levelColor(_ level: Int) -> NSColor {
+    private static func levelColor(_ level: Int, dark: Bool) -> NSColor {
         if level <= 0 { return Palette.heatDotEmpty }
         let t = Double(min(level, 4) - 1) / 3
+        let levels = Palette.heatLevels(dark: dark)
         func lerp(_ a: Int, _ b: Int) -> CGFloat {
             CGFloat(a) + (CGFloat(b) - CGFloat(a)) * CGFloat(t)
         }
-        return NSColor(calibratedRed: lerp(Palette.heatLevelFrom.r, Palette.heatLevelTo.r) / 255,
-                       green: lerp(Palette.heatLevelFrom.g, Palette.heatLevelTo.g) / 255,
-                       blue: lerp(Palette.heatLevelFrom.b, Palette.heatLevelTo.b) / 255, alpha: 1)
+        return NSColor(calibratedRed: lerp(levels.from.r, levels.to.r) / 255,
+                       green: lerp(levels.from.g, levels.to.g) / 255,
+                       blue: lerp(levels.from.b, levels.to.b) / 255, alpha: 1)
     }
 
-    /// 项目行图标：文件夹符号（统一单色化为系统灰，与行文本同色；缓存染色结果）
-    private func projectIcon() -> NSImage? {
-        if let cached = iconCache["__folder__"] { return cached }
-        let base = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 9, weight: .medium))
-        let image = base.flatMap { tintedImage($0, .systemGray) }
-        iconCache["__folder__"] = image
-        return image
+    /// 面板 icon 统一入口：来源（品牌 SVG / SF Symbol）一律 sourceAtop 单色化后按键缓存
+    /// （品牌色直接上屏在深色玻璃上不可读；单色化与文件历史定稿一致）
+    private func tintedIcon(key: String, color: NSColor, make: () -> NSImage?) -> NSImage? {
+        if let cached = iconCache[key] { return cached }
+        guard let base = make() else { return nil }
+        let img = tintedImage(base, color)
+        iconCache[key] = img
+        return img
+    }
+
+    /// 列表行图标：SF Symbol 单色化为系统灰（与行文本同色）
+    private func rowIcon() -> NSImage? {
+        let symbol = rowIconSymbol
+        return tintedIcon(key: symbol, color: .systemGray) {
+            NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 9, weight: .medium))
+        }
     }
 
     /// 品牌图标染色经 sourceAtop 烘进缓存图，会定格当时外观：主题切换时清缓存重染；
@@ -715,6 +897,10 @@ final class ZcodeTokensPanelController: NSViewController {
     var onHoverChanged: ((Bool) -> Void)?
     /// 词元活动每日/每周切换后同步 popover 尺寸（回传新 preferredContentSize，由 BalancePanelView 接线）
     var onActivityModeChanged: ((NSSize) -> Void)?
+    /// 数据源分流（ZCode / WorkBuddy 共用此面板），透传给内容视图
+    var source: TokensPanelSource = .zcode {
+        didSet { contentView.source = source }
+    }
     /// 背景配色继承自主面板（show 时经 BalancePanelView.syncTokensPanelBackground 同步）。
     /// 默认值 = 主面板渐变开配色，保证任何时序下首帧都不偏色；三个属性 didSet 即时上屏，
     /// 赋值顺序无关（渐变开关切换会连带换配色，必须走 syncTokensPanelBackground 重取色）。
@@ -743,7 +929,7 @@ final class ZcodeTokensPanelController: NSViewController {
         backgroundView.blendingMode = .behindWindow
         backgroundView.state = .active
         backgroundView.isEmphasized = false
-        // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；渐变开强制深色；否则跟随系统
+        // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；其余（含渐变开）跟随系统
         backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                             gradientOn: panelGradientEnabled)
         backgroundView.tintColor = panelTintColor
@@ -792,7 +978,7 @@ final class ZcodeTokensPanelController: NSViewController {
 
     private func applyPanelBackground() {
         guard isViewLoaded else { return }
-        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
         backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                             gradientOn: panelGradientEnabled)
         backgroundView.tintColor = panelTintColor
@@ -802,18 +988,19 @@ final class ZcodeTokensPanelController: NSViewController {
     }
 }
 
-// MARK: - BalancePanelView 接线（ZCode 卡片 hover 展示/收起）
+// MARK: - BalancePanelView 接线（ZCode / WorkBuddy 卡片 hover 展示/收起）
 
 extension BalancePanelView {
 
-    /// ZCode 卡片 hover 回调入口：进入 0.25s 后弹出（滤掉划过），离开延迟收起。
+    /// 卡片 hover 回调入口（ZCode / WorkBuddy）：进入 0.25s 后弹出（滤掉划过），离开延迟收起。
     /// anchorCard 为弱引用目标（卡片可能随快照重建被替换）。
-    func zcodeCardHoverTokens(_ showing: Bool, anchorCard: NSView?) {
+    func cardHoverTokens(_ showing: Bool, anchorCard: NSView?, source: TokensPanelSource) {
+        tokensPanelSource = source
         tokensShowTask?.cancel()
         if showing {
             tokensCardHovered = true
             let task = DispatchWorkItem { [weak self, weak anchorCard] in
-                self?.showTokensPanel(from: anchorCard)
+                self?.showTokensPanel(from: anchorCard, source: source)
             }
             tokensShowTask = task
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: task)
@@ -835,18 +1022,19 @@ extension BalancePanelView {
             controller.panelTintColor = container.tintColor
             controller.panelTintBottomColor = container.tintBottomColor
         } else {
-            let colors = Palette.containerColors(lightTheme: lightThemeEnabled,
-                                                 gradientOn: panelGradientEnabled)
+            let colors = Palette.containerColors(
+                lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
+                gradientOn: panelGradientEnabled)
             controller.panelTintColor = colors.top
             controller.panelTintBottomColor = colors.bottom
         }
         // popover 窗口外观（含箭头）同样随开关即时切换（子面板可能跨开关切换存活）：
-        // 统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+        // 统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
         tokensPanelPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                                 gradientOn: panelGradientEnabled)
     }
 
-    private func showTokensPanel(from card: NSView?) {
+    private func showTokensPanel(from card: NSView?, source: TokensPanelSource) {
         guard tokensCardHovered, let card, card.window != nil else { return }
         tokensCloseTask?.cancel()
 
@@ -868,7 +1056,7 @@ extension BalancePanelView {
             }
             let popover = NSPopover()
             popover.behavior = .applicationDefined
-            // 外观与主面板同策略：浅色 > 渐变深色 > 跟随系统（统一走 Palette.panelAppearance）
+            // 外观与主面板同策略：浅色强制浅色，其余跟随系统（统一走 Palette.panelAppearance）
             popover.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                         gradientOn: panelGradientEnabled)
             popover.hasFullSizeContent = true
@@ -880,24 +1068,29 @@ extension BalancePanelView {
             tokensPanelPopover = popover
         }
         guard let controller = tokensPanelController, let popover = tokensPanelPopover else { return }
+        controller.source = source
 
         // 背景/字体开关与主面板保持一致（单一同步入口，见 syncTokensPanelBackground）
         syncTokensPanelBackground()
         controller.monoFontEnabled = monoFontEnabled
         controller.interFontEnabled = interFontEnabled
 
-        // 定位锚点：贴卡片右缘中点（右翻左逻辑与用量子面板一致）
-        let cardRect = card.convert(card.bounds, to: self)
+        // 间距与用量子面板同口径：锚点 X = 内容右缘(-7) 再 -2 ⇒ bounds.maxX - 9，与
+        // 用量子面板 titleRect.maxX - 2 同点；右侧屏幕空间不足时翻到面板左缘（仍固定）
         let size = controller.preferredContentSize
         var edge: NSRectEdge = .maxX
-        var anchorX = min(max(bounds.minX + 1, cardRect.maxX - 1), bounds.maxX - 1)
+        var anchorX = bounds.maxX - 9
         if let visible = window?.screen?.visibleFrame, let window,
            visible.maxX - window.frame.maxX < size.width + 16 {
             edge = .minX
-            anchorX = min(max(bounds.minX + 1, cardRect.minX + 1), bounds.maxX - 1)
+            anchorX = bounds.minX + 8
         }
-        let anchorY = min(max(bounds.minY + 1, cardRect.midY), bounds.maxY - 1)
-        tokensPanelPositionAnchor.frame = NSRect(x: anchorX, y: anchorY - 0.5, width: 1, height: 1)
+        // 锚点 = 1×1 点，popover 以点为内容垂直中心：anchorY = 可视顶边 - 内容高/2
+        // ⇒ 子面板顶边与主面板可视顶边对齐（高随内容伸缩，顶边不动）；
+        // 系统三角恒在窗口缘中点 ⇒ 固定停在余额板块中部，不随 hover 卡片移动
+        let visRect = visibleRect
+        let anchorCenterY = min(max(bounds.minY + 1, visRect.maxY - size.height / 2), bounds.maxY - 1)
+        tokensPanelPositionAnchor.frame = NSRect(x: anchorX, y: anchorCenterY - 0.5, width: 1, height: 1)
         tokensPanelPositionAnchor.isHidden = false
         tokensPanelPositionAnchor.superview?.layoutSubtreeIfNeeded()
 
@@ -912,26 +1105,27 @@ extension BalancePanelView {
                              of: card, preferredEdge: edge)
             }
         }
-        // 换卡片 hover 重定位：先关再弹（animates=false，无动画帧残留）
-        if popover.isShown { popover.close() }
-        present()
-        if popover.isShown != true {
-            DispatchQueue.main.async { [weak self] in
-                guard self?.tokensCardHovered == true else { return }
-                present()
+        // 固定定位：popover 已展示且锚点不变，换卡片 hover 不重弹（内容/配色原位刷新）
+        if !popover.isShown {
+            present()
+            if popover.isShown != true {
+                DispatchQueue.main.async { [weak self] in
+                    guard self?.tokensCardHovered == true else { return }
+                    present()
+                }
             }
         }
 
         // 数据：先展示占位，再异步取最新（缓存命中时回调同步执行，内容立即落定；
         // 到达后原位更新内容与尺寸，并重同步一次背景色防展示期间主面板配色变化）
         controller.update(summary: nil)
-        ZcodeTokenStore.fetch { [weak self, weak controller, weak popover] summary in
+        source.fetch { [weak self, weak controller, weak popover] summary in
             guard let controller, let popover else { return }
             controller.update(summary: summary)
             popover.contentSize = controller.preferredContentSize
             self?.syncTokensPanelBackground()
         }
-        // 打开期间低频刷新（间隔 = store 缓存 TTL，到期即真查库）：总计变化时滚动到新值
+        // 打开期间低频套用最新缓存（与后台缓存同周期，fetch 同步回缓存零读取）：总计变化时滚动到新值
         startTokensRefreshTimer()
     }
 
@@ -947,18 +1141,18 @@ extension BalancePanelView {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: task)
     }
 
-    /// 打开期间每 15s（= store 缓存 TTL，到期即真查库）刷一次数据；
-    /// 总计词元变化时经 RollingNumberView 从旧值滚动到新值。pop 面板已关则空转自清。
+    /// 打开期间每 60s（与后台缓存重建同周期）套用一次最新缓存，零额外读取；
+    /// 总计词元变化时经 RollingNumberView 从旧值滚动到新值。面板已关则空转自清。
     private func startTokensRefreshTimer() {
         tokensRefreshTimer?.invalidate()
-        tokensRefreshTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        tokensRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             guard let self, self.tokensPanelPopover?.isShown == true,
                   let controller = self.tokensPanelController else {
                 self?.tokensRefreshTimer?.invalidate()
                 self?.tokensRefreshTimer = nil
                 return
             }
-            ZcodeTokenStore.fetch { summary in
+            tokensPanelSource.fetch { summary in
                 controller.update(summary: summary)
             }
         }

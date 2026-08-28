@@ -362,6 +362,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
 
+        // Token 用量缓存预热：启动即触发后台构建（此后每 60s 自动重建），
+        // 用户 hover 卡片时直接命中缓存，弹面板零等待
+        ZcodeTokenStore.fetch { _ in }
+        WBTokenStore.fetch { _ in }
+
         // 自动签到：启动时检查 + 每小时轮询（本地日期守卫，每天最多一次网络请求）
         startCheckinTimer()
         if config.traeAutoCheckin {

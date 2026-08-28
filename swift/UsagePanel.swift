@@ -192,9 +192,8 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         let graphLineColor = Palette.chartLine
         let headerY: CGFloat = 12
 
-        // 表头两行式（相对图表 plot 区域）：第一行平台名（左对齐），
-        // 第二行「本周用量」标签（左对齐）；周用量数值右对齐、加大字号，
-        // 垂直居中跨占两行高度。
+        // 表头两行式：第一行「平台名 + 本周累计用量」标签（同行同字号同色，与 Token 子面板
+        // 首行同款，右缘同一纵坐标为周切换箭头）；第二行周用量数值换行左对齐（字号不变）。
         let plotFullWidth = max(1, bounds.width - plotInset - yAxisGap
                                 - yAxisLabelWidth - yAxisRightInset)
         let valueFont = monoFontEnabled
@@ -202,36 +201,33 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             : (interFontEnabled
                 ? InterFontProvider.font(size: 17, weight: .semibold)
                 : NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold))
-        // 平台名标题字体与用量表格行一致：10pt medium
-        let platformNameFont = uiFont(size: 10, weight: .medium)
-        let headerLineHeight = "Ag".size(withAttributes: [.font: titleFont]).height
-        let titleLineHeight = "Ag".size(withAttributes: [.font: platformNameFont]).height
-        let headerLineGap: CGFloat = 2
-        let headerBlockHeight = titleLineHeight + headerLineGap + headerLineHeight
         // 当前浏览的周页（weekOffset 由右上角箭头切换；越界防御性夹取）
         let pageCount = max(1, row.historyWeeks.count)
         let safeOffset = min(max(0, weekOffset), pageCount - 1)
+        let isCurrentWeek = safeOffset == 0
         let week = row.historyWeeks.indices.contains(safeOffset)
             ? row.historyWeeks[safeOffset]
             : UsageWeekData(daily: Array(repeating: 0, count: 7),
                             dailyTexts: Array(repeating: "—", count: 7),
                             headerLabel: "本周累计用量", totalText: row.weekText)
-        let isCurrentWeek = safeOffset == 0
-        drawText(row.name, at: NSPoint(x: plotInset, y: headerY),
-                 font: platformNameFont, color: titleColor)
-        drawText(week.headerLabel, at: NSPoint(x: plotInset, y: headerY + titleLineHeight + headerLineGap),
-                 font: titleFont, color: titleColor)
+        // 第一行：平台名 + 空格 + 周标签（9pt 同字号同色 + 0.8 字距）
+        let headerAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .kern: 0.8]
+        let headerText = "\(row.name) \(week.headerLabel)"
+        let headerTextH = headerText.size(withAttributes: [.font: titleFont]).height
+        (headerText as NSString).draw(at: NSPoint(x: plotInset, y: headerY),
+                                      withAttributes: headerAttrs.merging([.foregroundColor: secondaryColor]) { cur, _ in cur })
+        // 第二行：数值换行左对齐（17pt semibold 不变）
+        let valueY = headerY + headerTextH + 4
         let weekSize = week.totalText.size(withAttributes: [.font: valueFont])
-        drawText(week.totalText,
-                 at: NSPoint(x: plotInset + plotFullWidth - weekSize.width,
-                             y: headerY + (headerBlockHeight - weekSize.height) / 2),
-                 font: valueFont, color: titleColor)
+        drawText(week.totalText, at: NSPoint(x: plotInset, y: valueY), font: valueFont, color: titleColor)
+        let headerBlockHeight = valueY + weekSize.height - headerY
 
-        // 右上角周切换箭头（有历史周才显示）：左=过去周（offset+1），右=回到本周（offset-1）；到边界时置灰
+        // 第一行右缘的周切换箭头（有历史周才显示，右对齐、与首行同一纵坐标）：
+        // 左=过去周（offset+1），右=回到本周（offset-1）；到边界时置灰
         if row.historyWeeks.count > 1 {
             let arrowBox: CGFloat = 13
             let arrowGap: CGFloat = 6
-            let arrowCenterY = headerY + headerBlockHeight / 2
+            let arrowCenterY = headerY + headerTextH / 2
             let rightRect = NSRect(x: bounds.maxX - 4 - arrowBox,
                                    y: arrowCenterY - arrowBox / 2,
                                    width: arrowBox, height: arrowBox)
@@ -566,8 +562,12 @@ final class UsageHistoryPopoverController: NSViewController {
         didSet { applyPanelBackground() }
     }
     /// 主面板当前生效的背景遮罩色（含渐变开关状态）：子弹窗继承同一配色
-    var panelTintColor: NSColor? = Palette.containerTint
-    var panelTintBottomColor: NSColor? = Palette.containerTintBottom
+    var panelTintColor: NSColor? = Palette.containerTint {
+        didSet { applyPanelBackground() }
+    }
+    var panelTintBottomColor: NSColor? = Palette.containerTintBottom {
+        didSet { applyPanelBackground() }
+    }
     /// Mono 字体开关：图表内文本（标题/刻度/日期）与数值随开关切换字体
     var monoFontEnabled = false {
         didSet { chartView.monoFontEnabled = monoFontEnabled }
@@ -582,7 +582,7 @@ final class UsageHistoryPopoverController: NSViewController {
         backgroundView.blendingMode = .behindWindow
         backgroundView.state = .active
         backgroundView.isEmphasized = false
-        // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；渐变开强制深色；否则跟随系统
+        // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；其余（含渐变开）跟随系统
         backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                             gradientOn: panelGradientEnabled)
         backgroundView.tintColor = panelTintColor
@@ -621,7 +621,7 @@ final class UsageHistoryPopoverController: NSViewController {
 
     private func applyPanelBackground() {
         guard isViewLoaded else { return }
-        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
         backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                             gradientOn: panelGradientEnabled)
         backgroundView.tintColor = panelTintColor
@@ -908,6 +908,27 @@ extension BalancePanelView {
         return nil
     }
 
+    /// 用量子面板背景配色 → 主面板当前生效值（渐变/浅色/系统主题切换时的重同步入口）：
+    /// 优先拷贝主面板容器当前生效实色，容器查找失败按 Palette.containerColors 兜底
+    /// （lightTint 与 Token 子面板同口径：浅色主题开关开或生效外观为浅色）
+    func syncUsageHistoryPanelBackground() {
+        guard let controller = usageHistoryController else { return }
+        controller.panelGradientEnabled = panelGradientEnabled
+        controller.lightThemeEnabled = lightThemeEnabled
+        if let container = Self.findPanelContainer(from: self) {
+            controller.panelTintColor = container.tintColor
+            controller.panelTintBottomColor = container.tintBottomColor
+        } else {
+            let colors = Palette.containerColors(
+                lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
+                gradientOn: panelGradientEnabled)
+            controller.panelTintColor = colors.top
+            controller.panelTintBottomColor = colors.bottom
+        }
+        usageHistoryPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                                  gradientOn: panelGradientEnabled)
+    }
+
     private func showUsageHistory(row: UsageRowSnapshot, from anchor: NSView?) {
         guard let anchor, anchor.window != nil else { return }
         // 标题尚未完成挂窗或正在重建时先回退到当前行，避免 hover 事件被直接吞掉。
@@ -941,7 +962,7 @@ extension BalancePanelView {
             let popover = NSPopover()
             popover.behavior = .applicationDefined
             // 三角箭头由 NSPopover 窗口本身绘制，外观与主面板同策略：
-            // 统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+            // 统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
             popover.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                          gradientOn: panelGradientEnabled)
             // 让内容背景延伸覆盖系统三角箭头区域，箭头与主面板背景保持一致。
@@ -958,13 +979,8 @@ extension BalancePanelView {
 
         let anchorChanged = usageHistoryAnchor !== fixedAnchor
         usageHistoryAnchor = fixedAnchor
-        usageHistoryController?.panelGradientEnabled = panelGradientEnabled
-        usageHistoryController?.lightThemeEnabled = lightThemeEnabled
-        // 继承主面板容器当前生效的背景遮罩色（含渐变开关两种形态），子弹窗与主面板底色一致
-        if let container = Self.findPanelContainer(from: self) {
-            usageHistoryController?.panelTintColor = container.tintColor
-            usageHistoryController?.panelTintBottomColor = container.tintBottomColor
-        }
+        // 背景/字体开关与主面板保持一致（主题/渐变切换时的唯一重同步入口，见下方同名方法）
+        syncUsageHistoryPanelBackground()
         // Mono 开关在面板打开期间切换时，子弹窗是懒创建的——每次 show 前同步当前状态
         usageHistoryController?.monoFontEnabled = monoFontEnabled
         // Inter 字体开关同样在各次 show 前同步（优先级 Mono > Inter）

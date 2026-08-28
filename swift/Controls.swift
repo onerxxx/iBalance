@@ -1,5 +1,5 @@
 // Controls.swift — iBalance
-// 自绘控件:MiniSwitch / MonoSegmented / HoverCard / ActionTileButton 等(自包含)
+// 自绘控件:MiniSwitch / HoverCard / ActionTileButton 等(自包含)
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 
 import Cocoa
@@ -76,13 +76,13 @@ final class MiniSwitch: NSSwitch {
 }
 
 /// 字符风格开关（Mono 模式专用）：[×] 关 / [▪] 开（U+25AA BLACK SMALL SQUARE）。
-/// 全自绘（draw(_:)），与 MonoSegmentedControl 同一渲染机制（attributed string + kern），
+/// 全自绘（draw(_:)），attributed string + kern 渲染，
 /// 消除 NSTextField cell 内边距导致的对齐偏差——两个字符控件直接锚定到各自容器的 trailing。
 /// 点击（或 performClick）翻转 state 并发送 action，与 NSSwitch 的 state/target/action 语义一致。
 final class MonoCharSwitch: NSControl {
-    /// 字号/字重与 MonoSegmentedControl 一致
+    /// 字号/字重
     private let fontSize: CGFloat = 12
-    /// 字符间距（与 MonoSegmentedControl 一致，不用空格破坏等宽对齐）
+    /// 字符间距（不用空格破坏等宽对齐）
     private let kern: CGFloat = 2.0
     /// 开关状态（NSControl 的 state 不可覆写，这里自定义同名存储属性，对外语义一致）
     private var _state: NSControl.StateValue = .off
@@ -123,7 +123,7 @@ final class MonoCharSwitch: NSControl {
         ]
         let str = text as NSString
         let sz = str.size(withAttributes: attrs)
-        // 控件被约束拉伸时内容居中（与 MonoSegmentedControl 一致）
+        // 控件被约束拉伸时内容居中
         let startX = max((bounds.width - sz.width) / 2, 0)
         str.draw(at: NSPoint(x: startX, y: bounds.midY - sz.height / 2), withAttributes: attrs)
     }
@@ -162,233 +162,54 @@ final class SwitchRowTapHandler: NSObject {
     }
 }
 
-/// 字符风格分段控件（Mono 模式专用）：方括号包裹 + 段间制表符竖线分隔 [1│3│5]
-/// （│ = U+2502 box drawings light vertical，JetBrainsMono 已覆盖），
-/// 与 MonoCharSwitch 的 [▪]/[×] 容器风格一致：方括号与竖线固定淡灰（tertiaryLabelColor），
-/// 数字选中 Palette.cardForeground（#DFDFDF）、未选中灰。
-/// 用 JetBrainsMono 等宽字体渲染（与 MonoCharSwitch 同设计语言：12pt semibold，略放宽段间距），
-/// 点击段切换 selectedSegment 并发送 action，与 NSSegmentedControl 的
-/// selectedSegment/target/action 语义一致，便于按 Mono 模式与原生分段控件同框显隐切换。
-/// 全自绘（draw(_:)）、无子视图、无 layer transform，避免 AppKit 复杂控件重置问题。
-final class MonoSegmentedControl: NSControl {
-    private let titles: [String]
-    /// 字号/字重与 MonoCharSwitch 一致
-    private let fontSize: CGFloat = 12
-    /// 字符间距：数值与括号/分隔线之间保留更明确的呼吸空间。
-    private let kern: CGFloat = 3.0
-    /// 段间制表符竖线（box drawings light vertical，等宽字下为实心竖线）
-    private let separator = "│"
-    /// 整体包裹方括号（与 MonoCharSwitch 的 [▪]/[×] 容器同风格）
-    private let bracket = "["
-    /// 当前选中段（-1 = 无选中，语义与 NSSegmentedControl 一致）
-    var selectedSegment: Int = -1 {
-        didSet { needsDisplay = true }
-    }
-
-    init(titles: [String], target: AnyObject?, action: Selector?) {
-        self.titles = titles
-        super.init(frame: .zero)
-        self.target = target
-        self.action = action
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    /// 单段数字渲染宽度（JetBrainsMono 等宽，各段同宽）
-    private var digitWidth: CGFloat {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
-        ]
-        return ("0" as NSString).size(withAttributes: attrs).width
-    }
-
-    /// 制表符竖线渲染宽度（等宽字体下与数字同宽，但显式测量避免字体差异）
-    private var separatorWidth: CGFloat {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
-        ]
-        return (separator as NSString).size(withAttributes: attrs).width
-    }
-
-    /// 方括号渲染宽度（等宽字体下与数字同宽）
-    private var bracketWidth: CGFloat {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
-        ]
-        return (bracket as NSString).size(withAttributes: attrs).width
-    }
-
-    /// 按实际绘制的富文本测量总宽，避免逐字符测量与绘制时重复计算 kern，导致右括号被裁切。
-    private var totalWidth: CGFloat {
-        ceil(renderedString().size().width)
-    }
-
-    private func renderedString() -> NSAttributedString {
-        let font = MonoFontProvider.font(size: fontSize, weight: .semibold)
-        let separatorAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.tertiaryLabelColor,
-            .kern: kern,
-        ]
-        let bracketAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: Palette.cardForeground,
-            .kern: kern,
-        ]
-        let text = NSMutableAttributedString(string: bracket, attributes: bracketAttrs)
-        for (i, title) in titles.enumerated() {
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: i == selectedSegment ? Palette.cardForeground : NSColor.secondaryLabelColor,
-                .kern: kern,
-            ]
-            text.append(NSAttributedString(string: title, attributes: attrs))
-            if i < titles.count - 1 {
-                text.append(NSAttributedString(string: separator, attributes: separatorAttrs))
-            }
-        }
-        // 最后一个字符不再附带 kern，避免测量宽度包含不可见的尾部字距，导致内容视觉偏左。
-        let closingAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: Palette.cardForeground,
-        ]
-        text.append(NSAttributedString(string: "]", attributes: closingAttrs))
-        return text
-    }
-
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: totalWidth, height: 16)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let text = renderedString()
-        let size = text.size()
-        // 内容右对齐（视觉右缘贴设置行尾，与最初紧凑排版位置一致）；
-        // 控件本体撑满 114pt overlay 容器以扩大命中区，视觉排版不受影响。
-        let startX = max(bounds.width - size.width, 0)
-        text.draw(at: NSPoint(x: startX, y: bounds.midY - size.height / 2))
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        guard !titles.isEmpty else { return }
-        // 命中区约束在 [] 内容区内：内容右对齐，左括号以左的空白不响应点击。
-        // 段间命中边界 = 视觉分隔符（│）的中点：
-        // 点击数字/方括号/竖线左半 → 竖线左侧的段，竖线右半/右侧数字 → 右侧的段。
-        // 排版与 draw/renderedString 一致：[ k 数字 k │ k 数字 k │ k 数字 k ]
-        let contentX = bounds.width - totalWidth
-        guard p.x >= contentX else { return }
-        let step = digitWidth + kern * 2 + separatorWidth
-        var idx = titles.count - 1
-        for i in 0..<(titles.count - 1) {
-            // 第 i 个分隔符（段 i 与 i+1 之间）的左缘与中点
-            let sepLeft = contentX + bracketWidth + kern + CGFloat(i) * step + digitWidth + kern
-            let sepMid = sepLeft + separatorWidth / 2
-            if p.x < sepMid { idx = i; break }
-        }
-        if selectedSegment != idx {
-            selectedSegment = idx
-            sendAction(action, to: target)
-        }
-    }
-}
-
-/// 紧凑分段控件：纯使用 AppKit 原生 controlSize/font/segmentWidth 控制尺寸，
-/// 不使用任何 layer transform（AppKit 复杂控件会在首次显示时重置 layer 属性导致缩放失效）。
-/// 选中段高亮色固定为 #7F7F7F。
-/// NSSegmentedControl 的自定义 cell：收窄每段标题的水平内边距。
-/// 系统 .mini 分段控件每段内边距约 7pt/侧，「3分钟」@9pt 宽约 25pt，38pt 段下
-/// 25 + 14 ≈ 39pt 仍会溢出被省略号截断。这里改由 cell 自绘标题：
-/// 水平余量均分居中（约 6.5pt/侧，等价于收窄内边距），38pt 段即可稳定容纳。
-final class CompactSegmentedCell: NSSegmentedCell {
-    override func drawSegment(_ segment: Int, inFrame frame: NSRect, with view: NSView) {
-        // 临时清空标题让 super 只画背景/选中 bezel（选中态由 isSelected(forSegment:)
-        // 驱动，与标题内容无关），随后按收窄内边距自绘标题，避免双层文字。
-        let originalLabel = self.label(forSegment: segment)
-        setLabel("", forSegment: segment)
-        super.drawSegment(segment, inFrame: frame, with: view)
-        setLabel(originalLabel ?? "", forSegment: segment)
-        guard let label = originalLabel, !label.isEmpty else { return }
-
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font ?? NSFont.systemFont(ofSize: 9),
-            .foregroundColor: NSColor.controlTextColor,
-        ]
-        let size = (label as NSString).size(withAttributes: attrs)
-        // 水平：段内余量均分居中；垂直：draw(in:) 实测不垂直居中（偏上约 3pt），
-        // 需手动以 (midY - 文本高/2) 定位用 draw(at:)。
-        let origin = NSPoint(x: frame.midX - size.width / 2,
-                             y: frame.midY - size.height / 2)
-        (label as NSString).draw(at: origin, withAttributes: attrs)
-    }
-}
-
-final class MiniSegmentedControl: NSSegmentedControl {
-    /// 当前是否浅色主题（决定 bezel 高亮色取深色定制值还是浅色系统默认）
-    private var lightTheme = false
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        controlSize = .mini
-        segmentStyle = .rounded
-        appearance = NSAppearance(named: .darkAqua)
-        applyBezelColor()
-        // 监听系统颜色变化通知，在主题色切换时更新 bezel 颜色
-        NotificationCenter.default.addObserver(self, selector: #selector(accentColorChanged),
-                                               name: NSColor.systemColorsDidChangeNotification, object: nil)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
-
-    /// 选中段高亮色 = #666666（AppKit bezel 会提亮渐变，填暗一档补偿）；
-    /// 浅色主题回退系统默认（原生浅色选中观感已调好）
-    private func applyBezelColor() {
-        selectedSegmentBezelColor = lightTheme
-            ? nil
-            : NSColor(calibratedRed: 0x66/255.0, green: 0x66/255.0, blue: 0x66/255.0, alpha: 1)
-    }
-
-    /// 主题跟随：控件自带 appearance（不继承容器），浅色主题时需显式切换为浅色
-    func applyThemeAppearance(light: Bool) {
-        lightTheme = light
-        appearance = light ? NSAppearance(named: .aqua) : NSAppearance(named: .darkAqua)
-        applyBezelColor()
-    }
-
-    @objc private func accentColorChanged() {
-        applyBezelColor()
-        needsDisplay = true
-    }
+/// 视觉缩放下拉菜单：在原生 NSPopUpButton 基础上通过 affineTransform 缩至 0.8 倍，
+/// 与 MiniSwitch 同一套 layer transform 处理（layout / viewDidMoveToWindow / viewWillDraw
+/// 三处兜底重放——AppKit 复杂控件会在布局同步后重置 layer 属性）。
+/// frame 不缩小：点击区域保持原生尺寸，仅视觉缩放。
+/// ⚠️ 不自定义初始化器：NSPopUpButton 的指定初始化器是 init(frame:pullsDown:)，
+/// 覆写 init(frame:) 走 NSControl 链会内部转发回指定初始化器并触发 Swift 运行时陷阱（实测崩溃）。
+final class CompactPopUpButton: NSPopUpButton {
+    private let visualScale: CGFloat = 0.8
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // 首次进窗口时换成 CompactSegmentedCell（收窄内边距）。此刻 segment 已由
-        // init(labels:...) 配置完毕，直接复制配置；target/action/segmentStyle 等状态
-        // 在 NSControl/NSSegmentedControl 层，换 cell 不受影响。
-        if !(cell is CompactSegmentedCell), let old = cell as? NSSegmentedCell {
-            let compact = CompactSegmentedCell()
-            compact.segmentCount = old.segmentCount
-            compact.trackingMode = old.trackingMode
-            compact.controlSize = .mini
-            for i in 0..<old.segmentCount {
-                compact.setLabel(old.label(forSegment: i) ?? "", forSegment: i)
-            }
-            // selectedSegment 状态存储在 cell 上，换 cell 会丢失（新 cell 默认 -1 无选中），
-            // 首次打开会视觉上"没选中任何段"，必须显式迁移。
-            compact.selectedSegment = old.selectedSegment
-            cell = compact
+        wantsLayer = true
+        applyTransform()
+    }
+
+    override func layout() {
+        super.layout()
+        applyTransform()
+        // AppKit 可能在 layout 同步后重置 layer transform，下一帧再设一次
+        DispatchQueue.main.async { [weak self] in
+            self?.applyTransform()
         }
-        let miniFont = NSFont.systemFont(ofSize: 9, weight: .medium)
-        font = miniFont
-        cell?.font = miniFont
-        for i in 0..<segmentCount {
-            setWidth(38, forSegment: i)
+    }
+
+    override func viewWillDraw() {
+        super.viewWillDraw()
+        applyTransform()
+    }
+
+    private func applyTransform() {
+        guard let l = layer, l.bounds.width > 0 else { return }
+        // 锚点取右缘中点：缩放向右收拢，视觉右缘与 frame 右缘重合，
+        // 与设置行开关控件（trailing 贴行尾）右对齐；垂直方向仍绕中心
+        let anchor = CGPoint(x: 1.0, y: 0.5)
+        let target = CGAffineTransform(scaleX: visualScale, y: visualScale)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if l.anchorPoint != anchor {
+            var p = l.position
+            p.x += l.bounds.width * (anchor.x - l.anchorPoint.x)
+            p.y += l.bounds.height * (anchor.y - l.anchorPoint.y)
+            l.anchorPoint = anchor
+            l.position = p
         }
-        needsLayout = true
+        if l.affineTransform() != target {
+            l.setAffineTransform(target)
+        }
+        CATransaction.commit()
     }
 }
 
