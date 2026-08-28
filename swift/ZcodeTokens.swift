@@ -279,9 +279,6 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     var monoFontEnabled = false {
         didSet { totalRollView.refreshFont(); needsDisplay = true }
     }
-    var interFontEnabled = false {
-        didSet { totalRollView.refreshFont(); needsDisplay = true }
-    }
     /// 数据源分流（ZCode=项目 / WorkBuddy=模型）：影响区块标题与行图标
     var source: TokensPanelSource = .zcode {
         didSet { guard oldValue != source else { return }; needsDisplay = true }
@@ -363,8 +360,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     private func makeLabelFont() -> NSFont {
         monoFontEnabled ? MonoFontProvider.font(size: 9)
-            : (interFontEnabled ? InterFontProvider.font(size: 9)
-                : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular))
+            : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
     }
     /// 标签墨迹高度（9pt 小标签）
     private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
@@ -411,9 +407,9 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         totalRollView.setText(text, animated: true)
     }
 
-    /// 大数字字体：系统字体态用等宽数字变体（滚轮槽宽恒定）；Mono/Inter 本身即等宽/按主面板策略
+    /// 大数字字体：系统字体态用等宽数字变体（滚轮槽宽恒定）；Mono 按主面板策略
     private func totalFont(size: CGFloat, weight: NSFont.Weight, monoDigits: Bool) -> NSFont {
-        if monoDigits, !monoFontEnabled, !interFontEnabled {
+        if monoDigits, !monoFontEnabled {
             return .monospacedDigitSystemFont(ofSize: size, weight: weight)
         }
         return uiFont(size: size, weight: weight)
@@ -484,10 +480,9 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         return NSSize(width: Self.contentWidth, height: height)
     }
 
-    /// 按当前字体开关取字体（优先级 Mono > Inter > 系统，与面板/用量图表同策略）
+    /// 按当前字体开关取字体（优先级 Mono > 系统，与面板/用量图表同策略）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
         if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
-        if interFontEnabled { return InterFontProvider.font(size: size, weight: weight) }
         return .systemFont(ofSize: size, weight: weight)
     }
 
@@ -550,14 +545,16 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         super.draw(dirtyRect)
         let labelFont = makeLabelFont()
         let labelColor = NSColor.secondaryLabelColor
+        // 区块标题统一系统灰（与列表行同色；切换文案的未选中态仍用次级灰）
+        let titleColor = NSColor.systemGray
 
         // ── 首行：平台名 + 总计词元（同一行、同字号同色）──
         drawSpacedText(source.platformName, at: NSPoint(x: insets.left, y: totalLabelTop),
-                       font: labelFont, color: labelColor, kern: 0.8)
+                       font: labelFont, color: titleColor, kern: 0.8)
         let nameWidth = (source.platformName as NSString).size(
             withAttributes: [.font: labelFont, .kern: 0.8]).width
         drawSpacedText("总计词元", at: NSPoint(x: insets.left + ceil(nameWidth) + 6, y: totalLabelTop),
-                       font: labelFont, color: labelColor, kern: 0.8)
+                       font: labelFont, color: titleColor, kern: 0.8)
 
         // ── 总计大数字：RollingNumberView 子视图渲染（layout() 定位，summary didSet 驱动滚动）──
 
@@ -568,7 +565,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         let projects = Array((showModels ? allModels : allProjects).prefix(Self.maxListRows))
         let sectionY = sectionLabelTop
         drawSpacedText(showModels ? "模型" : "项目", at: NSPoint(x: insets.left, y: sectionY),
-                       font: labelFont, color: labelColor, kern: 0.8)
+                       font: labelFont, color: titleColor, kern: 0.8)
         projectToggleRect = .zero
         modelToggleRect = .zero
         if !allModels.isEmpty {
@@ -601,7 +598,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
         // 词元活动顶 = 末行墨迹底 + 20（行框居中留白不计入间距）
         drawActivitySection(topY: rowsInkBottom(rows: projects.count) + Self.sectionGap,
-                            labelFont: labelFont, labelColor: labelColor)
+                            labelFont: labelFont, labelColor: labelColor, titleColor: titleColor)
     }
 
     /// 项目行：文件夹 icon + 项目名（限宽截断）+ token 值 + 百分比；返回行块底部 Y。
@@ -656,9 +653,10 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     /// 词元活动：标题 + 每日/每周切换 + 正圆点阵（用量越多越亮）。
     /// 每日 = 7 行（周一→周日）× 26 周列；每周 = 单行 26 点（每周合计）。
-    private func drawActivitySection(topY: CGFloat, labelFont: NSFont, labelColor: NSColor) {
+    private func drawActivitySection(topY: CGFloat, labelFont: NSFont, labelColor: NSColor,
+                                     titleColor: NSColor) {
         drawSpacedText("词元活动", at: NSPoint(x: insets.left, y: topY),
-                       font: labelFont, color: labelColor, kern: 0.8)
+                       font: labelFont, color: titleColor, kern: 0.8)
 
         // 右上角切换：选中 = 主前景，未选中 = 次级灰
         let toggleFont = labelFont
@@ -920,9 +918,6 @@ final class ZcodeTokensPanelController: NSViewController {
     var monoFontEnabled = false {
         didSet { contentView.monoFontEnabled = monoFontEnabled }
     }
-    var interFontEnabled = false {
-        didSet { contentView.interFontEnabled = interFontEnabled }
-    }
 
     override func loadView() {
         backgroundView.material = .menu
@@ -1073,7 +1068,6 @@ extension BalancePanelView {
         // 背景/字体开关与主面板保持一致（单一同步入口，见 syncTokensPanelBackground）
         syncTokensPanelBackground()
         controller.monoFontEnabled = monoFontEnabled
-        controller.interFontEnabled = interFontEnabled
 
         // 间距与用量子面板同口径：锚点 X = 内容右缘(-7) 再 -2 ⇒ bounds.maxX - 9，与
         // 用量子面板 titleRect.maxX - 2 同点；右侧屏幕空间不足时翻到面板左缘（仍固定）

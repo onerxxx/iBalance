@@ -247,8 +247,6 @@ extension BalancePanelView {
         lightThemeSwitch.action = #selector(lightThemeToggled)
         monoSwitch.target = self
         monoSwitch.action = #selector(monoFontToggled)
-        interSwitch.target = self
-        interSwitch.action = #selector(interFontToggled)
         valuePreviewSwitch.target = self
         valuePreviewSwitch.action = #selector(valueScrollPreviewToggled)
         updateAutoSwitch.target = self
@@ -292,8 +290,9 @@ extension BalancePanelView {
             switchRow(title: "面板渐变背景", sub: nil, sw: gradientSwitch),
             switchRow(title: "浅色主题", sub: nil, sw: lightThemeSwitch),
             switchRow(title: "Mono 风格", sub: nil, sw: monoSwitch),
-            switchRow(title: "Inter 字体", sub: nil, sw: interSwitch),
-            switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),
+            // 「滚动预览」暂时隐藏（2026-08-28）：恢复时把 switchRow 加回此处，
+            // 并同步恢复下方 valuePreviewSub.isHidden = false
+            // switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),
             switchRow(title: "自动检查更新", sub: nil, sw: updateAutoSwitch),
         ].map {
             let hover = wrapHoverRow($0)
@@ -303,7 +302,7 @@ extension BalancePanelView {
             return hover
         }
         // 副标题默认隐藏（switchRow 内统一设置），静态文案行直接显示
-        valuePreviewSub.isHidden = false
+        // valuePreviewSub.isHidden = false
         // 「设置」标题：可折叠标题条（hover 余额卡片样式，点击折叠整个设置卡片）
         var settingCollapseTargets: [NSView] = []
         let settingTitle = collapsibleSectionTitle(name: "设置", key: UDKey.settingsSectionCollapsed,

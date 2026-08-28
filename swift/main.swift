@@ -572,7 +572,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onToggleLightTheme = { [weak self] in self?.onToggleLightTheme() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
-        panel.onToggleInterFont = { [weak self] in self?.onToggleInterFont() }
         panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onCheckForUpdate = { [weak self] in self?.onCheckForUpdate() }
@@ -1076,7 +1075,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.panelGradientEnabled = config.panelGradientEnabled
         s.lightThemeEnabled = config.lightThemeEnabled
         s.monoFontEnabled = config.monoFontEnabled
-        s.interFontEnabled = config.interFontEnabled
         return s
     }
 
@@ -1184,14 +1182,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 保存后经快照同步，面板对已注册 label 就地换字体（不重建卡片）
     @objc private func onToggleMonoFont() {
         config.monoFontEnabled = !config.monoFontEnabled
-        ConfigStore.save(config)
-        syncPanel()
-    }
-
-    /// Inter 字体：面板文本切换 Inter（中文回退系统字体），优先级 Mono 风格 > Inter。
-    /// 保存后经快照同步，面板对已注册 label 就地换字体（不重建卡片）
-    @objc private func onToggleInterFont() {
-        config.interFontEnabled = !config.interFontEnabled
         ConfigStore.save(config)
         syncPanel()
     }

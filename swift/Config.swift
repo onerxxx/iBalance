@@ -157,9 +157,6 @@ struct AppConfig: Codable {
     /// Mono 字体开关：true = 余额卡片与用量列表使用 JetBrainsMono（拉丁字符），
     /// 缺字（中文等）通过 cascade 级联回退系统字体
     var monoFontEnabled: Bool = false
-    /// Inter 字体开关：true = 面板文本使用 Inter（Inter Variable 可变字体），
-    /// 中文缺字通过 cascade 级联回退系统字体；优先级 Mono 风格 > Inter
-    var interFontEnabled: Bool = false
     /// 数值滚动预览开关：true = 余额卡片数值周期随机变化，演示逐位滚动动画
     ///（替换原「调试用量样例数据」功能；关闭后恢复真实数值）
     var valueScrollPreviewEnabled: Bool = false
@@ -212,7 +209,6 @@ struct AppConfig: Codable {
         case panelGradientEnabled = "panel_gradient_enabled"
         case lightThemeEnabled = "light_theme_enabled"
         case monoFontEnabled = "mono_font_enabled"
-        case interFontEnabled = "inter_font_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case updateAutoCheck = "update_auto_check"
         case fadeHintBandHeight = "fade_hint_band_height"
@@ -262,7 +258,6 @@ struct AppConfig: Codable {
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
         lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? false
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
-        interFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .interFontEnabled) ?? false
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
         updateAutoCheck = try c.decodeIfPresent(Bool.self, forKey: .updateAutoCheck) ?? true
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34

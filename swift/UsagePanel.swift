@@ -50,10 +50,6 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     var monoFontEnabled = false {
         didSet { needsDisplay = true }
     }
-    /// Inter 字体开关：开启时图表内文本用 Inter（优先级 Mono > Inter）
-    var interFontEnabled = false {
-        didSet { needsDisplay = true }
-    }
     private var trackingArea: NSTrackingArea?
     /// 当日圆点 Pulse Dot 相位（0~1 线性周期位置）：驱动光环扩散进度
     private var blinkPhase: CGFloat = 0
@@ -61,10 +57,9 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     /// 视图移出 window（子弹窗关闭）时暂停，重新出现时复用。
     private weak var blinkLink: CADisplayLink?
 
-    /// 按当前字体开关取字体（优先级：Mono 风格 > Inter > 系统字体，与面板 uiFont 同策略）
+    /// 按当前字体开关取字体（优先级：Mono 风格 > 系统字体，与面板 uiFont 同策略）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
         if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
-        if interFontEnabled { return InterFontProvider.font(size: size, weight: weight) }
         return .systemFont(ofSize: size, weight: weight)
     }
 
@@ -178,9 +173,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
 
         let titleFont = monoFontEnabled
             ? MonoFontProvider.font(size: 9)
-            : (interFontEnabled
-                ? InterFontProvider.font(size: 9)
-                : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular))
+            : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
         let detailFont = uiFont(size: 10)
         let axisFont = titleFont
         let titleColor = Palette.cardForeground
@@ -198,9 +191,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                                 - yAxisLabelWidth - yAxisRightInset)
         let valueFont = monoFontEnabled
             ? MonoFontProvider.font(size: 17, weight: .semibold)
-            : (interFontEnabled
-                ? InterFontProvider.font(size: 17, weight: .semibold)
-                : NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold))
+            : NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
         // 当前浏览的周页（weekOffset 由右上角箭头切换；越界防御性夹取）
         let pageCount = max(1, row.historyWeeks.count)
         let safeOffset = min(max(0, weekOffset), pageCount - 1)
@@ -210,12 +201,12 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             : UsageWeekData(daily: Array(repeating: 0, count: 7),
                             dailyTexts: Array(repeating: "—", count: 7),
                             headerLabel: "本周累计用量", totalText: row.weekText)
-        // 第一行：平台名 + 空格 + 周标签（9pt 同字号同色 + 0.8 字距）
+        // 第一行：平台名 + 空格 + 周标签（9pt 同字号同色 + 0.8 字距，系统灰对齐 Token 子面板标题）
         let headerAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .kern: 0.8]
         let headerText = "\(row.name) \(week.headerLabel)"
         let headerTextH = headerText.size(withAttributes: [.font: titleFont]).height
         (headerText as NSString).draw(at: NSPoint(x: plotInset, y: headerY),
-                                      withAttributes: headerAttrs.merging([.foregroundColor: secondaryColor]) { cur, _ in cur })
+                                      withAttributes: headerAttrs.merging([.foregroundColor: NSColor.systemGray]) { cur, _ in cur })
         // 第二行：数值换行左对齐（17pt semibold 不变）
         let valueY = headerY + headerTextH + 4
         let weekSize = week.totalText.size(withAttributes: [.font: valueFont])
@@ -571,10 +562,6 @@ final class UsageHistoryPopoverController: NSViewController {
     /// Mono 字体开关：图表内文本（标题/刻度/日期）与数值随开关切换字体
     var monoFontEnabled = false {
         didSet { chartView.monoFontEnabled = monoFontEnabled }
-    }
-    /// Inter 字体开关：图表内文本随开关切换（优先级 Mono > Inter）
-    var interFontEnabled = false {
-        didSet { chartView.interFontEnabled = interFontEnabled }
     }
 
     override func loadView() {
@@ -983,8 +970,6 @@ extension BalancePanelView {
         syncUsageHistoryPanelBackground()
         // Mono 开关在面板打开期间切换时，子弹窗是懒创建的——每次 show 前同步当前状态
         usageHistoryController?.monoFontEnabled = monoFontEnabled
-        // Inter 字体开关同样在各次 show 前同步（优先级 Mono > Inter）
-        usageHistoryController?.interFontEnabled = interFontEnabled
         // 外观与渐变/浅色开关每次 show 前重设（开关可能在面板存在期间切换：深色 ↔ 浅色玻璃）
         usageHistoryPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                                   gradientOn: panelGradientEnabled)

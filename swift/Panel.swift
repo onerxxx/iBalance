@@ -54,8 +54,6 @@ struct PanelSnapshot: Equatable {
     var lightThemeEnabled = false
     /// Mono 字体开关（同步自配置；余额卡片与用量列表 JetBrainsMono ↔ 系统字体）
     var monoFontEnabled = false
-    /// Inter 字体开关（同步自配置；面板文本 Inter ↔ 系统字体，优先级 Mono > Inter）
-    var interFontEnabled = false
     /// 数值滚动预览开关（开启后余额卡片周期随机变化，演示逐位滚动动画）
     var valueScrollPreviewEnabled = false
     /// 自动检查更新开关（GitHub Releases 启动静默检查）
@@ -135,7 +133,7 @@ final class NickBadgeTextField: NSTextField {
 
 /// 动效统一取值表（UIUX-OPTIMIZATION.md §1）：时长与曲线只允许从这里取，
 /// 新增动效不得再引入裸字面量。脉冲循环（0.5/0.55/0.6）与签名动效
-/// （字重渐变 1s、字符模糊切换 0.35、刷新按钮旋转 0.45）保留自有参数不进表。
+/// （字符模糊切换 0.35、刷新按钮旋转 0.45）保留自有参数不进表。
 enum Motion {
     /// 按压反馈：100–160ms 区间，越快越跟手
     static let press: CFTimeInterval = 0.12
@@ -143,8 +141,6 @@ enum Motion {
     static let hover: CFTimeInterval = 0.25
     /// 布局重排/换位：屏上位移
     static let layout: CFTimeInterval = 0.20
-    /// 标题 hover 字重动画（Inter 500↔900）：跟手优先（用户定稿 0.16s）
-    static let weight: CFTimeInterval = 0.16
     /// 内容揭示/淡入：偶发动作稍从容
     static let reveal: CFTimeInterval = 0.24
     /// 强调动效硬顶：一切 UI 动画 ≤ 0.40
@@ -397,73 +393,6 @@ enum MonoFontProvider {
 
 /// 四字节 FourCC 轴标签 → 32 位有符号整数（CoreText descriptor .variation 要求整数键）。
 /// 'wght' = 0x77676874 = 2003265652；'MONO' / 'CASL' / 'slnt' / 'CRSV' 同理。
-private func axisTag(_ s: String) -> Int {
-    let b = Array(s.utf8)
-    let v = (UInt32(b[0]) << 24) | (UInt32(b[1]) << 16) | (UInt32(b[2]) << 8) | UInt32(b[3])
-    return Int(Int32(bitPattern: v))
-}
-
-/// Inter（Inter Variable 可变字体，无中文字形）：拉丁字符用 Inter，缺字（中文/特殊符号）
-/// 通过 cascade 级联自动回退系统字体。字体文件随 App 打包在 Resources/，首次使用时按进程注册（幂等）。
-/// 双轴：wght（100..900，默认 400）+ opsz（14..32，默认 14）。这里**只连续写 wght 轴**（Light→Black
-/// 无极可调），opsz 固定在 14（正文观感），中文级联回退系统字体。
-enum InterFontProvider {
-    /// 基础实例：所有变体从同一 PostScript 名派生，wght 由 .variation 覆盖
-    private static let basePostScript = "InterVariable"
-    private static var registeredInstance = false
-
-    static func register() {
-        guard !registeredInstance else { return }
-        registeredInstance = true
-        guard let url = Bundle.main.url(forResource: "InterVariable", withExtension: "ttf")
-            ?? Bundle.main.url(forResource: "InterVariable", withExtension: "otf")
-        else { return }
-        CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
-    }
-
-    /// NSFont.Weight → Inter wght 轴连续值（100..900）：
-    /// 用标准 CSS 字重刻度锚点映射，非 NSFont.Weight.rawValue 线性（regular=0 若线性会落到 550 偏粗）。
-    private static func wghtValue(for weight: NSFont.Weight) -> Double {
-        switch weight {
-        case .ultraLight: return 100
-        case .thin:       return 100
-        case .light:      return 300
-        case .regular:    return 400
-        case .medium:     return 500
-        case .semibold:   return 600
-        case .bold:       return 700
-        case .heavy:      return 800
-        case .black:      return 900
-        default:          return 400
-        }
-    }
-
-    /// Inter + 系统字体级联：wght 无级写入（opsz 固定），中文回退系统字体
-    static func font(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        font(size: size, wght: wghtValue(for: weight))
-    }
-
-    /// 按任意 wght 值（100..900）生成 Inter 字体（opsz 固定 14，中文级联回退系统字体）。
-    /// 供 hover 字重动画逐帧驱动（接受连续插值，如 400→800）。
-    static func font(size: CGFloat, wght: Double) -> NSFont {
-        register()
-        guard let base = NSFont(name: basePostScript, size: size) else {
-            return .systemFont(ofSize: size, weight: .regular)
-        }
-        let variations: [Int: Double] = [
-            axisTag("wght"): wght,
-            axisTag("opsz"): 14,
-        ]
-        let cascade = NSFont.systemFont(ofSize: size, weight: .regular).fontDescriptor
-        let desc = base.fontDescriptor.addingAttributes([
-            .variation: variations,
-            .cascadeList: [cascade],
-        ])
-        if let f = NSFont(descriptor: desc, size: size) { return f }
-        return base
-    }
-}
-
 /// 通用 layer keypath 过渡（borderWidth / shadowOpacity 等），0.22s easeInEaseOut
 func animateLayerKey(_ layer: CALayer?, keyPath: String, to value: Any?, duration: Double = Motion.hover) {
     guard let l = layer else { return }
@@ -954,8 +883,6 @@ final class BalancePanelView: NSView {
     var onToggleLightTheme: (() -> Void)?
     /// Mono 字体开关（设置卡片开关触发：余额卡片与用量列表切换 JetBrainsMono）
     var onToggleMonoFont: (() -> Void)?
-    /// Inter 字体开关（设置卡片开关触发：面板文本切换 Inter，优先级 Mono > Inter）
-    var onToggleInterFont: (() -> Void)?
     /// 数值滚动预览开关（设置卡片开关触发：余额数值周期随机变化演示滚动）
     var onToggleValueScrollPreview: (() -> Void)?
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
@@ -1252,10 +1179,6 @@ final class BalancePanelView: NSView {
     let monoSwitch = MiniSwitch()
     /// Mono 字体开关状态（update 同步；变化时对已注册 label 就地切换字体，不重建卡片）
     private(set) var monoFontEnabled = false
-    /// Inter 字体开关（update 时随快照同步状态）
-    let interSwitch = MiniSwitch()
-    /// Inter 字体开关状态（update 同步；变化时对已注册 label 就地切换字体，不重建卡片）
-    private(set) var interFontEnabled = false
     /// 非当前账号弱化透明度（已固化为默认行为：整卡降透明、悬停复亮）
     private static let subCardDimAlpha: CGFloat = 0.6
     /// 数值滚动预览开关状态（update 同步；开启后周期随机变动余额演示滚动）
@@ -1280,12 +1203,11 @@ final class BalancePanelView: NSView {
     }
     private var fontTargets: [FontTarget] = []
 
-    /// 按当前字体开关状态取字体（优先级：Mono 风格 > Inter > 系统字体）。
-    /// Mono = JetBrainsMono（中文级联回退系统字体），Inter = Inter（中文级联回退系统字体），
+    /// 按当前字体开关状态取字体（优先级：Mono 风格 > 系统字体）。
+    /// Mono = JetBrainsMono（中文级联回退系统字体），
     /// 关 = 系统字体（等宽数字列可选，余额数值右对齐用）。
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
         if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
-        if interFontEnabled { return InterFontProvider.font(size: size, weight: weight) }
         return monoDigits
             ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
             : .systemFont(ofSize: size, weight: weight)
@@ -1313,100 +1235,16 @@ final class BalancePanelView: NSView {
     }
 
     /// 余额滚动数值视图注册表（weak：卡片重建后自动失效）。
-    /// RollingNumberView 非 NSTextField、不进 fontTargets，Mono/Inter 开关切换时单独就地刷字体
+    /// RollingNumberView 非 NSTextField、不进 fontTargets，Mono 开关切换时单独就地刷字体
     private let rollingTargets = NSHashTable<RollingNumberView>()
 
-    /// 注册余额滚动数值视图并注入字体策略（uiFont：Mono/Inter/系统 + 等宽数字）
+    /// 注册余额滚动数值视图并注入字体策略（uiFont：Mono/系统 + 等宽数字）
     func registerRollingNumber(_ v: RollingNumberView, size: CGFloat, weight: NSFont.Weight) {
         v.configure(size: size, weight: weight, fontProvider: { [weak self] s, w, mono in
             guard let self else { return .monospacedDigitSystemFont(ofSize: s, weight: w) }
             return self.uiFont(size: s, weight: w, monoDigits: mono)
         })
         rollingTargets.add(v)
-    }
-
-    // MARK: - 标题 hover 字重动画（Inter：500↔700，1s 平滑）
-
-    /// 单个标题的进行中动画参数（weak label：卡片重建后自动失效，tick 时清扫）
-    private struct WeightAnimState {
-        weak var label: NSTextField?
-        var from: Double
-        var to: Double
-        var start: CFTimeInterval
-    }
-    /// 进行中的标题动画（按 label 索引，**多卡并存**）：
-    /// 鼠标扫过多张卡时前一张的回落不能被后一张的进入抢占，否则前一张停在中间字重不释放
-    private var weightAnims: [ObjectIdentifier: WeightAnimState] = [:]
-    /// 字重动画时长（Motion.weight = 0.16s）
-    private let weightAnimDuration: CFTimeInterval = Motion.weight
-    /// 帧驱动：随屏幕刷新（单实例驱动 weightAnims 全部条目，空表即停）
-    private var weightAnimLink: CADisplayLink?
-    /// 字重动画加粗端（进入 700）
-    private let weightAnimBold: Double = 700
-
-    /// 启动/刷新标题字重动画。同一 label 在动画中被打断时从当前插值续走（平滑不跳变）；
-    /// 新动画从**确定性基准**起步——进入恒从 light 起、移出恒从 700 起，
-    /// 保证任何情况下移出都可靠恢复基准（不依赖可能失配的 per-label 持久状态）。
-    /// light = 该卡标题的常规基准 wght（当前统一 500 medium）
-    private func animateTitleWeight(label: NSTextField, to target: Double, light: Double) {
-        let key = ObjectIdentifier(label)
-        var from: Double
-        if let s = weightAnims[key], s.label === label {
-            // 同一张卡方向反转（如进入动画中途移出）：从当前插值继续，避免回跳
-            from = weightAnimValue(s, at: CACurrentMediaTime())
-        } else {
-            from = (target == weightAnimBold) ? light : weightAnimBold
-        }
-        if from == target {
-            // 恰在基准（如进入动画 t=0 即移出）：直接落终值并清条目
-            label.font = titleWeightFont(size: label.font?.pointSize ?? 13, wght: target)
-            weightAnims[key] = nil
-        } else {
-            weightAnims[key] = WeightAnimState(label: label, from: from, to: target, start: CACurrentMediaTime())
-        }
-        guard !weightAnims.isEmpty else { return }
-        if weightAnimLink == nil {
-            let link = displayLink(target: self, selector: #selector(onWeightAnimTick(_:)))
-            // ⚠️ 必须 add 到 RunLoop mode：否则 CADisplayLink 不派发回调，动画永不渲染
-            //（与 UsageHistoryChartView 的 displayLink 用法一致）
-            link.add(to: .main, forMode: .common)
-            weightAnimLink = link
-        }
-        weightAnimLink?.isPaused = false
-    }
-
-    /// 某条目在时刻 t 的 wght 插值（clamp 到 [from, to] 区间）
-    private func weightAnimValue(_ s: WeightAnimState, at t: CFTimeInterval) -> Double {
-        let p = min(1, max(0, (t - s.start) / weightAnimDuration))
-        return s.from + (s.to - s.from) * p
-    }
-
-    /// 字重动画帧回调：逐条目逐帧改 label.font（wght = 插值），全部到位后停
-    @objc private func onWeightAnimTick(_ link: CADisplayLink) {
-        // Inter 中途关闭：清表停驱动，字体由 applyFontPolicy 归位
-        guard interFontEnabled else {
-            weightAnims.removeAll()
-            link.isPaused = true
-            return
-        }
-        let now = link.timestamp
-        for (key, s) in weightAnims {
-            guard let label = s.label else {
-                weightAnims[key] = nil
-                continue
-            }
-            let w = weightAnimValue(s, at: now)
-            label.font = titleWeightFont(size: label.font?.pointSize ?? 13, wght: w)
-            if now - s.start >= weightAnimDuration { weightAnims[key] = nil }
-        }
-        if weightAnims.isEmpty { link.isPaused = true }
-    }
-
-    /// 按当前字体开关取标题字体（动画用：任意 wght 插值；字号取 label 当前值——
-    /// 两列压缩版式标题 11pt，沿用 13pt 会在 hover 动画时把字号顶回大号）
-    private func titleWeightFont(size: CGFloat, wght: Double) -> NSFont {
-        if interFontEnabled { return InterFontProvider.font(size: size, wght: wght) }
-        return .systemFont(ofSize: size, weight: .regular)
     }
 
     /// Mono 开关变化：对所有存活 label 就地切换字体（保留点阵脉冲等动画状态）
@@ -1472,15 +1310,6 @@ final class BalancePanelView: NSView {
             // 用量子弹窗（图表）跟随同一开关：文本和数值切换 Mono 风格
             usageHistoryController?.monoFontEnabled = monoFontEnabled
             tokensPanelController?.monoFontEnabled = monoFontEnabled
-        }
-        // Inter 字体开关状态同步：优先级 Mono 风格 > Inter，Mono 开启时本开关不生效
-        let interChanged = s.interFontEnabled != interFontEnabled
-        interFontEnabled = s.interFontEnabled
-        interSwitch.state = s.interFontEnabled ? .on : .off
-        if interChanged {
-            applyFontPolicy()
-            usageHistoryController?.interFontEnabled = interFontEnabled
-            tokensPanelController?.interFontEnabled = interFontEnabled
         }
         valueScrollPreviewEnabled = s.valueScrollPreviewEnabled
         valuePreviewSwitch.state = s.valueScrollPreviewEnabled ? .on : .off
@@ -1769,7 +1598,7 @@ final class BalancePanelView: NSView {
             let badge = makeFailureBadge()
             // 渐变 icon：未上菜单栏的账号由 apply 阶段开启垂直透明渐变（底部 20% → 顶部 100%）
             let fadeIcon = MenuBarFadeIconView()
-            // 标题 label 引用：供 hover 字重动画逐帧驱动（weak 在卡片重建后自动失效）
+            // 标题 label 引用：CardEntry 持有，apply 阶段驱动菜单栏渐变标记（weak 在卡片重建后自动失效）
             weak var capturedTitle: FadeableTextField?
             let card = addCard(rows: [
                 balanceContentRow(icon: style.icon, name: style.name, valueView: valueView,
@@ -1818,12 +1647,7 @@ final class BalancePanelView: NSView {
             // 内容前景同步提亮：文字/图标由 dimmed 升至主卡前景色（hover 提亮后模型色已是
             // Palette.cardForeground，匹配两种色态保证可往返）
             if let hc = card as? HoverCard {
-                hc.onHover = { [weak self, weak card, weak label = nickLabel, weak title = capturedTitle] showing in
-                    // 标题字重动画（仅 Inter）：hover 进入 500→700，离开 700→500
-                    //（标题基准统一 500 medium，峰值 700）
-                    if self?.interFontEnabled == true, let title {
-                        self?.animateTitleWeight(label: title, to: showing ? 700 : 500, light: 500)
-                    }
+                hc.onHover = { [weak self, weak card, weak label = nickLabel] showing in
                     if let label {
                         // 昵称（含签到状态附件）淡入与卡片背景/边框统一时长与曲线；
                         // 子卡昵称不进全亮提亮（scan 排除）——昵称是次级信息，hover 时
@@ -2161,7 +1985,6 @@ final class BalancePanelView: NSView {
         intervalPopup.appearance = NSAppearance(named: light ? .aqua : .darkAqua)
     }
     @objc func monoFontToggled() { onToggleMonoFont?() }
-    @objc func interFontToggled() { onToggleInterFont?() }
     @objc func valueScrollPreviewToggled() { onToggleValueScrollPreview?() }
     @objc func checkUpdateTapped() { onCheckForUpdate?() }
     @objc func updateAutoCheckToggled() { onToggleUpdateAutoCheck?() }
