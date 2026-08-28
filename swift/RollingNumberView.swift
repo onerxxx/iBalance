@@ -66,6 +66,11 @@ final class DigitWheelView: NSView {
             rebuildStrip()
         }
     }
+    /// 数字带是预渲染位图，动态色定格其中：系统主题/面板外观（渐变开关）切换时重渲
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        rebuildStrip()
+    }
 
     /// 单格行高（滚动步长 = 一格）：ascender - descender + leading
     private var cellH: CGFloat { ceil(font.ascender - font.descender + font.leading) }
@@ -114,7 +119,17 @@ final class DigitWheelView: NSView {
     /// 一次性渲染整条数字带（12 格位图，@2x）。
     /// 位图上下文非 flipped（y 向上）：cell i 画在 (11-i)*cellH，使图像首行 = cell 0，
     /// 作为 layer.contents 时 cell 0 位于图层顶部——与旧 draw 的视觉顺序一致。
+    /// ⚠️ 动态色在位图里按 NSAppearance.current 解算后定格——必须包在本视图的
+    /// effectiveAppearance 下渲染（面板后台刷新时 current 可能是系统浅色，直接渲染
+    /// 会把黑字定格进位图，渐变开的深色面板上不可读）。
     private func rebuildStrip() {
+        let appearance = effectiveAppearance
+        appearance.performAsCurrentDrawingAppearance {
+            self.renderStripBitmap()
+        }
+    }
+
+    private func renderStripBitmap() {
         let w = ceil(max(tabWidth, 1))
         let h = cellH * 12
         let scale: CGFloat = 2
@@ -314,6 +329,10 @@ final class RollingNumberView: NSView {
     }
 
     private(set) var currentText: String = "—"   // 最近一次应用的文本（滚动续接/判据用）
+
+    /// 排布对齐方向：默认右对齐（余额数值口径，右缘锚定 + 左溢裁剪）；
+    /// 左对齐供 ZCode Token 子面板总计大数字使用（左缘贴版心，与原 drawText 排版一致）
+    var alignsLeft = false
 
     private var mainFont: NSFont = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
     private var prefixFont: NSFont = .monospacedDigitSystemFont(ofSize: 7.8, weight: .semibold)
@@ -524,11 +543,18 @@ final class RollingNumberView: NSView {
     /// 单元格文本行右缘 = 62.5；逐槽锚 65 会整体右偏 2.5pt —— 即「数字偏右」根因）。
     private let cellTextPadding: CGFloat = 2.5
     private func relayoutSlots() {
-        var x = bounds.width - cellTextPadding
-        for s in slots.reversed() {
+        // 左对齐：左缘锚 0（原 drawText 的 pen 位置），正向逐槽排布；
+        // 右对齐：右缘锚 bounds−cellTextPadding，逆向排布（超宽左溢裁掉）
+        var x = alignsLeft ? 0 : bounds.width - cellTextPadding
+        for s in alignsLeft ? slots : slots.reversed() {
             let w = slotWidth(s)
-            x -= w
-            s.view.frame = NSRect(x: x, y: s.yOff, width: w, height: s.height)
+            if alignsLeft {
+                s.view.frame = NSRect(x: x, y: s.yOff, width: w, height: s.height)
+                x += w
+            } else {
+                x -= w
+                s.view.frame = NSRect(x: x, y: s.yOff, width: w, height: s.height)
+            }
         }
         // TODO(诊断): 槽位坐标 dump（限前 24 次），定位偏右；确认后移除
         Self.posDiagCount += 1

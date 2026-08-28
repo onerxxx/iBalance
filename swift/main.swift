@@ -565,6 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onManualRefresh = { [weak self] in self?.onRefresh() }
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
+        panel.onToggleLightTheme = { [weak self] in self?.onToggleLightTheme() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
         panel.onToggleInterFont = { [weak self] in self?.onToggleInterFont() }
         panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
@@ -643,9 +644,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let popover = NSPopover()
         popover.delegate = self
         popover.behavior = .transient
-        // 固定深色外观：面板背景是深色纯色，强制 darkAqua 保证 labelColor 等动态颜色
-        // 在浅色系统外观下也渲染为深色模式取值（否则深色底配黑字不可读），且不受焦点影响
-        popover.appearance = NSAppearance(named: .darkAqua)
+        // 外观统一走 Palette.panelAppearance：浅色主题开=强制浅色（不受系统深色影响）；
+        // 渐变开=固定深色（深色玻璃+浅色字）；都关=跟随系统外观，浅色主题下面板即原生
+        // 浅色 Liquid Glass，文本走 Palette 动态色自动转黑灰
+        popover.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
+                                                      gradientOn: config.panelGradientEnabled)
         // 注：曾用 hasFullSizeContent=true 让背景延伸盖住箭头实现「箭头同色」，
         // 但该模式会放大 AppKit resize 的重新锚定噪声（折叠/展开时面板左右抖动），已回滚。
         let panelVC = BalancePanelViewController(panel: panel)
@@ -1066,6 +1069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.checkinInProgress = manualCheckinInProgress
         s.refreshIntervalSeconds = Int(config.refreshInterval)
         s.panelGradientEnabled = config.panelGradientEnabled
+        s.lightThemeEnabled = config.lightThemeEnabled
         s.monoFontEnabled = config.monoFontEnabled
         s.interFontEnabled = config.interFontEnabled
         return s
@@ -1153,6 +1157,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func onTogglePanelGradient() {
         config.panelGradientEnabled = !config.panelGradientEnabled
         ConfigStore.save(config)
+        // popover 窗口外观必须同步重设：容器 appearance=nil（渐变关）时沿继承链取窗口值，
+        // 只在启动时设一次的话，运行中切换后面板会一直停留在启动时的主题
+        popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
+                                                                gradientOn: config.panelGradientEnabled)
+        syncPanel()
+    }
+
+    /// 浅色主题：开启后强制浅色外观（即使系统是深色主题）；优先级高于渐变开关。
+    /// 保存后经快照同步，VC 容器/popover/子面板统一换外观
+    @objc private func onToggleLightTheme() {
+        config.lightThemeEnabled = !config.lightThemeEnabled
+        ConfigStore.save(config)
+        // popover 窗口外观（含箭头）必须同步重设，否则停留在启动时的主题
+        popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
+                                                                gradientOn: config.panelGradientEnabled)
         syncPanel()
     }
 

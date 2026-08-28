@@ -60,6 +60,8 @@ extension BalancePanelView {
 
     func beginPlatformDrag(_ id: String, locationInWindow: NSPoint) {
         guard draggingPlatform == nil, let platformView = platformCards[id] else { return }
+        // 拖拽接管手势期间收起 ZCode Token 子面板，避免悬窗遮挡排序区域
+        dismissTokensPanel()
         balanceGroupContainer.layoutSubtreeIfNeeded()
 
         guard let card = draggableCard(for: id) else { return }
@@ -156,6 +158,9 @@ extension BalancePanelView {
             platformOrder = nextOrder
             applyPlatformOrder(animated: true)
             applyUsageOrder(animated: true)
+            // 拖动中即时回调让菜单栏顺序实时跟随（持久化仍只在松手时写入）；
+            // 高频跨行由 TitleDebouncer 合并、指纹相同则跳过重绘。
+            onPlatformOrderChanged?(nextOrder)
         }
     }
 

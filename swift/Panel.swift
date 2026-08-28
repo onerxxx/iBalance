@@ -50,6 +50,8 @@ struct PanelSnapshot: Equatable {
     var refreshIntervalSeconds: Int = 300
     /// 面板背景渐变开关（同步自配置，VC 据此决定遮罩渐变/单色）
     var panelGradientEnabled = true
+    /// 浅色主题开关（同步自配置；开启时强制浅色外观，优先级高于渐变开关）
+    var lightThemeEnabled = false
     /// Mono 字体开关（同步自配置；余额卡片与用量列表 JetBrainsMono ↔ 系统字体）
     var monoFontEnabled = false
     /// Inter 字体开关（同步自配置；面板文本 Inter ↔ 系统字体，优先级 Mono > Inter）
@@ -158,20 +160,45 @@ enum Motion {
     static let easeInOutStrong = CAMediaTimingFunction(controlPoints: 0.77, 0, 0.175, 1)
 }
 
+extension NSAppearance {
+    /// 深色外观判定（动态色分支用）
+    var isDark: Bool {
+        bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    }
+}
+
 /// 配色 token：集中管理所有自定义颜色，避免硬编码散落各处
 enum Palette {
-    /// 卡片前景色 #DDDDDD（余额卡片 icon/标题/数值、三大分组标题统一使用）
-    static let cardForeground = NSColor(calibratedRed: 0xE9/255.0, green: 0xE9/255.0, blue: 0xE9/255.0, alpha: 1)
-    /// 非当前账号前景色：石墨灰（不透明；用户定稿 0.61）
-    static let cardForegroundDimmed = NSColor(calibratedWhite: 0.61, alpha: 1.0)
+    /// 卡片前景色（动态解析）：深色外观 #DFDFDF / 浅色外观黑灰（0.13）。
+    /// 渐变背景开=面板强制深色外观恒取深色值；关=面板跟随系统外观，浅色主题自动转黑灰。
+    /// 动态色按绘制环境外观解算；经 .cgColor 落盘（layer）会定格当时外观，需外观变化时重设。
+    static let cardForeground = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor(calibratedRed: 0xDF/255.0, green: 0xDF/255.0, blue: 0xDF/255.0, alpha: 1)
+            : NSColor(calibratedWhite: 0.13, alpha: 1)
+    }
+    /// 非当前账号前景色：深色石墨灰（用户定稿 0.61）/ 浅色 0.42
+    static let cardForegroundDimmed = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor(calibratedWhite: 0.61, alpha: 1.0)
+            : NSColor(calibratedWhite: 0.42, alpha: 1.0)
+    }
     /// 卡片底色：完全透明（露出容器毛玻璃）
     static let cardBackground = NSColor.clear
     /// 卡片 hover 提亮色 #333333 @ 30%
     static let cardBackgroundHover = NSColor(calibratedWhite: 51.0 / 255.0, alpha: 0.3)
     /// 统一 hover 渐变背景（余额卡片/操作磁贴/折叠标题条/用量条目共用）：
-    /// 沿 60° 方向从亮到暗的白色渐变。改色只动这两个端点。
-    static let hoverGradientBright = NSColor.white.withAlphaComponent(0.08)
-    static let hoverGradientDark = NSColor.white.withAlphaComponent(0.05)
+    /// 深/浅色外观动态解析——深色 = 白色提亮 8%→5%，浅色 = 黑色压暗 5%→3%。改色只动这四个分支。
+    static let hoverGradientBright = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.white.withAlphaComponent(0.08)
+            : NSColor.black.withAlphaComponent(0.05)
+    }
+    static let hoverGradientDark = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.white.withAlphaComponent(0.05)
+            : NSColor.black.withAlphaComponent(0.03)
+    }
     /// 渐变端点数组（CAGradientLayer.colors 直接可用）
     static let hoverGradient: [NSColor] = [hoverGradientBright, hoverGradientDark]
     /// 渐变视觉角度：水平向右为 0°，顺时针偏移
@@ -201,14 +228,116 @@ enum Palette {
     static let containerTint = NSColor(calibratedWhite: 0.02, alpha: 0.45)
     /// 容器玻璃渐变底色（中灰半透明）：与 containerTint 组成纵向渐变，顶部近黑 → 底部中灰
     static let containerTintBottom = NSColor(calibratedWhite: 0.25, alpha: 0.45)
+
+    /// 浅色主题渐变遮罩两端：顶部亮白 → 底部全透明（提亮浅色毛玻璃底色，
+    /// 与深色遮罩方向互补——深色是顶部透明 → 底部近黑）
+    static let containerTintLightTop = NSColor.white.withAlphaComponent(0.45)
+    static let containerTintLightBottom = NSColor.white.withAlphaComponent(0)
+
+    /// 主面板容器背景配色（单一事实源）：applyGradient 与各子弹窗（Token/用量）兜底共用。
+    /// 渐变开 = 深色主题：顶部全透明 → 底部深灰（containerTint）；
+    ///          浅色主题：顶部亮白 → 底部全透明（containerTintLight 两端）；
+    /// 关 = 无任何遮罩（top/bottom 均 nil，露出原生 Liquid Glass 毛玻璃）。
+    /// top/bottom 分别对应 TintedVisualEffectView 的 tintColor / tintBottomColor
+    /// （TintOverlayView 对 nil 不绘制）。
+    static func containerColors(lightTheme: Bool, gradientOn: Bool) -> (top: NSColor?, bottom: NSColor?) {
+        guard gradientOn else { return (nil, nil) }
+        return lightTheme
+            ? (containerTintLightTop, containerTintLightBottom)
+            : (containerTint.withAlphaComponent(0), containerTint)
+    }
+    /// 面板外观统一解析（唯一事实源，所有容器/popover/子面板必须走这里，禁止散落三元式）：
+    /// 浅色主题开 = 强制浅色 aqua（即使系统是深色主题）；否则渐变开 = 强制深色 darkAqua；
+    /// 都关 = nil 跟随系统（浅色系统即原生浅色玻璃，动态色自动转黑灰）。
+    static func panelAppearance(lightTheme: Bool, gradientOn: Bool) -> NSAppearance? {
+        if lightTheme { return NSAppearance(named: .aqua) }
+        return gradientOn ? NSAppearance(named: .darkAqua) : nil
+    }
+    /// 渐变遮罩是否生效：渐变开关开即生效（浅色主题用亮白→透明遮罩，深色用深灰遮罩）
+    static func gradientEffective(lightTheme: Bool, gradientOn: Bool) -> Bool {
+        gradientOn
+    }
     /// 卡片圆角 10pt（对齐 macOS Big Sur+ NSPopover 窗口系统圆角）
     static let cardCornerRadius: CGFloat = 10
     /// 卡片边框色/分割线色（暗主题：浅灰半透明，1px 描边，统一白@10%）
     static let cardBorderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10)
-    /// hover 边框常态色（白@20%）：卡片预设边框色，非 hover 时使用
-    static let hoverBorderNormal = NSColor.white.withAlphaComponent(0.20)
-    /// hover 边框提亮色（白@35%）：hover 时边框色随宽度一起动画到此色
-    static let hoverBorderBright = NSColor.white.withAlphaComponent(0.35)
+    /// hover 边框常态色（深色白@20% / 浅色黑@12%）：卡片预设边框色，非 hover 时使用
+    static let hoverBorderNormal = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.white.withAlphaComponent(0.20)
+            : NSColor.black.withAlphaComponent(0.12)
+    }
+    /// hover 边框提亮色（深色白@35% / 浅色黑@25%）：hover 时边框色随宽度一起动画到此色
+    static let hoverBorderBright = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.white.withAlphaComponent(0.35)
+            : NSColor.black.withAlphaComponent(0.25)
+    }
+
+    // ── 图表与提示元素（用量趋势子面板 / Token 统计子面板 / 滚动渐隐提示共用）──
+
+    /// 面积图折线（深 0.65 / 浅 0.5 灰）
+    static let chartLine = NSColor(name: nil) { appearance in
+        appearance.isDark ? NSColor(calibratedWhite: 0.65, alpha: 1) : NSColor(calibratedWhite: 0.5, alpha: 1)
+    }
+    /// 面积图曲线下方渐变填充（深 白40%→2% / 浅 黑10%→1%，上下端）
+    static let chartAreaTop = NSColor(name: nil) { appearance in
+        appearance.isDark ? NSColor.white.withAlphaComponent(0.40) : NSColor.black.withAlphaComponent(0.10)
+    }
+    static let chartAreaBottom = NSColor(name: nil) { appearance in
+        appearance.isDark ? NSColor.white.withAlphaComponent(0.02) : NSColor.black.withAlphaComponent(0.01)
+    }
+    /// 图表当日数值标注（深 0.72 / 浅 0.35）
+    static let chartValueColor = NSColor(name: nil) { appearance in
+        appearance.isDark ? NSColor(calibratedWhite: 0.72, alpha: 1) : NSColor(calibratedWhite: 0.35, alpha: 1)
+    }
+    /// 用量图表当日 Pulse Dot（深 常规 0.75 / 峰值 #DFDFDF；浅 常规 0.40 / 峰值 0x26）。
+    /// ⚠️ 与主前景同源定稿（峰值曾硬编码 0xE9，改主前景色时需同步）
+    static let pulseDotBase = NSColor(name: nil) { appearance in
+        appearance.isDark ? NSColor(calibratedWhite: 0.75, alpha: 1) : NSColor(calibratedWhite: 0.40, alpha: 1)
+    }
+    static let pulseDotPeak = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor(calibratedRed: 0xDF/255.0, green: 0xDF/255.0, blue: 0xDF/255.0, alpha: 1)
+            : NSColor(calibratedWhite: 0x26 / 255.0, alpha: 1)
+    }
+    /// Token 热力图无用量底点（深 #262626 / 浅 0.87 浅灰）
+    static let heatDotEmpty = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor(calibratedRed: 0x26/255.0, green: 0x26/255.0, blue: 0x26/255.0, alpha: 1)
+            : NSColor(calibratedWhite: 0.87, alpha: 1)
+    }
+    /// Token 热力图 hover 高亮环（深 白@90% / 浅 黑@70%）
+    static let heatDotRing = NSColor(name: nil) { appearance in
+        appearance.isDark ? NSColor.white.withAlphaComponent(0.9) : NSColor.black.withAlphaComponent(0.7)
+    }
+    /// Token 热力图有量级两端（深浅主题同值，集中管理勿散落）：#313d4b → #84c3ff
+    static let heatLevelFrom = (r: 49, g: 61, b: 75)
+    static let heatLevelTo = (r: 132, g: 195, b: 255)
+    /// 悬浮提示气泡（深 近黑@94% + 白@16% 边 / 浅 近白@95% + 黑@15% 边）
+    static let tooltipBackground = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor(calibratedWhite: 0.10, alpha: 0.94)
+            : NSColor(calibratedWhite: 0.98, alpha: 0.95)
+    }
+    static let tooltipBorder = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.white.withAlphaComponent(0.16)
+            : NSColor.black.withAlphaComponent(0.15)
+    }
+    /// 滚动渐隐提示底色（深 近黑@22% / 浅 亮白@55%——浅色主题提示为亮色渐变）：
+    /// 经 tintMask 渐变蒙版呈现「贴靠边最浓 → 对侧透明」的渐变；须比容器底更透，避免发重
+    static let scrollHintTint = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor(calibratedWhite: 0.02, alpha: 0.22)
+            : NSColor.white.withAlphaComponent(0.55)
+    }
+    /// 点阵进度未点亮方块（深 系统灰压暗 25% / 浅 系统灰；均为系统色，较原定稿更深）
+    static let dotsDim = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.systemGray.withAlphaComponent(0.75)
+            : NSColor.systemGray
+    }
     /// 卡片边框宽度 1pt
     static let cardBorderWidth: CGFloat = 1
 }
@@ -400,10 +529,17 @@ final class BalancePanelViewController: NSViewController {
         container.blendingMode = .behindWindow   // 合成窗口背后内容，保持玻璃透明
         container.state = .active                // 跟随窗口激活状态
         container.isEmphasized = false
-        container.appearance = NSAppearance(named: .darkAqua)  // 强制深色外观加深底色
-        // 叠加半透明遮罩：渐变开启时顶部 100% 透明 → 底部深灰；关闭时整面单色深灰
-        container.tintColor = panel.panelGradientEnabled ? Palette.containerTint.withAlphaComponent(0) : Palette.containerTint
-        container.tintBottomColor = panel.panelGradientEnabled ? Palette.containerTint : nil
+        // 外观统一走 Palette.panelAppearance：浅色主题开=强制浅色（即使系统深色）；
+        // 渐变开=强制深色（深色玻璃+浅色字）；都关=跟随系统外观（浅色系统即原生
+        // 浅色 Liquid Glass，文本走 Palette 动态色自动转黑灰）
+        container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
+                                                       gradientOn: panel.panelGradientEnabled)
+        // 叠加半透明遮罩：深色主题渐变开=顶部透明→底部深灰；浅色主题渐变开=顶部亮白→
+        // 底部透明；关闭时无遮罩（原生玻璃）
+        let initialColors = Palette.containerColors(lightTheme: panel.lightThemeEnabled,
+                                                    gradientOn: panel.panelGradientEnabled)
+        container.tintColor = initialColors.top
+        container.tintBottomColor = initialColors.bottom
         // 容器圆角与系统 popover 窗口对齐（10pt 连续曲率），裁掉遮罩层直角边缘
         container.wantsLayer = true
         container.layer?.cornerRadius = Palette.cardCornerRadius
@@ -721,11 +857,17 @@ final class BalancePanelViewController: NSViewController {
         walk(panel)
     }
 
-    /// 按当前开关状态刷新背景遮罩：顶部全透明 → 底部深灰的纵向渐变，或单色深灰
+    /// 按当前开关状态刷新背景遮罩与外观：浅色主题强制浅色；渐变生效时
+    /// 顶部全透明 → 底部深灰的纵向渐变；否则无遮罩（原生玻璃）
     private func applyGradient() {
         guard let container = view as? TintedVisualEffectView else { return }
-        container.tintColor = panel.panelGradientEnabled ? Palette.containerTint.withAlphaComponent(0) : Palette.containerTint
-        container.tintBottomColor = panel.panelGradientEnabled ? Palette.containerTint : nil
+        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+        container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
+                                                       gradientOn: panel.panelGradientEnabled)
+        let colors = Palette.containerColors(lightTheme: panel.lightThemeEnabled,
+                                             gradientOn: panel.panelGradientEnabled)
+        container.tintColor = colors.top
+        container.tintBottomColor = colors.bottom
         container.tintGradientStartY = 0
     }
 
@@ -751,6 +893,7 @@ final class BalancePanelViewController: NSViewController {
     override func viewDidDisappear() {
         super.viewDidDisappear()
         panel.dismissUsageHistoryPopover()
+        panel.dismissTokensPanel()
         // 面板关闭后停止箭头浮动动画，避免不可见时持续渲染
         fadeHint.setShown(false)
         topHint.setShown(false)
@@ -797,6 +940,8 @@ final class BalancePanelView: NSView {
     var onSetApiKey: (() -> Void)?
     /// 面板渐变背景开关（设置卡片开关触发）
     var onTogglePanelGradient: (() -> Void)?
+    /// 浅色主题开关（设置卡片开关触发：强制浅色外观，即使系统是深色主题）
+    var onToggleLightTheme: (() -> Void)?
     /// Mono 字体开关（设置卡片开关触发：余额卡片与用量列表切换 JetBrainsMono）
     var onToggleMonoFont: (() -> Void)?
     /// Inter 字体开关（设置卡片开关触发：面板文本切换 Inter，优先级 Mono > Inter）
@@ -979,6 +1124,32 @@ final class BalancePanelView: NSView {
     var usageHistoryRowHovered = false
     var usageHistoryChartHovered = false
     var usageHistoryCloseTask: DispatchWorkItem?
+    /// ZCode 卡片 hover Token 统计子面板（机制与用量趋势子面板一致：单实例 popover + 面板内定位锚点）
+    var tokensPanelPopover: NSPopover?
+    var tokensPanelController: ZcodeTokensPanelController?
+    let tokensPanelPositionAnchor = UsageHistoryPopoverAnchorView(frame: .zero)
+    var tokensCardHovered = false
+    var tokensPanelHovered = false
+    var tokensCloseTask: DispatchWorkItem?
+    var tokensShowTask: DispatchWorkItem?
+    /// 子面板打开期间的低频刷新定时器（间隔 = store 缓存 TTL；关闭时销毁）
+    var tokensRefreshTimer: Timer?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // 预设边框色/hover 渐变经 .cgColor 落盘会定格当时外观：外观变化时重解算。
+        // hover 中（borderWidth > 0）的层跳过——其动画路径每次都取当前解算值。
+        let appearance = effectiveAppearance
+        var stack = subviews
+        while let v = stack.popLast() {
+            if let layer = v.layer, layer.borderWidth == 0 {
+                appearance.performAsCurrentDrawingAppearance {
+                    layer.borderColor = Palette.hoverBorderNormal.cgColor
+                }
+            }
+            stack.append(contentsOf: v.subviews)
+        }
+    }
     /// 用量行最大内容宽度（列宽自动分配的预算上限）
     private let usageMaxRowWidth: CGFloat = 240
     /// 当前自动分配的三列宽（每次行重建前按内容重算；此为初值兜底）
@@ -1052,10 +1223,14 @@ final class BalancePanelView: NSView {
     let monoSegmentBox = NSView()
     /// 面板渐变背景开关（update 时随快照同步状态）
     let gradientSwitch = MiniSwitch()
+    /// 浅色主题开关（update 时随快照同步状态）
+    let lightThemeSwitch = MiniSwitch()
     /// 自动检查更新开关（update 时随快照同步状态）
     let updateAutoSwitch = MiniSwitch()
     /// 渐变开关状态（update 同步；VC 读取决定遮罩渐变/单色）
     private(set) var panelGradientEnabled = true
+    /// 浅色主题开关状态（update 同步；优先级高于渐变——开启即强制浅色外观）
+    private(set) var lightThemeEnabled = false
     /// Mono 字体开关（update 时随快照同步状态）
     let monoSwitch = MiniSwitch()
     /// Mono 字体开关状态（update 同步；变化时对已注册 label 就地切换字体，不重建卡片）
@@ -1133,7 +1308,7 @@ final class BalancePanelView: NSView {
         rollingTargets.add(v)
     }
 
-    // MARK: - 标题 hover 字重动画（Inter：500↔800，1s 平滑）
+    // MARK: - 标题 hover 字重动画（Inter：500↔700，1s 平滑）
 
     /// 单个标题的进行中动画参数（weak label：卡片重建后自动失效，tick 时清扫）
     private struct WeightAnimState {
@@ -1149,11 +1324,11 @@ final class BalancePanelView: NSView {
     private let weightAnimDuration: CFTimeInterval = Motion.weight
     /// 帧驱动：随屏幕刷新（单实例驱动 weightAnims 全部条目，空表即停）
     private var weightAnimLink: CADisplayLink?
-    /// 字重动画加粗端（进入 800）
-    private let weightAnimBold: Double = 800
+    /// 字重动画加粗端（进入 700）
+    private let weightAnimBold: Double = 700
 
     /// 启动/刷新标题字重动画。同一 label 在动画中被打断时从当前插值续走（平滑不跳变）；
-    /// 新动画从**确定性基准**起步——进入恒从 light 起、移出恒从 800 起，
+    /// 新动画从**确定性基准**起步——进入恒从 light 起、移出恒从 700 起，
     /// 保证任何情况下移出都可靠恢复基准（不依赖可能失配的 per-label 持久状态）。
     /// light = 该卡标题的常规基准 wght（当前统一 500 medium）
     private func animateTitleWeight(label: NSTextField, to target: Double, light: Double) {
@@ -1255,13 +1430,21 @@ final class BalancePanelView: NSView {
             || previousSnapshot?.offline != s.offline
             || previousSnapshot?.lastCheckinTime != s.lastCheckinTime
 
-        // 渐变开关状态同步（VC 通过 onPanelGradientChanged 即时刷新遮罩绘制）
+        // 渐变/浅色主题开关状态同步（VC 通过 onPanelGradientChanged 即时刷新遮罩与外观绘制）
         let gradientChanged = s.panelGradientEnabled != panelGradientEnabled
         panelGradientEnabled = s.panelGradientEnabled
         gradientSwitch.state = s.panelGradientEnabled ? .on : .off
-        if gradientChanged {
+        let lightChanged = s.lightThemeEnabled != lightThemeEnabled
+        lightThemeEnabled = s.lightThemeEnabled
+        lightThemeSwitch.state = s.lightThemeEnabled ? .on : .off
+        if gradientChanged || lightChanged {
             usageHistoryController?.panelGradientEnabled = panelGradientEnabled
+            usageHistoryController?.lightThemeEnabled = lightThemeEnabled
+            // Token 子面板渐变切换必须整体重同步：开关连带顶部/底部配色一起换（全透明 ↔ 深灰）
+            syncTokensPanelBackground()
             onPanelGradientChanged?()
+            // 自带深色外观的自绘控件（MiniSwitch/MiniSegmented）需显式换肤（不继承容器外观）
+            if lightChanged { applyControlsTheme() }
         }
         // Mono 字体开关状态同步：变化时对已注册 label 就地切换字体（不重建卡片）
         let monoChanged = s.monoFontEnabled != monoFontEnabled
@@ -1271,6 +1454,7 @@ final class BalancePanelView: NSView {
             applyFontPolicy()
             // 用量子弹窗（图表）跟随同一开关：文本和数值切换 Mono 风格
             usageHistoryController?.monoFontEnabled = monoFontEnabled
+            tokensPanelController?.monoFontEnabled = monoFontEnabled
         }
         // Inter 字体开关状态同步：优先级 Mono 风格 > Inter，Mono 开启时本开关不生效
         let interChanged = s.interFontEnabled != interFontEnabled
@@ -1279,6 +1463,7 @@ final class BalancePanelView: NSView {
         if interChanged {
             applyFontPolicy()
             usageHistoryController?.interFontEnabled = interFontEnabled
+            tokensPanelController?.interFontEnabled = interFontEnabled
         }
         valueScrollPreviewEnabled = s.valueScrollPreviewEnabled
         valuePreviewSwitch.state = s.valueScrollPreviewEnabled ? .on : .off
@@ -1623,15 +1808,15 @@ final class BalancePanelView: NSView {
             // Palette.cardForeground，匹配两种色态保证可往返）
             if let hc = card as? HoverCard {
                 hc.onHover = { [weak self, weak card, weak label = nickLabel, weak title = capturedTitle] showing in
-                    // 标题字重动画（仅 Inter）：hover 进入 500→800，离开 800→500
-                    //（标题基准统一 500 medium，峰值 800）
+                    // 标题字重动画（仅 Inter）：hover 进入 500→700，离开 700→500
+                    //（标题基准统一 500 medium，峰值 700）
                     if self?.interFontEnabled == true, let title {
-                        self?.animateTitleWeight(label: title, to: showing ? 800 : 500, light: 500)
+                        self?.animateTitleWeight(label: title, to: showing ? 700 : 500, light: 500)
                     }
                     if let label {
                         // 昵称（含签到状态附件）淡入与卡片背景/边框统一时长与曲线；
                         // 子卡昵称不进全亮提亮（scan 排除）——昵称是次级信息，hover 时
-                        // 只从 dimmed 升到 systemGray（与主卡昵称一致），不到 #E9E9E9
+                        // 只从 dimmed 升到 systemGray（与主卡昵称一致），不到 #DFDFDF
                         NSAnimationContext.runAnimationGroup { ctx in
                             ctx.duration = Motion.hover
                             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -1640,6 +1825,10 @@ final class BalancePanelView: NSView {
                                 label.animator().textColor = showing ? .systemGray : Palette.cardForegroundDimmed
                             }
                         }
+                    }
+                    // ZCode 卡片：hover 弹出 Token 统计子面板（进入延迟弹出/离开延迟收起）
+                    if style.platformID == "zcode" {
+                        self?.zcodeCardHoverTokens(showing, anchorCard: card)
                     }
                     guard let card, !isCurrent else { return }
                     let target: CGFloat = showing ? 1 : Self.subCardDimAlpha
@@ -1949,6 +2138,15 @@ final class BalancePanelView: NSView {
     @objc func addCodexAccountTapped() { onAddCodexAccount?() }
     @objc func addTraeAccountTapped() { onCollectTraeAccount?() }
     @objc func panelGradientToggled() { onTogglePanelGradient?() }
+    @objc func lightThemeToggled() { onToggleLightTheme?() }
+
+    /// 浅色主题切换时对自带深色外观的自绘控件换肤（MiniSwitch/MiniSegmented
+    /// 各自持有 appearance、不继承容器外观，必须显式设置；其余自绘控件用动态色自动跟随）
+    private func applyControlsTheme() {
+        let light = lightThemeEnabled
+        for entry in switchRows { entry.sw.applyThemeAppearance(light: light) }
+        intervalSegment.applyThemeAppearance(light: light)
+    }
     @objc func monoFontToggled() { onToggleMonoFont?() }
     @objc func interFontToggled() { onToggleInterFont?() }
     @objc func valueScrollPreviewToggled() { onToggleValueScrollPreview?() }

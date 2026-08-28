@@ -71,6 +71,9 @@ extension BalancePanelView {
         usageHistoryPositionAnchor.translatesAutoresizingMaskIntoConstraints = true
         usageHistoryPositionAnchor.alphaValue = 0
         addSubview(usageHistoryPositionAnchor)
+        tokensPanelPositionAnchor.translatesAutoresizingMaskIntoConstraints = true
+        tokensPanelPositionAnchor.alphaValue = 0
+        addSubview(tokensPanelPositionAnchor)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
@@ -240,6 +243,8 @@ extension BalancePanelView {
         autoCheckinSwitch.action = #selector(autoCheckinToggled)
         gradientSwitch.target = self
         gradientSwitch.action = #selector(panelGradientToggled)
+        lightThemeSwitch.target = self
+        lightThemeSwitch.action = #selector(lightThemeToggled)
         monoSwitch.target = self
         monoSwitch.action = #selector(monoFontToggled)
         interSwitch.target = self
@@ -339,6 +344,7 @@ extension BalancePanelView {
             intervalRow,
             switchRow(title: "自动签到", sub: autoCheckinSub, sw: autoCheckinSwitch),
             switchRow(title: "面板渐变背景", sub: nil, sw: gradientSwitch),
+            switchRow(title: "浅色主题", sub: nil, sw: lightThemeSwitch),
             switchRow(title: "Mono 风格", sub: nil, sw: monoSwitch),
             switchRow(title: "Inter 字体", sub: nil, sw: interSwitch),
             switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),

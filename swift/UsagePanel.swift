@@ -189,7 +189,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         let yAxisLabelWidth: CGFloat = 30
         let yAxisGap: CGFloat = 5
         let yAxisRightInset: CGFloat = 4
-        let graphLineColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
+        let graphLineColor = Palette.chartLine
         let headerY: CGFloat = 12
 
         // 表头两行式（相对图表 plot 区域）：第一行平台名（左对齐），
@@ -343,21 +343,20 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
 
             // 圆点尺寸按数值相对比例：本周最大值 8.2pt，最小 3.2pt，
             // 其余在区间内按 value/maxValue 线性映射；只画到今天为止（未来占位天不画）。
-            // 当日圆点为 Pulse Dot：中心实心点常亮（#E9E9E9 区分于其余灰点），
+            // 当日圆点为 Pulse Dot：中心实心点常亮（峰值色区分于其余灰点，动态色随主题反转），
             // 光环按 blinkPhase 相位向外扩散并淡出（雷达 ping，1.8s 周期）。
             let dotMaxSize: CGFloat = 8.2
             let dotMinSize: CGFloat = 3.2
             let scale = maxValue > 0.000001 ? (dotMaxSize - dotMinSize) / maxValue : 0
-            let dotBaseWhite: CGFloat = 0.75
-            let dotPeakWhite: CGFloat = 0xE9 / 255.0
+            let dotBaseColor = Palette.pulseDotBase
+            let dotPeakColor = Palette.pulseDotPeak
             for (index, point) in points.enumerated() where index <= todayIndex {
                 let size = dotMinSize + values[index] * scale
                 let radius = size / 2
                 // 圆点必须以数据点为中心，保持与平滑曲线使用同一组坐标。
                 let dot = NSBezierPath(ovalIn: NSRect(x: point.x - radius, y: point.y - radius,
                                                        width: size, height: size))
-                NSColor(calibratedWhite: index == todayIndex && isCurrentWeek ? dotPeakWhite : dotBaseWhite,
-                        alpha: 1.0).setFill()
+                (index == todayIndex && isCurrentWeek ? dotPeakColor : dotBaseColor).setFill()
                 dot.fill()
                 // 当日 Pulse 光环（仅本周）：前 70% 相位 ease-out 扩散到 ~2.4x 并淡出，后 30% 停顿（alpha=0 天然隐形）
                 if index == todayIndex, isCurrentWeek {
@@ -369,9 +368,13 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                                                            y: point.y - ringRadius,
                                                            width: ringRadius * 2,
                                                            height: ringRadius * 2))
-                    NSColor(calibratedWhite: dotPeakWhite, alpha: ringAlpha).setStroke()
+                    // 动态色 + 随相位变化的 alpha：withAlphaComponent 不保证保留动态解析，
+                    // 改用图形上下文全局 alpha（draw 内上下文外观即本视图 effectiveAppearance）
+                    NSGraphicsContext.current?.cgContext.setAlpha(ringAlpha)
+                    dotPeakColor.setStroke()
                     ring.lineWidth = max(0.8, 2.6 * (1 - ping))
                     ring.stroke()
+                    NSGraphicsContext.current?.cgContext.setAlpha(1)
                 }
             }
 
@@ -385,7 +388,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                                 plot.maxX - valueWidth)
                     let y = max(26, points[annotateIndex].y - 17)
                     drawText(valueText, at: NSPoint(x: x, y: y), font: axisFont,
-                             color: NSColor(calibratedWhite: 0.72, alpha: 1.0))
+                             color: Palette.chartValueColor)
                 }
             }
         } else {
@@ -470,8 +473,8 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let colors = [
-            NSColor.white.withAlphaComponent(0.40).cgColor,
-            NSColor.white.withAlphaComponent(0.02).cgColor,
+            Palette.chartAreaTop.cgColor,
+            Palette.chartAreaBottom.cgColor,
         ] as CFArray
         guard let gradient = CGGradient(colorsSpace: colorSpace, colors: colors,
                                         locations: [0, 1]) else { return }
@@ -558,6 +561,10 @@ final class UsageHistoryPopoverController: NSViewController {
     var panelGradientEnabled = true {
         didSet { applyPanelBackground() }
     }
+    /// 浅色主题开关：开启即强制浅色外观（优先级高于渐变，主面板切换时同步）
+    var lightThemeEnabled = false {
+        didSet { applyPanelBackground() }
+    }
     /// 主面板当前生效的背景遮罩色（含渐变开关状态）：子弹窗继承同一配色
     var panelTintColor: NSColor? = Palette.containerTint
     var panelTintBottomColor: NSColor? = Palette.containerTintBottom
@@ -575,9 +582,13 @@ final class UsageHistoryPopoverController: NSViewController {
         backgroundView.blendingMode = .behindWindow
         backgroundView.state = .active
         backgroundView.isEmphasized = false
-        backgroundView.appearance = NSAppearance(named: .darkAqua)
+        // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；渐变开强制深色；否则跟随系统
+        backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                            gradientOn: panelGradientEnabled)
         backgroundView.tintColor = panelTintColor
-        backgroundView.tintBottomColor = panelGradientEnabled ? panelTintBottomColor : nil
+        backgroundView.tintBottomColor = Palette.gradientEffective(lightTheme: lightThemeEnabled,
+                                                                   gradientOn: panelGradientEnabled)
+            ? panelTintBottomColor : nil
         backgroundView.wantsLayer = true
         backgroundView.layer?.cornerRadius = Palette.cardCornerRadius
         backgroundView.layer?.cornerCurve = .continuous
@@ -610,8 +621,13 @@ final class UsageHistoryPopoverController: NSViewController {
 
     private func applyPanelBackground() {
         guard isViewLoaded else { return }
+        // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+        backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                            gradientOn: panelGradientEnabled)
         backgroundView.tintColor = panelTintColor
-        backgroundView.tintBottomColor = panelGradientEnabled ? panelTintBottomColor : nil
+        backgroundView.tintBottomColor = Palette.gradientEffective(lightTheme: lightThemeEnabled,
+                                                                   gradientOn: panelGradientEnabled)
+            ? panelTintBottomColor : nil
     }
 }
 
@@ -651,8 +667,8 @@ final class UsageDots: NSView {
     private let dotWidth: CGFloat = 5.06  // 正方形宽高（4.6 × 1.1 ≈ 5.06）
     private let dotGap: CGFloat = 0.0     // 点间距
     private let dotRadius: CGFloat = 0.0  // 圆角 0（直角方块）
-    /// 未点亮点的颜色：不透明石墨灰
-    private static let dotDimColor = NSColor(calibratedWhite: 0.32, alpha: 1.0)
+    /// 未点亮点的颜色：石墨灰（动态色，浅色主题转浅灰）
+    private static let dotDimColor = Palette.dotsDim
     private var dotLayers: [CALayer] = []
     private var lastActiveCount: Int = -1   // 上次亮起点数，-1 = 未初始化
 
@@ -671,6 +687,11 @@ final class UsageDots: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         setupDotLayersIfNeeded()
+    }
+    /// 未点亮底色为动态色经 .cgColor 落盘会定格外观：主题切换时重跑着色
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateDots()
     }
     private func setupDotLayersIfNeeded() {
         guard dotLayers.isEmpty, let rootLayer = layer else { return }
@@ -919,9 +940,10 @@ extension BalancePanelView {
             }
             let popover = NSPopover()
             popover.behavior = .applicationDefined
-            // 三角箭头由 NSPopover 窗口本身绘制，显式继承主面板的深色外观，
-            // 避免内容区域已变暗但箭头仍按系统浅色外观渲染。
-            popover.appearance = NSAppearance(named: .darkAqua)
+            // 三角箭头由 NSPopover 窗口本身绘制，外观与主面板同策略：
+            // 统一走 Palette.panelAppearance（浅色 > 渐变深色 > 跟随系统）
+            popover.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                         gradientOn: panelGradientEnabled)
             // 让内容背景延伸覆盖系统三角箭头区域，箭头与主面板背景保持一致。
             popover.hasFullSizeContent = true
             // hover 反馈需要即时出现；跨行切换时也不让系统 popover 动画制造延迟感。
@@ -937,6 +959,7 @@ extension BalancePanelView {
         let anchorChanged = usageHistoryAnchor !== fixedAnchor
         usageHistoryAnchor = fixedAnchor
         usageHistoryController?.panelGradientEnabled = panelGradientEnabled
+        usageHistoryController?.lightThemeEnabled = lightThemeEnabled
         // 继承主面板容器当前生效的背景遮罩色（含渐变开关两种形态），子弹窗与主面板底色一致
         if let container = Self.findPanelContainer(from: self) {
             usageHistoryController?.panelTintColor = container.tintColor
@@ -946,6 +969,9 @@ extension BalancePanelView {
         usageHistoryController?.monoFontEnabled = monoFontEnabled
         // Inter 字体开关同样在各次 show 前同步（优先级 Mono > Inter）
         usageHistoryController?.interFontEnabled = interFontEnabled
+        // 外观与渐变/浅色开关每次 show 前重设（开关可能在面板存在期间切换：深色 ↔ 浅色玻璃）
+        usageHistoryPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                                  gradientOn: panelGradientEnabled)
         let wasShown = usageHistoryPopover?.isShown == true
         usageHistoryController?.update(row: row)
         usageHistoryChartHovered = false

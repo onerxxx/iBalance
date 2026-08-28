@@ -151,6 +151,9 @@ struct AppConfig: Codable {
     var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
     /// 面板背景渐变开关：true = 顶部暗 → 底部中灰纵向渐变；false = 恢复单色近黑遮罩
     var panelGradientEnabled: Bool = true
+    /// 浅色主题开关：true = 强制浅色外观（即使系统是深色主题）；优先级高于渐变开关
+    /// （浅色生效时不用深色遮罩，走原生浅色玻璃 + Palette 浅色分支）
+    var lightThemeEnabled: Bool = false
     /// Mono 字体开关：true = 余额卡片与用量列表使用 JetBrainsMono（拉丁字符），
     /// 缺字（中文等）通过 cascade 级联回退系统字体
     var monoFontEnabled: Bool = false
@@ -207,6 +210,7 @@ struct AppConfig: Codable {
         case traeAutoCheckin = "trae_auto_checkin"
         case hideWbNickname = "hide_wb_nickname"
         case panelGradientEnabled = "panel_gradient_enabled"
+        case lightThemeEnabled = "light_theme_enabled"
         case monoFontEnabled = "mono_font_enabled"
         case interFontEnabled = "inter_font_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
@@ -256,6 +260,7 @@ struct AppConfig: Codable {
         traeAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .traeAutoCheckin) ?? true
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? false
         panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
+        lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? false
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
         interFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .interFontEnabled) ?? false
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false

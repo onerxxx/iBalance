@@ -21,6 +21,12 @@ final class MiniSwitch: NSSwitch {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    /// 主题跟随：控件自带 appearance（不继承容器），浅色主题时需显式切换为浅色，
+    /// 否则浅色面板里开关仍渲染深色样式
+    func applyThemeAppearance(light: Bool) {
+        appearance = light ? NSAppearance(named: .aqua) : NSAppearance(named: .darkAqua)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyTransform()
@@ -111,7 +117,7 @@ final class MonoCharSwitch: NSControl {
         let text = on ? "[▪]" : "[×]"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
-            // 选中态亮色用 Palette.cardForeground（#E9E9E9），与折叠标题/余额卡前景一致
+            // 选中态亮色用 Palette.cardForeground（#DFDFDF），与折叠标题/余额卡前景一致
             .foregroundColor: on ? Palette.cardForeground : NSColor.secondaryLabelColor,
             .kern: kern,
         ]
@@ -159,7 +165,7 @@ final class SwitchRowTapHandler: NSObject {
 /// 字符风格分段控件（Mono 模式专用）：方括号包裹 + 段间制表符竖线分隔 [1│3│5]
 /// （│ = U+2502 box drawings light vertical，JetBrainsMono 已覆盖），
 /// 与 MonoCharSwitch 的 [▪]/[×] 容器风格一致：方括号与竖线固定淡灰（tertiaryLabelColor），
-/// 数字选中 Palette.cardForeground（#E9E9E9）、未选中灰。
+/// 数字选中 Palette.cardForeground（#DFDFDF）、未选中灰。
 /// 用 JetBrainsMono 等宽字体渲染（与 MonoCharSwitch 同设计语言：12pt semibold，略放宽段间距），
 /// 点击段切换 selectedSegment 并发送 action，与 NSSegmentedControl 的
 /// selectedSegment/target/action 语义一致，便于按 Mono 模式与原生分段控件同框显隐切换。
@@ -318,14 +324,15 @@ final class CompactSegmentedCell: NSSegmentedCell {
 }
 
 final class MiniSegmentedControl: NSSegmentedControl {
+    /// 当前是否浅色主题（决定 bezel 高亮色取深色定制值还是浅色系统默认）
+    private var lightTheme = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         controlSize = .mini
         segmentStyle = .rounded
         appearance = NSAppearance(named: .darkAqua)
-        // 选中段高亮色 = #666666（AppKit bezel 会提亮渐变，填暗一档补偿）
-        selectedSegmentBezelColor = NSColor(calibratedRed: 0x66/255.0, green: 0x66/255.0, blue: 0x66/255.0, alpha: 1)
+        applyBezelColor()
         // 监听系统颜色变化通知，在主题色切换时更新 bezel 颜色
         NotificationCenter.default.addObserver(self, selector: #selector(accentColorChanged),
                                                name: NSColor.systemColorsDidChangeNotification, object: nil)
@@ -337,8 +344,23 @@ final class MiniSegmentedControl: NSSegmentedControl {
         NotificationCenter.default.removeObserver(self)
     }
 
+    /// 选中段高亮色 = #666666（AppKit bezel 会提亮渐变，填暗一档补偿）；
+    /// 浅色主题回退系统默认（原生浅色选中观感已调好）
+    private func applyBezelColor() {
+        selectedSegmentBezelColor = lightTheme
+            ? nil
+            : NSColor(calibratedRed: 0x66/255.0, green: 0x66/255.0, blue: 0x66/255.0, alpha: 1)
+    }
+
+    /// 主题跟随：控件自带 appearance（不继承容器），浅色主题时需显式切换为浅色
+    func applyThemeAppearance(light: Bool) {
+        lightTheme = light
+        appearance = light ? NSAppearance(named: .aqua) : NSAppearance(named: .darkAqua)
+        applyBezelColor()
+    }
+
     @objc private func accentColorChanged() {
-        selectedSegmentBezelColor = NSColor(calibratedRed: 0x66/255.0, green: 0x66/255.0, blue: 0x66/255.0, alpha: 1)
+        applyBezelColor()
         needsDisplay = true
     }
 
@@ -407,6 +429,15 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     /// 统一 hover 渐变层：首次进入 hover 时挂载，之后常驻复用
     private let hoverGradientLayer = CAGradientLayer()
     private var hoverGradientInstalled = false
+    /// 动态色经 .cgColor 落盘会定格当时外观：系统主题切换时按新 effectiveAppearance 重解算
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if hoverGradientInstalled, let gradient = hoverGradientColors {
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                self.hoverGradientLayer.colors = gradient.map { $0.cgColor }
+            }
+        }
+    }
     /// 行背景圆角（hoverBackgroundColor 非 nil 时生效）
     var backgroundCornerRadius: CGFloat = 6
     /// 行 hover 状态回调（用量行用于显示右侧趋势 popover）。
@@ -991,6 +1022,14 @@ class HoverCard: NSView, PanelScrollHoverSync {
         hoverGradientLayer.endPoint = pts.end
     }
 
+    /// 动态色经 .cgColor 落盘会定格当时外观：系统主题切换时按新 effectiveAppearance 重解算
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.hoverGradientLayer.colors = Palette.hoverGradient.map { $0.cgColor }
+        }
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let ta = trackingArea { removeTrackingArea(ta) }
@@ -1417,9 +1456,9 @@ final class ScrollFadeHint: NSView {
         // 本视图翻转坐标系（y=0 在顶）；贴靠边的 y：top=0，bottom=1
         let nearY: CGFloat = edge == .top ? 0 : 1
         let farY: CGFloat = edge == .top ? 1 : 0
-        // 底色遮罩层最底：半透明近黑打底。
+        // 底色遮罩层最底：半透明近黑/浅灰打底（动态色随主题）。
         // 专用色而非 Palette.containerTint：提示层要比面板容器底更透，避免滚动提示发黑发重
-        tintLayer.backgroundColor = NSColor(calibratedWhite: 0.02, alpha: 0.22).cgColor
+        tintLayer.backgroundColor = Palette.scrollHintTint.cgColor
         tintMaskLayer.locations = [0, 0.5, 1]
         tintMaskLayer.startPoint = CGPoint(x: 0.5, y: farY)
         tintMaskLayer.endPoint = CGPoint(x: 0.5, y: nearY)
@@ -1453,11 +1492,25 @@ final class ScrollFadeHint: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    /// 动态色经 .cgColor 落盘会定格当时外观：系统/浅色主题切换时按新 effectiveAppearance
+    /// 重解算（tint 底色、高光分支、箭头颜色全部主题相关，统一走 applyParams 重设）
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyParams()
+    }
+
     /// 参数变化即时生效：颜色/渐变重设 + 浮动动画按新幅度重建
     /// （bandHeight 由 VC 的约束更新）
     private func applyParams() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        // 当前生效外观（浅色主题时容器强制 aqua，本视图继承 → isDark=false）
+        let light = !effectiveAppearance.isDark
+        // 底色遮罩：深色=近黑半透明 / 浅色=亮白半透明（亮色渐变由蒙版 alpha 渐变呈现）；
+        // 动态色按本视图外观解算后落 layer
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            tintLayer.backgroundColor = Palette.scrollHintTint.cgColor
+        }
         // 底色遮罩不透明度：0（对侧）→ maskMidAlpha（50%）→ 1（贴靠边）
         tintMaskLayer.colors = [
             NSColor.white.withAlphaComponent(0).cgColor,
@@ -1477,7 +1530,9 @@ final class ScrollFadeHint: NSView {
         //          |alpha| 越大、灰阶越暗 + 蒙版越满，效果越深。
         //    说明：纯黑源在 Darken 下与 Normal 等价（min(底,0)=0），故下限保留 0.05 而非 0。
         let hiAbs = abs(params.highlightAlpha)
-        if params.highlightAlpha >= 0 {
+        // 浅色外观一律走白色高光分支：Darken 混合在浅色底上会压出深色条带，
+        // 与「浅色主题提示为亮色渐变」的视觉方向相反
+        if params.highlightAlpha >= 0 || light {
             gradientLayer.compositingFilter = nil
             gradientLayer.mask = nil
             gradientLayer.backgroundColor = nil
@@ -1501,7 +1556,9 @@ final class ScrollFadeHint: NSView {
             ]
             gradientLayer.mask = gradientMaskLayer
         }
-        arrowLayer.strokeColor = NSColor.white.withAlphaComponent(params.arrowAlpha).cgColor
+        // 箭头描边：深色外观透明白 / 浅色外观黑（亮色提示上保证对比度）
+        arrowLayer.strokeColor = (light ? NSColor.black : NSColor.white)
+            .withAlphaComponent(params.arrowAlpha).cgColor
         CATransaction.commit()
         // 浮动幅度变化：重建动画（正在显示时立即以新幅度浮动）
         arrowLayer.removeAnimation(forKey: "fadeHintBob")
