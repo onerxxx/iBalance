@@ -310,7 +310,7 @@ enum Palette {
             ? NSColor(calibratedRed: 0xDF/255.0, green: 0xDF/255.0, blue: 0xDF/255.0, alpha: 1)
             : NSColor(calibratedWhite: 0x26 / 255.0, alpha: 1)
     }
-    /// Token 热力图无用量底点（深 #262626 / 浅 sRGB 210,210,210 中性浅灰）。
+    /// Token 热力图无用量底点（深 中性灰 #262626（去饱和定稿，亮度取自 #1E262E 中值）/ 浅 sRGB 210,210,210 中性浅灰）。
     /// 浅色值必须用 sRGB 定义：calibratedWhite 是 gamma1.8 校准空间，合成到 sRGB 屏幕时
     /// 做 gamma 补偿会把 215 渲染成 223（取色实测），sRGB 定义则所见即所得。
     static let heatDotEmpty = NSColor(name: nil) { appearance in
@@ -322,13 +322,16 @@ enum Palette {
     static let heatDotRing = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor.white.withAlphaComponent(0.9) : NSColor.black.withAlphaComponent(0.7)
     }
-    /// Token 热力图有量级两端（深浅两套，按生效外观选择，集中管理勿散落）：
-    /// 深色主题 #314b39 → #7cf097（暗底由暗到亮；顶格亮度从满绿 255 压到 240，
-    /// 用户定稿「最高亮度略降」）；浅色主题 #b9eac5 → #2cc859（浅底由浅到深，4 级对比）。
-    /// 色相 = 蓝色基准（≈209°）-75° 移到绿色区间，明度/饱和度与蓝色版一致。
-    static func heatLevels(dark: Bool) -> (from: (r: Int, g: Int, b: Int), to: (r: Int, g: Int, b: Int)) {
-        dark ? ((49, 75, 57), (124, 240, 151)) : ((185, 234, 197), (44, 200, 89))
-    }
+    /// Token 热力图有量级配色（按生效外观选择，集中管理勿散落）：
+    /// 深色主题 = GitHub 暗色绿阶 4 级离散色（用户定稿 2026-08-29）：
+    /// #063A16 / #196C2E / #2EA043 / #56D364（level 1→4），见 heatLevelsDark；
+    /// 浅色主题沿用两端点线性插值 #b9eac5 → #2cc859（浅底由浅到深，4 级对比）。
+    static let heatLevelsLight: (from: (r: Int, g: Int, b: Int), to: (r: Int, g: Int, b: Int)) =
+        ((185, 234, 197), (44, 200, 89))
+    /// 深色主题热力图 4 级离散色（level 1→4），levelColor 直取不做插值
+    static let heatLevelsDark: [(r: Int, g: Int, b: Int)] = [
+        (6, 58, 22), (25, 108, 46), (46, 160, 67), (86, 211, 100)
+    ]
     /// 悬浮提示气泡（深 近黑@94% + 白@16% 边 / 浅 近白@95% + 黑@15% 边）
     static let tooltipBackground = NSColor(name: nil) { appearance in
         appearance.isDark

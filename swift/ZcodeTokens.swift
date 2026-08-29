@@ -849,7 +849,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     /// 亮度第 level 级的正圆印章（懒建缓存）：0 = 无用量底色（动态色，浅色外观=浅灰），
-    /// 1-4 = #313d4b→#84c3ff 线性过渡。动态色按本视图 effectiveAppearance 解算成实色
+    /// 1-4 = 深色 GitHub 暗色绿阶离散色 / 浅色两端点插值。动态色按本视图 effectiveAppearance 解算成实色
     /// 后烘焙（NSImage 位图缓存会定格颜色，主题/浅色开关切换经 viewDidChangeEffectiveAppearance
     /// 清缓存重建）
     private func stamp(level: Int) -> NSImage {
@@ -873,8 +873,15 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     private static func levelColor(_ level: Int, dark: Bool) -> NSColor {
         if level <= 0 { return Palette.heatDotEmpty }
+        // 深色主题：GitHub 暗色绿阶离散色直取；浅色主题：两端点线性插值
+        if dark {
+            let c = Palette.heatLevelsDark[min(level, 4) - 1]
+            return NSColor(calibratedRed: CGFloat(c.r) / 255,
+                           green: CGFloat(c.g) / 255,
+                           blue: CGFloat(c.b) / 255, alpha: 1)
+        }
         let t = Double(min(level, 4) - 1) / 3
-        let levels = Palette.heatLevels(dark: dark)
+        let levels = Palette.heatLevelsLight
         func lerp(_ a: Int, _ b: Int) -> CGFloat {
             CGFloat(a) + (CGFloat(b) - CGFloat(a)) * CGFloat(t)
         }
