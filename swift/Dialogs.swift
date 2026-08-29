@@ -460,6 +460,16 @@ final class DeepSeekSettingsDialog: NSObject {
     }
 }
 
+/// 弹窗内小号 checkbox：空标题、居中，辅助功能名用于旁白等读屏
+private func makeCheckbox(label: String, isOn: Bool) -> NSButton {
+    let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    checkbox.controlSize = .small
+    checkbox.alignment = .center
+    checkbox.state = isOn ? .on : .off
+    checkbox.setAccessibilityLabel(label)
+    return checkbox
+}
+
 /// 各平台刷新 / 自动签到 / 卡片显示开关弹窗：沿用 DialogShell 的原生标题、说明和按钮布局。
 @MainActor
 final class PlatformAutomationSettingsDialog: NSObject {
@@ -472,20 +482,43 @@ final class PlatformAutomationSettingsDialog: NSObject {
         let usage: NSButton?    // nil = 该平台无用量行，「用量」列显「—」占位
     }
 
+    /// 行首「全选」控制器：勾选时全开该行所有开关，取消时全关；
+    /// 行内任一开关变化时反向同步全选态（部分勾选显示为未勾选）。
+    /// 以 self 为 target 接收行内按钮的 action，实例须存活至弹窗关闭。
+    private final class RowAllHandler: NSObject {
+        private let all: NSButton
+        private let options: [NSButton]
+
+        init(all: NSButton, options: [NSButton]) {
+            self.all = all
+            self.options = options
+            super.init()
+            all.state = options.allSatisfy { $0.state == .on } ? .on : .off
+            all.target = self
+            all.action = #selector(toggleAll(_:))
+            for option in options {
+                option.target = self
+                option.action = #selector(syncAllState(_:))
+            }
+        }
+
+        @objc private func toggleAll(_ sender: NSButton) {
+            let state: NSControl.StateValue = sender.state == .on ? .on : .off
+            for option in options { option.state = state }
+        }
+
+        @objc private func syncAllState(_ sender: NSButton) {
+            all.state = options.allSatisfy { $0.state == .on } ? .on : .off
+        }
+    }
+
     private let rows: [Row]
     private let initialConfig: AppConfig
+    /// 行首「全选」checkbox 的控制器；action 目标需存活至弹窗关闭，由本类持有
+    private var rowAllHandlers: [RowAllHandler] = []
 
     init(config: AppConfig) {
         initialConfig = config
-        func makeCheckbox(label: String, isOn: Bool) -> NSButton {
-            let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-            checkbox.controlSize = .small
-            checkbox.alignment = .center
-            checkbox.state = isOn ? .on : .off
-            checkbox.setAccessibilityLabel(label)
-            return checkbox
-        }
-
         rows = [
             Row(name: "DeepSeek", platformID: "ds",
                 refresh: makeCheckbox(label: "DeepSeek 刷新", isOn: config.deepseekRefreshEnabled),
@@ -546,17 +579,19 @@ final class PlatformAutomationSettingsDialog: NSObject {
         shell.addIcon(icon)
         shell.addTitle("平台开关")
         shell.addInfo("选择各平台是否参与刷新、自动签到（支持签到的平台）、在面板显示余额卡片，以及是否显示该平台的用量行。")
-        shell.contentWidth = DialogMetrics.width + 8 + 60 + 54 + 4
+        shell.contentWidth = DialogMetrics.width + 8 + 60 + 54 + 4 + 30
 
+        let headerAll = NSTextField(labelWithString: "")
         let headerName = NSTextField(labelWithString: "平台")
         let headerRefresh = NSTextField(labelWithString: "刷新")
         let headerCheckin = NSTextField(labelWithString: "签到")
         let headerCard = NSTextField(labelWithString: "卡片")
         let headerUsage = NSTextField(labelWithString: "用量")
-        for label in [headerName, headerRefresh, headerCheckin, headerCard, headerUsage] {
+        for label in [headerAll, headerName, headerRefresh, headerCheckin, headerCard, headerUsage] {
             label.font = .systemFont(ofSize: 11, weight: .semibold)
             label.textColor = .secondaryLabelColor
         }
+        headerAll.alignment = .center
         headerRefresh.alignment = .center
         headerCheckin.alignment = .center
         headerCard.alignment = .center
@@ -571,17 +606,20 @@ final class PlatformAutomationSettingsDialog: NSObject {
             unavailable.setAccessibilityLabel(label)
             return unavailable
         }
-        var gridRows: [[NSView]] = [[headerName, headerRefresh, headerCheckin, headerCard, headerUsage]]
+        var gridRows: [[NSView]] = [[headerAll, headerName, headerRefresh, headerCheckin, headerCard, headerUsage]]
         for row in rows {
             let name = NSTextField(labelWithString: row.name)
             name.font = .systemFont(ofSize: 12)
             name.textColor = .labelColor
+            let rowAll = makeCheckbox(label: "\(row.name) 全选", isOn: false)
+            rowAllHandlers.append(RowAllHandler(all: rowAll,
+                                                options: [row.refresh, row.checkin, row.card, row.usage].compactMap { $0 }))
             let checkinView = row.checkin ?? unavailablePlaceholder("该平台不支持签到")
             let usageView = row.usage ?? unavailablePlaceholder("该平台不支持用量显示")
-            gridRows.append([name, row.refresh, checkinView, row.card, usageView])
+            gridRows.append([rowAll, name, row.refresh, checkinView, row.card, usageView])
         }
 
-        // NSGridView 让每一列共享同一条轨道：平台列左对齐，各控件列居中，
+        // NSGridView 让每一列共享同一条轨道：全选列与各控件列居中，平台列左对齐，
         // 表头、checkbox 和「—」占位符天然保持表格对齐，不再手算坐标。
         let grid = NSGridView(views: gridRows)
         let headerHeight: CGFloat = 22
@@ -591,16 +629,18 @@ final class PlatformAutomationSettingsDialog: NSObject {
         grid.columnSpacing = 4
         grid.xPlacement = .fill
         grid.yPlacement = .center
-        grid.column(at: 0).width = 116
-        grid.column(at: 0).xPlacement = .leading
-        grid.column(at: 1).width = 54
-        grid.column(at: 1).xPlacement = .center
+        grid.column(at: 0).width = 26
+        grid.column(at: 0).xPlacement = .center
+        grid.column(at: 1).width = 116
+        grid.column(at: 1).xPlacement = .leading
         grid.column(at: 2).width = 54
         grid.column(at: 2).xPlacement = .center
         grid.column(at: 3).width = 54
         grid.column(at: 3).xPlacement = .center
         grid.column(at: 4).width = 54
         grid.column(at: 4).xPlacement = .center
+        grid.column(at: 5).width = 54
+        grid.column(at: 5).xPlacement = .center
         grid.row(at: 0).height = headerHeight
         for index in 1...rows.count {
             grid.row(at: index).height = rowHeight
