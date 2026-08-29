@@ -144,6 +144,7 @@ cd iBalance/swift
 | [docs/macos-26-appkit-migration.md](docs/macos-26-appkit-migration.md) | macOS 26 AppKit 迁移笔记 |
 | [docs/native-segmented-control-guide.md](docs/native-segmented-control-guide.md) | 原生分段控件用法 |
 | [docs/menubar-template-pitfalls.md](docs/menubar-template-pitfalls.md) | 菜单栏模板踩坑记录 |
+| [docs/pr-review-checklist.md](docs/pr-review-checklist.md) | PR 自查清单（提交前与评审时核对） |
 
 ---
 
