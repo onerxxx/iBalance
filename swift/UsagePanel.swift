@@ -313,16 +313,19 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                 NSPoint(x: plot.minX + plot.width * CGFloat(index) / 6,
                         y: plot.maxY - graphHeight * CGFloat(value / axisMaxValue))
             }
+            // 本周只把线/面积画到今天为止，未来日期保留坐标轴与标签但无曲线；
+            // 历史周仍是完整 7 天（todayIndex 已置为 6）。
+            let drawPoints = isCurrentWeek ? Array(points[0...todayIndex]) : points
             let area = NSBezierPath()
-            area.move(to: NSPoint(x: points[0].x, y: plot.maxY))
-            appendSmoothSegments(points, to: area)
-            area.line(to: NSPoint(x: points[6].x, y: plot.maxY))
+            area.move(to: NSPoint(x: drawPoints[0].x, y: plot.maxY))
+            appendSmoothSegments(drawPoints, to: area)
+            area.line(to: NSPoint(x: drawPoints.last!.x, y: plot.maxY))
             area.close()
             // 渐变锚点固定在绘图区上下边界，不随曲线最高点变化：顶部最实、向下渐隐。
             fillAreaGradient(area, in: plot)
 
             let line = NSBezierPath()
-            appendSmoothSegments(points, to: line, movesToFirst: true)
+            appendSmoothSegments(drawPoints, to: line, movesToFirst: true)
             graphLineColor.setStroke()
             line.lineWidth = 2.2
             line.lineCapStyle = .round
@@ -769,8 +772,8 @@ extension BalancePanelView {
     func makeUsageHeaderRow() -> NSView {
         func headerLabel(_ text: String, width: CGFloat) -> NSTextField {
             let l = NSTextField(labelWithString: text)
-            registerFont(l, size: 10, weight: .semibold)
-            l.textColor = .systemGray
+            registerFont(l, size: SmallTable.titleSize, weight: SmallTable.titleWeight)
+            l.textColor = SmallTable.textColor
             l.alignment = .right
             l.translatesAutoresizingMaskIntoConstraints = false
             l.widthAnchor.constraint(equalToConstant: width).isActive = true
@@ -778,8 +781,8 @@ extension BalancePanelView {
         }
         // 左列名「平台」左对齐（与下方 icon 左缘同起点），右侧三列列名右对齐
         let platformHeader = NSTextField(labelWithString: "平台")
-        registerFont(platformHeader, size: 10, weight: .semibold)
-        platformHeader.textColor = .systemGray
+        registerFont(platformHeader, size: SmallTable.titleSize, weight: SmallTable.titleWeight)
+        platformHeader.textColor = SmallTable.textColor
         let row = NSStackView(views: [platformHeader, stretchSpacer(),
                                       headerLabel("1H", width: usageColWidths.hour),
                                       headerLabel("1D", width: usageColWidths.today),
@@ -806,17 +809,17 @@ extension BalancePanelView {
         let iconView = NSImageView()
         iconView.image = bundleIcon(row.icon, size: usageIconSize) ?? Self.trimmedSymbolImage("app.fill", size: usageIconSize)
         iconView.image?.isTemplate = true
-        iconView.contentTintColor = Palette.cardForeground
+        iconView.contentTintColor = .systemGray
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.widthAnchor.constraint(equalToConstant: 10).isActive = true
         iconView.heightAnchor.constraint(equalToConstant: 10).isActive = true
         let nameLabel = NSTextField(labelWithString: row.name)
-        registerFont(nameLabel, size: 10, weight: .medium)
-        nameLabel.textColor = Palette.cardForeground
+        registerFont(nameLabel, size: SmallTable.rowSize, weight: SmallTable.rowWeight)
+        nameLabel.textColor = SmallTable.textColor
         func valueLabel(_ text: String, width: CGFloat) -> NSTextField {
             let l = NSTextField(labelWithString: text)
-            registerFont(l, size: 10, weight: .medium, monoDigits: true)
-            l.textColor = Palette.cardForeground
+            registerFont(l, size: SmallTable.rowSize, weight: SmallTable.rowWeight, monoDigits: true)
+            l.textColor = SmallTable.textColor
             l.alignment = .right
             l.translatesAutoresizingMaskIntoConstraints = false
             l.widthAnchor.constraint(equalToConstant: width).isActive = true
@@ -836,14 +839,14 @@ extension BalancePanelView {
         rowStack.translatesAutoresizingMaskIntoConstraints = false
         // 位移动画需要 layer-backed
         rowStack.wantsLayer = true
-        // 用量条目 hover：不做文本提亮，改为整行渐变背景（与余额卡片/磁贴/折叠标题条同一套 Palette）
+        // 用量条目 hover：整行渐变背景 + 发丝边框（与余额卡片/磁贴/折叠标题条同一套 Palette）；
+        // 行内容常态系统灰，hover 时文字/icon 提亮（HoverRowView 内建：文字→hoverTextColor、
+        // 灰 tint 图标→labelColor；退出回落 systemGray；hover 锁定期间保持提亮）
         let hoverRow = wrapHoverRow(rowStack, hoverTextColor: Palette.cardForeground,
                                     horizontalPadding: usageHorizontalInset,
                                     topInset: usageRowTopInset,
                                     bottomInset: usageRowBottomInset)
         hoverRow.hoverGradientColors = Palette.hoverGradient
-        // 行内容常态即 cardForeground（不再做 hover 提亮，与表头灰字区分层级）
-        hoverRow.enablesTextBrightening = false
         // 发丝边框：与余额卡片 HoverCard 同款（白@20%→白@35%，0.8pt，0.22s）
         hoverRow.enablesHoverBorder = true
         hoverRow.wantsLayer = true

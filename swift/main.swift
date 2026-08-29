@@ -130,6 +130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var cacheBigModelCycleStartBalance: Double?
     /// 点阵已用比（-1 = 无数据）
     private var cacheBigModelUsedRatio: Double = -1
+    /// Qwen（千问 Token Plan）周额度快照缓存（卡片值=周剩余百分比，副标题=到期倒计时）
+    private var cacheQwen: QwenService.Quota?
     var cacheWb: (remain: Double, total: Double)?
     /// WorkBuddy 多账号额度缓存：uid → (remain, total)，用于面板显示每号余额卡片
     private var cacheWbAccounts: [String: (remain: Double, total: Double)] = [:]
@@ -150,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var zcodePulsingTracker = PulsingTracker()
     private var dsPulsingTracker = PulsingTracker()
     private var zhipuPulsingTracker = PulsingTracker()
+    private var qwenPulsingTracker = PulsingTracker()
     private var codexPulsingTracker = PulsingTracker()
 
     /// 点阵脉冲状态机（全平台共用）：跟踪 usedRatio 的上次值，上升 → pulsing=true（被消耗），
@@ -251,6 +254,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             config.codexAccounts.append(account)
             ConfigStore.save(config)
         }
+        // ZCode 同理：credentials.json 为登录态权威来源，当前登录号未导入时自动纳入，
+        // 恢复面板「当前账号」大卡片（否则全部卡片按非当前号渲染成小卡片）。
+        if case .success(let account) = ZcodeService.importCurrentAccount(),
+           !config.zcodeAccounts.contains(where: { $0.uid == account.uid }) {
+            config.zcodeAccounts.append(account)
+            ConfigStore.save(config)
+        }
 
         // 菜单栏 status item（标题整体渲染为位图 template，见 updateTitle）
         statusItem = statusBar.statusItem(withLength: NSStatusItem.variableLength)
@@ -301,7 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let apiKeyMenuItem = NSMenuItem(title: "DeepSeek / ZhiPu 设置…", action: #selector(onSetApiKey), keyEquivalent: "")
+        let apiKeyMenuItem = NSMenuItem(title: "DeepSeek / ZhiPu / Qwen 设置…", action: #selector(onSetApiKey), keyEquivalent: "")
         apiKeyMenuItem.target = self
         menu.addItem(apiKeyMenuItem)
 
@@ -591,6 +601,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onClickZhiPu = {
             NSWorkspace.shared.open(URL(string: "https://bigmodel.cn/finance-center/finance/overview")!)
         }
+        // Qwen 卡片点击：打开千问 Token Plan 计费页
+        panel.onClickQwen = {
+            NSWorkspace.shared.open(URL(string: "https://platform.qianwenai.com/home/billing/subscription/token-plan-individual")!)
+        }
         panel.onClickTrae = { [weak self] in
             guard let self = self else { return }
             self.openApp(bundleId: "cn.trae.solo.app", missingTitle: "未找到 TRAE 应用",
@@ -683,6 +697,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let popover = popoverController, let panel = panelView else { return }
         // 先展示缓存数据（即时响应），再触发自动刷新拿最新
         panel.update(makePanelSnapshot())
+        // Token 板块跟随缓存即时上屏：缓存命中同步落位（打开即在）；
+        // 冷缓存挂起待后台构建完成补发，数据一到立即显示，不再等 60s 定时器
+        panel.refreshInlineTokens()
         // 1分钟内已刷新过则跳过，避免频繁开关面板触发大量 API 请求
         if Date().timeIntervalSince(lastRefreshTime) >= 60 {
             onRefresh()
@@ -805,7 +822,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.panelUsageVisible = config.panelUsageVisible
         // 刷新失败标记：按固定顺序列出本轮获取失败的服务（footer 展示，成功即自动清除）
         if !failedServices.isEmpty {
-            let order = ["DeepSeek", "ZhiPu", "WorkBuddy", "TRAE", "ZCode", "Codex"]
+            let order = ["DeepSeek", "ZhiPu", "Qwen", "WorkBuddy", "TRAE", "ZCode", "Codex"]
             let names = order.filter { failedServices.contains($0) }
             if !names.isEmpty { s.failedText = names.joined(separator: "、") + " 刷新失败" }
         }
@@ -842,6 +859,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         zpSnap.expireText = "打开财务中心"
         s.zhipuAccounts = [zpSnap]
+        // Qwen 卡片：千问 Token Plan 周剩余百分比（同多号管线单元素，uid 恒 "qwen"，
+        // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.qwen）；副标题为套餐到期倒计时
+        var qwSnap = AccountCardSnapshot(uid: "qwen", nickname: "", isCurrent: true)
+        if let q = cacheQwen, q.weekLimit > 0 {
+            let pct = q.weekRem / q.weekLimit * 100
+            qwSnap.value = fmtAmountCommas(pct, decimals: 1) + "%"
+            qwSnap.usedRatio = min(1, max(0, 1 - pct / 100))
+            qwSnap.pulsing = qwenPulsingTracker.isPulsing("main")
+            qwSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.qwen, isCurrent: true)
+            if q.expireAt > 0 {
+                if let text = Self.expireCountdownText(endsAt: q.expireAt, suffix: "后到期") {
+                    qwSnap.expireText = text
+                } else {
+                    qwSnap.expired = true
+                    qwSnap.expireText = "套餐已到期"
+                }
+            }
+        }
+        // 本周尚未消耗（usedRatio=0）或无数据时隐藏点阵（对齐 DS 口径）
+        qwSnap.hideDots = qwSnap.usedRatio <= 0
+        s.qwenAccounts = [qwSnap]
         let today = Self.todayString()
         // TRAE 多账号余额卡片：当前账号排最上
         let traeMainUid = TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? ""
@@ -1013,6 +1051,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
            let row = usageRow(icon: "zhipu", name: "ZhiPu", platform: "zhipu",
                               accounts: [(uid: "zhipu", current: bal)], increasing: false,
                               decimals: 2, percent: false, prefix: "¥") {
+            s.usageRows.append(row)
+        }
+        // Qwen 用量行：周剩余额度百分比的消耗（百分点，同 ZCode 行口径）
+        if let q = cacheQwen, q.weekLimit > 0,
+           let row = usageRow(icon: "qwen", name: "Qwen", platform: "qwen",
+                              accounts: [(uid: "qwen", current: q.weekRem / q.weekLimit * 100)],
+                              increasing: false, decimals: 1, percent: true) {
             s.usageRows.append(row)
         }
         if let row = usageRow(icon: "workbuddy", name: "WorkBuddy", platform: "wb",
@@ -1241,7 +1286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 长文阅读类弹窗：内容宽 +8 抵消 sidePadding 增量，再 +20 加宽正文行宽
         shell.contentWidth = DialogMetrics.width + 8 + 20
         shell.addInfo("菜单栏常驻小工具，实时聚合多平台账户余额与积分。\n\n"
-            + "• DeepSeek 余额（API Key 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（JSON 导入，多号切换）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
+            + "• DeepSeek 余额（API Key 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• Qwen Token Plan 周额度（浏览器登录态自动采集）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（JSON 导入，多号切换）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
             + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }
@@ -1376,11 +1421,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let result = keepPanelAliveDuring({
             DeepSeekSettingsDialog(apiKey: config.deepseekApiKey,
                                    quota: config.deepseekCommonQuota,
-                                   zhipuToken: config.bigmodelTokenOverride).present()
+                                   zhipuToken: config.bigmodelTokenOverride,
+                                   qwenTicket: config.qwenTicketOverride).present()
         }) else { return }
         if let apiKey = result.apiKey { config.deepseekApiKey = apiKey }
         config.deepseekCommonQuota = max(0, result.quota)
         if let zpToken = result.zhipuToken { config.bigmodelTokenOverride = zpToken }
+        if let qwenTicket = result.qwenTicket { config.qwenTicketOverride = qwenTicket }
         ConfigStore.save(config)
         onRefresh()
     }
@@ -1391,6 +1438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     enum MenuBarPrefix {
         static let ds = "ds"
         static let zhipu = "zhipu"
+        static let qwen = "qwen"
         static let trae = "trae:"
         static let wb = "wb:"
         static let zcode = "zcode:"
@@ -1410,6 +1458,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return (Double(cacheDs?.totalRaw ?? "") ?? 0) <= 0
         case MenuBarPrefix.zhipu:
             return (cacheBigModelBalance ?? 0) <= 0
+        case MenuBarPrefix.qwen:
+            // 周额度用尽（weekRem ≤ 0）→ 自动隐藏；下周刷新回正后自动恢复
+            guard let q = cacheQwen, q.weekLimit > 0 else { return false }
+            return q.weekRem <= 0
         default:
             break
         }
@@ -1438,7 +1490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if menuItemExhausted(id) { return false }
         if let v = config.menuBarVisible[id] { return v }
         // 默认值
-        if id == MenuBarPrefix.ds || id == MenuBarPrefix.zhipu { return true }
+        if id == MenuBarPrefix.ds || id == MenuBarPrefix.zhipu || id == MenuBarPrefix.qwen { return true }
         if isCurrent {
             // 主账号：Trae/Wb 默认显示，ZCode 默认隐藏
             if id.hasPrefix(MenuBarPrefix.zcode) || id.hasPrefix(MenuBarPrefix.codex) { return false }
@@ -1463,8 +1515,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             break
         }
         if !entryFound {
-            // DS / ZhiPu 是单账号平台，条目恒为当前账号
-            isCurrent = (itemId == MenuBarPrefix.ds || itemId == MenuBarPrefix.zhipu)
+            // DS / ZhiPu / Qwen 是单账号平台，条目恒为当前账号
+            isCurrent = (itemId == MenuBarPrefix.ds || itemId == MenuBarPrefix.zhipu || itemId == MenuBarPrefix.qwen)
                 || itemId.hasPrefix(MenuBarPrefix.trae) && itemId.hasSuffix(TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? "")
                 || itemId.hasPrefix(MenuBarPrefix.wb) && itemId.hasSuffix(WorkBuddyService.authInfo()?.uid ?? "")
                 || itemId.hasPrefix(MenuBarPrefix.zcode) && itemId.hasSuffix(ZcodeService.currentUid() ?? "")
@@ -1512,6 +1564,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 1b. ZhiPu（智谱 BigModel；icon 复用 zhipu，货币符号走 DS 同款小字号）
         if let bal = cacheBigModelBalance {
             entries.append((id: MenuBarPrefix.zhipu, symbol: "¥", value: fmtAmountCommas(bal, decimals: 2), isCurrent: true, icon: "zhipu"))
+        }
+
+        // 1c. Qwen（千问 Token Plan；周额度剩余百分比，同 ZCode 行口径）
+        if let q = cacheQwen, q.weekLimit > 0 {
+            let pct = fmtAmountCommas(q.weekRem / q.weekLimit * 100, decimals: 1) + "%"
+            entries.append((id: MenuBarPrefix.qwen, symbol: "", value: pct, isCurrent: true, icon: "qwen"))
         }
 
         // 2. ZCode 账号（当前账号优先）
@@ -1573,6 +1631,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return entries.filter { $0.id == MenuBarPrefix.ds }
             case BalancePlatform.bigModel.rawValue:
                 return entries.filter { $0.id == MenuBarPrefix.zhipu }
+            case BalancePlatform.qwen.rawValue:
+                return entries.filter { $0.id == MenuBarPrefix.qwen }
             case "zcode":
                 return entries.filter { $0.id.hasPrefix(MenuBarPrefix.zcode) }
             case "codex":
@@ -1690,6 +1750,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             case "trae-color": iconScale = 0.94
             case "zhipu": iconScale = 0.87
             case "codex": iconScale = 0.90
+            case "qwen": iconScale = 0.90
             default: iconScale = 1.0
             }
             // DeepSeek 图标后用细空格（后面紧跟 ¥ 符号），其余平台保持普通空格
@@ -1766,11 +1827,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 服务并行请求，先到先显示：每个服务返回后立即写缓存并重绘标题，互不等待
         async let a: Void = refreshOneDeepSeek(cfg, seq: seq)
         async let g: Void = refreshOneBigModel(cfg, seq: seq)
+        async let h: Void = refreshOneQwen(cfg, seq: seq)
         async let b: Void = refreshOneWorkBuddy(cfg, seq: seq)
         async let c: Void = refreshOneTrae(cfg, seq: seq)
         async let e: Void = refreshOneZcode(cfg, seq: seq)
         async let f: Void = refreshOneCodex(cfg, seq: seq)
-        _ = await (a, g, b, c, e, f)
+        _ = await (a, g, h, b, c, e, f)
 
         let totalMs = Int(Date().timeIntervalSince(t0) * 1000)
         Logger.log(.refresh, "[\(seq)] performRefresh all children joined in \(totalMs)ms")
@@ -1805,6 +1867,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         cacheBigModelCycleStartInflow = c.bigmodelCycleStartInflow
         cacheBigModelCycleStartBalance = c.bigmodelCycleStartBalance
         cacheBigModelUsedRatio = c.bigmodelUsedRatio
+        cacheQwen = c.qwen.map { QwenService.Quota(weekRem: $0.weekRem, weekLimit: $0.weekLimit,
+                                                   remainingDays: $0.remainingDays, expireAt: $0.expireAt) }
         if let wb = c.wb { cacheWb = (wb.remain, wb.total) }
         cacheWbAccounts = c.wbAccounts.mapValues { ($0.remain, $0.total) }
         cacheTraeAccounts = c.traeAccounts.mapValues { ($0.limit, $0.used) }
@@ -1825,6 +1889,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         c.bigmodelInflow = cacheBigModelInflow
         c.bigmodelCycleStartInflow = cacheBigModelCycleStartInflow
         c.bigmodelCycleStartBalance = cacheBigModelCycleStartBalance
+        c.qwen = cacheQwen.map { .init(weekRem: $0.weekRem, weekLimit: $0.weekLimit,
+                                       remainingDays: $0.remainingDays, expireAt: $0.expireAt) }
         c.wbAccounts = cacheWbAccounts.mapValues { .init(remain: $0.remain, total: $0.total) }
         c.traeAccounts = cacheTraeAccounts.mapValues { .init(limit: $0.limit, used: $0.used) }
         c.zcodeAccounts = cacheZcodeAccounts.mapValues { .init(remain: $0.remain, total: $0.total, planEndsAt: $0.planEndsAt) }
@@ -1946,6 +2012,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// Qwen（千问 Token Plan）周额度刷新：手填覆盖 ticket 优先，否则扫浏览器 Cookies 解密登录态，
+    /// 调控制台网关取周配额。无凭据静默跳过（对齐 ZhiPu 行为）。
+    private func refreshOneQwen(_ cfg: AppConfig, seq: Int64) async {
+        let t0 = Date()
+        guard cfg.qwenRefreshEnabled else {
+            Logger.log(.refresh, "[\(seq)] Qwen: disabled, skipped")
+            if ownsRefresh(seq) { failedServices.remove("Qwen") }
+            return
+        }
+        // 鉴权失败自愈：清 ticket 缓存重新采集再试一轮；仍失败才报错
+        var result = await qwenFetch(cfg: cfg, seq: seq)
+        if result.authFailed {
+            Logger.log(.refresh, "[\(seq)] Qwen: 登录态失效，清缓存重采")
+            QwenService.clearCachedTicket()
+            result = await qwenFetch(cfg: cfg, seq: seq)
+        }
+        guard ownsRefresh(seq) else {
+            Logger.log(.refresh, "[\(seq)] Qwen: not owner after fetch (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip writeback")
+            return
+        }
+        if let q = result.quota {
+            cacheQwen = q
+            // 用量记录：口径 = 周剩余额度百分比（同 ZCode 行的百分点口径；
+            // fetch 已保证 weekLimit > 0）。周重置跳涨由 UsageStore 基线平移承接，用量不清零。
+            UsageStore.observe(platform: "qwen", uid: "qwen", value: q.weekRem / q.weekLimit * 100, increasing: false)
+            let ratio = q.weekLimit > 0 ? min(1, max(0, (q.weekLimit - q.weekRem) / q.weekLimit)) : 0
+            _ = qwenPulsingTracker.observe("main", ratio: ratio)
+            failedServices.remove("Qwen")
+            Logger.log(.refresh, "[\(seq)] Qwen: OK weekRem=\(q.weekRem)/\(q.weekLimit) used=\(Int(ratio*100))% days=\(q.remainingDays) (elapsed=\(Int(Date().timeIntervalSince(t0)*1000))ms)")
+        }
+        if !result.error.isEmpty {
+            notify("Qwen 配额查询", result.error)
+            failedServices.insert("Qwen")
+            Logger.log(.refresh, "[\(seq)] Qwen: ERROR \(result.error)")
+        }
+        updateTitle(tag: "qwen-\(seq)")
+    }
+
+    /// 单轮 Qwen 查询：解析 ticket（手填 > 缓存 > 浏览器采集）后请求控制台网关
+    private func qwenFetch(cfg: AppConfig, seq: Int64) async -> (quota: QwenService.Quota?, authFailed: Bool, error: String) {
+        guard let ticket = QwenService.resolveTicket(override: cfg.qwenTicketOverride), !ticket.isEmpty else {
+            Logger.log(.refresh, "[\(seq)] Qwen: no login cookie found, skipped")
+            if ownsRefresh(seq) { failedServices.remove("Qwen") }
+            return (nil, false, "")
+        }
+        return await Logger.measure("[\(seq)] Qwen.fetch") {
+            await QwenService.fetch(ticket: ticket)
+        }
+    }
+
     func refreshOneWorkBuddy(_ cfg: AppConfig, seq: Int64) async {
         let t0 = Date()
         guard cfg.workbuddyEnabled else {
@@ -2060,13 +2176,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         var zcodeFailed = false
-        Logger.log(.refresh, "[\(seq)] ZCode: accounts=\(cfg.zcodeAccounts.count)")
-        for (i, ac) in cfg.zcodeAccounts.enumerated() {
+        // 当前登录号变化（ZCode 端独立登录/切号）时自动追加，保证大卡片恒落在当前登录号；
+        // 只追加、不覆盖已存账号的 token（已存 token 可能比本轮 provider 解析出的更适合恢复会话）。
+        var accounts = cfg.zcodeAccounts
+        if case .success(let current) = ZcodeService.importCurrentAccount(),
+           !accounts.contains(where: { $0.uid == current.uid }) {
+            accounts.append(current)
+            Logger.log(.refresh, "[\(seq)] ZCode: current login uid=\(current.uid) not imported, appended")
+            if !config.zcodeAccounts.contains(where: { $0.uid == current.uid }) {
+                config.zcodeAccounts.append(current)
+                ConfigStore.save(config)
+            }
+        }
+        Logger.log(.refresh, "[\(seq)] ZCode: accounts=\(accounts.count)")
+        for (i, ac) in accounts.enumerated() {
             if !ownsRefresh(seq) {
-                Logger.log(.refresh, "[\(seq)] ZCode[\(i)/\(cfg.zcodeAccounts.count)]: not owner (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip remaining")
+                Logger.log(.refresh, "[\(seq)] ZCode[\(i)/\(accounts.count)]: not owner (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip remaining")
                 return
             }
-            let acctag = "[\(seq)] ZCode[\(i)/\(cfg.zcodeAccounts.count)] uid=\(ac.uid)"
+            let acctag = "[\(seq)] ZCode[\(i)/\(accounts.count)] uid=\(ac.uid)"
             // 存量账号自动回填昵称（早期导入无 nickname）：credentials.json 可解出且 uid 匹配时写入一次
             if ac.nickname.isEmpty, let nick = ZcodeService.autoNickname(forUid: ac.uid),
                let idx = config.zcodeAccounts.firstIndex(where: { $0.uid == ac.uid }) {
@@ -2416,7 +2544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return 1
     }
 
-    /// 到期倒计时文案（ZCode/Codex 共用）：剩余 > 0 → "x天 HH:mm 后到期" / "HH:mm 后到期"（天与数字间细空格）；
+    /// 到期倒计时文案（ZCode/Codex 共用）：剩余 > 0 → "x天HH:mm 后到期" / "HH:mm 后到期"（天数与时间间不加间距）；
     /// 已到期 → nil（由调用方给各自的红色提示文案）
     private static func expireCountdownText(endsAt: TimeInterval, suffix: String = "后重置") -> String? {
         let remainSec = endsAt - Date().timeIntervalSince1970
@@ -2426,7 +2554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let h = (total % 86400) / 3600
         let m = (total % 3600) / 60
         if days > 0 {
-            return String(format: "\u{2009}%d天 %02d:%02d\u{2009}%@", days, h, m, suffix)
+            return String(format: "\u{2009}%d天%02d:%02d\u{2009}%@", days, h, m, suffix)
         }
         return String(format: "\u{2009}%02d:%02d\u{2009}%@", h, m, suffix)
     }

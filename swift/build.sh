@@ -18,35 +18,23 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/iBalance"
 
-# 收集 swift/ 下所有 .swift（含 Services/ 子目录）作为编译输入
-# 排除 scratch_ 前缀的临时测试文件（top-level statements 在非 main.swift 中非法）
-SOURCES=()
-while IFS= read -r f; do SOURCES+=("$f"); done < <(find "$SCRIPT_DIR" -maxdepth 2 -name "*.swift" ! -name "scratch_*" | sort)
-
-# 编译优化级别：默认 -Onone（快速编译，适合日常小修改迭代，实测比 -O 快 ~3.7 倍）；
-# 传 --release 参数时用 -O（优化构建，用于正式分发）。
-# 对菜单栏小工具而言两者运行性能无感知差异。
-OPT_FLAG="-Onone"
+# 编译模式：默认 debug（-Onone + SwiftPM 跨调用增量，日常小修改只重编受影响文件 ~2s，
+# 全量约 20s 的场景只出现在首次/清缓存后）；传 --release 时用 release 配置（-O + WMO，正式分发）。
+# 对菜单栏小工具而言运行性能无感知差异。
 BUILD_MODE="fast"
+SPM_CONF="debug"
 if [[ "${1:-}" == "--release" ]]; then
-    OPT_FLAG="-O"
+    SPM_CONF="release"
     BUILD_MODE="release"
 fi
 
-echo "==> 编译源文件（${#SOURCES[@]} 个 .swift，模式：${BUILD_MODE}）"
-# -target arm64-apple-macos26 仅支持 macOS 26+（Liquid Glass 适配基线）
-# -framework Network：NWPathMonitor 离线感知需要
-swiftc \
-    -parse-as-library \
-    -framework Cocoa \
-    -framework UserNotifications \
-    -framework Security \
-    -framework Network \
-    -lsqlite3 \
-    -target arm64-apple-macos26 \
-    "$OPT_FLAG" \
-    "${SOURCES[@]}" \
-    -o "$SCRIPT_DIR/iBalance"
+echo "==> 编译源文件（SwiftPM 增量，配置：${SPM_CONF}，模式：${BUILD_MODE}）"
+# -explicit-module-build 不用：小项目固定开销大（SDK 预构建 55s、无改动仍 14s）
+# --build-system native：显式指定 llbuild 后端（新版 SwiftPM 默认 XCBuild 后端在
+# Swift 6.4-dev 上报 "Unknown error parsing property list"，native 稳定且增量更快）
+swift build --package-path "$SCRIPT_DIR" -c "$SPM_CONF" --build-system native
+# 产物路径由 SwiftPM 管理（swift/.build/<conf>/iBalance）；show-bin-path 不触发构建
+BIN_DIR="$(swift build --package-path "$SCRIPT_DIR" -c "$SPM_CONF" --build-system native --show-bin-path)"
 
 # 先停掉旧 iBalance 再删旧 bundle：旧进程还在跑时删 bundle，open 只会激活旧实例，
 # 新二进制根本没运行。SIGTERM + 1.0s 优雅退出，随后循环等 pgrep 为空，超时升级 SIGKILL，
@@ -79,7 +67,7 @@ wait_iBalance_exit() {
 if pgrep -x iBalance >/dev/null 2>&1; then
     echo "==> 停止运行中的 iBalance"
     killall iBalance 2>/dev/null || true
-    sleep 1.0
+    # 不再固定 sleep 1.0：wait_iBalance_exit 以 0.1s 粒度轮询退出（实测 SIGTERM 后 ~0.1s 退完）
 fi
 wait_iBalance_exit
 
@@ -87,8 +75,8 @@ echo "==> 组装 .app bundle"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
-# 移动编译产物到 MacOS/
-mv "$SCRIPT_DIR/iBalance" "$EXECUTABLE"
+# 拷贝编译产物到 MacOS/（产物由 SwiftPM 增量管理，此处只复制不重复编译）
+cp "$BIN_DIR/iBalance" "$EXECUTABLE"
 
 # 拷贝 Info.plist
 cp "$PLIST" "$CONTENTS_DIR/Info.plist"
@@ -176,9 +164,14 @@ while pgrep -x iBalance >/dev/null 2>&1; do
     fi
 done
 open "$APP_DIR"
-# 启动验证：新进程 PID ≠ 原 PID（若 open 激活的是其他旧 bundle 会告警）
-sleep 2
-new_pid=$(pgrep -x iBalance 2>/dev/null | head -1)
+# 启动验证：0.1s 间隔轮询等新进程出现（实测 open 后 ~0.2s 起完），出现即验证运行路径；
+# 5s 兜底超时仍无进程才告警（旧进程已由 wait_iBalance_exit 确认清空，首个 PID 即新实例）
+new_pid=""
+for _ in $(seq 1 50); do
+    new_pid=$(pgrep -x iBalance 2>/dev/null | head -1)
+    [ -n "$new_pid" ] && break
+    sleep 0.1
+done
 if [ -n "$new_pid" ]; then
     new_cmd=$(ps -o command= -p "$new_pid" 2>/dev/null | tr -s ' ')
     if [[ "$new_cmd" == "$APP_DIR"* ]]; then

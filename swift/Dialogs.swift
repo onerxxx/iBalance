@@ -279,13 +279,14 @@ func makeWbBrandIcon() -> NSImage? {
     return img
 }
 
-/// DeepSeek 设置弹窗：配置 DeepSeek API Key / 日常充值额度 + ZhiPu Token 覆盖。
+/// DeepSeek 设置弹窗：配置 DeepSeek API Key / 日常充值额度 + ZhiPu Token / Qwen Ticket 覆盖。
 @MainActor
 final class DeepSeekSettingsDialog: NSObject {
     private let apiKeyField = NSTextField()
     private let popup = NSPopUpButton()
     private let customField = NSTextField()
     private let zhipuTokenField = NSTextField()
+    private let qwenTicketField = NSTextField()
     private let presets: [(label: String, value: Double)] = [
         ("未设置", 0),
         ("¥10", 10),
@@ -298,7 +299,8 @@ final class DeepSeekSettingsDialog: NSObject {
     ///   - apiKey: 当前 DeepSeek API Key
     ///   - quota: 当前已设置的日常充值额度（0 = 未设置）
     ///   - zhipuToken: 当前 ZhiPu Token 覆盖（空 = 自动从浏览器登录态读取）
-    init(apiKey: String, quota: Double, zhipuToken: String = "") {
+    ///   - qwenTicket: 当前 Qwen Ticket 覆盖（空 = 自动从浏览器登录态读取）
+    init(apiKey: String, quota: Double, zhipuToken: String = "", qwenTicket: String = "") {
         super.init()
         apiKeyField.isBezeled = true
         apiKeyField.bezelStyle = .roundedBezel
@@ -319,6 +321,16 @@ final class DeepSeekSettingsDialog: NSObject {
         zhipuTokenField.cell?.isScrollable = true
         zhipuTokenField.cell?.wraps = false
         zhipuTokenField.lineBreakMode = .byTruncatingTail
+
+        qwenTicketField.isBezeled = true
+        qwenTicketField.bezelStyle = .roundedBezel
+        qwenTicketField.isEditable = true
+        qwenTicketField.isSelectable = true
+        qwenTicketField.font = NSFont.systemFont(ofSize: 12)
+        qwenTicketField.stringValue = qwenTicket
+        qwenTicketField.cell?.isScrollable = true
+        qwenTicketField.cell?.wraps = false
+        qwenTicketField.lineBreakMode = .byTruncatingTail
 
         for opt in presets { popup.addItem(withTitle: opt.label) }
         popup.menu?.addItem(withTitle: "自定义", action: nil, keyEquivalent: "")
@@ -347,14 +359,14 @@ final class DeepSeekSettingsDialog: NSObject {
         }
     }
 
-    func present() -> (apiKey: String?, quota: Double, zhipuToken: String?)? {
+    func present() -> (apiKey: String?, quota: Double, zhipuToken: String?, qwenTicket: String?)? {
         let shell = DialogShell()
         if let icon = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: DialogMetrics.iconSize, weight: .regular)) {
             icon.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
             shell.addIcon(icon)
         }
-        shell.addTitle("DeepSeek / ZhiPu 设置")
+        shell.addTitle("DeepSeek / ZhiPu / Qwen 设置")
         let infoAttr = NSMutableAttributedString(
             string: "配置 API Key 和日常充值额度。获取 API Key：",
             attributes: [.font: NSFont.systemFont(ofSize: 12),
@@ -368,7 +380,7 @@ final class DeepSeekSettingsDialog: NSObject {
         shell.addInfo(infoAttr)
         shell.contentWidth = DialogMetrics.inputWidth
 
-        // 三行设置共用一个 accessory 容器：文本在上、控件在下，统一左对齐。
+        // 四行设置共用一个 accessory 容器：文本在上、控件在下，统一左对齐。
         let rowWidth = shell.contentWidth - DialogMetrics.sidePadding * 2
         let labelHeight: CGFloat = 18
         let controlHeight: CGFloat = 28
@@ -377,16 +389,16 @@ final class DeepSeekSettingsDialog: NSObject {
         let rowGap: CGFloat = 10
         let content = NSView(frame: NSRect(x: 0, y: 0,
                                            width: rowWidth,
-                                           height: rowHeight * 3 + rowGap * 2))
+                                           height: rowHeight * 4 + rowGap * 3))
         // 每行结构同构（label 在上偏 +32，控件在下），自底向上逐行叠放：
-        // ZhiPu Token（底）→ 日常额度（中）→ API Key（顶）
+        // Qwen Ticket（底）→ ZhiPu Token → 日常额度 → API Key（顶）
         let keyLabel = NSTextField(labelWithString: "API Key")
         keyLabel.font = NSFont.systemFont(ofSize: 12)
         keyLabel.textColor = NSColor.labelColor
         keyLabel.alignment = .left
-        keyLabel.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2 + controlHeight + labelControlGap,
+        keyLabel.frame = NSRect(x: 0, y: rowHeight * 3 + rowGap * 3 + controlHeight + labelControlGap,
                                 width: rowWidth, height: labelHeight)
-        apiKeyField.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2,
+        apiKeyField.frame = NSRect(x: 0, y: rowHeight * 3 + rowGap * 3,
                                    width: rowWidth, height: controlHeight)
         content.addSubview(keyLabel)
         content.addSubview(apiKeyField)
@@ -395,11 +407,11 @@ final class DeepSeekSettingsDialog: NSObject {
         quotaLabel.font = NSFont.systemFont(ofSize: 12)
         quotaLabel.textColor = NSColor.labelColor
         quotaLabel.alignment = .left
-        quotaLabel.frame = NSRect(x: 0, y: rowHeight + rowGap + controlHeight + labelControlGap,
+        quotaLabel.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2 + controlHeight + labelControlGap,
                                   width: rowWidth, height: labelHeight)
         let popupWidth: CGFloat = 110
-        popup.frame = NSRect(x: 0, y: rowHeight + rowGap, width: popupWidth, height: controlHeight)
-        customField.frame = NSRect(x: popupWidth + 8, y: rowHeight + rowGap + 2,
+        popup.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2, width: popupWidth, height: controlHeight)
+        customField.frame = NSRect(x: popupWidth + 8, y: rowHeight * 2 + rowGap * 2 + 2,
                                    width: rowWidth - popupWidth - 8,
                                    height: 24)
         content.addSubview(quotaLabel)
@@ -410,12 +422,23 @@ final class DeepSeekSettingsDialog: NSObject {
         zpLabel.font = NSFont.systemFont(ofSize: 12)
         zpLabel.textColor = NSColor.labelColor
         zpLabel.alignment = .left
-        zpLabel.frame = NSRect(x: 0, y: controlHeight + labelControlGap,
+        zpLabel.frame = NSRect(x: 0, y: rowHeight + rowGap + controlHeight + labelControlGap,
                                width: rowWidth, height: labelHeight)
-        zhipuTokenField.frame = NSRect(x: 0, y: 0,
+        zhipuTokenField.frame = NSRect(x: 0, y: rowHeight + rowGap,
                                        width: rowWidth, height: controlHeight)
         content.addSubview(zpLabel)
         content.addSubview(zhipuTokenField)
+
+        let qwLabel = NSTextField(labelWithString: "Qwen Ticket（空 = 自动读取浏览器登录态）")
+        qwLabel.font = NSFont.systemFont(ofSize: 12)
+        qwLabel.textColor = NSColor.labelColor
+        qwLabel.alignment = .left
+        qwLabel.frame = NSRect(x: 0, y: controlHeight + labelControlGap,
+                               width: rowWidth, height: labelHeight)
+        qwenTicketField.frame = NSRect(x: 0, y: 0,
+                                       width: rowWidth, height: controlHeight)
+        content.addSubview(qwLabel)
+        content.addSubview(qwenTicketField)
         shell.addContent(content, height: content.frame.height)
         shell.firstResponder = apiKeyField
 
@@ -427,12 +450,13 @@ final class DeepSeekSettingsDialog: NSObject {
 
         let apiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let zpRaw = zhipuTokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let qwRaw = qwenTicketField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if let customVal = Double(customField.stringValue.trimmingCharacters(in: .whitespaces)), customVal > 0 {
-            return (apiKey.isEmpty ? nil : apiKey, customVal, zpRaw.isEmpty ? nil : zpRaw)
+            return (apiKey.isEmpty ? nil : apiKey, customVal, zpRaw.isEmpty ? nil : zpRaw, qwRaw.isEmpty ? nil : qwRaw)
         }
         let idx = popup.indexOfSelectedItem
         let quota = idx < presets.count ? presets[idx].value : 0
-        return (apiKey.isEmpty ? nil : apiKey, quota, zpRaw.isEmpty ? nil : zpRaw)
+        return (apiKey.isEmpty ? nil : apiKey, quota, zpRaw.isEmpty ? nil : zpRaw, qwRaw.isEmpty ? nil : qwRaw)
     }
 }
 
@@ -445,7 +469,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
         let refresh: NSButton
         let checkin: NSButton?
         let card: NSButton
-        let usage: NSButton
+        let usage: NSButton?    // nil = 该平台无用量行，「用量」列显「—」占位
     }
 
     private let rows: [Row]
@@ -477,6 +501,13 @@ final class PlatformAutomationSettingsDialog: NSObject {
                                    isOn: config.panelCardVisible["zhipu"] ?? true),
                 usage: makeCheckbox(label: "ZhiPu 用量显示",
                                     isOn: config.panelUsageVisible["zhipu"] ?? true)),
+            Row(name: "Qwen", platformID: "qwen",
+                refresh: makeCheckbox(label: "Qwen 刷新", isOn: config.qwenRefreshEnabled),
+                checkin: nil,
+                card: makeCheckbox(label: "Qwen 卡片显示",
+                                   isOn: config.panelCardVisible["qwen"] ?? true),
+                usage: makeCheckbox(label: "Qwen 用量显示",
+                                    isOn: config.panelUsageVisible["qwen"] ?? true)),
             Row(name: "WorkBuddy", platformID: "wb",
                 refresh: makeCheckbox(label: "WorkBuddy 刷新", isOn: config.workbuddyEnabled),
                 checkin: makeCheckbox(label: "WorkBuddy 自动签到", isOn: config.workbuddyAutoCheckin),
@@ -531,23 +562,23 @@ final class PlatformAutomationSettingsDialog: NSObject {
         headerCard.alignment = .center
         headerUsage.alignment = .center
 
+        /// 「—」占位（该平台无此项能力）
+        func unavailablePlaceholder(_ label: String) -> NSView {
+            let unavailable = NSTextField(labelWithString: "—")
+            unavailable.alignment = .center
+            unavailable.font = .systemFont(ofSize: 12)
+            unavailable.textColor = .tertiaryLabelColor
+            unavailable.setAccessibilityLabel(label)
+            return unavailable
+        }
         var gridRows: [[NSView]] = [[headerName, headerRefresh, headerCheckin, headerCard, headerUsage]]
         for row in rows {
             let name = NSTextField(labelWithString: row.name)
             name.font = .systemFont(ofSize: 12)
             name.textColor = .labelColor
-            let checkinView: NSView
-            if let checkin = row.checkin {
-                checkinView = checkin
-            } else {
-                let unavailable = NSTextField(labelWithString: "—")
-                unavailable.alignment = .center
-                unavailable.font = .systemFont(ofSize: 12)
-                unavailable.textColor = .tertiaryLabelColor
-                unavailable.setAccessibilityLabel("该平台不支持签到")
-                checkinView = unavailable
-            }
-            gridRows.append([name, row.refresh, checkinView, row.card, row.usage])
+            let checkinView = row.checkin ?? unavailablePlaceholder("该平台不支持签到")
+            let usageView = row.usage ?? unavailablePlaceholder("该平台不支持用量显示")
+            gridRows.append([name, row.refresh, checkinView, row.card, usageView])
         }
 
         // NSGridView 让每一列共享同一条轨道：平台列左对齐，各控件列居中，
@@ -584,15 +615,18 @@ final class PlatformAutomationSettingsDialog: NSObject {
         var updatedConfig = initialConfig
         updatedConfig.deepseekRefreshEnabled = rows[0].refresh.state == .on
         updatedConfig.bigmodelRefreshEnabled = rows[1].refresh.state == .on
-        updatedConfig.workbuddyEnabled = rows[2].refresh.state == .on
-        updatedConfig.workbuddyAutoCheckin = rows[2].checkin?.state == .on
-        updatedConfig.traeRefreshEnabled = rows[3].refresh.state == .on
-        updatedConfig.traeAutoCheckin = rows[3].checkin?.state == .on
-        updatedConfig.zcodeRefreshEnabled = rows[4].refresh.state == .on
-        updatedConfig.codexRefreshEnabled = rows[5].refresh.state == .on
+        updatedConfig.qwenRefreshEnabled = rows[2].refresh.state == .on
+        updatedConfig.workbuddyEnabled = rows[3].refresh.state == .on
+        updatedConfig.workbuddyAutoCheckin = rows[3].checkin?.state == .on
+        updatedConfig.traeRefreshEnabled = rows[4].refresh.state == .on
+        updatedConfig.traeAutoCheckin = rows[4].checkin?.state == .on
+        updatedConfig.zcodeRefreshEnabled = rows[5].refresh.state == .on
+        updatedConfig.codexRefreshEnabled = rows[6].refresh.state == .on
         for row in rows {
             updatedConfig.panelCardVisible[row.platformID] = (row.card.state == .on)
-            updatedConfig.panelUsageVisible[row.platformID] = (row.usage.state == .on)
+            if let usage = row.usage {
+                updatedConfig.panelUsageVisible[row.platformID] = (usage.state == .on)
+            }
         }
         return updatedConfig
     }

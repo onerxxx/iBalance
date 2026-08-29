@@ -32,15 +32,18 @@ extension BalancePanelView {
             let vis = r.arrangedSubviews.filter { !$0.isHidden }
             parts.append("rootChildren=" + vis.map { String(format: "%.1f", $0.frame.height) }.joined(separator: ","))
         }
-        if let bgc = balanceGroupContainer {
-            parts.append("bgc=\(String(format: "%.1f", bgc.frame.height))")
-            let containers = platformCards.values
-                .compactMap { $0 as? NSStackView }
-                .sorted { $0.frame.minY < $1.frame.minY }
-            for c in containers {
-                let hs = c.arrangedSubviews.filter { !$0.isHidden }
-                    .map { String(format: "%.1f", $0.frame.height) }
-                if !hs.isEmpty { parts.append("[\(hs.joined(separator: ","))]") }
+        for (name, group) in [("bgc", balanceGroupContainer), ("agc", apiGroupContainer)] {
+            if let g = group {
+                parts.append("\(name)=\(String(format: "%.1f", g.frame.height))")
+                let containers = platformCards.values
+                    .compactMap { $0 as? NSStackView }
+                    .filter { g.arrangedSubviews.contains($0) }
+                    .sorted { $0.frame.minY < $1.frame.minY }
+                for c in containers {
+                    let hs = c.arrangedSubviews.filter { !$0.isHidden }
+                        .map { String(format: "%.1f", $0.frame.height) }
+                    if !hs.isEmpty { parts.append("[\(hs.joined(separator: ","))]") }
+                }
             }
         }
         Logger.log(.layout, "[\(tag)] \(parts.joined(separator: " "))")
@@ -96,23 +99,88 @@ extension BalancePanelView {
         root.addArrangedSubview(offlineBanner)
         pinFullWidth(offlineBanner, in: root)
 
-        // ── 余额分组标题（12pt bold + systemGray 石墨灰）+ 行尾 pin 置顶按钮 ──
-        let balanceTitle = sectionTitleRow(name: "余额")
+        // ── API 分组标题（12pt bold + systemGray 石墨灰）+ 行尾 pin 置顶按钮 ──
+        // DeepSeek/ZhiPu API 余额板块，置于面板最上；pin 随首行标题
+        let apiTitle = sectionTitleRow(name: "API")
+        apiTitle.translatesAutoresizingMaskIntoConstraints = false
+        root.addArrangedSubview(apiTitle)
+        // 对齐到卡片内标题的左边界（root.leading + 8pt）
+        apiTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8).isActive = true
+        // 行撑满宽，pin 按钮贴行尾（与标题同一行）：点击切换置顶常驻
+        let titleSpacer = NSView()
+        titleSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        apiTitle.addArrangedSubview(titleSpacer)
+        apiTitle.addArrangedSubview(pinBtn)
+        apiTitle.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -6).isActive = true
+        // 上下间距统一 6pt（离线横幅→标题、标题→卡片）
+        root.setCustomSpacing(6, after: offlineBanner)
+        root.setCustomSpacing(0, after: apiTitle)
+
+        // ── API 卡片组容器：统一 kCardBackground 背景 + 圆角，子卡片透明 ──
+        let apiGroupContainer = NSStackView()
+        apiGroupContainer.orientation = .vertical
+        apiGroupContainer.alignment = .width
+        apiGroupContainer.distribution = .fill
+        apiGroupContainer.spacing = 0
+        apiGroupContainer.translatesAutoresizingMaskIntoConstraints = false
+        apiGroupContainer.wantsLayer = true
+        apiGroupContainer.layer?.cornerRadius = Palette.cardCornerRadius
+        apiGroupContainer.layer?.cornerCurve = .continuous
+        apiGroupContainer.layer?.masksToBounds = true
+        apiGroupContainer.layer?.backgroundColor = kCardBackground.cgColor
+        self.apiGroupContainer = apiGroupContainer
+        root.addArrangedSubview(apiGroupContainer)
+        apiGroupContainer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        // ── DeepSeek 单账号卡片容器（动态创建，走多号卡片管线；置于 API 组首位）──
+        dsCardsContainer = NSStackView(views: [])
+        dsCardsContainer.orientation = .vertical
+        dsCardsContainer.alignment = .leading
+        dsCardsContainer.distribution = .fill
+        dsCardsContainer.spacing = 0
+        dsCardsContainer.translatesAutoresizingMaskIntoConstraints = false
+        apiGroupContainer.addArrangedSubview(dsCardsContainer)
+        pinPlatformWidth(dsCardsContainer, in: apiGroupContainer)
+        platformCards[BalancePlatform.deepSeek.rawValue] = dsCardsContainer
+        // 平台间间隔 4pt（同平台内各容器内部 spacing=0 不加间隔）
+        apiGroupContainer.setCustomSpacing(4, after: dsCardsContainer)
+
+        // ── ZhiPu 单账号卡片容器（智谱 BigModel，同 DS 管线；置于 DeepSeek 卡片下方）──
+        zhipuCardsContainer = NSStackView(views: [])
+        zhipuCardsContainer.orientation = .vertical
+        zhipuCardsContainer.alignment = .leading
+        zhipuCardsContainer.distribution = .fill
+        zhipuCardsContainer.spacing = 0
+        zhipuCardsContainer.translatesAutoresizingMaskIntoConstraints = false
+        apiGroupContainer.addArrangedSubview(zhipuCardsContainer)
+        pinPlatformWidth(zhipuCardsContainer, in: apiGroupContainer)
+        platformCards[BalancePlatform.bigModel.rawValue] = zhipuCardsContainer
+        apiGroupContainer.setCustomSpacing(4, after: zhipuCardsContainer)
+
+        // ── Qwen 单账号卡片容器（千问 Token Plan 周额度，同 DS 管线；置于 ZhiPu 卡片下方）──
+        qwenCardsContainer = NSStackView(views: [])
+        qwenCardsContainer.orientation = .vertical
+        qwenCardsContainer.alignment = .leading
+        qwenCardsContainer.distribution = .fill
+        qwenCardsContainer.spacing = 0
+        qwenCardsContainer.translatesAutoresizingMaskIntoConstraints = false
+        apiGroupContainer.addArrangedSubview(qwenCardsContainer)
+        pinPlatformWidth(qwenCardsContainer, in: apiGroupContainer)
+        platformCards[BalancePlatform.qwen.rawValue] = qwenCardsContainer
+        apiGroupContainer.setCustomSpacing(4, after: qwenCardsContainer)
+
+        // API 区块 → Agent 区块（分割线已移除，用区块间距分隔）
+        root.setCustomSpacing(10, after: apiGroupContainer)
+
+        // ── Agent 分组标题（原「余额」板块改名；ZCode/Codex/TRAE/WB 等 Agent 平台）──
+        let balanceTitle = sectionTitleRow(name: "Agent")
         balanceTitle.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(balanceTitle)
         // 对齐到卡片内标题的左边界（root.leading + 8pt）
         balanceTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8).isActive = true
-        // 行撑满宽，pin 按钮贴行尾（与标题同一行）：点击切换置顶常驻
-        let titleSpacer = NSView()
-        titleSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        balanceTitle.addArrangedSubview(titleSpacer)
-        balanceTitle.addArrangedSubview(pinBtn)
-        balanceTitle.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -6).isActive = true
-        // 上下间距统一 6pt（离线横幅→标题、标题→卡片）
-        root.setCustomSpacing(6, after: offlineBanner)
         root.setCustomSpacing(0, after: balanceTitle)
 
-        // ── 余额卡片组容器：统一 kCardBackground 背景 + 圆角，子卡片透明 ──
+        // ── Agent 卡片组容器：统一 kCardBackground 背景 + 圆角，子卡片透明 ──
         let balanceGroupContainer = NSStackView()
         balanceGroupContainer.orientation = .vertical
         balanceGroupContainer.alignment = .width
@@ -128,32 +196,7 @@ extension BalancePanelView {
         root.addArrangedSubview(balanceGroupContainer)
         balanceGroupContainer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
-        // ── DeepSeek 单账号卡片容器（动态创建，走多号卡片管线；置于余额组首位）──
-        dsCardsContainer = NSStackView(views: [])
-        dsCardsContainer.orientation = .vertical
-        dsCardsContainer.alignment = .leading
-        dsCardsContainer.distribution = .fill
-        dsCardsContainer.spacing = 0
-        dsCardsContainer.translatesAutoresizingMaskIntoConstraints = false
-        balanceGroupContainer.addArrangedSubview(dsCardsContainer)
-        pinPlatformWidth(dsCardsContainer)
-        platformCards[BalancePlatform.deepSeek.rawValue] = dsCardsContainer
-        // 平台间间隔 4pt（同平台内各容器内部 spacing=0 不加间隔）
-        balanceGroupContainer.setCustomSpacing(4, after: dsCardsContainer)
-
-        // ── ZhiPu 单账号卡片容器（智谱 BigModel，同 DS 管线；置于 DeepSeek 卡片下方）──
-        zhipuCardsContainer = NSStackView(views: [])
-        zhipuCardsContainer.orientation = .vertical
-        zhipuCardsContainer.alignment = .leading
-        zhipuCardsContainer.distribution = .fill
-        zhipuCardsContainer.spacing = 0
-        zhipuCardsContainer.translatesAutoresizingMaskIntoConstraints = false
-        balanceGroupContainer.addArrangedSubview(zhipuCardsContainer)
-        pinPlatformWidth(zhipuCardsContainer)
-        platformCards[BalancePlatform.bigModel.rawValue] = zhipuCardsContainer
-        balanceGroupContainer.setCustomSpacing(4, after: zhipuCardsContainer)
-
-        // ── ZCode 多账号卡片容器（动态创建，账号列表变化时重建；置于 DeepSeek 卡片下方）──
+        // ── ZCode 多账号卡片容器（动态创建，账号列表变化时重建）──
         zcodeCardsContainer = NSStackView(views: [])
         zcodeCardsContainer.orientation = .vertical
         zcodeCardsContainer.alignment = .leading
@@ -209,10 +252,41 @@ extension BalancePanelView {
         balanceGroupContainer.setCustomSpacing(4, after: wbCardsContainer)
 
         // 应用上次拖拽保存的平台顺序；隐藏的账号组仍保留位置，之后重新出现时顺序不跳变。
+        // 须在两组容器都建好后调用：重排按组内过滤进行
         applyPlatformOrder(animated: false)
 
-        // 余额区块 → 用量区块（分割线已移除，用区块间距分隔）
+        // Agent 区块 → Token 板块（分割线已移除，用区块间距分隔）
         root.setCustomSpacing(10, after: balanceGroupContainer)
+
+        // ── Token 板块（内嵌 ZCode / WorkBuddy 卡片 hover 子面板同款内容，单实例，
+        // 只显示 Agent 组最顶上平台的 Token；可折叠。顶部平台无 Token 数据源或无数据时整块隐藏）──
+        var tokenCollapseTargets: [NSView] = []
+        let tokenTitle = collapsibleSectionTitle(name: "Token", key: UDKey.tokenSectionCollapsed,
+                                                 titleWeight: .semibold,
+                                                 targets: { tokenCollapseTargets })
+        root.addArrangedSubview(tokenTitle)
+        pinFullWidth(tokenTitle, in: root)
+        root.setCustomSpacing(0, after: tokenTitle)
+        tokenTitleRef = tokenTitle
+        sectionTitleViews["token"] = tokenTitle
+        tokenContentStack.orientation = .vertical
+        tokenContentStack.alignment = .width
+        tokenContentStack.distribution = .fill
+        tokenContentStack.spacing = 0
+        tokenContentStack.translatesAutoresizingMaskIntoConstraints = false
+        // 内容视图撑满版心（宽随卡片），自身左右缩进 8 对齐其他板块；热力图按实际宽
+        // 等比放大，所有字号不变
+        let tokenCard = addCard(rows: [tokenContentStack], to: root, spacing: 6, topPadding: 2,
+                                bottomPadding: 2, horizontalPadding: 0)
+        tokenCardRef = tokenCard
+        tokenCollapseTargets = [tokenCard]
+        // 初始隐藏：数据异步到达后由 applyInlineTokensVisibility 统一裁决显隐（含折叠态）
+        tokenCard.isHidden = true
+        tokenTitle.isHidden = true
+        // Token 板块 → 用量区块
+        root.setCustomSpacing(10, after: tokenCard)
+        // 填充内嵌内容并启动低频刷新（数据源 60s 后台缓存，fetch 只回缓存零读取）
+        setupInlineTokens()
 
         // ── 日/周用量区块（可折叠；行内容随快照重建）──
         var usageCollapseTargets: [NSView] = []
@@ -414,12 +488,12 @@ extension BalancePanelView {
         root.setCustomSpacing(actionsCollapsed ? 6 : 0, after: actionTitle)
 
         // ── 底部：更新时间（严格水平居中）+ 退出按钮（贴右）──
-        // pin 按钮（挂「余额」标题行尾）：属性在此配置，布局见 balanceTitle 段
+        // pin 按钮（挂 API 标题行尾，面板首行标题）：属性在此配置，布局见 apiTitle 段
         pinBtn.image = symbolImage("pin", size: 11)
         pinBtn.target = self
         pinBtn.action = #selector(pinTapped)
         pinBtn.toolTip = "置顶面板（置顶后可自由拖动）"
-        // 拖动示意条：绝对定位在「余额」标题行（root top padding 14pt）上方的留白带内居中
+        // 拖动示意条：绝对定位在面板顶部（root top padding 14pt）上方的留白带内居中
         addSubview(dragGrabber)
         dragGrabber.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -510,7 +584,7 @@ extension BalancePanelView {
         card.layer?.cornerCurve = .continuous
         card.layer?.masksToBounds = true
         // 预设边框色（hover 时由 HoverCard/ActionTileButton 动画 borderWidth 显示）
-        card.layer?.borderColor = Palette.hoverBorderNormal.cgColor
+        card.layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: card)
         card.layer?.borderWidth = 0
         // 卡片底色：cardBackground=nil 表示子卡片透明（由外层容器统一提供背景）
         if let bg = cardBackground {
@@ -584,7 +658,7 @@ extension BalancePanelView {
         hc.layer?.cornerCurve = .continuous
         hc.layer?.masksToBounds = true
         // 边框色预设（HoverCard mouseEntered 只动画 borderWidth，色值由此处提供）
-        hc.layer?.borderColor = Palette.hoverBorderNormal.cgColor
+        hc.layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: hc)
         hc.layer?.borderWidth = 0
         // label 与箭头直接锚到标题条两端——不经 NSStackView（默认 .gravityAreas
         // 会把子视图全堆在 leading 重力区，行撑满也没法把箭头推到最右）

@@ -18,6 +18,8 @@ struct PanelSnapshot: Equatable {
     var dsAccounts: [AccountCardSnapshot] = []
     /// ZhiPu（智谱 BigModel）卡片数据（单元素；uid 恒 "zhipu"）
     var zhipuAccounts: [AccountCardSnapshot] = []
+    /// Qwen（千问 Token Plan）卡片数据（单元素；uid 恒 "qwen"，值为周剩余百分比）
+    var qwenAccounts: [AccountCardSnapshot] = []
     /// 面板余额卡片可见性：key = 平台 ID（"ds" / "zcode" / "codex" / "trae" / "wb"），
     /// value=true 显示、false 隐藏；未记录的平台默认 true。
     var panelCardVisible: [String: Bool] = [:]
@@ -265,11 +267,20 @@ enum Palette {
             ? NSColor.white.withAlphaComponent(0.20)
             : NSColor.black.withAlphaComponent(0.12)
     }
-    /// hover 边框提亮色（深色白@35% / 浅色黑@25%）：hover 时边框色随宽度一起动画到此色
+    /// hover 边框提亮色（深色白@35% / 浅色黑@80%）：hover 时边框色随宽度一起动画到此色
     static let hoverBorderBright = NSColor(name: nil) { appearance in
         appearance.isDark
             ? NSColor.white.withAlphaComponent(0.35)
-            : NSColor.black.withAlphaComponent(0.25)
+            : NSColor.black.withAlphaComponent(0.80)
+    }
+    /// 动态色落 CALayer 前按「视图生效外观」解算（hover 路径必须走这里）。
+    /// 事件回调（mouseEntered/Exited）里 NSAppearance.current 是**系统**外观，
+    /// 而浅色主题开关（light_theme_enabled）是给面板强制 aqua 的——两者不一致时
+    /// 直接取 .cgColor 会解算到深色分支（白@35%），浅色面板上出现近乎不可见的白边。
+    static func borderCGColor(_ color: NSColor, in view: NSView) -> CGColor {
+        var resolved = NSColor.clear.cgColor
+        view.effectiveAppearance.performAsCurrentDrawingAppearance { resolved = color.cgColor }
+        return resolved
     }
 
     // ── 图表与提示元素（用量趋势子面板 / Token 统计子面板 / 滚动渐隐提示共用）──
@@ -537,9 +548,37 @@ final class BalancePanelViewController: NSViewController {
                 let c = self.scrollView.contentView
                 Logger.log(.layout, "[scroll] origin.y=\(String(format: "%.1f", c.bounds.origin.y)) clipH=\(String(format: "%.1f", c.bounds.height)) docH=\(String(format: "%.1f", self.panel.bounds.height))")
             }
+            // 视口尺寸变化（popover/浮窗高度变化）：重新落地「顶边贴视口顶」不变量。
+            // popover 高度变化分两步落地（文档先长/缩，窗口高度延迟百毫秒级才跟随），
+            // eager 补偿写入的 origin 在旧视口合法、新视口下越界或不足——越界瞬间
+            // clip 显示范围探出文档顶边，内容整体下坠 Δ，光标下方卡片身份错位，
+            // AppKit 按错位几何补发 mouseEntered（上方卡片假亮）。视口每变一次就把
+            // 不变量重新落地：变化前贴顶 → 回到新 legalMax；否则仅钳入合法范围
+            // （不扰用户滚动位置）
+            if let self {
+                let clip = self.scrollView.contentView
+                let size = clip.bounds.size
+                if size != self.lastClipViewportSize {
+                    let docH = self.panel.bounds.height
+                    let legalBefore = max(0, docH - self.lastClipViewportSize.height)
+                    let wasTopPinned = self.lastClipOriginY >= legalBefore - 0.5
+                    let legalNow = max(0, docH - size.height)
+                    let originY = clip.bounds.origin.y
+                    let target = wasTopPinned ? legalNow : min(originY, legalNow)
+                    self.lastClipViewportSize = size
+                    if abs(target - originY) > 0.1 {
+                        clip.scroll(to: NSPoint(x: 0, y: target))
+                        self.scrollView.reflectScrolledClipView(clip)
+                    }
+                }
+                self.lastClipOriginY = clip.bounds.origin.y
+            }
             self?.updateFadeHint()
             // 滚动后修正各卡片/按钮的 hover 状态（AppKit 不补发 enter/exit 事件）
             self?.syncHoverAfterScroll()
+            // 几何稳定后再校准一次：popover 高度变化分两步落地，窗口落地后
+            // 的补发事件可能落在上面即时同步之后
+            self?.scheduleHoverSync()
         })
         fadeObservers.append(NotificationCenter.default.addObserver(
             forName: NSView.frameDidChangeNotification, object: panel, queue: .main
@@ -634,7 +673,21 @@ final class BalancePanelViewController: NSViewController {
             ? max(contentSize.height, scrollView.contentView.bounds.height)
             : max(1, contentSize.height)
         let nextFrame = NSRect(x: 0, y: 0, width: documentWidth, height: contentHeight)
+        let oldDocHeight = panel.frame.height
         if panel.frame != nextFrame { panel.frame = nextFrame }
+        // 文档高度变化时补偿滚动原点（浮窗 syncDocumentSizeToViewport 同款顶边锚定口径）：
+        // 非翻转文档内容顶边锚定，高度增减若保持 origin 不变，视口内内容会整体视觉位移 δ。
+        // 随 δ 平移 origin 把可见内容钉回原位，clamp 到有效滚动范围
+        let docHeightDelta = nextFrame.height - oldDocHeight
+        if abs(docHeightDelta) > 0.1 {
+            let clip = scrollView.contentView
+            let maxOrigin = max(0, nextFrame.height - clip.bounds.height)
+            let target = min(max(0, clip.bounds.origin.y + docHeightDelta), maxOrigin)
+            if abs(target - clip.bounds.origin.y) > 0.1 {
+                clip.scroll(to: NSPoint(x: 0, y: target))
+                scrollView.reflectScrolledClipView(clip)
+            }
+        }
         let viewportHeight = min(contentHeight, maximumHeight)
         // 滚动条始终隐藏（初始化 hasVerticalScroller=false，这里不再动态开启）
         let nextContentSize = NSSize(width: documentWidth, height: viewportHeight)
@@ -645,6 +698,11 @@ final class BalancePanelViewController: NSViewController {
         }
         updateFadeHint()
         layoutProbe("ucs", force: true)
+        // 折叠/展开、行数增减等高度变化落定后按光标位置校准 hover：
+        // 无鼠标移动的几何变化 AppKit 补发的 enter/exit 不可靠（同滚动假 hover），
+        // 立即同步一次清场 + 防抖收尾按屏幕坐标 hitTest 权威补亮
+        syncHoverAfterScroll()
+        scheduleHoverSync()
     }
 
     // MARK: - 布局探针（诊断余额卡片被拉伸问题）
@@ -795,6 +853,26 @@ final class BalancePanelViewController: NSViewController {
         walk(panel)
     }
 
+    /// 几何稳定后的 hover 校准（防抖 0.15s）：区块折叠/展开、行数增减等内容位移后
+    /// AppKit 补发的 enter/exit 不可靠（同滚动假 hover），且 popover 高度变化分两步
+    /// 落地——防抖到几何不再变化后按光标 hitTest 权威同步。只重排日程不叠加调用：
+    /// 每次触发重置计时，几何连续变化时只在停稳后执行一次
+    private var pendingHoverSync: DispatchWorkItem?
+    /// 视口尺寸（clip bounds.size）/ 原点上一次取值：尺寸变化时据上一次原点
+    /// 判断「变化前是否顶边贴定」，据此把不变量重新落地（见观察器内注释）
+    private var lastClipViewportSize: CGSize = .zero
+    private var lastClipOriginY: CGFloat = 0
+
+    private func scheduleHoverSync() {
+        pendingHoverSync?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.isViewLoaded, self.view.window != nil else { return }
+            self.syncHoverAfterScroll()
+        }
+        pendingHoverSync = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
+    }
+
     /// 按当前开关与生效外观刷新背景遮罩：浅色主题强制浅色；渐变生效时按生效外观
     /// 取深灰（深）或亮白（浅）的纵向渐变遮罩；否则无遮罩（原生玻璃）
     private func applyGradient() {
@@ -851,6 +929,7 @@ final class BalancePanelViewController: NSViewController {
 enum BalancePlatform: String, CaseIterable {
     case deepSeek = "ds"
     case bigModel = "zhipu"
+    case qwen
     case zcode
     case codex
     case trae
@@ -903,9 +982,10 @@ final class BalancePanelView: NSView {
     var onTogglePin: (() -> Void)?
     /// 置顶状态（pin ↔ pin.fill 图标切换）
     private(set) var panelPinned = false
-    // 余额卡片点击回调：DeepSeek/ZhiPu 打开网页，TRAE / WorkBuddy / ZCode 启动应用
+    // 余额卡片点击回调：DeepSeek/ZhiPu/Qwen 打开网页，TRAE / WorkBuddy / ZCode 启动应用
     var onClickDeepSeek: (() -> Void)?
     var onClickZhiPu: (() -> Void)?
+    var onClickQwen: (() -> Void)?
     var onClickTrae: (() -> Void)?
     var onClickWorkBuddy: (() -> Void)?
     /// WorkBuddy 非当前账号卡片点击：传入 uid，触发切号重启
@@ -950,6 +1030,10 @@ final class BalancePanelView: NSView {
     var zhipuCardsContainer: NSStackView!
     private var zhipuCardEntries: [CardEntry] = []
     private var zhipuCardUids: [String] = []
+    // Qwen 单账号卡片容器（同 DeepSeek 管线，置于 ZhiPu 下方）
+    var qwenCardsContainer: NSStackView!
+    private var qwenCardEntries: [CardEntry] = []
+    private var qwenCardUids: [String] = []
 
     /// 单个多号卡片的控件引用（update 时直接赋值，无需重建；WB / TRAE / ZCode 共用）。
     /// 非当前账号的 dots 为占位实例（未加入视图层级，更新时跳过）。
@@ -992,6 +1076,9 @@ final class BalancePanelView: NSView {
         static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
         // ZhiPu：与 ds 同构的单账号卡（uid 恒 "zhipu" 无前缀，右键菜单 id 恰为 MenuBarPrefix.zhipu）；副标题带 external-link 图标
         static let zhipu = CardStyle(icon: "zhipu", name: "ZhiPu", platformID: "zhipu", iconSize: 19, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
+        // Qwen（千问 Token Plan）：单账号卡，值为周剩余百分比；副标题为套餐到期倒计时（clock-stop 图标）
+        // qwen.svg 图形满幅 viewBox（同 codex 口径），iconSize 与 codex 一致
+        static let qwen = CardStyle(icon: "qwen", name: "Qwen", platformID: "qwen", iconSize: 19.45, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -999,11 +1086,14 @@ final class BalancePanelView: NSView {
     private var traeCardEntries: [CardEntry] = []
     private var traeCardUids: [String] = []  // 当前已渲染卡片的 uid 列表（检测变化）
 
-    // 余额卡片组容器（统一背景 + 圆角，子卡片透明）；背景渐变起点定位依据
+    // Agent 卡片组容器（统一背景 + 圆角，子卡片透明）
     var balanceGroupContainer: NSStackView!
+    // API 卡片组容器（DeepSeek/ZhiPu/Qwen，样式与 Agent 组一致）
+    var apiGroupContainer: NSStackView!
     /// 平台容器 == 组宽：单列布局下容器撑满组宽，数值/点阵才能贴右对齐
-    func pinPlatformWidth(_ container: NSStackView) {
-        let c = container.widthAnchor.constraint(equalTo: balanceGroupContainer.widthAnchor)
+    /// group 省略时锚定 Agent 组（API 组容器需显式传 apiGroupContainer）
+    func pinPlatformWidth(_ container: NSStackView, in group: NSStackView? = nil) {
+        let c = container.widthAnchor.constraint(equalTo: (group ?? balanceGroupContainer).widthAnchor)
         c.isActive = true
     }
     /// 余额卡片组视觉底边距面板顶部的距离（背景渐变从此处开始；panel 非 flipped，
@@ -1073,6 +1163,15 @@ final class BalancePanelView: NSView {
     var tokensShowTask: DispatchWorkItem?
     /// 子面板打开期间的低频刷新定时器（间隔 = store 缓存 TTL；关闭时销毁）
     var tokensRefreshTimer: Timer?
+    /// 主面板「Token」板块：内嵌 ZCode / WorkBuddy hover 子面板同款内容（数据到达前整块隐藏）
+    let tokenContentStack = NSStackView()
+    var tokenTitleRef: NSView?
+    var tokenCardRef: NSView?
+    /// 内嵌 Token 内容视图单实例（与卡片 hover 子面板共用 ZcodeTokensPanelView；
+    /// 显示平台 = Agent 组最顶上的平台，由 refreshInlineTokens 动态解析）
+    var inlineTokenView: ZcodeTokensPanelView?
+    /// Token 板块低频刷新定时器（间隔 = store 缓存 TTL，fetch 只回缓存零读取）
+    var inlineTokensRefreshTimer: Timer?
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -1103,8 +1202,9 @@ final class BalancePanelView: NSView {
     /// 名称列再不够由自身截断兜底）。字体度量取当前 uiFont——字体开关切换后
     /// applyFontPolicy 强制清空 renderedUsageRows 触发重建重算。
     private func computeUsageColumnLayout(_ rows: [UsageRowSnapshot]) {
-        let valueFont = uiFont(size: 10, weight: .regular, monoDigits: true)
-        let headerFont = uiFont(size: 10, weight: .semibold)
+        // 度量字体与行渲染同源（小表格口径），避免测量/渲染字重不一致
+        let valueFont = SmallTable.rowFont(mono: monoFontEnabled, monoDigits: true)
+        let headerFont = SmallTable.titleFont(mono: monoFontEnabled)
         func w(_ s: String, _ f: NSFont) -> CGFloat {
             s.size(withAttributes: [.font: f]).width
         }
@@ -1117,10 +1217,11 @@ final class BalancePanelView: NSView {
             week = max(week, w(r.weekText, valueFont))
         }
         hour += 6; today += 6; week += 6
-        let nameFont = uiFont(size: 10)
+        let nameFont = SmallTable.rowFont(mono: monoFontEnabled)
         let nameW = rows.map { w($0.name, nameFont) }.max() ?? 40
         // 固定开销：左右 inset 16 + icon 14 + icon↔名 4 + 名↔数值区 6 + 三个列间隙 24
-        let budget = usageMaxRowWidth - 16 - 14 - 4 - 6 - 24 - nameW
+        let budget = usageMaxRowWidth - SmallTable.horizontalInset * 2 - 14 - 4 - 6
+            - 3 * SmallTable.columnSpacing - nameW
         let total = hour + today + week
         if total > budget, total > 0 {
             let scale = budget / total
@@ -1131,11 +1232,12 @@ final class BalancePanelView: NSView {
         usageColWidths = (week: week, today: today, hour: hour)
     }
 
-    let usageColumnSpacing: CGFloat = 8
-    let usageHorizontalInset: CGFloat = 8
-    /// 用量行行内垂直缩进（行间距 0，每行上下统一缩进 4pt）
-    let usageRowTopInset: CGFloat = 4
-    let usageRowBottomInset: CGFloat = 4
+    // 用量表样式口径统一走 SmallTable（小表格，与 Token 面板共用）
+    var usageColumnSpacing: CGFloat { SmallTable.columnSpacing }
+    var usageHorizontalInset: CGFloat { SmallTable.horizontalInset }
+    /// 用量行行内垂直缩进（行间距 0，每行上下统一缩进 3pt）
+    var usageRowTopInset: CGFloat { SmallTable.rowInset }
+    var usageRowBottomInset: CGFloat { SmallTable.rowInset }
 
     let autoCheckinSwitch = MiniSwitch()
     let autoCheckinSub = NSTextField(labelWithString: "")
@@ -1310,6 +1412,8 @@ final class BalancePanelView: NSView {
             // 用量子弹窗（图表）跟随同一开关：文本和数值切换 Mono 风格
             usageHistoryController?.monoFontEnabled = monoFontEnabled
             tokensPanelController?.monoFontEnabled = monoFontEnabled
+            // 主面板内嵌 Token 板块跟随同一开关（就地刷字体）
+            inlineTokenView?.monoFontEnabled = monoFontEnabled
         }
         valueScrollPreviewEnabled = s.valueScrollPreviewEnabled
         valuePreviewSwitch.state = s.valueScrollPreviewEnabled ? .on : .off
@@ -1368,6 +1472,14 @@ final class BalancePanelView: NSView {
             applyZhiPuCardData(s.zhipuAccounts)
         }
 
+        // Qwen 卡片：同 DeepSeek 单账号管线（uid 恒 "qwen"）
+        let newQwenUids = s.qwenAccounts.map { $0.uid + ($0.isCurrent ? "✓" : "") }
+        if newQwenUids != qwenCardUids {
+            rebuildQwenCards(s.qwenAccounts)
+        } else {
+            applyQwenCardData(s.qwenAccounts)
+        }
+
         // ZCode 多账号卡片：uid 或当前账号变化时重建（弱化跟随 isCurrent），否则就地更新数据
         let newZcodeUids = s.zcodeAccounts.map { $0.uid + ($0.isCurrent ? "✓" : "") }
         if newZcodeUids != zcodeCardUids {
@@ -1412,6 +1524,7 @@ final class BalancePanelView: NSView {
         // DS 是单卡片，永远有内容（标题+value占位），直接按配置切换。
         for pid in [BalancePlatform.deepSeek.rawValue,
                     BalancePlatform.bigModel.rawValue,
+                    BalancePlatform.qwen.rawValue,
                     BalancePlatform.zcode.rawValue,
                     BalancePlatform.codex.rawValue,
                     BalancePlatform.trae.rawValue,
@@ -1419,8 +1532,9 @@ final class BalancePanelView: NSView {
             guard let view = platformCards[pid] else { continue }
             let userWantsShow = s.panelCardVisible[pid] ?? true
             let shouldHide: Bool
-            // DS / ZhiPu 是单卡片，永远有内容（标题+value占位），直接按配置切换
-            if pid == BalancePlatform.deepSeek.rawValue || pid == BalancePlatform.bigModel.rawValue {
+            // DS / ZhiPu / Qwen 是单卡片，永远有内容（标题+value占位），直接按配置切换
+            if pid == BalancePlatform.deepSeek.rawValue || pid == BalancePlatform.bigModel.rawValue
+                || pid == BalancePlatform.qwen.rawValue {
                 shouldHide = !userWantsShow
             } else {
                 // 多账号组：空容器（无卡片）即使开关打开也维持隐藏；
@@ -1462,6 +1576,9 @@ final class BalancePanelView: NSView {
 
         // Mono 模式切换设置开关外观（字符开关 [×]/[▪] ↔ 原生 NSSwitch）
         applySwitchVisuals(animated: monoChanged)
+        // Token 板块跟随快照落定后刷新：账号增删/容器显隐变化会改变「Agent 顶部平台」
+        // 的解析结果（fetch 缓存命中同步、零读取，幂等）
+        refreshInlineTokens()
         if contentSizeChanged { onContentChanged?() }
     }
 
@@ -1474,7 +1591,8 @@ final class BalancePanelView: NSView {
     func staggerRevealBalanceGroupsIfNeeded() {
         guard !Self.didStaggerReveal else { return }
         Self.didStaggerReveal = true
-        let groups = platformOrder.compactMap { platformCards[$0] }.filter { !$0.isHidden }
+        let groups = (apiGroupContainer.arrangedSubviews + balanceGroupContainer.arrangedSubviews)
+            .filter { !$0.isHidden }
         guard groups.count > 1 else { return }
         // 平台组自上而下 40ms 阶梯（30–80ms 区间），每组 240ms「上浮 6pt + 淡入」。
         // 编排总时长 ≤ 240 + 40×组数；纯视觉层动画，不阻塞任何交互。
@@ -1866,6 +1984,17 @@ final class BalancePanelView: NSView {
     }
     private func applyZhiPuCardData(_ accounts: [AccountCardSnapshot]) {
         applyAccountCardData(accounts, entries: &zhipuCardEntries, style: .zhipu)
+    }
+
+    private func rebuildQwenCards(_ accounts: [AccountCardSnapshot]) {
+        rebuildAccountCards(accounts, style: .qwen, container: qwenCardsContainer,
+                            entries: &qwenCardEntries, uids: &qwenCardUids,
+                            onCurrentClick: { [weak self] in self?.onClickQwen?() },
+                            onSwitch: nil)
+    }
+
+    private func applyQwenCardData(_ accounts: [AccountCardSnapshot]) {
+        applyAccountCardData(accounts, entries: &qwenCardEntries, style: .qwen)
     }
 
     private func rebuildZcodeCards(_ accounts: [AccountCardSnapshot]) {

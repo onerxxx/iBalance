@@ -143,6 +143,9 @@ struct AppConfig: Codable {
     /// ZhiPu（智谱 BigModel）余额：各平台独立刷新开关 + 手填 token 覆盖（空 = 自动从浏览器 Cookies 解密）
     var bigmodelRefreshEnabled: Bool = true
     var bigmodelTokenOverride: String = ""
+    /// Qwen（千问 Token Plan）周额度：独立刷新开关 + 手填 ticket 覆盖（空 = 自动从浏览器 Cookies 解密）
+    var qwenRefreshEnabled: Bool = true
+    var qwenTicketOverride: String = ""
     var traeRefreshEnabled: Bool = true
     var zcodeRefreshEnabled: Bool = true
     var codexRefreshEnabled: Bool = true
@@ -200,6 +203,8 @@ struct AppConfig: Codable {
         case deepseekRefreshEnabled = "deepseek_refresh_enabled"
         case bigmodelRefreshEnabled = "bigmodel_refresh_enabled"
         case bigmodelTokenOverride = "bigmodel_token_override"
+        case qwenRefreshEnabled = "qwen_refresh_enabled"
+        case qwenTicketOverride = "qwen_ticket_override"
         case traeRefreshEnabled = "trae_refresh_enabled"
         case zcodeRefreshEnabled = "zcode_refresh_enabled"
         case codexRefreshEnabled = "codex_refresh_enabled"
@@ -249,6 +254,8 @@ struct AppConfig: Codable {
         deepseekRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .deepseekRefreshEnabled) ?? true
         bigmodelRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .bigmodelRefreshEnabled) ?? true
         bigmodelTokenOverride = try c.decodeIfPresent(String.self, forKey: .bigmodelTokenOverride) ?? ""
+        qwenRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .qwenRefreshEnabled) ?? true
+        qwenTicketOverride = try c.decodeIfPresent(String.self, forKey: .qwenTicketOverride) ?? ""
         traeRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .traeRefreshEnabled) ?? true
         zcodeRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .zcodeRefreshEnabled) ?? true
         codexRefreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .codexRefreshEnabled) ?? true
@@ -455,6 +462,7 @@ enum UDKey {
     static var settingsSectionCollapsed: String { "panel_settings_section_collapsed" }
     static var actionsSectionCollapsed: String { "panel_actions_section_collapsed" }
     static var usageSectionCollapsed: String { "panel_usage_section_collapsed" }
+    static var tokenSectionCollapsed: String { "panel_token_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
 
@@ -482,6 +490,9 @@ struct BalanceCache: Codable {
     var bigmodelInflow: Double?
     var bigmodelCycleStartInflow: Double?
     var bigmodelCycleStartBalance: Double?
+    /// Qwen（千问 Token Plan）周额度快照（重启后秒显，随下一轮刷新覆盖）
+    struct QwenAmount: Codable { let weekRem: Double; let weekLimit: Double; let remainingDays: Int; let expireAt: Double }
+    var qwen: QwenAmount?
     var wbAccounts: [String: WbAmount] = [:]
     var traeAccounts: [String: TraeAmount] = [:]
     var zcodeAccounts: [String: ZcodeAmount] = [:]

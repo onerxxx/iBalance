@@ -222,6 +222,20 @@ protocol PanelScrollHoverSync: AnyObject {
     func syncHoverState(_ inside: Bool)
 }
 
+/// 几何变化期间补发 mouseEntered 的事件级校验：折叠/展开、滚动、窗口 resize 等
+/// 内容位移后，AppKit 会按陈旧几何补发 enter/exit（实测事件位置可偏离视图当前
+/// bounds 数百 pt，且成对事件可能重复/丢失）。真实进入必然发生在视图框内，
+/// 因此 enter 到达时校验事件位置 ∈ bounds 即可无状态地滤掉全部错位补发——
+/// 这类事件点亮的是错位位置上的旧卡片，是折叠/展开假 hover 的根源。
+/// 自造事件（syncHoverState 的 NSEvent()，window 为 nil）不经此校验。
+enum HoverEnterValidation {
+    /// true = 事件可信（自造事件或位置确在当前 bounds 内）
+    static func isPlausible(_ event: NSEvent, in view: NSView) -> Bool {
+        guard event.window != nil else { return true }
+        return view.bounds.contains(view.convert(event.locationInWindow, from: nil))
+    }
+}
+
 /// 设置卡片行容器：hover 时仅提亮文本颜色（secondaryLabel/tertiaryLabel → hoverTextColor），
 /// switch/radio 等控件保持不变；无背景变化。光标变为 pointingHand 提示可点击。
 final class HoverRowView: NSView, PanelScrollHoverSync {
@@ -265,15 +279,15 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     var onHoverChanged: ((Bool) -> Void)?
     /// hover 时是否对灰色文本/tint 做提亮（false = 仅背景变化，用于用量行等）
     var enablesTextBrightening: Bool = true
-    /// hover 时是否绘制发丝边框（与余额卡片 HoverCard 同一套 Palette：常态白@20%、
-    /// hover 提亮到白@35%，0.8pt borderWidth，0.22s 渐变）。仅用量行启用，
+    /// hover 时是否绘制发丝边框（与余额卡片 HoverCard 同一套 Palette：常态深白@20%/浅黑@12%、
+    /// hover 提亮到深白@35%/浅黑@80%，0.8pt borderWidth，0.22s 渐变）。仅用量行启用，
     /// 设置卡片行保持纯平态。开启时预设 borderColor 避免首帧从黑边渐变。
     var enablesHoverBorder: Bool = false {
         didSet {
             guard enablesHoverBorder != oldValue else { return }
             wantsLayer = true
             if enablesHoverBorder {
-                layer?.borderColor = Palette.hoverBorderNormal.cgColor
+                layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
             } else {
                 layer?.borderWidth = 0
                 layer?.borderColor = nil
@@ -349,6 +363,7 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        guard HoverEnterValidation.isPlausible(event, in: self) else { return }
         isMouseInside = true
         onHoverChanged?(true)
         enterHoverVisual()
@@ -403,7 +418,8 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
             layer?.cornerCurve = .continuous
             // 与余额卡片 HoverCard 同款：0.8pt + 白@35% 发丝边框
             animateLayerKey(layer, keyPath: "borderWidth", to: 0.8)
-            animateLayerKey(layer, keyPath: "borderColor", to: Palette.hoverBorderBright.cgColor)
+            animateLayerKey(layer, keyPath: "borderColor",
+                            to: Palette.borderCGColor(Palette.hoverBorderBright, in: self))
         }
         guard enablesTextBrightening else { return }
         collectLabels()
@@ -440,7 +456,8 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
         }
         if enablesHoverBorder {
             animateLayerKey(layer, keyPath: "borderWidth", to: 0)
-            animateLayerKey(layer, keyPath: "borderColor", to: Palette.hoverBorderNormal.cgColor)
+            animateLayerKey(layer, keyPath: "borderColor",
+                            to: Palette.borderCGColor(Palette.hoverBorderNormal, in: self))
         }
         guard enablesTextBrightening else { return }
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -529,6 +546,7 @@ final class HoverIconButton: NSButton, PanelScrollHoverSync {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        guard HoverEnterValidation.isPlausible(event, in: self) else { return }
         isMouseInside = true
         contentTintColor = .labelColor
         // 兜底：确保 hover 背景几何已就位（layout 时序未触发时）
@@ -675,6 +693,7 @@ final class RefreshIconButton: NSButton, PanelScrollHoverSync {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        guard HoverEnterValidation.isPlausible(event, in: self) else { return }
         isMouseInside = true
         // 兜底：确保 hover 背景几何已就位（layout 时序未触发时）
         updateHoverBgGeometry()
@@ -721,6 +740,10 @@ class HoverCard: NSView, PanelScrollHoverSync {
     private var hasCapturedDragBackground = false
     private var isMouseInside = false
     private var isDragHoverLocked = false
+    /// 点击后主动清 hover 时置位：光标仍停留在原位，此后折叠/展开等内容位移触发的
+    /// 补发 mouseEntered（系统 tracking 重算、syncHoverState 校准）不再点亮，
+    /// 直到光标真实离开（mouseExited 复位）才恢复进入能力
+    private var suppressEnterUntilExit = false
     /// 点击回调：由外部设置，mouseUp 时触发
     var onClick: (() -> Void)?
     /// 右键点击回调：由外部设置，rightMouseDown 时触发（参数为事件，可用于弹出菜单定位）
@@ -788,7 +811,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
             hoverEffectLayer.isHidden = true
             layer?.backgroundColor = dragNormalBackgroundColor ?? kCardBackground.cgColor
             layer?.borderWidth = 0
-            layer?.borderColor = Palette.hoverBorderNormal.cgColor
+            layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
             CATransaction.commit()
             return
         }
@@ -805,7 +828,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
             CATransaction.setDisableActions(true)
             hoverEffectLayer.opacity = showing ? 1 : 0
             layer?.borderWidth = showing ? 0.8 : 0
-            layer?.borderColor = (showing ? Palette.hoverBorderBright : Palette.hoverBorderNormal).cgColor
+            layer?.borderColor = Palette.borderCGColor(
+                showing ? Palette.hoverBorderBright : Palette.hoverBorderNormal, in: self)
             CATransaction.commit()
             onHover?(showing)
             return
@@ -813,7 +837,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
         animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: showing ? 1 : 0)
         animateLayerKey(layer, keyPath: "borderWidth", to: showing ? 0.8 : 0)
         animateLayerKey(layer, keyPath: "borderColor",
-                        to: (showing ? Palette.hoverBorderBright : Palette.hoverBorderNormal).cgColor)
+                        to: Palette.borderCGColor(
+                            showing ? Palette.hoverBorderBright : Palette.hoverBorderNormal, in: self))
         onHover?(showing)
     }
 
@@ -864,11 +889,13 @@ class HoverCard: NSView, PanelScrollHoverSync {
     /// 主动清除 hover 材质，避免点击可折叠标题后高亮一直残留。
     func clearHoverEffect(animated: Bool = true) {
         isMouseInside = false
+        suppressEnterUntilExit = true
         guard !isDragHoverLocked else { return }
         if animated {
             animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
             animateLayerKey(layer, keyPath: "borderWidth", to: 0)
-            animateLayerKey(layer, keyPath: "borderColor", to: Palette.hoverBorderNormal.cgColor)
+            animateLayerKey(layer, keyPath: "borderColor",
+                            to: Palette.borderCGColor(Palette.hoverBorderNormal, in: self))
         } else {
             hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
             layer?.removeAnimation(forKey: "borderWidthTransition")
@@ -877,7 +904,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
             CATransaction.setDisableActions(true)
             hoverEffectLayer.opacity = 0
             layer?.borderWidth = 0
-            layer?.borderColor = Palette.hoverBorderNormal.cgColor
+            layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
             CATransaction.commit()
         }
         onHover?(false)
@@ -900,24 +927,28 @@ class HoverCard: NSView, PanelScrollHoverSync {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        guard HoverEnterValidation.isPlausible(event, in: self) else { return }
         isMouseInside = true
-        if isDragHoverLocked { return }
+        if isDragHoverLocked || suppressEnterUntilExit { return }
         // hover 背景淡入（与用量条目同色）
         animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 1)
         // 发丝边框淡入：0.8pt + 边框色提亮到 Palette.hoverBorderBright
         animateLayerKey(layer, keyPath: "borderWidth", to: 0.8)
-        animateLayerKey(layer, keyPath: "borderColor", to: Palette.hoverBorderBright.cgColor)
+        animateLayerKey(layer, keyPath: "borderColor",
+                        to: Palette.borderCGColor(Palette.hoverBorderBright, in: self))
         onHover?(true)
     }
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
         isMouseInside = false
+        suppressEnterUntilExit = false
         if isDragHoverLocked { return }
         // hover 背景淡出，露出容器统一背景
         animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
         animateLayerKey(layer, keyPath: "borderWidth", to: 0)
-        animateLayerKey(layer, keyPath: "borderColor", to: Palette.hoverBorderNormal.cgColor)
+        animateLayerKey(layer, keyPath: "borderColor",
+                        to: Palette.borderCGColor(Palette.hoverBorderNormal, in: self))
         onHover?(false)
     }
 
@@ -1008,8 +1039,8 @@ final class ActionTileButton: HoverCard {
         layer?.cornerRadius = 10
         layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
-        // 边框色与卡片统一 white@20%（hover 时由 HoverCard 动画 borderWidth 到 0.8）
-        layer?.borderColor = Palette.hoverBorderNormal.cgColor
+        // 边框色与卡片统一（hover 时由 HoverCard 动画 borderWidth 到 0.8）
+        layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
         layer?.borderWidth = 0
 
         // 只缩不放：SVG 微调尺寸（如 14.45）在 16pt 盒内保持原大居中，

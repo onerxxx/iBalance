@@ -277,7 +277,12 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     /// 词元活动视图切换每日/每周时回调（控制器据此刷新 popover 尺寸）
     var onActivityModeChanged: (() -> Void)?
     var monoFontEnabled = false {
-        didSet { totalRollView.refreshFont(); needsDisplay = true }
+        didSet {
+            totalRollView.refreshFont()
+            // 行距随墨迹推导（大数字 ascender 同理）：字体切换后固有高度已变，需失效重排
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
+        }
     }
     /// 数据源分流（ZCode=项目 / WorkBuddy=模型）：影响区块标题与行图标
     var source: TokensPanelSource = .zcode {
@@ -336,10 +341,21 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     /// 列表行数上限（超出按用量截断，头部项目已覆盖绝大多数占比）
     static let maxListRows = 4
     private static let contentWidth: CGFloat = 240
-    private static let rowHeight: CGFloat = 16
+    /// 列表行距 = 行墨迹高 + 6：文字在行带内居中后上下各留 3pt，行间墨迹空隙恒 6pt，
+    /// 与用量表格（usageRowTop/BottomInset 3+3）同口径；Mono 墨迹更高时行距自动放宽
+    private var rowHeight: CGFloat { rowInkHeight + 6 }
     /// 区块间距（总计词元 / 列表 / 词元活动 统一 20pt）
     private static let sectionGap: CGFloat = 20
-    private let insets = NSEdgeInsets(top: 20, left: 16, bottom: 20, right: 16)
+    /// 左右内容缩进：hover 子面板保持 16（原版视觉）；主面板内嵌设 8，与用量行 /
+    /// 设置卡片的内容边界（usageHorizontalInset / 卡片 horizontalPadding）对齐
+    var horizontalInset: CGFloat = 16
+    /// 顶部内容缩进：hover 子面板保持 20（弹窗顶留白）；主面板内嵌设 4 = usageRowTopInset，
+    /// 使「Token 标题 → 首行」与「用量标题 → 平台表头」的间距同口径（其余结构项两边一致：
+    /// 标题行高 24 + 标题下间距 0 + 卡片 topPadding 2）
+    var topInset: CGFloat = 20
+    private var insets: NSEdgeInsets {
+        NSEdgeInsets(top: topInset, left: horizontalInset, bottom: 20, right: horizontalInset)
+    }
 
     override var isFlipped: Bool { true }
 
@@ -355,37 +371,58 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     // MARK: 墨迹几何（区块视觉间距恒 = sectionGap）
-    // 名义行框（标签 10/12、数字带 32、列表行 16 居中）自带行框留白，
+    // 名义行框（标签 10/12、数字带 32、列表行 = 墨迹+6 居中）自带行框留白，
     // 区块锚点全部按字体实际墨迹（boundingRect/ascender）推导，间距不掺留白
 
+    /// 9pt 小注释字体：仅「项目/模型」「每日/每周」切换文案与热力图月份轴（非标题）
     private func makeLabelFont() -> NSFont {
         monoFontEnabled ? MonoFontProvider.font(size: 9)
             : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
     }
-    /// 标签墨迹高度（9pt 小标签）
+    /// 标签墨迹高度（9pt 小注释）
     private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
-    /// 列表行墨迹高度（10pt medium）
-    private var rowInkHeight: CGFloat { ceil(uiFont(size: 10, weight: .medium).boundingRectForFont.height) }
+    /// 区块标题字体（「平台名 总计」「项目」「词元活动」）：与用量表头同款（小表格口径）
+    private func makeTitleFont() -> NSFont { SmallTable.titleFont(mono: monoFontEnabled) }
+    /// 标题墨迹高度（10pt semibold）
+    private var titleInkHeight: CGFloat { ceil(makeTitleFont().boundingRectForFont.height) }
+    /// 列表行墨迹高度（小表格行字体 10pt medium）
+    private var rowInkHeight: CGFloat { ceil(SmallTable.rowFont(mono: monoFontEnabled).boundingRectForFont.height) }
     /// 大数字字体（与 totalRollView configure 同参；数字轮行带贴顶排版，墨迹底 = 带顶 + ascender）
     private var numberFont: NSFont { totalFont(size: totalNumberSize, weight: .semibold, monoDigits: true) }
 
     /// 总计标签顶 = 面板首行（与平台名同行）
     private var totalLabelTop: CGFloat { insets.top }
-    /// 大数字行带顶（layout 与 draw 共用同一推导，防错位）
-    private var numberRowY: CGFloat { totalLabelTop + labelInkHeight + 4 }
+    /// 大数字行带顶（layout 与 draw 共用同一推导，防错位）；首行段高 = 标题墨迹 + 4
+    private var numberRowY: CGFloat { totalLabelTop + titleInkHeight + 4 }
     /// 列表标签顶 = 数字墨迹底 + 20
     private var sectionLabelTop: CGFloat { numberRowY + numberFont.ascender + Self.sectionGap }
-    /// 列表首行顶 = 列表标签墨迹底 + 6
-    private var listStartTop: CGFloat { sectionLabelTop + labelInkHeight + 6 }
+    /// 列表首行顶 = 区块标题墨迹底 + 3（叠加行内上留白 3pt 后，标题→首行墨迹空隙 6pt，
+    /// 与用量表格表头→首行的 3+3 同口径）
+    private var listStartTop: CGFloat { sectionLabelTop + titleInkHeight + 3 }
     /// 末行墨迹底（行内文字垂直居中；无行时回落列表首行顶）
     private func rowsInkBottom(rows: Int) -> CGFloat {
         rows <= 0 ? listStartTop
-            : listStartTop + CGFloat(rows - 1) * Self.rowHeight + Self.rowHeight / 2 + rowInkHeight / 2
+            : listStartTop + CGFloat(rows - 1) * rowHeight + rowHeight / 2 + rowInkHeight / 2
+    }
+    /// 词元活动标题顶 = 末行墨迹底 + sectionGap（draw 与 intrinsic 共用）
+    private func activityTitleTop(rows: Int) -> CGFloat {
+        rowsInkBottom(rows: rows) + Self.sectionGap
+    }
+    /// 热力图网格顶 = 活动标题墨迹底 + 6（draw 与 intrinsic 共用）
+    private func activityGridTop(rows: Int) -> CGFloat {
+        activityTitleTop(rows: rows) + titleInkHeight + 6
     }
 
     /// 大数字行框：与原 draw 排版同位（行带高 32）
     override func layout() {
         super.layout()
+        // 热力图行高（7×点距）随实际版心宽变化：宽度落定/变化后失效固有尺寸，让外层
+        // 按真实行高重排（宽定后高度单向收敛，无循环）；旧点阵印章一并作废重烘
+        if bounds.width != lastLaidOutWidth {
+            lastLaidOutWidth = bounds.width
+            dotStamps.removeAll()
+            invalidateIntrinsicContentSize()
+        }
         totalRollView.frame = NSRect(x: insets.left, y: numberRowY,
                                      width: max(0, bounds.width - insets.left - insets.right),
                                      height: 32)
@@ -394,6 +431,8 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             applyTotalNumberSize(for: ZcodeTokenStore.grouped(tokens))
         }
     }
+    /// 上次布局宽度（intrinsic 高度依赖实际宽，宽度变化时需重算，见 layout()）
+    private var lastLaidOutWidth: CGFloat = 0
 
     /// 总计数字落位：nil → 占位 —；有值 → 滚动落值（结构相同=逐位滚动，
     /// 仅在数值变动时表现；位数增减/—↔数值为结构变化，整组重建直接落值）
@@ -427,6 +466,10 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         }
         guard size != totalNumberSize else { return }
         totalNumberSize = size
+        // 字号参与锚点链（numberFont.ascender → intrinsic 高度）：变化必须同步失效
+        // 固有尺寸，否则高度滞留旧值，直到下一次无关的 invalidate（如首次列表切换）
+        // 才一次性落地，文档高度跳变带动面板内容肉眼位移
+        invalidateIntrinsicContentSize()
         totalRollView.configure(size: size, weight: .semibold,
                                 fontProvider: { [weak self] s, w, monoDigits in
             self?.totalFont(size: s, weight: w, monoDigits: monoDigits)
@@ -456,10 +499,12 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         let days = cal.dateComponents([.day], from: start, to: todayMonday).day ?? 0
         return (start, days / 7 + 1, firstOfMonth)
     }
-    /// 点距 = 版心宽 / 周列数（精确均分，不取整）：网格恰撑满版心，
-    /// 最右点列与模型表的百分比右缘对齐；正圆 = 点距 - 2（格内四周各缩 1pt）
+    /// 点距 = 实际版心宽 / 周列数（精确均分，不取整）：网格恰撑满版心，
+    /// 最右点列与模型表的百分比右缘对齐；正圆 = 点距 - 2（格内四周各缩 1pt）。
+    /// 嵌入宽度 ≠ intrinsic 标称宽时按实际 bounds 等比放大（未布局时回退标称宽）
     private var activityPitch: CGFloat {
-        let avail = Self.contentWidth - insets.left - insets.right
+        let width = bounds.width > 0 ? bounds.width : Self.contentWidth
+        let avail = width - insets.left - insets.right
         return max(6, avail / CGFloat(activityWindow().cols))
     }
 
@@ -469,14 +514,9 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             (listMode == .models && !s.models.isEmpty) ? s.models : s.projects
         } ?? []
         let rows = min(active.count, Self.maxListRows)
-        // 墨迹推导（与 draw 同一锚点链）：首行(平台名+总计标签) + 4 + 数字墨迹(ascender) + 20
-        // + 列表标签 + 6 + n 行(末行扣行框留白) + 20
-        // + 活动标签 + 6 + 热力图 + 4 + 月份轴标签 + 底留白
-        let height: CGFloat = insets.top
-            + labelInkHeight + 4 + numberFont.ascender + Self.sectionGap
-            + labelInkHeight + 6 + CGFloat(rows) * Self.rowHeight
-                - (Self.rowHeight - rowInkHeight) / 2 + Self.sectionGap
-            + labelInkHeight + 6 + activityGridHeight + activityAxisHeight + insets.bottom
+        // 高度 = 锚点链一路推到热力图网格顶（与 draw 同一表达式，无重复字面量）
+        let height: CGFloat = activityGridTop(rows: rows)
+            + activityGridHeight + activityAxisHeight + insets.bottom
         return NSSize(width: Self.contentWidth, height: height)
     }
 
@@ -545,16 +585,16 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         super.draw(dirtyRect)
         let labelFont = makeLabelFont()
         let labelColor = NSColor.secondaryLabelColor
-        // 区块标题统一系统灰（与列表行同色；切换文案的未选中态仍用次级灰）
-        let titleColor = NSColor.systemGray
+        // 区块标题统一系统灰 = 小表格口径（与列表行同色；切换文案的未选中态仍用次级灰）
+        let titleColor = SmallTable.textColor
 
-        // ── 首行：平台名 + 总计词元（同一行、同字号同色）──
-        drawSpacedText(source.platformName, at: NSPoint(x: insets.left, y: totalLabelTop),
-                       font: labelFont, color: titleColor, kern: 0.8)
-        let nameWidth = (source.platformName as NSString).size(
-            withAttributes: [.font: labelFont, .kern: 0.8]).width
-        drawSpacedText("总计词元", at: NSPoint(x: insets.left + ceil(nameWidth) + 6, y: totalLabelTop),
-                       font: labelFont, color: titleColor, kern: 0.8)
+        // ── 首行：平台名 + 总计（标题样式同用量表头，两段间留 4pt 间距）──
+        let titleFont = makeTitleFont()
+        drawText(source.platformName, at: NSPoint(x: insets.left, y: totalLabelTop),
+                 font: titleFont, color: titleColor)
+        let nameWidth = (source.platformName as NSString).size(withAttributes: [.font: titleFont]).width
+        drawText("总计", at: NSPoint(x: insets.left + ceil(nameWidth) + 4, y: totalLabelTop),
+                 font: titleFont, color: titleColor)
 
         // ── 总计大数字：RollingNumberView 子视图渲染（layout() 定位，summary didSet 驱动滚动）──
 
@@ -564,40 +604,43 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         let showModels = listMode == .models && !allModels.isEmpty
         let projects = Array((showModels ? allModels : allProjects).prefix(Self.maxListRows))
         let sectionY = sectionLabelTop
-        drawSpacedText(showModels ? "模型" : "项目", at: NSPoint(x: insets.left, y: sectionY),
-                       font: labelFont, color: titleColor, kern: 0.8)
+        drawText(showModels ? "模型" : "项目", at: NSPoint(x: insets.left, y: sectionY),
+                 font: titleFont, color: titleColor)
         projectToggleRect = .zero
         modelToggleRect = .zero
         if !allModels.isEmpty {
             let tFont = labelFont
             let modelW = "模型".size(withAttributes: [.font: tFont]).width
             let projW = "项目".size(withAttributes: [.font: tFont]).width
-            let tY = sectionY + (10 - tFont.boundingRectForFont.height) / 2
+            // 切换文案在标题行带内垂直居中（标题 10pt 比切换文案 9pt 高半档）
+            let tY = sectionY + (titleInkHeight - tFont.boundingRectForFont.height) / 2
             let mX = bounds.width - insets.right - modelW
             let pX = mX - 6 - projW
             drawText("模型", at: NSPoint(x: mX, y: tY), font: tFont,
                      color: showModels ? Palette.cardForeground : labelColor)
             drawText("项目", at: NSPoint(x: pX, y: tY), font: tFont,
                      color: showModels ? labelColor : Palette.cardForeground)
-            projectToggleRect = NSRect(x: pX, y: sectionY, width: projW, height: 10)
-            modelToggleRect = NSRect(x: mX, y: sectionY, width: modelW, height: 10)
+            projectToggleRect = NSRect(x: pX, y: sectionY, width: projW, height: titleInkHeight)
+            modelToggleRect = NSRect(x: mX, y: sectionY, width: modelW, height: titleInkHeight)
         }
 
         var listEndY = listStartTop
         if projects.isEmpty {
             if summary == nil {
                 drawText("读取中…", at: NSPoint(x: insets.left, y: listEndY),
-                         font: uiFont(size: 10), color: labelColor)
+                         font: SmallTable.rowFont(mono: monoFontEnabled), color: labelColor)
             }
         } else if let summary {
+            // 行字体 = 用量行同款（小表格口径）：名称/百分比 medium，数值等宽数字
             listEndY = drawProjectRows(projects, summary: summary, topY: listEndY,
-                                       nameFont: uiFont(size: 10, weight: .medium),
-                                       valueFont: uiFont(size: 10, weight: .medium),
-                                       pctFont: uiFont(size: 10))
+                                       nameFont: SmallTable.rowFont(mono: monoFontEnabled),
+                                       valueFont: SmallTable.rowFont(mono: monoFontEnabled, monoDigits: true),
+                                       pctFont: SmallTable.rowFont(mono: monoFontEnabled))
         }
 
         // 词元活动顶 = 末行墨迹底 + 20（行框居中留白不计入间距）
-        drawActivitySection(topY: rowsInkBottom(rows: projects.count) + Self.sectionGap,
+        drawActivitySection(topY: activityTitleTop(rows: projects.count),
+                            gridTop: activityGridTop(rows: projects.count),
                             labelFont: labelFont, labelColor: labelColor, titleColor: titleColor)
     }
 
@@ -616,7 +659,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         let nameColWidth = max(40, valueLeft - 8 - nameX)
         let namePs = NSMutableParagraphStyle()
         namePs.lineBreakMode = .byTruncatingTail
-        let rowH = Self.rowHeight
+        let rowH = rowHeight
         var rowY = topY
         for p in projects {
             let iconRect = NSRect(x: insets.left, y: rowY + (rowH - 10) / 2, width: 10, height: 10)
@@ -629,13 +672,13 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             let nameRect = NSRect(x: nameX, y: rowY + (rowH - nameH) / 2,
                                   width: nameColWidth, height: ceil(nameH))
             (p.name as NSString).draw(in: nameRect, withAttributes: [
-                .font: nameFont, .foregroundColor: NSColor.systemGray, .paragraphStyle: namePs,
+                .font: nameFont, .foregroundColor: SmallTable.textColor, .paragraphStyle: namePs,
             ])
             let valueText = ZcodeTokenStore.cnCompact(p.tokens)
             let valueW = valueText.size(withAttributes: [.font: valueFont]).width
             let valueH = valueFont.boundingRectForFont.height
             drawText(valueText, at: NSPoint(x: valueLeft + (valueColWidth - valueW), y: rowY + (rowH - valueH) / 2),
-                     font: valueFont, color: NSColor.systemGray)
+                     font: valueFont, color: SmallTable.textColor)
             // 百分比一位小数（"69.6%"；各行四舍五入之和可能 ≠100%，属正常舍入误差）
             let pctValue = summary.totalTokens > 0
                 ? Double(p.tokens) / Double(summary.totalTokens) * 100 : 0
@@ -643,7 +686,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             let pctW = pctText.size(withAttributes: [.font: pctFont]).width
             let pctH = pctFont.boundingRectForFont.height
             drawText(pctText, at: NSPoint(x: bounds.width - insets.right - pctW, y: rowY + (rowH - pctH) / 2),
-                     font: pctFont, color: NSColor.systemGray)
+                     font: pctFont, color: SmallTable.textColor)
             rowY += rowH
         }
         return rowY
@@ -653,10 +696,11 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     /// 词元活动：标题 + 每日/每周切换 + 正圆点阵（用量越多越亮）。
     /// 每日 = 7 行（周一→周日）× 26 周列；每周 = 单行 26 点（每周合计）。
-    private func drawActivitySection(topY: CGFloat, labelFont: NSFont, labelColor: NSColor,
-                                     titleColor: NSColor) {
-        drawSpacedText("词元活动", at: NSPoint(x: insets.left, y: topY),
-                       font: labelFont, color: titleColor, kern: 0.8)
+    /// topY/gridTop 由锚点链传入（activityTitleTop/activityGridTop），与 intrinsic 同源
+    private func drawActivitySection(topY: CGFloat, gridTop gridTopAnchor: CGFloat, labelFont: NSFont,
+                                     labelColor: NSColor, titleColor: NSColor) {
+        drawText("词元活动", at: NSPoint(x: insets.left, y: topY),
+                 font: makeTitleFont(), color: titleColor)
 
         // 右上角切换：选中 = 主前景，未选中 = 次级灰
         let toggleFont = labelFont
@@ -664,21 +708,22 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         let weeklyText = "每周"
         let weeklyW = weeklyText.size(withAttributes: [.font: toggleFont]).width
         let dailyW = dailyText.size(withAttributes: [.font: toggleFont]).width
-        let toggleY = topY + (10 - toggleFont.boundingRectForFont.height) / 2
+        // 切换文案在标题行带内垂直居中（标题 10pt 比切换文案 9pt 高半档）
+        let toggleY = topY + (titleInkHeight - toggleFont.boundingRectForFont.height) / 2
         let weeklyX = bounds.width - insets.right - weeklyW
         let dailyX = weeklyX - 6 - dailyW
         drawText(weeklyText, at: NSPoint(x: weeklyX, y: toggleY), font: toggleFont,
                  color: activityMode == .weekly ? Palette.cardForeground : labelColor)
         drawText(dailyText, at: NSPoint(x: dailyX, y: toggleY), font: toggleFont,
                  color: activityMode == .daily ? Palette.cardForeground : labelColor)
-        dailyToggleRect = NSRect(x: dailyX, y: topY, width: dailyW, height: 10)
-        weeklyToggleRect = NSRect(x: weeklyX, y: topY, width: weeklyW, height: 10)
+        dailyToggleRect = NSRect(x: dailyX, y: topY, width: dailyW, height: titleInkHeight)
+        weeklyToggleRect = NSRect(x: weeklyX, y: topY, width: weeklyW, height: titleInkHeight)
 
         // ── 点阵（全格子绘制：无用量 = 底色点，有用量 = 渐变亮点；格内四周各缩 1pt）──
         dotCells.removeAll()
         let pitch = activityPitch
         let size = pitch - 2
-        let gridTop = topY + labelInkHeight + 6
+        let gridTop = gridTopAnchor
         let window = activityWindow()
         let cells = activityCells()
         let maxVal = cells.map(\.tokens).max() ?? 0
@@ -801,11 +846,6 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     private func drawText(_ text: String, at point: NSPoint, font: NSFont, color: NSColor) {
         text.draw(at: point, withAttributes: [.font: font, .foregroundColor: color])
-    }
-
-    /// 带字距的小标签（总计词元 / 模型 / 词元活动）
-    private func drawSpacedText(_ text: String, at point: NSPoint, font: NSFont, color: NSColor, kern: CGFloat) {
-        text.draw(at: point, withAttributes: [.font: font, .foregroundColor: color, .kern: kern])
     }
 
     /// 亮度第 level 级的正圆印章（懒建缓存）：0 = 无用量底色（动态色，浅色外观=浅灰），
@@ -1165,5 +1205,117 @@ extension BalancePanelView {
         tokensPanelController = nil
         tokensCardHovered = false
         tokensPanelHovered = false
+    }
+
+    // MARK: - 主面板「Token」板块（内嵌 hover 子面板同款内容，hover 功能不变）
+
+    /// 创建唯一的内嵌内容视图并启动低频刷新。与卡片 hover 子面板共用 ZcodeTokensPanelView
+    /// 与数据仓缓存；显示平台由 refreshInlineTokens 按 Agent 组顶部平台动态解析。
+    func setupInlineTokens() {
+        let view = ZcodeTokensPanelView()
+        view.source = .zcode
+        view.monoFontEnabled = monoFontEnabled
+        // 左右缩进 8 = 用量行 / 设置卡片内容边界（usageHorizontalInset），内容撑满版心后
+        // 热力图按实际宽等比放大、字号不变（hover 子面板保持默认 16 不受影响）；
+        // 顶部缩进 4 = usageRowTopInset，标题→首行间距与用量区块同口径
+        view.horizontalInset = 8
+        view.topInset = 4
+        view.isHidden = true
+        // 列表（项目/模型）/热力图（每日/每周）切换改变内容高度：与折叠标题同口径
+        // 通知 VC 按新内容高度重算面板尺寸
+        view.onActivityModeChanged = { [weak self] in self?.onContentChanged?() }
+        tokenContentStack.addArrangedSubview(view)
+        // 显式等宽撑满版心：intrinsic 标称宽 240 仅供 hover 弹窗定尺寸，主面板按卡片实际宽拉伸
+        view.widthAnchor.constraint(equalTo: tokenContentStack.widthAnchor).isActive = true
+        inlineTokenView = view
+        // 启动即无条件预热两个数据仓：App 启动阶段账号卡片尚未建好，「顶部平台」暂时
+        // 解析不出，若只按解析结果取数会连带跳过预热 → 首次开面板要现等后台构建，板块延迟出现
+        TokensPanelSource.zcode.fetch { _ in }
+        TokensPanelSource.workbuddy.fetch { _ in }
+        refreshInlineTokens()
+        startInlineTokensRefreshTimer()
+    }
+
+    /// Token 板块跟随的平台 = Agent 组最顶上的可见卡片容器；该平台无 Token 数据源
+    /// （Codex/TRAE）或组为空时返回 nil（板块整体隐藏）。
+    private var inlineTokensSource: TokensPanelSource? {
+        guard let group = balanceGroupContainer else { return nil }
+        for container in group.arrangedSubviews where !container.isHidden {
+            guard let id = platformCards.first(where: { $0.value === container })?.key else { continue }
+            if id == BalancePlatform.zcode.rawValue { return .zcode }
+            if id == BalancePlatform.workBuddy.rawValue { return .workbuddy }
+            return nil
+        }
+        return nil
+    }
+
+    /// 取数并套用到内嵌视图。缓存命中同步返回（零读取），未命中挂起待后台构建补发；
+    /// 无数据时块保持隐藏（主面板内不放「读取中」常驻占位）。
+    func refreshInlineTokens() {
+        guard let view = inlineTokenView, view.superview != nil else { return }
+        guard let source = inlineTokensSource else {
+            if !view.isHidden {
+                view.isHidden = true
+                applyInlineTokensVisibility()
+            }
+            return
+        }
+        source.fetch { [weak self, weak view] summary in
+            guard let self, let view, view.superview != nil else { return }
+            // 取数期间顶部平台已切换：丢弃过期结果，等下一轮刷新（60s 定时器/排序回调/开面板）重取
+            guard self.inlineTokensSource == source else { return }
+            if view.source != source {
+                view.summary = nil   // 先清旧平台数据，防标题与数字错位一帧
+                view.source = source
+            }
+            guard let summary = summary else {
+                // 单次后台构建失败：已有数据则保留展示（本机库/trace 仍在，下一轮重试即恢复），
+                // 避免偶发失败导致整块闪隐 60s；从未拿到过数据才保持隐藏
+                if view.summary == nil, !view.isHidden {
+                    view.isHidden = true
+                    applyInlineTokensVisibility()
+                }
+                return
+            }
+            view.summary = summary
+            if view.isHidden {
+                view.isHidden = false
+                applyInlineTokensVisibility()
+            }
+        }
+    }
+
+    /// Token 板块显隐总闸：顶部平台有数据 → 标题+卡片按折叠态显隐（与用量区块同款）；
+    /// 无数据 → 标题+卡片一并隐藏，标题隐藏期间折叠态不变（点击入口已消失），
+    /// 数据恢复时按持久化的折叠态重新落地。
+    private func applyInlineTokensVisibility() {
+        guard let view = inlineTokenView else { return }
+        let hasData = !view.isHidden
+        tokenTitleRef?.isHidden = !hasData
+        guard let card = tokenCardRef else { return }
+        if hasData {
+            let collapsed = UserDefaults.standard.bool(forKey: UDKey.tokenSectionCollapsed)
+            card.isHidden = collapsed
+            if let title = tokenTitleRef {
+                (card.superview as? NSStackView)?.setCustomSpacing(collapsed ? 6 : 0, after: title)
+            }
+        } else {
+            card.isHidden = true
+        }
+        onContentChanged?()
+    }
+
+    /// 主面板 Token 板块低频刷新（与后台缓存重建同周期 60s，fetch 只回缓存零读取）；
+    /// 总计词元变化时经 RollingNumberView 从旧值滚动到新值。面板销毁后定时器空转自清。
+    private func startInlineTokensRefreshTimer() {
+        inlineTokensRefreshTimer?.invalidate()
+        inlineTokensRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self, self.inlineTokenView?.superview != nil else {
+                self?.inlineTokensRefreshTimer?.invalidate()
+                self?.inlineTokensRefreshTimer = nil
+                return
+            }
+            self.refreshInlineTokens()
+        }
     }
 }

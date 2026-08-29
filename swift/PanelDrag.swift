@@ -13,6 +13,14 @@ extension BalancePanelView {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
+    /// 平台所属板块容器：DeepSeek/ZhiPu/Qwen 在 API 板块，其余在 Agent 板块。
+    /// 拖拽排序与重排动画都限定在组内，卡片不跨板块移动。
+    func groupContainer(forPlatformID id: String) -> NSStackView {
+        (id == BalancePlatform.deepSeek.rawValue || id == BalancePlatform.bigModel.rawValue
+            || id == BalancePlatform.qwen.rawValue)
+            ? apiGroupContainer : balanceGroupContainer
+    }
+
     private func visiblePlatformIDs() -> [String] {
         platformOrder.filter { id in
             guard let card = platformCards[id] else { return false }
@@ -62,7 +70,7 @@ extension BalancePanelView {
         guard draggingPlatform == nil, let platformView = platformCards[id] else { return }
         // 拖拽接管手势期间收起 ZCode Token 子面板，避免悬窗遮挡排序区域
         dismissTokensPanel()
-        balanceGroupContainer.layoutSubtreeIfNeeded()
+        groupContainer(forPlatformID: id).layoutSubtreeIfNeeded()
 
         guard let card = draggableCard(for: id) else { return }
         draggingPlatform = id
@@ -132,10 +140,14 @@ extension BalancePanelView {
     func updatePlatformDrag(_ id: String, locationInWindow: NSPoint) {
         guard draggingPlatform == id else { return }
         movePlatformGhost(to: locationInWindow)
-        balanceGroupContainer.layoutSubtreeIfNeeded()
+        groupContainer(forPlatformID: id).layoutSubtreeIfNeeded()
 
         let visibleIDs = Set(visiblePlatformIDs())
-        let remaining = platformOrder.filter { $0 != id && visibleIDs.contains($0) }
+        // 排序只在所属板块内进行：remaining 过滤掉其他板块的平台，
+        // 拖到另一板块区域时不产生跨组重排
+        let group = groupContainer(forPlatformID: id)
+        let remaining = platformOrder.filter { $0 != id && visibleIDs.contains($0)
+            && groupContainer(forPlatformID: $0) === group }
         let targetIndex = min(remaining.count,
                              remaining.reduce(into: 0) { result, candidate in
                                  guard let card = platformCards[candidate] else { return }
@@ -215,7 +227,7 @@ extension BalancePanelView {
         let ghostSourceView = draggingGhostSourceView ?? card
         draggingGhostSourceView = nil
         // 释放时以当前 arrangedSubview 的最终坐标为准，确保幽灵卡片归位到真实卡片位置。
-        balanceGroupContainer.layoutSubtreeIfNeeded()
+        groupContainer(forPlatformID: id).layoutSubtreeIfNeeded()
         platformView.layer?.removeAnimation(forKey: "platformReorder")
         let finalFrame = ghostSourceView.convert(ghostSourceView.bounds, to: self)
         if let ghost, !shouldReduceMotion {
@@ -260,37 +272,44 @@ extension BalancePanelView {
     }
 
     /// 调整 arrangedSubview 顺序，并仅用 Y 轴位移动画让相邻平台卡片平滑让位。
+    /// platformOrder 是全平台一维序，重排时按板块过滤：各板块内保持组内相对顺序。
     func applyPlatformOrder(animated: Bool) {
-        let orderedViews = platformOrder.compactMap { platformCards[$0] }
-        guard orderedViews.count == platformCards.count else { return }
+        for group in [balanceGroupContainer, apiGroupContainer] as [NSStackView] {
+            let orderedViews = platformOrder.compactMap { platformCards[$0] }
+                .filter { group.arrangedSubviews.contains($0) }
+            // 防御：platformOrder 缺组内平台时不重排，避免把缺的容器挤到组尾（原全量口径按组细化）
+            guard orderedViews.count == group.arrangedSubviews.count else { continue }
 
-        let oldFrames = Dictionary(uniqueKeysWithValues: orderedViews.map {
-            (ObjectIdentifier($0), $0.frame)
-        })
-        for (index, view) in orderedViews.enumerated() {
-            guard let currentIndex = balanceGroupContainer.arrangedSubviews.firstIndex(of: view),
+            let oldFrames = Dictionary(uniqueKeysWithValues: orderedViews.map {
+                (ObjectIdentifier($0), $0.frame)
+            })
+            for (index, view) in orderedViews.enumerated() {
+                guard let currentIndex = group.arrangedSubviews.firstIndex(of: view),
                   currentIndex != index else { continue }
-            balanceGroupContainer.removeArrangedSubview(view)
-            balanceGroupContainer.insertArrangedSubview(view, at: index)
-        }
-        for view in orderedViews {
-            balanceGroupContainer.setCustomSpacing(4, after: view)
-        }
-        balanceGroupContainer.layoutSubtreeIfNeeded()
+                group.removeArrangedSubview(view)
+                group.insertArrangedSubview(view, at: index)
+            }
+            for view in orderedViews {
+                group.setCustomSpacing(4, after: view)
+            }
+            group.layoutSubtreeIfNeeded()
 
-        guard animated, !shouldReduceMotion else { return }
-        for view in orderedViews {
-            guard let oldFrame = oldFrames[ObjectIdentifier(view)],
+            guard animated, !shouldReduceMotion else { continue }
+            for view in orderedViews {
+                guard let oldFrame = oldFrames[ObjectIdentifier(view)],
                   oldFrame != view.frame,
                   let layer = view.layer else { continue }
-            // 使用 transform.translation.y，明确锁住 X 轴，避免重排时出现水平漂移。
-            let animation = CABasicAnimation(keyPath: "transform.translation.y")
-            animation.fromValue = oldFrame.midY - view.frame.midY
-            animation.toValue = 0
-            animation.duration = Motion.layout
-            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            layer.add(animation, forKey: "platformReorder")
+                // 使用 transform.translation.y，明确锁住 X 轴，避免重排时出现水平漂移。
+                let animation = CABasicAnimation(keyPath: "transform.translation.y")
+                animation.fromValue = oldFrame.midY - view.frame.midY
+                animation.toValue = 0
+                animation.duration = Motion.layout
+                animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(animation, forKey: "platformReorder")
+            }
         }
+        // 主面板 Token 板块跟随 Agent 组顶部平台：排序变化（拖拽实时重排/账号重建）后立即重解析取数
+        refreshInlineTokens()
     }
 
 }
