@@ -482,9 +482,8 @@ final class PlatformAutomationSettingsDialog: NSObject {
         let usage: NSButton?    // nil = 该平台无用量行，「用量」列显「—」占位
     }
 
-    /// 行首「全选」控制器：勾选时全开该行所有开关，取消时全关；
-    /// 行内任一开关变化时反向同步全选态（部分勾选显示为未勾选）。
-    /// 以 self 为 target 接收行内按钮的 action，实例须存活至弹窗关闭。
+    /// 行首「全选」控制器：勾选全开该行所有开关、取消全关；
+    /// 行内任一开关变化时反向同步——全开=勾选、全关=空白、部分开启=混合态「−」。
     private final class RowAllHandler: NSObject {
         private let all: NSButton
         private let options: [NSButton]
@@ -493,7 +492,8 @@ final class PlatformAutomationSettingsDialog: NSObject {
             self.all = all
             self.options = options
             super.init()
-            all.state = options.allSatisfy { $0.state == .on } ? .on : .off
+            all.allowsMixedState = true
+            all.state = Self.syncedState(of: options)
             all.target = self
             all.action = #selector(toggleAll(_:))
             for option in options {
@@ -502,13 +502,22 @@ final class PlatformAutomationSettingsDialog: NSObject {
             }
         }
 
+        /// 全选框应显示的状态：全开=勾选、全关=空白、部分=「−」
+        private static func syncedState(of options: [NSButton]) -> NSControl.StateValue {
+            if options.allSatisfy({ $0.state == .on }) { return .on }
+            return options.contains { $0.state == .on } ? .mixed : .off
+        }
+
         @objc private func toggleAll(_ sender: NSButton) {
-            let state: NSControl.StateValue = sender.state == .on ? .on : .off
+            // 点击后 sender.state 已按系统循环 off→mixed→on→off 跳变（实测）：
+            // mixed 只会从「全关」点出，按主流惯例（混合态点击=全选）与 .on 一样导向全开
+            let state: NSControl.StateValue = sender.state == .off ? .off : .on
             for option in options { option.state = state }
+            sender.state = state    // 归一「−」中间值：选项全开时全选框不能停在混合态
         }
 
         @objc private func syncAllState(_ sender: NSButton) {
-            all.state = options.allSatisfy { $0.state == .on } ? .on : .off
+            all.state = Self.syncedState(of: options)
         }
     }
 
