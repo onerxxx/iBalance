@@ -74,9 +74,6 @@ extension BalancePanelView {
         usageHistoryPositionAnchor.translatesAutoresizingMaskIntoConstraints = true
         usageHistoryPositionAnchor.alphaValue = 0
         addSubview(usageHistoryPositionAnchor)
-        tokensPanelPositionAnchor.translatesAutoresizingMaskIntoConstraints = true
-        tokensPanelPositionAnchor.alphaValue = 0
-        addSubview(tokensPanelPositionAnchor)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
@@ -686,7 +683,7 @@ extension BalancePanelView {
     /// failureBadge：外部创建的签到失败角标视图，叠加在 icon 右上角（显隐由调用方控制）
     /// monoSize：Mono 模式 ASCII icon 标称尺寸（缺省 = imgSize 即不微调场景）。
     /// SVG 微调（imageSize）与 Mono 标称解耦：像素字母各平台等大，SVG 保持视觉微调
-    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil) -> NSView {
+    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil) -> NSView {
         var imgSize = imageSize ?? iconSize
         // 左：大 icon（固定列宽 = iconSize + 4，image 居中显示，imageSize 可独立缩小）；
         // premadeIconView 由外部传入（多号卡片用 MenuBarFadeIconView 以支持菜单栏渐变标记）
@@ -828,6 +825,15 @@ extension BalancePanelView {
             ])
             row2HasContent = true
         }
+        // hover 其余账号条：与点阵同槽（trailing 叠放），hover 时由卡片 onHover 互换显隐
+        if let strip = hoverSubStrip {
+            strip.translatesAutoresizingMaskIntoConstraints = false
+            row2.addSubview(strip)
+            NSLayoutConstraint.activate([
+                strip.trailingAnchor.constraint(equalTo: row2.trailingAnchor),
+                strip.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
+            ])
+        }
         // row2 高度由内容撑开（取 info 和 dots 中较高的）
         if row2HasContent {
             row2.heightAnchor.constraint(equalToConstant: 12).isActive = true
@@ -854,6 +860,14 @@ extension BalancePanelView {
                 dots.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor, constant: -1),
                 row1.topAnchor.constraint(greaterThanOrEqualTo: contentContainer.topAnchor),
             ])
+            // TRAE 单行模式：其余账号条与点阵同位（贴底右角）
+            if let strip = hoverSubStrip {
+                contentContainer.addSubview(strip)
+                NSLayoutConstraint.activate([
+                    strip.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+                    strip.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor, constant: -1),
+                ])
+            }
         } else {
             // ── 原两行（或单行）模式 ──
             var contentViews: [NSView] = [row1]
@@ -985,7 +999,8 @@ extension BalancePanelView {
     /// ⚠️ 只能用 layer.filters（作用于自身内容，macOS 有效）；
     /// backgroundFilters 在 macOS 被渲染服务端忽略（勿再尝试）。
     /// 每帧重建 CIFilter 实例——改 inputRadius 不触发 CA 重合成，必须换实例。
-    private func playCharBlurTransition(on views: [NSView]) {
+    /// Mono 开关与 Agent 卡「点阵↔其余账号条」互换共用（internal 供 Panel.swift 调用）。
+    func playCharBlurTransition(on views: [NSView]) {
         guard !shouldReduceMotion else { return }
         var layers: [CALayer] = []
         for v in views {
@@ -994,6 +1009,14 @@ extension BalancePanelView {
             if let l = v.layer { layers.append(l) }
         }
         guard !layers.isEmpty else { return }
+        // 接管共享 timer：上一轮过渡被打断在中间模糊半径。同一图层集重启（点阵↔条
+        // 快速进出）无需清理（新 timer 立即重新模糊）；不同图层集（Mono 开关 ↔ 卡片
+        // 互换互相打断）必须清旧集滤镜——它的 timer 已被夺走，无人收尾会永久停在模糊态
+        let sameSet = charBlurLayers.map(ObjectIdentifier.init) == layers.map(ObjectIdentifier.init)
+        if !sameSet {
+            for l in charBlurLayers { l.filters = nil }
+        }
+        charBlurLayers = layers
         charBlurTimer?.invalidate()
         let duration = 0.35
         let maxRadius: Double = 4
@@ -1022,12 +1045,16 @@ extension BalancePanelView {
     }
 
     /// 在同一容器内交叉淡入淡出两个控件，避免 Mono 开关切换时控件瞬间跳变。
-    private func crossfade(_ outgoing: NSView, to incoming: NSView, animated: Bool) {
+    /// hideOutgoingOnFinish=false 时由调用方在 completion 里自行收尾
+    /// （Agent 卡点阵↔账号条互换用：快速进出时按代际守卫决定是否落藏）。
+    func crossfade(_ outgoing: NSView, to incoming: NSView, animated: Bool,
+                   hideOutgoingOnFinish: Bool = true, completion: (() -> Void)? = nil) {
         guard animated, !shouldReduceMotion else {
             outgoing.isHidden = true
             outgoing.alphaValue = 1
             incoming.isHidden = false
             incoming.alphaValue = 1
+            completion?()
             return
         }
 
@@ -1042,9 +1069,10 @@ extension BalancePanelView {
             outgoing.animator().alphaValue = 0
             incoming.animator().alphaValue = 1
         }, completionHandler: { [weak outgoing, weak incoming] in
-            outgoing?.isHidden = true
+            if hideOutgoingOnFinish { outgoing?.isHidden = true }
             outgoing?.alphaValue = 1
             incoming?.alphaValue = 1
+            completion?()
         })
     }
 

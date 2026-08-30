@@ -22,6 +22,7 @@ enum WBTokenStore {
         let sessionId: String
         let tokens: Int64    // input + output
         let calls: Int64
+        let startedAt: TimeInterval?   // trace 原始起点（秒）；缺失/不可解析为 nil（不计入周期总计）
         let dayStart: TimeInterval?   // 本地时区当日零点；startedAt 缺失/不可解析为 nil
     }
 
@@ -38,9 +39,10 @@ enum WBTokenStore {
     private static var fileCache: [String: FileContribution] = [:]
     private static var diskCacheLoaded = false
 
-    /// 增量缓存落盘位置（App Support/wb-tokens-filecache.json）
+    /// 增量缓存落盘位置（App Support/wb-tokens-filecache-v2.json）；
+    /// v2 = FileContribution 增加 startedAt 字段后换名，旧缓存解码失败自动全量重建一次
     private static var diskCacheURL: URL {
-        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache.json")
+        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v2.json")
     }
 
     /// 首次查询前把持久化的单文件贡献装回内存（进程生命周期内只装一次）
@@ -98,8 +100,13 @@ enum WBTokenStore {
         // 按模型/项目聚合（模型大小写归并）+ 按天聚合（词元活动热力图）
         var models: [String: ModelAgg] = [:]
         var projects: [String: Int64] = [:]
+        /// 项目完整目录（basename 键 → 首个命中的 cwd 末段），供行点击打开
+        var projectPaths: [String: String] = [:]
         var dailyMap: [TimeInterval: Int64] = [:]
         var requests: Int64 = 0
+        // 周期总计（5h/1d/7d/30d 滚动窗口）：startedAt 落在各窗口起点之后即计入（All 补全量）
+        let periodStarts = TokenPeriodWindows.starts()
+        var periodTotals: [TokenPeriod: Int64] = [:]
         for c in fresh.values {
             let key = c.model.lowercased()
             var agg = models[key] ?? ModelAgg()
@@ -110,15 +117,23 @@ enum WBTokenStore {
                 agg.nameTokens = c.tokens
             }
             models[key] = agg
-            let proj = sessionMap[c.sessionId].map { ($0 as NSString).lastPathComponent } ?? "(未知项目)"
+            let full = sessionMap[c.sessionId]
+            let proj = full.map { ($0 as NSString).lastPathComponent } ?? "(未知项目)"
             projects[proj, default: 0] += c.tokens
+            if let full, projectPaths[proj] == nil { projectPaths[proj] = full }
             requests += c.calls
             if let d = c.dayStart { dailyMap[d, default: 0] += c.tokens }
+            if let s = c.startedAt {
+                for p in TokenPeriod.windowed where s >= (periodStarts[p] ?? .infinity) {
+                    periodTotals[p, default: 0] += c.tokens
+                }
+            }
         }
 
         let projectRows = projects
             .filter { $0.value > 0 }
-            .map { ZcodeTokenSummary.ProjectUsage(name: $0.key, tokens: $0.value) }
+            .map { ZcodeTokenSummary.ProjectUsage(name: $0.key, tokens: $0.value,
+                                                  path: projectPaths[$0.key]) }
             .sorted { $0.tokens > $1.tokens }
         guard !projectRows.isEmpty else { return nil }
         let modelRows = models.values
@@ -126,11 +141,12 @@ enum WBTokenStore {
             .map { ZcodeTokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
             .sorted { $0.tokens > $1.tokens }
         let total = projectRows.reduce(Int64(0)) { $0 + $1.tokens }
+        periodTotals[.all] = total   // All = 全量总计，无窗口
         let daily = dailyMap
             .map { ZcodeDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
         return ZcodeTokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
-                                 requestCount: requests, daily: daily)
+                                 requestCount: requests, daily: daily, periodTotals: periodTotals)
     }
 
     /// workbuddy.db sessions 表 sessionId → cwd（含已删除会话，保留历史用量归属）。
@@ -171,16 +187,17 @@ enum WBTokenStore {
         let model = (mi["models"] as? [Any])?.compactMap { $0 as? String }.first ?? "unknown"
         let sid = trace["sessionId"] as? String ?? ""
         let calls = (mi["callCount"] as? NSNumber)?.int64Value ?? 0
-        let dayStart = (trace["startedAt"] as? String).flatMap { dayStart(iso: $0) }
+        let startedAt = (trace["startedAt"] as? String).flatMap { isoTimestamp(iso: $0) }
+        let dayStart = startedAt
+            .map { Calendar.current.startOfDay(for: Date(timeIntervalSince1970: $0)).timeIntervalSince1970 }
         return FileContribution(mtime: mtime, size: size, model: model, sessionId: sid,
-                                tokens: tokens, calls: calls, dayStart: dayStart)
+                                tokens: tokens, calls: calls, startedAt: startedAt, dayStart: dayStart)
     }
 
-    /// ISO8601 → 本地时区当日零点时间戳。容忍毫秒位有无：截前 19 位补 Z 再解析。
-    private static func dayStart(iso: String) -> TimeInterval? {
+    /// ISO8601 → 原始时间戳（秒）。容忍毫秒位有无：截前 19 位补 Z 再解析。
+    private static func isoTimestamp(iso: String) -> TimeInterval? {
         guard iso.count >= 19 else { return nil }
-        return Self.isoParser.date(from: String(iso.prefix(19)) + "Z")
-            .map { Calendar.current.startOfDay(for: $0).timeIntervalSince1970 }
+        return Self.isoParser.date(from: String(iso.prefix(19)) + "Z")?.timeIntervalSince1970
     }
 
     private static let isoParser: DateFormatter = {

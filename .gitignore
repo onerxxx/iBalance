@@ -48,3 +48,6 @@ reasonix.toml
 
 # Inter 字体发行包（完整 152 文件 / 59MB 分发版；app 仅用 swift/fonts/ 下精简子集，不入库）
 Inter-4.1/
+
+# codegraph 本机符号索引（守护进程自动重建，勿入库）
+.codegraph/

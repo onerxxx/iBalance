@@ -222,17 +222,32 @@ final class DigitWheelView: NSView {
         let p = min(1, tweenElapsed / tweenDuration)
         let eased = 1 - pow(1 - p, 3)
         pos = tweenStart + (targetPos - tweenStart) * eased
-        currentWidth = widthForPosition(pos)
+        if !widthFrozen { currentWidth = widthForPosition(pos) }
         applyStripOrigin()
         if p >= 1 {
             pos = targetPos            // 精确落点
             normalize()
             tweenDuration = 0
-            currentWidth = widthForPosition(pos)
+            if !widthFrozen { currentWidth = widthForPosition(pos) }
             applyStripOrigin()
             return false
         }
         return true
+    }
+
+    /// 槽宽冻结（结构变化滑移期专用）：比例数字字体下槽宽随滚动位置逐帧插值，
+    /// 逐帧累计位置漂移与整组平移叠加会让相邻位视觉换位——冻结后槽宽恒为
+    /// 目标位宽（垂直滚动照常），水平每帧位置恒定 = 纯平移。
+    /// 调 freezeWidthAtTarget 冻结、unfreezeWidth 解冻（滑移落定时必须解冻）。
+    private var widthFrozen = false
+    func freezeWidthAtTarget() {
+        widthFrozen = true
+        currentWidth = widthForPosition(targetPos)
+    }
+    func unfreezeWidth() {
+        guard widthFrozen else { return }
+        widthFrozen = false
+        currentWidth = widthForPosition(pos)
     }
 
     // —— 独立 tween 状态（每位车轮自己的时间轴；不共享任何全局缓动参数）——
@@ -446,9 +461,15 @@ final class RollingNumberView: NSView {
 
     /// 设置数值文本。结构不变（数字位/静态位一一对应）→ 终值一次下发，各位数字
     /// 轮独立滚动到自己的目标数字后停下（异步落定）；
-    /// 结构变化（位数增减、— ↔ 数值等）→ 整组重建直接落值。
-    /// rollDuration：本次滚动的时长预算（由最远行程的车轮占满），仅 animated=true 时生效。
-    func setText(_ text: String, animated: Bool, rollDuration: CFTimeInterval = 0.9) {
+    /// 结构变化（位数增减、— ↔ 数值等）→ 整组重建直接落值；
+    /// slideOnRebuild=true 时结构变化走「整组滑移」：数字轮从右对齐配对复用（原地
+    /// 滚到新值），全体槽位从旧布局缓动平移到新布局——变长时原数字右移、新增高位
+    /// 从左移入；变短时整组左移、移出高位列随组滑出后移除（周期切换等用户主动换值；
+    /// 打开/后台刷新保持直接落值不变）。
+    /// rollDuration：本次滚动/滑移的时长预算，仅 animated=true 时生效。
+    func setText(_ text: String, animated: Bool, rollDuration: CFTimeInterval = 0.9,
+                 slideOnRebuild: Bool = false) {
+        endSlide()   // 在途滑移立即落定，防陈旧槽位干扰结构比对
         let structureChanged: Bool
         let chars = Array(text)
         let isDigit = chars.map { $0.isASCII && $0.isNumber }
@@ -475,7 +496,7 @@ final class RollingNumberView: NSView {
             }
             structureChanged = false
         } else {
-            rebuild(chars)
+            rebuild(chars, slideOnRebuild: animated && slideOnRebuild, rollDuration: rollDuration)
             structureChanged = true
             // TODO(性能诊断): 每次结构重建打日志（滚动期间频繁重建 = 无动效根因），确认后移除
             Self.rebuildLogCount += 1
@@ -503,31 +524,147 @@ final class RollingNumberView: NSView {
 
     // —— 内部 ——
 
-    private func rebuild(_ chars: [Character]) {
-        for s in slots { s.view.removeFromSuperview() }
-        slots.removeAll()
+    /// 重建槽位（结构变化）。slideOnRebuild=false：直接落值（打开/后台刷新口径）。
+    /// true：结构变化滑移——数字轮按「从右对齐配对」复用（个位对个位，原地滚动到
+    /// 新值），未复用的旧槽位作为移出列随组滑出后移除；新布局由 relayoutSlots 给出，
+    /// 旧→新布局的平移由同一 ticker 驱动（见 onTick 滑移段），时长对齐 rollDuration。
+    private func rebuild(_ chars: [Character], slideOnRebuild: Bool, rollDuration: CFTimeInterval) {
+        // 旧槽位从右到左配对池：数字轮与「同字符」静态槽都可复用——静态槽若不复用，
+        // 逗号会以「旧槽滑出 + 新槽滑入」两份存在，两条轨迹不同（delta ≠ 逗号自己的
+        // 位移），中途会穿过相邻数字列 = 滑移期数字换位视觉 bug 的根源
+        var reusePool: [NSView] = []
+        var oldX: [ObjectIdentifier: CGFloat] = [:]
+        for s in slots.reversed() { reusePool.append(s.view) }
+        for s in slots { oldX[ObjectIdentifier(s.view)] = s.view.frame.origin.x }
+        let oldViews = slots.map { $0.view }
+        let oldWidth = slots.reduce(0) { $0 + slotWidth($1) }
+        let oldHadContent = !slots.isEmpty
+
+        // 先按从右到左扫描标记每个新槽位复用池里的哪个候选（数字对数字、同字符静态
+        // 对同字符静态；不兼容时不推进池，左侧继续尝试）。记录原始下标而非消费指针：
+        // 构建循环按 LTR 走，若用共享指针会与 RTL 标记序错位（错配 + 越界崩溃）
+        var reuseSource = [Int?](repeating: nil, count: chars.count)
+        var poolIdx = 0
+        for i in stride(from: chars.count - 1, through: 0, by: -1) {
+            guard poolIdx < reusePool.count else { break }
+            let ch = chars[i]
+            let cand = reusePool[poolIdx]
+            let compatible: Bool
+            if ch.isASCII, ch.isNumber {
+                compatible = cand is DigitWheelView
+            } else {
+                compatible = cand is TextSlotView && (cand as? TextSlotView)?.text == String(ch)
+            }
+            if compatible {
+                reuseSource[i] = poolIdx
+                poolIdx += 1
+            }
+        }
+        // 滑移成立才冻结槽宽（比例字体宽度插值 × 整组平移 = 相邻位换位，见 widthFrozen 注）
+        let willSlide = slideOnRebuild && oldHadContent
+
+        var reused: Set<ObjectIdentifier> = []
+        var newSlots: [Slot] = []
         for (i, ch) in chars.enumerated() {
             if ch.isASCII, ch.isNumber, let d = ch.wholeNumberValue {
-                let w = DigitWheelView()
-                w.font = mainFont
-                w.textColor = textColor
-                w.setDigit(d, animated: false)
-                addSubview(w)
-                slots.append(Slot(view: w, kind: .digit, width: w.currentWidth,
-                                  yOff: 0, height: lineH))
+                let w: DigitWheelView
+                if let src = reuseSource[i], let old = reusePool[src] as? DigitWheelView {
+                    w = old
+                    reused.insert(ObjectIdentifier(old))
+                } else {
+                    w = DigitWheelView()
+                    w.font = mainFont
+                    w.textColor = textColor
+                    addSubview(w)
+                }
+                w.setDigit(d, animated: slideOnRebuild, rollDuration: rollDuration)
+                if willSlide { w.freezeWidthAtTarget() }
+                newSlots.append(Slot(view: w, kind: .digit, width: w.currentWidth,
+                                     yOff: 0, height: lineH))
             } else {
                 // 首字符 ¥/$ 且后面还有内容 → 货币符号小字号槽（对齐原 applyValueText 判定）
                 let isPrefixSymbol = i == 0 && (ch == "¥" || ch == "$") && chars.count > 1
                 let kind: SlotKind = isPrefixSymbol ? .prefix : .plain
                 let f = isPrefixSymbol ? prefixFont : mainFont
-                let t = TextSlotView(text: String(ch), font: f, color: textColor)
-                addSubview(t)
-                slots.append(Slot(view: t, kind: kind,
-                                  width: textWidth(String(ch), font: f),
-                                  yOff: mainFont.ascender - f.ascender,
-                                  height: isPrefixSymbol ? prefixLineH : lineH))
+                let t: TextSlotView
+                if let src = reuseSource[i], let old = reusePool[src] as? TextSlotView {
+                    t = old
+                    reused.insert(ObjectIdentifier(old))   // 勿漏：否则旧逗号进滑出列表，落定时被连带移除
+                } else {
+                    t = TextSlotView(text: String(ch), font: f, color: textColor)
+                    addSubview(t)
+                }
+                newSlots.append(Slot(view: t, kind: kind,
+                                     width: textWidth(String(ch), font: f),
+                                     yOff: mainFont.ascender - f.ascender,
+                                     height: isPrefixSymbol ? prefixLineH : lineH))
             }
         }
+
+        // 滑移状态先清（endSlide 不适用：槽位表已被替换），旧未复用视图先记后移除
+        slideStarts.removeAll()
+        slideExits.removeAll()
+        slideDelta = 0
+        slideElapsed = 0
+        slideDuration = 0
+        let newWidth = newSlots.reduce(0) { $0 + slotWidth($1) }
+        for v in oldViews where !reused.contains(ObjectIdentifier(v)) {
+            if slideOnRebuild, oldHadContent {
+                let sx = oldX[ObjectIdentifier(v)] ?? v.frame.origin.x
+                slideExits.append(SlideExit(view: v, startX: sx))
+            } else {
+                v.removeFromSuperview()
+            }
+        }
+        slots = newSlots
+        // 滑移状态必须先于 relayoutSlots 登记：relayout 是滑移感知的（按进度插值），
+        // 状态空 = p=1 直接落终点，状态就位后这次调用即按起点铺首帧，无中间闪帧
+        if slideOnRebuild, oldHadContent {
+            slideDelta = newWidth - oldWidth
+            for s in slots where reused.contains(ObjectIdentifier(s.view)) {
+                if let sx = oldX[ObjectIdentifier(s.view)] {
+                    slideStarts[ObjectIdentifier(s.view)] = sx
+                }
+            }
+            slideDuration = rollDuration
+            slideElapsed = 0
+        }
+        relayoutSlots()
+        if slideDuration > 0 {
+            startTicker()
+        }
+    }
+
+    // —— 结构变化滑移（与车轮滚动共用 ticker；插值统一在 relayoutSlots 内做）——
+
+    private struct SlideExit { let view: NSView; let startX: CGFloat }
+    /// 保留槽位的旧布局 x（新布局 x 由 relayoutSlots 实时给出；新建槽起点 = 终点 − slideDelta）
+    private var slideStarts: [ObjectIdentifier: CGFloat] = [:]
+    /// 变短/换型时移出的旧槽位（随组滑出，落定移除）
+    private var slideExits: [SlideExit] = []
+    /// 新布局总宽 − 旧布局总宽：>0 变长（整组右移、高位移入），<0 变短（左移、移出）
+    private var slideDelta: CGFloat = 0
+    private var slideElapsed: CFTimeInterval = 0
+    private var slideDuration: CFTimeInterval = 0
+
+    /// 滑移进度 0→1（ease-out cubic；非滑移期恒 1 = 直接落最终布局）
+    private func slideProgress() -> CGFloat {
+        guard slideDuration > 0 else { return 1 }
+        let p = min(1, slideElapsed / slideDuration)
+        return CGFloat(1 - pow(1 - p, 3))
+    }
+
+    /// 滑移立即落定（setText 重入/视图销毁前的清理口径）
+    private func endSlide() {
+        guard slideDuration > 0 || !slideExits.isEmpty else { return }
+        slideDuration = 0
+        slideElapsed = 0
+        slideDelta = 0
+        slideStarts.removeAll()
+        for s in slots { (s.view as? DigitWheelView)?.unfreezeWidth() }
+        for e in slideExits { e.view.removeFromSuperview() }
+        slideExits.removeAll()
+        relayoutSlots()
     }
 
     /// 槽位当前宽度：数字槽直接读 wheel.currentWidth；静态槽使用字符 advance。
@@ -543,17 +680,33 @@ final class RollingNumberView: NSView {
     /// 单元格文本行右缘 = 62.5；逐槽锚 65 会整体右偏 2.5pt —— 即「数字偏右」根因）。
     private let cellTextPadding: CGFloat = 2.5
     private func relayoutSlots() {
+        // 滑移进行中：按进度插值落位（保留槽=旧x→新x；新建槽=终点−delta；
+        // 移出列随组平移）——所有铺布局路径（layout/setText/ticker）统一走这里，
+        // 滑移中间态不会被任何一次重排打回终点（闪动根因）
+        let p = slideProgress()
         // 左对齐：左缘锚 0（原 drawText 的 pen 位置），正向逐槽排布；
         // 右对齐：右缘锚 bounds−cellTextPadding，逆向排布（超宽左溢裁掉）
         var x = alignsLeft ? 0 : bounds.width - cellTextPadding
         for s in alignsLeft ? slots : slots.reversed() {
             let w = slotWidth(s)
+            var fx: CGFloat
             if alignsLeft {
-                s.view.frame = NSRect(x: x, y: s.yOff, width: w, height: s.height)
+                fx = x
                 x += w
             } else {
                 x -= w
-                s.view.frame = NSRect(x: x, y: s.yOff, width: w, height: s.height)
+                fx = x
+            }
+            if p < 1 {
+                let id = ObjectIdentifier(s.view)
+                let startX = slideStarts[id] ?? (fx - slideDelta)
+                fx = startX + (fx - startX) * p
+            }
+            s.view.frame = NSRect(x: fx, y: s.yOff, width: w, height: s.height)
+        }
+        if p < 1 {
+            for e in slideExits {
+                e.view.frame.origin.x = e.startX + slideDelta * p
             }
         }
         // TODO(诊断): 槽位坐标 dump（限前 24 次），定位偏右；确认后移除
@@ -644,8 +797,22 @@ final class RollingNumberView: NSView {
         for s in slots {
             if let w = s.view as? DigitWheelView, w.advance(dt: dt) { moving = true }
         }
-        // 比例数字字体：每帧读取 wheel.currentWidth，右缘固定、左缘自然移动。
-        relayoutSlots()
+        // 结构变化滑移：relayoutSlots 已按进度插值，这里只推进时间轴
+        var sliding = false
+        if slideDuration > 0 {
+            slideElapsed += dt
+            if slideElapsed >= slideDuration {
+                endSlide()   // 落定（清状态 + 按最终布局重排）
+            } else {
+                relayoutSlots()
+            }
+            moving = true
+            sliding = true
+        }
+        if !sliding {
+            // 比例数字字体：每帧读取 wheel.currentWidth，右缘固定、左缘自然移动。
+            relayoutSlots()
+        }
         if !moving {
             l.isPaused = true
             lastTS = 0

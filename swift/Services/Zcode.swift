@@ -13,8 +13,22 @@ enum ZcodeImportResult {
 enum ZcodeService {
     /// ZCode Desktop 配置文件（明文存 start-plan JWT / coding-plan API Key，登录后自动更新）
     private static let configPath = NSHomeDirectory() + "/.zcode/v2/config.json"
-    /// 余额查询端点（zai 渠道 JWT 走此网关；Anthropic 兼容网关同域）
+    /// 余额查询端点（zai 渠道 JWT 走此网关；Anthropic 兼容网关同域）。
+    /// 服务端要求客户端身份：URL 带 app_version（对齐客户端 buildZaiStartPlanBalanceUrl）、
+    /// 头带 X-Device-Mid（ZCode 遥测设备标识），缺任一返回 3001 parameter error。
     private static let balanceURL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance"
+    /// ZCode 遥测状态文件（X-Device-Mid 设备标识来源）
+    private static let telemetryPath = NSHomeDirectory() + "/.zcode/v2/telemetry-state.json"
+    /// 设备标识（随 ZCode 安装生成后不变，进程内读一次）
+    private static let deviceMid: String? = {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: telemetryPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return json["deviceMid"] as? String
+    }()
+    /// 本机已安装 ZCode 客户端版本（app_version 取真实客户端口径，随客户端更新）
+    private static let zcodeAppVersion: String? =
+        Bundle(url: URL(fileURLWithPath: "/Applications/ZCode.app"))?
+            .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
     /// bigmodel 渠道付费 Coding Plan（Lite 等档位）的 API Key 用量端点；
     /// 返回 data.level（套餐档）+ data.limits[]（usage=总额度 currentValue=已用 remaining=剩余，
     /// nextResetTime=窗口重置毫秒戳；同一套餐有 5 小时窗口与月度窗口两条，额度数值相同）
@@ -75,6 +89,21 @@ enum ZcodeService {
     static func currentUid() -> String? {
         guard case .success(let account) = importCurrentAccount() else { return nil }
         return account.uid
+    }
+
+    /// 当前登录号的体验套餐（start-plan）JWT：config.json start-plan 键的 apiKey（均为 JWT）。
+    /// 体验套餐余额（billing/balance）只认 JWT，付费档 API Key 查询为 401；仅当前登录号持有。
+    static func currentStartPlanJWT() -> (uid: String, token: String)? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let provider = json["provider"] as? [String: Any] else { return nil }
+        for key in providerKeys where key.hasSuffix("start-plan") {
+            guard let opts = (provider[key] as? [String: Any])?["options"] as? [String: Any],
+                  let ak = opts["apiKey"] as? String, isJWT(ak),
+                  let uid = jwtUserId(from: ak) else { continue }
+            return (uid, ak)
+        }
+        return nil
     }
     /// 解 JWT payload 的 user_id（JWT 为 HS256 签名，客户端不验签，仅取 payload）
     private static func jwtUserId(from jwt: String) -> String? {
@@ -275,10 +304,14 @@ enum ZcodeService {
     /// planEndsAt 为当前生效的免费套餐（Start Plan，plan_id 含 "start"）的到期时间戳（秒），
     /// 无免费套餐时为 0（调用方不显示到期副标题）。
     private static func fetchZaiBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
-        guard let url = URL(string: balanceURL) else { return nil }
+        guard let version = zcodeAppVersion, let deviceMid else { return nil }
+        guard var comps = URLComponents(string: balanceURL) else { return nil }
+        comps.queryItems = [URLQueryItem(name: "app_version", value: version)]
+        guard let url = comps.url else { return nil }
         let (data, status) = await HTTP.requestWithRetry(
             url: url, method: "GET",
-            headers: ["Authorization": "Bearer \(token)", "Accept": "application/json"],
+            headers: ["Authorization": "Bearer \(token)", "Accept": "application/json",
+                      "X-Device-Mid": deviceMid],
             timeout: 15
         )
         guard status == 200, let data,

@@ -21,6 +21,11 @@ extension BalancePanelView {
             ? apiGroupContainer : balanceGroupContainer
     }
 
+    /// 平台是否属 Agent 板块（groupContainer 的反面判定，单一事实源勿散落平台清单）
+    func isAgentPlatform(_ id: String) -> Bool {
+        groupContainer(forPlatformID: id) === balanceGroupContainer
+    }
+
     private func visiblePlatformIDs() -> [String] {
         platformOrder.filter { id in
             guard let card = platformCards[id] else { return false }
@@ -68,8 +73,8 @@ extension BalancePanelView {
 
     func beginPlatformDrag(_ id: String, locationInWindow: NSPoint) {
         guard draggingPlatform == nil, let platformView = platformCards[id] else { return }
-        // 拖拽接管手势期间收起 ZCode Token 子面板，避免悬窗遮挡排序区域
-        dismissTokensPanel()
+        // 拖拽接管手势期间清除 Token 板块 hover 覆盖，回落组顶平台避免拖动中内容跳动
+        clearTokensHoverOverride()
         groupContainer(forPlatformID: id).layoutSubtreeIfNeeded()
 
         guard let card = draggableCard(for: id) else { return }

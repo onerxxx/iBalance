@@ -236,6 +236,82 @@ enum HoverEnterValidation {
     }
 }
 
+/// Agent 卡其余账号切换项（icon+积分）：处于主卡 HoverCard 内部、整卡 hitTest 被卡片
+/// 接管，点击由卡片 mouseDown 命中路由转交 onClick；光标 pointingHand 提示可点击。
+/// 按钮样式：默认轻微背景（Palette hover 渐变弱端），hover 背景/文本/图标提亮
+/// （渐变强端 + 主前景，与用量行 hover 同语言）。
+final class SubAccountItemView: NSStackView {
+    /// 点击切换账号回调（nil = 不可点）
+    var onClick: (() -> Void)?
+    /// 昵称（hover 子面板内容,原小卡片标题信息）
+    var nickname = ""
+    /// 积分文本（hover 子面板第二行,与卡片数值同源）
+    var valueText = ""
+    /// hover 进出回调（面板侧弹/收昵称子面板;进出有 0.3s 延迟防扫过闪烁）
+    var onTipToggle: ((Bool) -> Void)?
+    private var isHovered = false
+    private var tipWorkItem: DispatchWorkItem?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        layer?.cornerCurve = .continuous
+        // 背景贴内容太紧：左右各 3pt 内边距（命中区随之略宽）
+        edgeInsets = NSEdgeInsets(top: 0, left: 3, bottom: 0, right: 3)
+        applyState(animated: false)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 动态色经 .cgColor 落盘定格外观：主题切换时重跑着色
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyState(animated: false)
+    }
+
+    /// hover 态由所在卡片的 mouseMoved/mouseEntered/mouseExited 统一驱动
+    /// （HoverCard.syncInteractiveHover）——整卡 hitTest 接管下子视图自身 tracking 不投递
+    func setHovered(_ inside: Bool) {
+        guard inside != isHovered else { return }
+        isHovered = inside
+        applyState(animated: true)
+        if inside { scheduleTip() } else { hideTip() }
+    }
+
+    /// 系统tooltip手感：悬停 0.3s 才触发，移开立即收（收起即便没弹过也回调,
+    /// 面板侧按 isShown 幂等）
+    private func scheduleTip() {
+        guard !nickname.isEmpty else { return }
+        tipWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.onTipToggle?(true) }
+        tipWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+    }
+
+    private func hideTip() {
+        tipWorkItem?.cancel()
+        tipWorkItem = nil
+        onTipToggle?(false)
+    }
+
+    /// 背景与文本/图标色随 hover 切换：背景走 CATransaction（图层属性），
+    /// 文本/图标走 NSAnimationContext animator（非图层属性），时长统一 Motion.hover
+    private func applyState(animated: Bool) {
+        let bg = isHovered ? Palette.hoverGradientBright : Palette.hoverGradientDark
+        let fg = isHovered ? Palette.cardForeground : NSColor.systemGray
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(animated ? Motion.hover : 0)
+        layer?.backgroundColor = bg.cgColor
+        CATransaction.commit()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = animated ? Motion.hover : 0
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            for case let tf as NSTextField in arrangedSubviews { tf.animator().textColor = fg }
+            for case let iv as NSImageView in arrangedSubviews { iv.animator().contentTintColor = fg }
+        }
+    }
+}
+
 /// 设置卡片行容器：hover 时仅提亮文本颜色（secondaryLabel/tertiaryLabel → hoverTextColor），
 /// switch/radio 等控件保持不变；无背景变化。光标变为 pointingHand 提示可点击。
 final class HoverRowView: NSView, PanelScrollHoverSync {
@@ -756,6 +832,15 @@ class HoverCard: NSView, PanelScrollHoverSync {
     var onDragEnded: (() -> Void)?
     /// hover 状态回调：true=进入，false=离开（如「悬停显示昵称」）
     var onHover: ((Bool) -> Void)?
+    /// hover 确认时长（Agent 卡 Token 板块切换用）：设置后进入卡片不再整体淡入背景，
+    /// 而是 hover 渐变从左到右进度填充（背景色即进度条），满时长触发 onHoverConfirmed；
+    /// 提前真实离开取消并复位。几何变化补发的 exit（事件位置仍在卡内）与补发 enter
+    /// （isMouseInside 未清）均不重置进度，避免确认切换引发高度变化后进度条重跑。
+    var hoverDwellDuration: CFTimeInterval?
+    /// 进度撑满回调（主线程，时长到达时触发一次）
+    var onHoverConfirmed: (() -> Void)?
+    private var dwellWork: DispatchWorkItem?
+    private var dwellConfirmed = false
     /// hover 效果容器：背景色 + 边框统一淡入淡出
     private let hoverEffectLayer = CALayer()
     /// hover 背景层：统一 hover 渐变（Palette.hoverGradient*）
@@ -800,6 +885,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
         guard isDragHoverLocked != locked else { return }
         isDragHoverLocked = locked
         if locked {
+            cancelHoverDwell()
             hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
             layer?.removeAnimation(forKey: "borderWidthTransition")
             layer?.removeAnimation(forKey: "borderColorTransition")
@@ -879,7 +965,10 @@ class HoverCard: NSView, PanelScrollHoverSync {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let ta = trackingArea { removeTrackingArea(ta) }
-        let ta = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+        // mouseMoved：其余账号项的按钮高亮/昵称气泡由卡片按光标位置统一驱动
+        // （整卡 hitTest 接管下，子视图自身 tracking 不投递）
+        let ta = NSTrackingArea(rect: .zero,
+                                options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                                 owner: self, userInfo: nil)
         addTrackingArea(ta)
         trackingArea = ta
@@ -888,6 +977,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
     /// 点击后鼠标通常仍停留在卡片内，AppKit 不会重新派发 mouseExited；
     /// 主动清除 hover 材质，避免点击可折叠标题后高亮一直残留。
     func clearHoverEffect(animated: Bool = true) {
+        cancelHoverDwell()
         isMouseInside = false
         suppressEnterUntilExit = true
         guard !isDragHoverLocked else { return }
@@ -918,20 +1008,35 @@ class HoverCard: NSView, PanelScrollHoverSync {
         return super.hitTest(point)
     }
 
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        if onDragStarted != nil {
-            addCursorRect(bounds, cursor: .openHand)
+    /// 其余账号项 hover 统一由卡片按光标位置驱动（mouseMoved / enter / exit 三入口）：
+    /// 命中项点亮、其余熄灭；合成事件（无 window,如 syncHoverState 自造 NSEvent）跳过
+    private func syncInteractiveHover(at event: NSEvent) {
+        guard !interactiveSubviews.isEmpty, event.window != nil else { return }
+        let hit = interactiveSubview(at: event.locationInWindow) as? SubAccountItemView
+        for case let item as SubAccountItemView in interactiveSubviews {
+            item.setHovered(item === hit)
         }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        syncInteractiveHover(at: event)
     }
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        syncInteractiveHover(at: event)
         guard HoverEnterValidation.isPlausible(event, in: self) else { return }
+        // dwell 卡：确认后几何变化补发的 enter（isMouseInside 未清）不重启进度
+        if isMouseInside, hoverDwellDuration != nil { return }
         isMouseInside = true
         if isDragHoverLocked || suppressEnterUntilExit { return }
-        // hover 背景淡入（与用量条目同色）
-        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 1)
+        if let dwell = hoverDwellDuration, !dwellConfirmed {
+            startHoverDwell(duration: dwell)
+        } else {
+            // hover 背景淡入（与用量条目同色）
+            animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 1)
+        }
         // 发丝边框淡入：0.8pt + 边框色提亮到 Palette.hoverBorderBright
         animateLayerKey(layer, keyPath: "borderWidth", to: 0.8)
         animateLayerKey(layer, keyPath: "borderColor",
@@ -941,6 +1046,15 @@ class HoverCard: NSView, PanelScrollHoverSync {
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        // 真实离开=位置在项外全部熄灭;几何变化补发的 exit（dwell 卡）位置仍在卡内,
+        // 按位置重算即停在原项上（光标未动,高亮不该丢）
+        syncInteractiveHover(at: event)
+        // dwell 卡：几何变化补发的 exit 其事件位置仍在卡内（陈旧坐标），忽略——
+        // 否则确认切换引发高度变化后进度被打回重跑；自造事件（syncHoverState，
+        // window=nil）是 hitTest 权威判定，照常退出
+        if hoverDwellDuration != nil, event.window != nil,
+           bounds.contains(convert(event.locationInWindow, from: nil)) { return }
+        cancelHoverDwell()
         isMouseInside = false
         suppressEnterUntilExit = false
         if isDragHoverLocked { return }
@@ -952,7 +1066,83 @@ class HoverCard: NSView, PanelScrollHoverSync {
         onHover?(false)
     }
 
+    /// 启动 hover 确认进度：hover 渐变层挂左锚 mask，bounds.width 0→满 线性填充；
+    /// 满时模型值落定 + 触发 onHoverConfirmed。
+    private func startHoverDwell(duration: CFTimeInterval) {
+        hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
+        let w = hoverGradientLayer.bounds.width
+        let h = hoverGradientLayer.bounds.height
+        guard w > 0, h > 0 else { return }
+        let mask = CALayer()
+        mask.anchorPoint = CGPoint(x: 0, y: 0.5)
+        mask.position = CGPoint(x: 0, y: h / 2)
+        mask.backgroundColor = NSColor.white.cgColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        hoverEffectLayer.opacity = 1
+        mask.bounds = CGRect(x: 0, y: 0, width: 0, height: h)
+        hoverGradientLayer.mask = mask
+        CATransaction.commit()
+        let anim = CABasicAnimation(keyPath: "bounds.size.width")
+        anim.fromValue = 0
+        anim.toValue = w
+        anim.duration = duration
+        anim.timingFunction = CAMediaTimingFunction(name: .linear)
+        anim.fillMode = .forwards
+        anim.isRemovedOnCompletion = false
+        mask.add(anim, forKey: "dwellFill")
+        dwellWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.dwellWork != nil else { return }
+            self.dwellWork = nil
+            self.dwellConfirmed = true
+            // 模型值落满并移除动画：后续淡出/复用不回退
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            mask.bounds = CGRect(x: 0, y: 0, width: w, height: h)
+            mask.removeAnimation(forKey: "dwellFill")
+            CATransaction.commit()
+            self.onHoverConfirmed?()
+        }
+        dwellWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+
+    /// 取消/复位确认进度（真实离开、点击清除、拖拽锁定）：mask 冻结在当前填充宽度
+    /// （不撤 mask，否则半截进度会闪成满背景再淡出），随 hover 层一起淡出；
+    /// 下次进入整体替换 mask，无需在此清理。
+    private func cancelHoverDwell() {
+        dwellWork?.cancel()
+        dwellWork = nil
+        dwellConfirmed = false
+        guard let mask = hoverGradientLayer.mask else { return }
+        let current = (mask.presentation()?.bounds ?? mask.bounds).width
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mask.removeAnimation(forKey: "dwellFill")
+        mask.bounds = CGRect(x: 0, y: 0, width: current, height: mask.bounds.height)
+        CATransaction.commit()
+    }
+
     /// 点击卡片：mouseDown 记录按下位置，mouseUp 在 bounds 内时触发回调（避免拖出后误触）
+    /// 可点击子区域（如 Agent 卡其余账号切换项）：mouseDown 落在这些视图内时，
+    /// 点击转交该视图的 onClick，不再触发整卡 onClick/拖拽（整卡 hitTest 被本类
+    /// 接管、子视图自身收不到事件，须由卡片代为路由）。
+    var interactiveSubviews: [NSView] = []
+
+    /// 命中检测：窗口坐标点落在任一 interactiveSubview 内返回该视图
+    /// （isHiddenOrHasHiddenAncestor 覆盖条整体显隐：strip 隐藏期间不命中）
+    private func interactiveSubview(at locationInWindow: NSPoint) -> NSView? {
+        guard !interactiveSubviews.isEmpty else { return nil }
+        let local = convert(locationInWindow, from: nil)
+        return interactiveSubviews.first {
+            // 命中框必须是按钮自身 bounds：点已转到按钮坐标系，若误用卡片 bounds,
+            // 按钮内小正值恒落在卡片内 → 条上所有项全部命中、first 恒取左边项
+            // （右边按钮 hover 无反应、点击触发左边账号的根因）
+            !$0.isHiddenOrHasHiddenAncestor && $0.bounds.contains(convert(local, to: $0))
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard onDragStarted != nil, let window else {
             // 不调用 super：避免被当作无意义点击传给父视图
@@ -960,6 +1150,21 @@ class HoverCard: NSView, PanelScrollHoverSync {
         }
 
         let start = event.locationInWindow
+        // 可点击子区域优先：按下点在切换项内时，松手仍在项内才触发项的 onClick
+        if let item = interactiveSubview(at: start) {
+            while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp],
+                                              until: .distantFuture,
+                                              inMode: .eventTracking,
+                                              dequeue: true) {
+                if next.type == .leftMouseUp {
+                    if interactiveSubview(at: next.locationInWindow) === item {
+                        (item as? SubAccountItemView)?.onClick?()
+                    }
+                    return
+                }
+            }
+            return
+        }
         var dragging = false
 
         while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp],

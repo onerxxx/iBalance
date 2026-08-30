@@ -1544,15 +1544,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// 读取面板保存的平台顺序；未知/新增平台自动追加到末尾。
+    /// 菜单栏跟随面板板块视觉序：API 组（DS/ZhiPu/Qwen，面板在上）在前，
+    /// Agent 组在后，组内相对顺序保持 platformOrder 不变。
     private func balancePlatformOrder() -> [String] {
         let saved = menuBarPlatformOrder
             ?? UserDefaults.standard.stringArray(forKey: UDKey.balancePlatformOrder)
             ?? []
-        return BalancePlatform.normalizedOrder(from: saved)
+        let order = BalancePlatform.normalizedOrder(from: saved)
+        let apiIDs: Set<String> = [BalancePlatform.deepSeek.rawValue,
+                                   BalancePlatform.bigModel.rawValue,
+                                   BalancePlatform.qwen.rawValue]
+        return order.filter { apiIDs.contains($0) } + order.filter { !apiIDs.contains($0) }
     }
 
     /// 按面板余额卡片顺序构建要显示在菜单栏的条目（id, symbol, value, icon）。
-    /// 平台组顺序与余额面板共用 UserDefaults，组内仍保持当前账号优先。
+    /// 平台组顺序与余额面板共用 UserDefaults；每平台只显示当前账号一条（2026-08-30，
+    /// 切号完成 performAccountSwitch 即时 updateTitle 实时换条，数值沿用缓存）。
     private func orderedMenuBarEntries() -> [(id: String, symbol: String, value: String, isCurrent: Bool, icon: String)] {
         var entries: [(id: String, symbol: String, value: String, isCurrent: Bool, icon: String)] = []
 
@@ -1572,56 +1579,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             entries.append((id: MenuBarPrefix.qwen, symbol: "", value: pct, isCurrent: true, icon: "qwen"))
         }
 
-        // 2. ZCode 账号（当前账号优先）
+        // 2. ZCode（仅当前账号）
         let zcodeMainUid = ZcodeService.currentUid() ?? ""
-        let zcodeList = config.zcodeAccounts.sorted { a, b in
-            if a.uid == zcodeMainUid { return true }
-            if b.uid == zcodeMainUid { return false }
-            return false
-        }
-        for ac in zcodeList {
-            guard let c = cacheZcodeAccounts[ac.uid], c.total > 0 else { continue }
+        if let main = config.zcodeAccounts.first(where: { $0.uid == zcodeMainUid }),
+           let c = cacheZcodeAccounts[main.uid], c.total > 0 {
             let pct = fmtAmountCommas(c.remain / c.total * 100, decimals: 1) + "%"
-            entries.append((id: MenuBarPrefix.zcode + ac.uid, symbol: "", value: pct, isCurrent: ac.uid == zcodeMainUid, icon: "zhipu"))
+            entries.append((id: MenuBarPrefix.zcode + main.uid, symbol: "", value: pct, isCurrent: true, icon: "zhipu"))
         }
 
-        // 3. Codex 账号（当前账号优先）
+        // 3. Codex（仅当前账号）
         let codexMainUid = CodexService.currentUid() ?? ""
-        let codexList = config.codexAccounts.sorted { a, b in
-            if a.uid == codexMainUid { return true }
-            if b.uid == codexMainUid { return false }
-            return false
-        }
-        for ac in codexList {
-            guard let c = cacheCodexAccounts[ac.uid] else { continue }
+        if let main = config.codexAccounts.first(where: { $0.uid == codexMainUid }),
+           let c = cacheCodexAccounts[main.uid] {
             let pct = fmtAmountCommas(100 - c.usedPercent, decimals: 0) + "%"
-            entries.append((id: MenuBarPrefix.codex + ac.uid, symbol: "", value: pct,
-                            isCurrent: ac.uid == codexMainUid, icon: "codex"))
+            entries.append((id: MenuBarPrefix.codex + main.uid, symbol: "", value: pct, isCurrent: true, icon: "codex"))
         }
 
-        // 4. TRAE 账号（当前账号优先）
+        // 4. TRAE（仅当前账号）
         let traeMainUid = TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? ""
-        let traeList = traeCheckinAccounts().sorted { a, b in
-            if a.uid == traeMainUid { return true }
-            if b.uid == traeMainUid { return false }
-            return false
-        }
-        for ac in traeList {
-            guard let c = cacheTraeAccounts[ac.uid] else { continue }
+        if let main = traeCheckinAccounts().first(where: { $0.uid == traeMainUid }),
+           let c = cacheTraeAccounts[main.uid] {
             let remaining = c.limit - c.used
-            entries.append((id: MenuBarPrefix.trae + ac.uid, symbol: "", value: fmtAmountCommas(remaining, decimals: 0), isCurrent: ac.uid == traeMainUid, icon: "trae-color"))
+            entries.append((id: MenuBarPrefix.trae + main.uid, symbol: "", value: fmtAmountCommas(remaining, decimals: 0), isCurrent: true, icon: "trae-color"))
         }
 
-        // 4. WorkBuddy 账号（当前账号优先）
+        // 5. WorkBuddy（仅当前账号）
         let wbMainUid = WorkBuddyService.authInfo()?.uid ?? ""
-        let wbList = wbCheckinAccounts().sorted { a, b in
-            if a.uid == wbMainUid { return true }
-            if b.uid == wbMainUid { return false }
-            return false
-        }
-        for ac in wbList {
-            guard let c = cacheWbAccounts[ac.uid] else { continue }
-            entries.append((id: MenuBarPrefix.wb + ac.uid, symbol: "", value: fmtAmountCommas(c.remain, decimals: 0), isCurrent: ac.uid == wbMainUid, icon: "workbuddy"))
+        if let main = wbCheckinAccounts().first(where: { $0.uid == wbMainUid }),
+           let c = cacheWbAccounts[main.uid] {
+            entries.append((id: MenuBarPrefix.wb + main.uid, symbol: "", value: fmtAmountCommas(c.remain, decimals: 0), isCurrent: true, icon: "workbuddy"))
         }
 
         // 余额面板拖拽只改变平台组顺序；这里按平台前缀重排，保持每组内部账号顺序不变。
@@ -2189,6 +2175,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         Logger.log(.refresh, "[\(seq)] ZCode: accounts=\(accounts.count)")
+        // 体验套餐（start-plan）JWT 仅当前登录号持有；余额查询时优先于存量 token（多为付费档 API Key）
+        let startPlanJWT = ZcodeService.currentStartPlanJWT()
         for (i, ac) in accounts.enumerated() {
             if !ownsRefresh(seq) {
                 Logger.log(.refresh, "[\(seq)] ZCode[\(i)/\(accounts.count)]: not owner (cancelled=\(Task.isCancelled), seqNow=\(refreshSeq)), skip remaining")
@@ -2204,8 +2192,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 到期跳过已移除（对齐 Cockpit）：套餐到期是服务端事实，本地缓存判定会在
             // 用户领取新套餐后永远卡在「已到期」（旧 planEndsAt 挡住新请求）；
             // 每轮真实请求，到期展示交给快照层按最新 planEndsAt 判断
-            let r = await Logger.measure("\(acctag).fetchBalance") {
-                await ZcodeService.fetchBalance(token: ac.token)
+            // 体验套餐优先：账号即当前登录号且存量 token 不是 JWT 时，先用 JWT 查体验套餐
+            // （billing/balance），无有效体验套餐（过期/未领取/请求失败）再回落存量 token 口径
+            let r: (remain: Double, total: Double, planEndsAt: TimeInterval)?
+            if let sp = startPlanJWT, sp.uid == ac.uid, sp.token != ac.token {
+                let primary = await Logger.measure("\(acctag).fetchBalance[startPlan]") {
+                    await ZcodeService.fetchBalance(token: sp.token)
+                }
+                if let primary, primary.total > 0 {
+                    r = primary
+                } else {
+                    r = await Logger.measure("\(acctag).fetchBalance") {
+                        await ZcodeService.fetchBalance(token: ac.token)
+                    }
+                }
+            } else {
+                r = await Logger.measure("\(acctag).fetchBalance") {
+                    await ZcodeService.fetchBalance(token: ac.token)
+                }
             }
             guard ownsRefresh(seq) else {
                 Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
@@ -2554,9 +2558,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let h = (total % 86400) / 3600
         let m = (total % 3600) / 60
         if days > 0 {
-            return String(format: "\u{2009}%d天%02d:%02d\u{2009}%@", days, h, m, suffix)
+            return String(format: "%d天%02d:%02d\u{2009}%@", days, h, m, suffix)
         }
-        return String(format: "\u{2009}%02d:%02d\u{2009}%@", h, m, suffix)
+        return String(format: "%02d:%02d\u{2009}%@", h, m, suffix)
     }
 
     /// 通用系统通知通道（余额查询失败 / 切号失败回滚等一次性事件共用）：
