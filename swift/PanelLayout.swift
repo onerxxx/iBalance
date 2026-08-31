@@ -876,7 +876,9 @@ extension BalancePanelView {
 
         let row = NSStackView(views: [iconContainer, contentContainer])
         row.orientation = .horizontal
-        row.spacing = 8
+        // icon 列↔标题区间距 8→5（2026-08-31 用户要求左侧整带统一 -3pt；
+        // 不动卡片 horizontalPadding 以免右缘数值/点阵列同步位移）
+        row.spacing = 5
         row.alignment = .centerY   // icon 与内容垂直居中
         // .fill：iconContainer 有 required 固定宽约束保持原宽，
         // contentContainer（低拥抱优先级）撑满剩余宽度到行尾，数值/点阵才能右对齐贴边

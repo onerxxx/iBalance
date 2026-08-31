@@ -8,7 +8,8 @@ enum SmallTable {
     /// 行内容左右缩进（用量表 usageHorizontalInset；Token 面板内嵌态同值）
     static let horizontalInset: CGFloat = 8
     /// 行内上下缩进：行间墨迹空隙 = 2 × rowInset（两表行距节奏同源）
-    static let rowInset: CGFloat = 3
+    /// 2026-08-31 用户要求两表行高各减 1pt：3 → 2.5（半磅在 2x 屏为整像素）
+    static let rowInset: CGFloat = 2.5
     /// 数值列间距
     static let columnSpacing: CGFloat = 8
     /// 表头/区块标题字号（「平台 1H 1D 1W」与「总计/项目/词元活动」同款）

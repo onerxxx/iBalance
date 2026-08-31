@@ -396,6 +396,10 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     /// 右键点击回调（rightMouseDown 触发；用量行映射到子面板「回到本周」）
     var onRightClick: (() -> Void)?
 
+    /// 整行即左键点击热区：置顶浮窗下若不消费 mouseDown，事件沿 responder chain
+    /// 转给 BalancePanelView 的拖窗循环，mouseUp 被吞、onLeftClick 失效（同 HoverCard 口径）
+    override func mouseDown(with event: NSEvent) {}
+
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
         guard event.buttonNumber == 0 else { return }
@@ -887,6 +891,30 @@ class HoverCard: NSView, PanelScrollHoverSync {
         return point != .zero && bounds.contains(point)
     }
 
+    /// 异步落点（计时回调）的权威在场校验：视图仍在窗口层级且光标仍在卡片 bounds 内。
+    /// 与 isPointerInsideCard 的区别：窗口已脱离（面板收起）时 isMouseInside 是滞留真值，
+    /// 此处按「不在场」处理。不依赖 enter/exit 事件配对——快速掠过时真实离开的 exit
+    /// 可能丢失或被 dwell 卡的陈旧坐标闸误吞，事件计数不可信，落点时刻以光标位置为准。
+    var isPointerInsideNow: Bool {
+        guard window != nil else { return false }
+        return isPointerInsideCard()
+    }
+
+    /// 离开收尾：取消进度 + 状态复位 + hover 材质淡出 + onHover(false)。
+    /// mouseExited 真实离开路径与 dwell 计时落点自检共用（保证两条路径视觉/回调一致）。
+    private func performHoverExitVisuals() {
+        cancelHoverDwell()
+        isMouseInside = false
+        suppressEnterUntilExit = false
+        if isDragHoverLocked { return }
+        // hover 背景淡出，露出容器统一背景
+        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
+        animateLayerKey(layer, keyPath: "borderWidth", to: 0)
+        animateLayerKey(layer, keyPath: "borderColor",
+                        to: Palette.borderCGColor(Palette.hoverBorderNormal, in: self))
+        onHover?(false)
+    }
+
     // MARK: - 面板滚动 hover 同步
     /// 滚动后 AppKit 不补发 enter/exit：按外部（hitTest）判定同步。
     /// 拖拽锁定期间跳过（材质由 setDragHoverLocked 全权管理）。
@@ -1071,16 +1099,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
         // window=nil）是 hitTest 权威判定，照常退出
         if hoverDwellDuration != nil, event.window != nil,
            bounds.contains(convert(event.locationInWindow, from: nil)) { return }
-        cancelHoverDwell()
-        isMouseInside = false
-        suppressEnterUntilExit = false
-        if isDragHoverLocked { return }
-        // hover 背景淡出，露出容器统一背景
-        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
-        animateLayerKey(layer, keyPath: "borderWidth", to: 0)
-        animateLayerKey(layer, keyPath: "borderColor",
-                        to: Palette.borderCGColor(Palette.hoverBorderNormal, in: self))
-        onHover?(false)
+        performHoverExitVisuals()
     }
 
     /// 启动 hover 确认进度：hover 渐变层挂左锚 mask，bounds.width 0→满 线性填充；
@@ -1118,6 +1137,12 @@ class HoverCard: NSView, PanelScrollHoverSync {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.dwellWork != nil else { return }
             self.dwellWork = nil
+            guard self.isPointerInsideNow else {
+                // 落点自检：快速掠过的真实 exit 可能丢失或被陈旧坐标闸误吞，
+                // 计时到点以光标真实位置为准——人不在卡上按真实离开收尾，不触发确认
+                self.performHoverExitVisuals()
+                return
+            }
             self.dwellConfirmed = true
             // 模型值落满并移除动画：后续淡出/复用不回退
             CATransaction.begin()

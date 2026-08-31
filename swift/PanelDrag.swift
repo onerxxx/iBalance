@@ -181,9 +181,11 @@ extension BalancePanelView {
         }
     }
 
-    /// 用量行跟随平台卡片顺序：重排 arrangedSubview 并用 Y 轴位移动画让行平滑让位（同 applyPlatformOrder 口径）
+    /// 用量行跟随面板卡片视觉序（API 板块在前、Agent 在后，组内保持 platformOrder）：
+    /// 重排 arrangedSubview 并用 Y 轴位移动画让行平滑让位（口径与 Panel.swift 渲染排序一致）
     private func applyUsageOrder(animated: Bool) {
-        let orderedViews = platformOrder.compactMap { usageRowViews[$0] }
+        let orderedViews = (platformOrder.filter { !isAgentPlatform($0) }
+            + platformOrder.filter { isAgentPlatform($0) }).compactMap { usageRowViews[$0] }
         let dataRows = usageContentStack.arrangedSubviews.filter { $0 !== usageHeaderRowRef }
         guard !orderedViews.isEmpty, orderedViews.count == dataRows.count else { return }
         let oldFrames = Dictionary(uniqueKeysWithValues: orderedViews.map {

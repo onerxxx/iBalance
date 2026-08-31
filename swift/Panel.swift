@@ -150,9 +150,9 @@ enum Motion {
     /// 余额数字滚动（Number Rolling）：数据变化反馈类动效，非 UI 状态切换，
     /// 用户指定加长时长，不适用 0.40 硬顶
     static let roll: CFTimeInterval = 3.0
-    /// Agent 卡 hover 确认时长：背景进度条从左到右撑满的时长，撑满才切换 Token 板块
-    /// （用户指定 1s，滤掉光标快速掠过；确认交互非装饰动效，不适用 0.40 硬顶）
-    static let hoverDwell: CFTimeInterval = 1.0
+    /// Agent 卡 hover 确认时长：背景进度条从左到右撑满的时长，撑满才切换 Token 板块，
+    /// 子账号积分条换入同此节拍（用户指定 0.8s，滤掉光标快速掠过；确认交互非装饰动效，不适用 0.40 硬顶）
+    static let hoverDwell: CFTimeInterval = 0.8
     /// 打开面板后滚动数字重滚入场的延迟（用户指定 0.5s）
     static let openRerollDelay: CFTimeInterval = 0.5
     /// 打开面板补发整段时长（用户指定 2s）：从开始到停下恒为此时长——行进最长的
@@ -1088,7 +1088,7 @@ final class BalancePanelView: NSView {
         //（视觉宽占 viewBox 比例：wb 92% / trae 72% / zhipu 86% / codex 满幅 / deepseek 75%）
         // 放大留白多的图标，使「图标视觉右缘 → 标题」的间距各卡一致（≈10-11pt）
         static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 20.47, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "wb:")
-        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", platformID: "trae", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: false, expireIconSymbol: nil, menuBarIdPrefix: "trae:")
+        static let trae  = CardStyle(icon: "trae-color", name: "TRAE", platformID: "trae", iconSize: 20.24, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: true, showsExpire: false, expireIconSymbol: nil, menuBarIdPrefix: "trae:")
         static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 19, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "zcode:")
         static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 19.45, secondaryIconSize: 12.02, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "codex:")
         static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 22, secondaryIconSize: 12.65, monoIconSize: 20.47, monoSecondaryIconSize: 12.65, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
@@ -1425,11 +1425,11 @@ final class BalancePanelView: NSView {
         setValueScrollPreview(s.valueScrollPreviewEnabled)
         offlineBanner.isHidden = !s.offline
 
-        // 行序跟随平台卡片顺序（拖拽排序持久化于 platformOrder）
+        // 行序跟随面板卡片视觉序：API 板块在前、Agent 板块在后，
+        // 组内保持 platformOrder 相对序（与菜单栏 balancePlatformOrder 同口径）
         let orderIndex = Dictionary(uniqueKeysWithValues: platformOrder.enumerated().map { ($1, $0) })
-        let sortedRows = s.usageRows.sorted {
-            (orderIndex[$0.platform] ?? Int.max) < (orderIndex[$1.platform] ?? Int.max)
-        }
+        func usageRank(_ id: String) -> (Int, Int) { (isAgentPlatform(id) ? 1 : 0, orderIndex[id] ?? Int.max) }
+        let sortedRows = s.usageRows.sorted { usageRank($0.platform) < usageRank($1.platform) }
         if sortedRows != renderedUsageRows {
             computeUsageColumnLayout(sortedRows)
             dismissUsageHistoryPopover()
@@ -1721,9 +1721,13 @@ final class BalancePanelView: NSView {
             // Agent 卡其余账号条：hover 时替换点阵，icon+积分（字号/颜色与副标题统一：10pt systemGray）
             var subStrip: NSStackView? = nil
             var subValueLabels: [NSTextField] = []
-            /// 点阵↔账号条互换的代际计数：0.35s 交叉淡化完成回调落藏前，hover 可能已
-            /// 反向重入——回调按代际判断，过期完成不得藏掉新一轮已显示的视图
+            /// 点阵↔账号条互换的代际计数：仅在换入真实落点（SHOW）与离场换出启动时推进；
+            /// 换入完成回调据此判断自己是否已被新一轮离场换出作废（被作废则不得落藏点阵）。
+            /// ⚠️ 勿改回「任何 hover 事件即 bump」：驻留 0.8s 后 enter≠显示，
+            /// 会把在途淡出的落藏吞掉，造成 isHidden/alpha 错位残留（积分按钮误亮根因）
             var subStripSwapEpoch = 0
+            /// 账号条换入的挂起计时（Motion.hoverDwell）：hover 不足时长离开即取消不显示
+            var stripRevealWork: DispatchWorkItem?
             if isAgentCard, accounts.contains(where: { !$0.isCurrent }) {
                 let strip = NSStackView()
                 strip.orientation = .horizontal
@@ -1901,38 +1905,61 @@ final class BalancePanelView: NSView {
                     hc.interactiveSubviews = strip.arrangedSubviews
                 }
                 hc.onHover = { [weak self, weak card, weak label = nickLabel] showing in
-                    // Agent 卡：hover 时点阵 ↔ 其余账号条互换（row2 行高不变，无几何反馈风险）。
+                    // Agent 卡：hover 驻留 Motion.hoverDwell 后点阵 ↔ 其余账号条互换
+                    // （row2 行高不变，无几何反馈风险），与 Token 板块切换同一节拍；
+                    // 时长未满离开则取消挂起计时，账号条不显示。
                     // 入场 = 账号条交错上移（Token 平台切换同款节奏）+ 点阵淡出落藏；
-                    // 离场维持原交叉淡化 + 模糊聚焦；落藏均由完成回调按代际守卫执行
+                    // 离场 = 交叉淡化 + 模糊聚焦，落藏由 crossfade 无条件收尾
                     if let strip = subStrip, let dotsView = dots {
-                        subStripSwapEpoch += 1
-                        let epoch = subStripSwapEpoch
+                        // 代际只在「真实换入落点 / 离场换出启动」时推进，enter/exit 事件本身不动
+                        // 计数：换入要驻留 0.8s，任何新一轮换入必然晚于在途 0.35s 淡出的完成，
+                        // 离场换出的落藏可无条件执行（旧实现 enter 即 bump，快速移出→再移入会把
+                        // 淡出完成回调的落藏吞掉，strip 滞留 isHidden=false/alpha=0 错位态，
+                        // 之后每次离场 crossfade 把 alpha 复位拉回 1 = 积分按钮无 hover 误亮）。
                         if showing {
-                            strip.isHidden = false
-                            strip.alphaValue = 1
-                            self?.staggerRiseIn(strip.arrangedSubviews)
-                            if self?.shouldReduceMotion == true {
-                                dotsView.isHidden = true
-                                dotsView.alphaValue = 1
-                            } else {
-                                NSAnimationContext.runAnimationGroup({ ctx in
-                                    ctx.duration = 0.35
-                                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1/3, 1, 1)
-                                    dotsView.animator().alphaValue = 0
-                                }, completionHandler: { [weak dotsView] in
-                                    guard epoch == subStripSwapEpoch else { return }
-                                    dotsView?.isHidden = true
-                                    dotsView?.alphaValue = 1
-                                })
+                            stripRevealWork?.cancel()
+                            let work = DispatchWorkItem { [weak self, weak strip, weak dotsView, weak hc] in
+                                guard let self, let strip, let dotsView else { return }
+                                stripRevealWork = nil
+                                // 落点权威校验：快速掠过时真实离开的 exit 可能丢失/被吞
+                                // （或面板已收起），光标不在卡上就不换入。
+                                // dwell 卡两计时同 tick 触发且 HoverCard 自检先跑（经
+                                // onHover(false) 已 cancel 本 work），此处主要兜 TRAE 等非 dwell 卡
+                                guard hc?.isPointerInsideNow == true else { return }
+                                subStripSwapEpoch += 1
+                                let showEp = subStripSwapEpoch
+                                strip.isHidden = false
+                                strip.alphaValue = 1
+                                self.staggerRiseIn(strip.arrangedSubviews)
+                                if self.shouldReduceMotion {
+                                    dotsView.isHidden = true
+                                    dotsView.alphaValue = 1
+                                } else {
+                                    NSAnimationContext.runAnimationGroup({ ctx in
+                                        ctx.duration = 0.35
+                                        ctx.timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1/3, 1, 1)
+                                        dotsView.animator().alphaValue = 0
+                                    }, completionHandler: { [weak dotsView] in
+                                        // 点阵落藏：期间该换入若已被离场换出作废（换出会推进代际并
+                                        // 把点阵回升），过期回调不得藏掉
+                                        guard showEp == subStripSwapEpoch, let dotsView else { return }
+                                        dotsView.isHidden = true
+                                        dotsView.alphaValue = 1
+                                    })
+                                }
                             }
+                            stripRevealWork = work
+                            DispatchQueue.main.asyncAfter(deadline: .now() + Motion.hoverDwell, execute: work)
                         } else {
-                            self?.crossfade(strip, to: dotsView, animated: true,
-                                            hideOutgoingOnFinish: false) { [weak strip] in
-                                guard epoch == subStripSwapEpoch else { return }
-                                strip?.isHidden = true
-                                strip?.alphaValue = 1
+                            stripRevealWork?.cancel()
+                            stripRevealWork = nil
+                            // 账号条尚未显示（驻留未满）：无换出对象，点阵保持原样
+                            if !strip.isHidden {
+                                subStripSwapEpoch += 1   // 作废在途换入的点阵落藏 guard
+                                // 落藏无条件收尾（hideOutgoingOnFinish 默认 true 由 crossfade 执行）
+                                self?.crossfade(strip, to: dotsView, animated: true)
+                                self?.playCharBlurTransition(on: [dotsView, strip])
                             }
-                            self?.playCharBlurTransition(on: [dotsView, strip])
                         }
                     }
                     if let label {
@@ -1967,7 +1994,7 @@ final class BalancePanelView: NSView {
                         scan(card)
                     }
                 }
-                // ZCode / WorkBuddy 卡片：hover 1s 确认（背景进度填充撑满）后切换内嵌 Token 板块，
+                // ZCode / WorkBuddy 卡片：hover 确认（背景进度填充撑满）后切换内嵌 Token 板块，
                 // 快速掠过不触发（HoverCard.hoverDwellDuration 实现进度与取消）
                 if style.platformID == "zcode" || style.platformID == "wb" {
                     hc.hoverDwellDuration = Motion.hoverDwell
