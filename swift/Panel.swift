@@ -155,6 +155,10 @@ enum Motion {
     static let hoverDwell: CFTimeInterval = 1.0
     /// 打开面板后滚动数字重滚入场的延迟（用户指定 0.5s）
     static let openRerollDelay: CFTimeInterval = 0.5
+    /// 打开面板补发整段时长（用户指定 2s）：从开始到停下恒为此时长——行进最长的
+    /// 车轮恰好占满，其余车轮按格数等比提前落定（共享角速度、错峰到达不变）。
+    /// 与 roll 的「满 10 格一圈」预算口径不同，走 setText(totalDuration:) 归一通道。
+    static let openRerollDuration: CFTimeInterval = 2.0
 
     /// 强 ease-out（等价 cubic-bezier(0.23,1,0.32,1)）：入场/反馈用，
     /// 起手快收尾长，比系统 easeOut 更有意图
@@ -172,12 +176,12 @@ extension NSAppearance {
 
 /// 配色 token：集中管理所有自定义颜色，避免硬编码散落各处
 enum Palette {
-    /// 卡片前景色（动态解析）：深色外观 #DFDFDF / 浅色外观黑灰（0.13）。
+    /// 卡片前景色（动态解析）：深色外观 #EBEBEB / 浅色外观黑灰（0.13）。
     /// 渐变背景开=面板强制深色外观恒取深色值；关=面板跟随系统外观，浅色主题自动转黑灰。
     /// 动态色按绘制环境外观解算；经 .cgColor 落盘（layer）会定格当时外观，需外观变化时重设。
     static let cardForeground = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor(calibratedRed: 0xDF/255.0, green: 0xDF/255.0, blue: 0xDF/255.0, alpha: 1)
+            ? NSColor(calibratedRed: 0xEB/255.0, green: 0xEB/255.0, blue: 0xEB/255.0, alpha: 1)
             : NSColor(calibratedWhite: 0.13, alpha: 1)
     }
     /// 非当前账号前景色：深色石墨灰（用户定稿 0.61）/ 浅色 0.42
@@ -305,14 +309,14 @@ enum Palette {
     static let chartValueColor = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor(calibratedWhite: 0.72, alpha: 1) : NSColor(calibratedWhite: 0.35, alpha: 1)
     }
-    /// 用量图表当日 Pulse Dot（深 常规 0.75 / 峰值 #DFDFDF；浅 常规 0.40 / 峰值 0x26）。
+    /// 用量图表当日 Pulse Dot（深 常规 0.75 / 峰值 #EBEBEB；浅 常规 0.40 / 峰值 0x26）。
     /// ⚠️ 与主前景同源定稿（峰值曾硬编码 0xE9，改主前景色时需同步）
     static let pulseDotBase = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor(calibratedWhite: 0.75, alpha: 1) : NSColor(calibratedWhite: 0.40, alpha: 1)
     }
     static let pulseDotPeak = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor(calibratedRed: 0xDF/255.0, green: 0xDF/255.0, blue: 0xDF/255.0, alpha: 1)
+            ? NSColor(calibratedRed: 0xEB/255.0, green: 0xEB/255.0, blue: 0xEB/255.0, alpha: 1)
             : NSColor(calibratedWhite: 0x26 / 255.0, alpha: 1)
     }
     /// Token 热力图无用量底点（深 中性灰 #262626（去饱和定稿，亮度取自 #1E262E 中值）/ 浅 sRGB 210,210,210 中性浅灰）。
@@ -1635,6 +1639,14 @@ final class BalancePanelView: NSView {
 
     /// 打开面板延迟重滚的挂起任务（关闭面板即取消，0.5s 内关面板不触发）
     private var openRerollItem: DispatchWorkItem?
+    /// 开面板重滚窗口截止时刻 = 打开 + openRerollDelay + openRerollDuration。窗口内
+    /// Token 总计的刷新路径派发（开面板触发的 onRefresh 首个完成 ~0.1s 即经 summary
+    /// didSet 落进来）按「最长轮恰好落在截止时刻」规划时长——否则 0.9 刷新短预算会在
+    /// 0.5s 补发前抢跑消耗掉挂起值的滚动、在补发后又截断在途的 2s 滚动（2026-08-31
+    /// [RollTotal] 日志定案）。过期不主动清：派发侧按剩余时间 ≤0 视为窗口已关。
+    var openRerollDeadline: Date? {
+        didSet { inlineTokenView?.openRerollDeadline = openRerollDeadline }
+    }
 
     /// 打开面板 openRerollDelay 后统一下发挂起的数值：面板隐藏期间数据管线不落值
     /// （applyAccountCardData / syncTotalRoll 挂起，视图保持旧显示），此处以动画一次
@@ -1642,11 +1654,12 @@ final class BalancePanelView: NSView {
     func scheduleOpenReroll() {
         openRerollItem?.cancel()
         guard !valueScrollPreviewEnabled else { return }   // 预览模式显示归预览定时器接管
+        openRerollDeadline = Date().addingTimeInterval(Motion.openRerollDelay + Motion.openRerollDuration)
         let item = DispatchWorkItem { [weak self] in
             guard let self, self.window != nil else { return }
             let animated = !shouldReduceMotion
             for e in self.allCardEntries() {
-                e.valueView.setText(e.lastValue, animated: animated, rollDuration: Motion.roll)
+                e.valueView.setText(e.lastValue, animated: animated, totalDuration: Motion.openRerollDuration)
             }
             self.inlineTokenView?.syncTotalRoll()
         }
@@ -1658,6 +1671,7 @@ final class BalancePanelView: NSView {
     func cancelOpenReroll() {
         openRerollItem?.cancel()
         openRerollItem = nil
+        openRerollDeadline = nil
     }
 
     // MARK: - 多号卡片通用实现（WB / TRAE / ZCode / Codex）
@@ -1739,7 +1753,7 @@ final class BalancePanelView: NSView {
                             onSwitch(sub.uid)
                         }
                     }
-                    // hover 提示账号昵称+积分：用量 hover 子面板同机制的迷你 NSPopover,
+                    // hover 提示账号昵称+积分：自绘圆角气泡窗（圆角与卡片统一）,
                     // 锚定整张卡、弹到卡片右侧（贴屏自动翻左缘）;面板侧统一弹/收
                     item.nickname = sub.nickname
                     item.valueText = sub.value ?? "—"
@@ -1753,8 +1767,12 @@ final class BalancePanelView: NSView {
                             self.dismissSubAccountTip()
                         }
                     }
+                    // chip hover 时当前账号积分/数值让位系统灰（含 coin 前缀图标）,离开复原
+                    item.onHoverChanged = { [weak valueView] inside in
+                        valueView?.setTextColor(inside ? .systemGray : Palette.cardForeground)
+                    }
                     let iv = NSImageView()
-                    iv.image = Self.trimmedBundleSvgIcon(style.icon, size: 10)
+                    iv.image = Self.trimmedBundleSvgIcon("coin", size: 10)
                     iv.image?.isTemplate = true   // systemGray 着色，与副标题图标统一
                     iv.contentTintColor = .systemGray
                     iv.imageScaling = .scaleProportionallyUpOrDown
@@ -1772,7 +1790,7 @@ final class BalancePanelView: NSView {
             }
             // 第二行信息：ZCode 当前账号为到期倒计时（clock-stop 图标 + 文本，10pt systemGray 行高 12）。
             // TRAE 原签到信息行是恒空的占位容器（文字条目已移除）——已废弃：
-            // info=nil 走单行模式（标题行相对整卡垂直居中 + 点阵贴底右角）；非当前账号无第二行
+            // info=nil 时点阵/账号条仍作第二行入组（标题+积分贴顶，与其他卡对齐）；非当前账号无第二行
             var expireLabel: NSTextField? = nil
             var expireIcon: NSImageView? = nil
             let info: NSStackView?
@@ -1837,6 +1855,7 @@ final class BalancePanelView: NSView {
                                   textColor: fgColor, failureBadge: badge,
                                   premadeIconView: fadeIcon,
                                   hoverSubStrip: subStrip,
+                                  valuePrefixIcon: isAgentCard ? "coin" : nil,
                                   titleLabelRef: { capturedTitle = $0 })
             ], to: container, onClick: {
                 if isCurrent || onSwitch == nil {
@@ -1883,17 +1902,28 @@ final class BalancePanelView: NSView {
                 }
                 hc.onHover = { [weak self, weak card, weak label = nickLabel] showing in
                     // Agent 卡：hover 时点阵 ↔ 其余账号条互换（row2 行高不变，无几何反馈风险）。
-                    // 动效与 Mono 开关切换同款：交叉淡化 + 模糊聚焦（0.35s ease-out）；
-                    // 落藏由完成回调按代际守卫执行（hideOutgoingOnFinish=false）
+                    // 入场 = 账号条交错上移（Token 平台切换同款节奏）+ 点阵淡出落藏；
+                    // 离场维持原交叉淡化 + 模糊聚焦；落藏均由完成回调按代际守卫执行
                     if let strip = subStrip, let dotsView = dots {
                         subStripSwapEpoch += 1
                         let epoch = subStripSwapEpoch
                         if showing {
-                            self?.crossfade(dotsView, to: strip, animated: true,
-                                            hideOutgoingOnFinish: false) { [weak dotsView] in
-                                guard epoch == subStripSwapEpoch else { return }
-                                dotsView?.isHidden = true
-                                dotsView?.alphaValue = 1
+                            strip.isHidden = false
+                            strip.alphaValue = 1
+                            self?.staggerRiseIn(strip.arrangedSubviews)
+                            if self?.shouldReduceMotion == true {
+                                dotsView.isHidden = true
+                                dotsView.alphaValue = 1
+                            } else {
+                                NSAnimationContext.runAnimationGroup({ ctx in
+                                    ctx.duration = 0.35
+                                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1/3, 1, 1)
+                                    dotsView.animator().alphaValue = 0
+                                }, completionHandler: { [weak dotsView] in
+                                    guard epoch == subStripSwapEpoch else { return }
+                                    dotsView?.isHidden = true
+                                    dotsView?.alphaValue = 1
+                                })
                             }
                         } else {
                             self?.crossfade(strip, to: dotsView, animated: true,
@@ -1902,13 +1932,13 @@ final class BalancePanelView: NSView {
                                 strip?.isHidden = true
                                 strip?.alphaValue = 1
                             }
+                            self?.playCharBlurTransition(on: [dotsView, strip])
                         }
-                        self?.playCharBlurTransition(on: [dotsView, strip])
                     }
                     if let label {
                         // 昵称（含签到状态附件）淡入与卡片背景/边框统一时长与曲线；
                         // 子卡昵称不进全亮提亮（scan 排除）——昵称是次级信息，hover 时
-                        // 只从 dimmed 升到 systemGray（与主卡昵称一致），不到 #DFDFDF
+                        // 只从 dimmed 升到 systemGray（与主卡昵称一致），不到 #EBEBEB
                         NSAnimationContext.runAnimationGroup { ctx in
                             ctx.duration = Motion.hover
                             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -2120,71 +2150,175 @@ final class BalancePanelView: NSView {
 
     // MARK: - 账号项昵称子面板（用量 hover 子面板同机制的迷你版）
 
-    /// 显示中的昵称子面板（hover 移开/面板关闭/卡片重建即收）
-    private var subAccountTipPopover: NSPopover?
+    /// 显示中的昵称气泡窗（hover 移开/面板关闭/卡片重建即收）
+    private var subAccountTipWindow: NSWindow?
 
-    /// 以整张卡片为锚弹出昵称+积分子面板：锚点=卡片右缘中点（1×1）,默认向右弹出;
-    /// 子账号悬浮气泡：高度与锚点卡片同高,排版与卡片内容区逐项同源——
-    /// 昵称行复刻主标题(13pt medium、行带 16),积分行复刻副标题(10pt systemGray、行带 12),
-    /// 行距 2、上下内边距 4;内容块在卡高内垂直居中,与卡片 content stack 居中规则一致。
-    /// 右侧屏幕空间不足时锚点移卡片左缘、翻转向左（用量子面板同款翻转逻辑）。
-    /// 不锚定按钮本身——右缘按钮贴屏幕右缘,.maxY 弹出会被 clamp 左移盖住按钮,
-    /// 引发「盖住→mouseExited→收起→重入→再弹」抖动循环（右缘按钮不弹的根因）
+    /// 以整张卡片为锚弹出昵称+积分气泡：高度与锚点卡片同高,两行均 10pt 副标题款（行带 12）——
+    /// 昵称行前缀「ID :」,积分行 systemGray;行距 2、上下内边距 4;
+    /// 内容块在卡高内垂直居中,与卡片 content stack 居中规则一致。
+    /// 自绘 borderless 窗口替代 NSPopover（系统 popover 圆角不受控、比卡片更圆）：
+    /// 背景 = 主面板同款 TintedVisualEffectView 玻璃（.menu/behindWindow）并继承面板
+    /// 当前生效遮罩色（用量子面板同口径）,按「圆角矩形+箭头」路径做 layer mask 裁切,
+    /// 圆角统一 Palette.cardCornerRadius。默认弹卡片右侧（箭头顶点贴卡右缘）,
+    /// 右侧屏幕空间不足时翻到左缘。
     private func showSubAccountTip(nickname: String, value: String, anchorCard: NSView) {
-        guard anchorCard.window != nil else { return }
-        let nick = NSTextField(labelWithString: nickname)
-        registerFont(nick, size: 13, weight: .medium)
+        guard let anchorWindow = anchorCard.window else { return }
+        let nick = NSTextField(labelWithString: "ID : \(nickname)")
+        registerFont(nick, size: 10, weight: .medium)
         nick.textColor = Palette.cardForeground
         let val = NSTextField(labelWithString: "积分 \(value)")
         registerFont(val, size: 10)
         val.textColor = .systemGray
         let nw = nick.intrinsicContentSize
         let vw = val.intrinsicContentSize
-        let w = ceil(max(nw.width, vw.width)) + 20
-        // 行带规格与卡片纵向布局同源：上下 4pt + 标题行带 16 + 行距 2 + 副标题行带 12
-        let titleBand: CGFloat = 16
+        let bodyW = ceil(max(nw.width, vw.width)) + 20
+        // 两行均 10pt 副标题款：行带 12,上下 4pt + 行距 2
+        let titleBand: CGFloat = 12
         let infoBand: CGFloat = 12
         let rowGap: CGFloat = 2
         let vPad: CGFloat = 4
         let h = anchorCard.frame.height
         let yOff = (h - (vPad * 2 + titleBand + rowGap + infoBand)) / 2
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
-        // 非 flipped 容器：y 自底向上——积分行带在下、昵称行带在上,文本在行带内垂直居中
-        val.frame = NSRect(x: 10, y: yOff + vPad + (infoBand - ceil(vw.height)) / 2,
+        let arrowLen = SubAccountTipBubbleView.arrowLength
+        let totalW = bodyW + arrowLen
+        var edge: NSRectEdge = .maxX
+        if let visible = anchorWindow.screen?.visibleFrame,
+           visible.maxX - anchorWindow.frame.maxX < totalW + 16 {
+            edge = .minX
+        }
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: totalW, height: h))
+        // 玻璃本体：与主面板同材质,继承面板容器当前生效遮罩色（用量子面板同口径）;
+        // 按气泡轮廓做 layer mask 裁切（mask 作用于整个子树,含 TintOverlayView 遮罩层）
+        let glass = TintedVisualEffectView(frame: container.bounds)
+        glass.autoresizingMask = [.width, .height]
+        glass.material = .menu
+        glass.blendingMode = .behindWindow
+        glass.state = .active
+        glass.isEmphasized = false
+        if let pc = Self.findPanelContainer(from: self) {
+            glass.tintColor = pc.tintColor
+            glass.tintBottomColor = pc.tintBottomColor
+        } else {
+            let colors = Palette.containerColors(
+                lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
+                gradientOn: panelGradientEnabled)
+            glass.tintColor = colors.top
+            glass.tintBottomColor = colors.bottom
+        }
+        let shape = SubAccountTipBubbleView.tipShapePath(bounds: container.bounds, edge: edge)
+        let maskImage = NSImage(size: container.frame.size)
+        maskImage.lockFocus()
+        NSColor.white.setFill()
+        shape.fill()
+        maskImage.unlockFocus()
+        let maskLayer = CALayer()
+        maskLayer.frame = CGRect(origin: .zero, size: container.frame.size)
+        maskLayer.contents = maskImage
+        glass.wantsLayer = true
+        glass.layer?.masksToBounds = true
+        glass.layer?.mask = maskLayer
+        container.addSubview(glass)
+        // 轮廓描边（独立覆盖层,不受 mask 裁切）
+        let outline = SubAccountTipBubbleView(frame: container.bounds)
+        outline.autoresizingMask = [.width, .height]
+        outline.arrowEdge = edge
+        container.addSubview(outline)
+        // 非 flipped 容器：y 自底向上——积分行带在下、昵称行带在上,文本在行带内垂直居中;
+        // 文本左缘 = 本体左缘 + 10（箭头顶点在窗口左缘时本体右移 arrowLen）
+        let textX: CGFloat = (edge == .maxX ? arrowLen : 0) + 10
+        val.frame = NSRect(x: textX, y: yOff + vPad + (infoBand - ceil(vw.height)) / 2,
                            width: ceil(vw.width) + 2, height: ceil(vw.height))
-        nick.frame = NSRect(x: 10, y: yOff + vPad + infoBand + rowGap + (titleBand - ceil(nw.height)) / 2,
+        nick.frame = NSRect(x: textX, y: yOff + vPad + infoBand + rowGap + (titleBand - ceil(nw.height)) / 2,
                             width: ceil(nw.width) + 2, height: ceil(nw.height))
         container.addSubview(nick)
         container.addSubview(val)
-        let vc = NSViewController()
-        vc.view = container
-        let popover = NSPopover()
-        popover.behavior = .applicationDefined   // 收起由 hover 移开/面板关闭/卡片重建统一管理
-        popover.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                     gradientOn: panelGradientEnabled)
-        popover.animates = false   // hover 反馈即时,不做系统动画延迟
-        popover.contentViewController = vc
-        popover.contentSize = container.frame.size
-        if subAccountTipPopover?.isShown == true { subAccountTipPopover?.close() }   // 换卡重新锚定
-        subAccountTipPopover = popover
-        let cardRect = anchorCard.convert(anchorCard.bounds, to: self)
-        var edge: NSRectEdge = .maxX
-        var anchorX = cardRect.maxX - 2
-        if let window = anchorCard.window,
-           let visible = window.screen?.visibleFrame,
-           visible.maxX - window.frame.maxX < w + 16 {
-            edge = .minX
-            anchorX = cardRect.minX + 2
-        }
-        let anchorRect = NSRect(x: min(max(anchorX, bounds.minX + 1), bounds.maxX - 1),
-                                y: cardRect.midY, width: 1, height: 1)
-        popover.show(relativeTo: anchorRect, of: self, preferredEdge: edge)
+        let win = NSWindow(contentRect: container.frame, styleMask: .borderless,
+                           backing: .buffered, defer: false)
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.ignoresMouseEvents = true   // 纯提示,不拦截鼠标（避免盖住卡片引发 hover 抖动）
+        win.level = NSWindow.Level(rawValue: anchorWindow.level.rawValue + 1)
+        win.collectionBehavior = [.transient, .ignoresCycle]
+        win.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                 gradientOn: panelGradientEnabled)
+        win.contentView = container
+        // 箭头顶点对准卡片侧边中点（贴边 2pt,与原 popover 锚点口径一致）
+        let cardRect = anchorWindow.convertToScreen(anchorCard.convert(anchorCard.bounds, to: nil))
+        let originX = edge == .maxX ? cardRect.maxX - 2 : cardRect.minX + 2 - totalW
+        win.setFrameOrigin(NSPoint(x: originX, y: cardRect.midY - h / 2))
+        subAccountTipWindow?.orderOut(nil)   // 换卡重新锚定
+        subAccountTipWindow = win
+        win.orderFrontRegardless()
     }
 
-    /// 收起昵称子面板（幂等）
+    /// 收起昵称气泡（幂等）
     func dismissSubAccountTip() {
-        subAccountTipPopover?.close()
-        subAccountTipPopover = nil
+        subAccountTipWindow?.orderOut(nil)
+        subAccountTipWindow = nil
+    }
+
+    /// 气泡轮廓（圆角矩形+一侧三角箭头,圆角=Palette.cardCornerRadius 与卡片统一）：
+    /// 同一份 tipShapePath 供两处消费——玻璃层 layer mask 裁切 + 本视图描边覆盖层
+    private final class SubAccountTipBubbleView: NSView {
+        /// 箭头方向：.maxX=箭头在本体左侧指向左（气泡在锚点右侧）;.minX 反向
+        var arrowEdge: NSRectEdge = .maxX
+        static let arrowLength: CGFloat = 8
+        static let arrowHalfWidth: CGFloat = 6
+
+        /// 单轮廓路径（bounds 局部坐标）：逆时针 上缘→右上弧→右缘（.minX 嵌箭头）
+        /// →右下弧→下缘→左下弧→左缘（.maxX 嵌箭头）→左上弧→闭合
+        static func tipShapePath(bounds: NSRect, edge: NSRectEdge) -> NSBezierPath {
+            let r = Palette.cardCornerRadius
+            let inset: CGFloat = 0.25   // 描边半宽,防轮廓被裁
+            let body: NSRect
+            let tipX: CGFloat
+            if edge == .maxX {
+                body = NSRect(x: bounds.minX + arrowLength, y: bounds.minY + inset,
+                              width: bounds.width - arrowLength - inset,
+                              height: bounds.height - inset * 2)
+                tipX = bounds.minX + inset
+            } else {
+                body = NSRect(x: bounds.minX + inset, y: bounds.minY + inset,
+                              width: bounds.width - arrowLength - inset,
+                              height: bounds.height - inset * 2)
+                tipX = bounds.maxX - inset
+            }
+            let midY = bounds.midY
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: body.minX + r, y: body.maxY))
+            path.line(to: NSPoint(x: body.maxX - r, y: body.maxY))
+            path.appendArc(withCenter: NSPoint(x: body.maxX - r, y: body.maxY - r),
+                           radius: r, startAngle: 90, endAngle: 0, clockwise: true)
+            if edge == .minX {
+                path.line(to: NSPoint(x: body.maxX, y: midY + arrowHalfWidth))
+                path.line(to: NSPoint(x: tipX, y: midY))
+                path.line(to: NSPoint(x: body.maxX, y: midY - arrowHalfWidth))
+            }
+            path.line(to: NSPoint(x: body.maxX, y: body.minY + r))
+            path.appendArc(withCenter: NSPoint(x: body.maxX - r, y: body.minY + r),
+                           radius: r, startAngle: 0, endAngle: -90, clockwise: true)
+            path.line(to: NSPoint(x: body.minX + r, y: body.minY))
+            path.appendArc(withCenter: NSPoint(x: body.minX + r, y: body.minY + r),
+                           radius: r, startAngle: -90, endAngle: 180, clockwise: true)
+            if edge == .maxX {
+                path.line(to: NSPoint(x: body.minX, y: midY - arrowHalfWidth))
+                path.line(to: NSPoint(x: tipX, y: midY))
+                path.line(to: NSPoint(x: body.minX, y: midY + arrowHalfWidth))
+            }
+            path.line(to: NSPoint(x: body.minX, y: body.maxY - r))
+            path.appendArc(withCenter: NSPoint(x: body.minX + r, y: body.maxY - r),
+                           radius: r, startAngle: 180, endAngle: 90, clockwise: true)
+            path.close()
+            return path
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            // 只描边（玻璃填充由 mask 后的 TintedVisualEffectView 承担）
+            let path = Self.tipShapePath(bounds: bounds, edge: arrowEdge)
+            Palette.tooltipBorder.setStroke()
+            path.lineWidth = 0.5
+            path.stroke()
+        }
     }
 
     // MARK: - 三平台卡片入口（薄封装，仅绑定容器/样式/回调）

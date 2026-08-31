@@ -683,7 +683,7 @@ extension BalancePanelView {
     /// failureBadge：外部创建的签到失败角标视图，叠加在 icon 右上角（显隐由调用方控制）
     /// monoSize：Mono 模式 ASCII icon 标称尺寸（缺省 = imgSize 即不微调场景）。
     /// SVG 微调（imageSize）与 Mono 标称解耦：像素字母各平台等大，SVG 保持视觉微调
-    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil) -> NSView {
+    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, valuePrefixIcon: String? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil) -> NSView {
         var imgSize = imageSize ?? iconSize
         // 左：大 icon（固定列宽 = iconSize + 4，image 居中显示，imageSize 可独立缩小）；
         // premadeIconView 由外部传入（多号卡片用 MenuBarFadeIconView 以支持菜单栏渐变标记）
@@ -773,6 +773,10 @@ extension BalancePanelView {
         // 基线对齐用视图内置探针（同字体隐藏 label 的 firstBaselineAnchor）
         registerRollingNumber(valueView, size: 13, weight: valueWeight)
         valueView.setTextColor(textColor)
+        // 数值前缀图标（Agent 卡积分前的 coin）：贴数字左侧、随槽位右对齐成组
+        if let pfx = valuePrefixIcon {
+            valueView.prefixIcon = Self.trimmedBundleSvgIcon(pfx, size: 10)
+        }
         valueView.setContentHuggingPriority(.required, for: .horizontal)
         valueView.setContentCompressionResistancePriority(.required, for: .horizontal)
         valueView.translatesAutoresizingMaskIntoConstraints = false
@@ -839,62 +843,36 @@ extension BalancePanelView {
             row2.heightAnchor.constraint(equalToConstant: 12).isActive = true
         }
 
-        // 「副标题是否有内容」分流：有文字副标题（到期/额度行）走纵向 stack 居中；
-        // 无文字副标题但有点阵时（TRAE：签到行占位已移除），点阵视作独立的用量
-        // 可视化而非副标题——退出纵向流、贴底右角，标题行独占垂直中心。
-        // （组合块居中会把标题顶离卡心，与恒居中的 icon 列产生视觉错位）
+        // 纵向 stack：row1（标题+数值）与第二行（副标题/点阵/账号条）成组垂直居中。
+        // 无文字副标题仅有点阵/账号条时（TRAE：签到行占位已移除）第二行照常入组——
+        // 容器恒绑定 DS 等高基准，组高=容器高，成组居中即标题行贴顶，
+        // 当前账号积分与其他卡对齐靠上。
         let contentContainer = NSView()
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
-        if let dots = dots, info == nil {
-            // ── 单行模式：row1 垂直居中 + 点阵浮底 ──
-            // centerY 上抬 1pt 与浮底点阵相切不重叠；依赖外部等高约束撑高容器
-            // （仅当前账号进入本模式，恒绑定 DS 等高基准）
-            contentContainer.addSubview(row1)
-            contentContainer.addSubview(dots)
-            NSLayoutConstraint.activate([
-                row1.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-                row1.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-                row1.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor, constant: -1),
-                dots.leadingAnchor.constraint(greaterThanOrEqualTo: contentContainer.leadingAnchor),
-                dots.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-                dots.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor, constant: -1),
-                row1.topAnchor.constraint(greaterThanOrEqualTo: contentContainer.topAnchor),
-            ])
-            // TRAE 单行模式：其余账号条与点阵同位（贴底右角）
-            if let strip = hoverSubStrip {
-                contentContainer.addSubview(strip)
-                NSLayoutConstraint.activate([
-                    strip.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-                    strip.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor, constant: -1),
-                ])
-            }
-        } else {
-            // ── 原两行（或单行）模式 ──
-            var contentViews: [NSView] = [row1]
-            if row2HasContent {
-                contentViews.append(row2)
-            }
-            let content = NSStackView(views: contentViews)
-            content.orientation = .vertical
-            content.alignment = .leading
-            content.spacing = 2
-            content.distribution = .fill
-            content.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            content.setContentHuggingPriority(.defaultLow, for: .vertical)
-            content.translatesAutoresizingMaskIntoConstraints = false
-            // 让两行撑满 content 宽度：这样行内 .trailing gravity 的元素（数值/点阵）才会贴右对齐
-            for v in contentViews {
-                v.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-            }
-            contentContainer.addSubview(content)
-            NSLayoutConstraint.activate([
-                content.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
-                content.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
-                content.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
-                content.topAnchor.constraint(greaterThanOrEqualTo: contentContainer.topAnchor),
-                content.bottomAnchor.constraint(lessThanOrEqualTo: contentContainer.bottomAnchor),
-            ])
+        var contentViews: [NSView] = [row1]
+        if row2HasContent {
+            contentViews.append(row2)
         }
+        let content = NSStackView(views: contentViews)
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 2
+        content.distribution = .fill
+        content.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        content.setContentHuggingPriority(.defaultLow, for: .vertical)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        // 让两行撑满 content 宽度：这样行内 .trailing gravity 的元素（数值/点阵）才会贴右对齐
+        for v in contentViews {
+            v.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        }
+        contentContainer.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            content.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
+            content.topAnchor.constraint(greaterThanOrEqualTo: contentContainer.topAnchor),
+            content.bottomAnchor.constraint(lessThanOrEqualTo: contentContainer.bottomAnchor),
+        ])
 
         let row = NSStackView(views: [iconContainer, contentContainer])
         row.orientation = .horizontal
@@ -1074,6 +1052,48 @@ extension BalancePanelView {
             incoming?.alphaValue = 1
             completion?()
         })
+    }
+
+    /// 交错上移入场（Agent 卡其余账号条 chip 用）：节奏 = Token 平台切换动效同口径
+    /// （行间 0.1s / 单行 0.4s / 上移 10pt，用户指定，豁免 Motion.emphasis 0.40 硬顶）。
+    /// 视图非 flipped：起点在终位下方 10pt（-y 平移）上移 + 淡入；
+    /// 减弱动态效果：直接落定仅复位透明度。
+    func staggerRiseIn(_ views: [NSView]) {
+        guard !shouldReduceMotion else {
+            for v in views { v.alphaValue = 1 }
+            return
+        }
+        let rise: CGFloat = 10
+        for (i, v) in views.enumerated() {
+            v.wantsLayer = true
+            v.alphaValue = 0
+            if let layer = v.layer {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.transform = CATransform3DMakeTranslation(0, -rise, 0)
+                CATransaction.commit()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.1) { [weak v] in
+                guard let v else { return }
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.4
+                    ctx.timingFunction = Motion.easeOutStrong
+                    v.animator().alphaValue = 1
+                }
+                guard let layer = v.layer else { return }
+                let anim = CABasicAnimation(keyPath: "transform.translation.y")
+                anim.fromValue = -rise
+                anim.toValue = 0
+                anim.duration = 0.4
+                anim.timingFunction = Motion.easeOutStrong
+                layer.add(anim, forKey: "staggerRise")
+                // model 立即归位（presentation 覆盖期间播完即无缝停在终位）
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.transform = CATransform3DIdentity
+                CATransaction.commit()
+            }
+        }
     }
 
     /// 按 Mono 模式切换设置开关控件外观：Mono 开 = 字符开关 [×]/[▪]，关 = 原生 NSSwitch。

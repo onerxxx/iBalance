@@ -117,7 +117,7 @@ final class MonoCharSwitch: NSControl {
         let text = on ? "[▪]" : "[×]"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: MonoFontProvider.font(size: fontSize, weight: .semibold),
-            // 选中态亮色用 Palette.cardForeground（#DFDFDF），与折叠标题/余额卡前景一致
+            // 选中态亮色用 Palette.cardForeground（#EBEBEB），与折叠标题/余额卡前景一致
             .foregroundColor: on ? Palette.cardForeground : NSColor.secondaryLabelColor,
             .kern: kern,
         ]
@@ -249,6 +249,9 @@ final class SubAccountItemView: NSStackView {
     var valueText = ""
     /// hover 进出回调（面板侧弹/收昵称子面板;进出有 0.3s 延迟防扫过闪烁）
     var onTipToggle: ((Bool) -> Void)?
+    /// hover 即时翻转回调（setHovered 状态真变化时触发,无 tooltip 延迟;
+    /// 锚卡借此让当前账号积分/数值让位）
+    var onHoverChanged: ((Bool) -> Void)?
     private var isHovered = false
     private var tipWorkItem: DispatchWorkItem?
 
@@ -275,6 +278,7 @@ final class SubAccountItemView: NSStackView {
         guard inside != isHovered else { return }
         isHovered = inside
         applyState(animated: true)
+        onHoverChanged?(inside)
         if inside { scheduleTip() } else { hideTip() }
     }
 
@@ -294,10 +298,23 @@ final class SubAccountItemView: NSStackView {
         onTipToggle?(false)
     }
 
+    /// chip 专用背景色档：共享 hoverGradientDark（白@5%）在卡面上太暗,
+    /// 默认态整档提亮（深色 白@10% / 浅色 黑@5%）,hover 再上一档（20%/8%）保留反馈差
+    private static let bgDefault = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.white.withAlphaComponent(0.10)
+            : NSColor.black.withAlphaComponent(0.05)
+    }
+    private static let bgHover = NSColor(name: nil) { appearance in
+        appearance.isDark
+            ? NSColor.white.withAlphaComponent(0.20)
+            : NSColor.black.withAlphaComponent(0.08)
+    }
+
     /// 背景与文本/图标色随 hover 切换：背景走 CATransaction（图层属性），
     /// 文本/图标走 NSAnimationContext animator（非图层属性），时长统一 Motion.hover
     private func applyState(animated: Bool) {
-        let bg = isHovered ? Palette.hoverGradientBright : Palette.hoverGradientDark
+        let bg = isHovered ? Self.bgHover : Self.bgDefault
         let fg = isHovered ? Palette.cardForeground : NSColor.systemGray
         CATransaction.begin()
         CATransaction.setAnimationDuration(animated ? Motion.hover : 0)
@@ -1068,6 +1085,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
 
     /// 启动 hover 确认进度：hover 渐变层挂左锚 mask，bounds.width 0→满 线性填充；
     /// 满时模型值落定 + 触发 onHoverConfirmed。
+    /// mask 带 16pt 高斯模糊：进度前缘软羽化（mask alpha 参与滤镜渲染），
+    /// 取消冻结/满宽落定均沿用同一 mask,行为不变。
     private func startHoverDwell(duration: CFTimeInterval) {
         hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
         let w = hoverGradientLayer.bounds.width
@@ -1077,6 +1096,10 @@ class HoverCard: NSView, PanelScrollHoverSync {
         mask.anchorPoint = CGPoint(x: 0, y: 0.5)
         mask.position = CGPoint(x: 0, y: h / 2)
         mask.backgroundColor = NSColor.white.cgColor
+        let blur = CIFilter(name: "CIGaussianBlur")
+        blur?.setDefaults()
+        blur?.setValue(16.0, forKey: kCIInputRadiusKey)
+        mask.filters = blur.map { [$0] }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         hoverEffectLayer.opacity = 1

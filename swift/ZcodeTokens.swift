@@ -90,7 +90,8 @@ enum TokenPeriodWindows {
 }
 
 /// 单日 token 用量（本地时区当日零点时间戳 + input+output 合计）
-struct ZcodeDayUsage {
+/// Equatable：热力图 cells 缓存按 daily 数组比对失效
+struct ZcodeDayUsage: Equatable {
     let dayStart: TimeInterval
     let tokens: Int64
 }
@@ -280,11 +281,17 @@ enum ZcodeTokenStore {
 
     // MARK: 数值格式化
 
-    /// 千分位完整数字（总计大数字用）：570902356 → "570,902,356"
-    static func grouped(_ t: Int64) -> String {
+    /// 千分位分组格式器（static 复用：NumberFormatter 构造含 locale 数据加载，
+    /// 原每次调用新建——总计落位与 cnCompact 小数值分支都走这里，draw 期间被逐格放大）
+    private static let groupedFormatter: NumberFormatter = {
         let f = NumberFormatter()
         f.numberStyle = .decimal
-        return f.string(from: NSNumber(value: t)) ?? "\(t)"
+        return f
+    }()
+
+    /// 千分位完整数字（总计大数字用）：570902356 → "570,902,356"
+    static func grouped(_ t: Int64) -> String {
+        groupedFormatter.string(from: NSNumber(value: t)) ?? "\(t)"
     }
 
     /// 紧凑三位有效数字（模型行用，参考同类工具口径）：273M / 189.3M / 27.7M / 11M / 452K / 890
@@ -404,9 +411,26 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 热力图窗口：最近 5 个月（列 = 周，末列为今天所在周，首列对齐其所在周的周一）
     static let activityMonths = 5
-    /// draw 时填充：每个可 hover 圆点的 (命中框, 悬浮文案)；mouseMoved 命中测试用
-    private struct DotCell { let rect: NSRect; let tooltip: String }
+    /// draw 时填充：每个可 hover 圆点的命中框 + 提示文案数据（day/tipTokens）；
+    /// mouseMoved 命中测试用。文案不缓存，hover 命中时按格现算（dotTooltip）
+    private struct DotCell { let rect: NSRect; let day: Date; let tipTokens: Int64 }
     private var dotCells: [DotCell] = []
+    /// activityCells() 结果缓存（单槽）：draw 高频（hover 移动/切换动效逐帧重绘），
+    /// 输入 = summary.daily + activityMode + 窗口起点，三者不变即整表复用——
+    /// 原实现每次 draw 全量重算 182 格并逐格生成日期文案
+    private var activityCellsCache: (daily: [ZcodeDayUsage], mode: ActivityMode,
+                                     windowStart: Date, cells: [ActivityCell])?
+    /// 热力图格子（缓存单元）：几何随 pitch/bounds 在 draw 现算，这里只留数据。
+    /// tokens = 亮度源（每日 = 当天用量；每周 = 周合计，列内未点亮行记 0）；
+    /// day = 提示锚点日（每日 = 当天；每周 = 该列周一）；tipTokens = 提示用量
+    /// （每周模式未点亮行同显周合计，与原文案口径一致）
+    private struct ActivityCell {
+        let col: Int
+        let row: Int
+        let tokens: Int64
+        let day: Date
+        let tipTokens: Int64
+    }
     private var hoveredDot: Int?
     /// 「每日/每周」切换文案命中区（draw 时更新）
     private var dailyToggleRect = NSRect.zero
@@ -528,14 +552,26 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     /// 面板不可见且大数字已是真实数值时挂起不下发（视图保持旧显示，最新总计随 summary 待命），
     /// 打开后由 scheduleOpenReroll 统一补发：有变化从旧值滚到新值，未变化原地不动。
     /// 占位「—」阶段不受挂起闸限制（启动预读）：首次数据到达即直接落位，打开即显示。
-    func syncTotalRoll(slideOnRebuild: Bool = false) {
+    /// totalDuration：整段式时长（开面板补发传 Motion.openRerollDuration）；缺省走 setText
+    /// 默认预算 0.9（刷新路径口径不变）。
+    /// 开面板重滚窗口截止时刻（BalancePanelView.scheduleOpenReroll 设定 / cancelOpenReroll
+    /// 清除）：非 nil 且未过期时，summary didSet 的刷新路径派发按「最长轮恰好落在截止
+    /// 时刻」规划时长，与 0.5s 补发同速合流；过期或 nil = 常规刷新 0.9 预算
+    var openRerollDeadline: Date?
+
+    func syncTotalRoll(slideOnRebuild: Bool = false, totalDuration: CFTimeInterval? = nil) {
         guard totalRollView.window != nil || totalRollView.currentText == "—" else { return }
         guard let text = totalDisplayText else {
             totalRollView.setText("—", animated: false)
             return
         }
         applyTotalNumberSize(for: text)
-        totalRollView.setText(text, animated: true, slideOnRebuild: slideOnRebuild)
+        var effectiveTotal = totalDuration
+        if effectiveTotal == nil, let deadline = openRerollDeadline {
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining > 0 { effectiveTotal = remaining }
+        }
+        totalRollView.setText(text, animated: true, slideOnRebuild: slideOnRebuild, totalDuration: effectiveTotal)
     }
 
     /// 大数字字体：系统字体态用等宽数字变体（滚轮槽宽恒定）；Mono 按主面板策略
@@ -833,14 +869,17 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             defer { if rowReveal != nil { cg?.restoreGState() } }
             let hovered = i == hoveredListRow
             let rowColor: NSColor = hovered ? Palette.cardForeground : SmallTable.textColor
-            // 百分比背景条：按行占比从左到右填充行底（复用热力图无用量底点色，深 #262626/浅 210 灰）
-            let pctBarRatio = summary.totalTokens > 0
-                ? CGFloat(p.tokens) / CGFloat(summary.totalTokens) : 0
-            let barRect = NSRect(x: 0, y: rowY,
-                                 width: bounds.width * pctBarRatio, height: rowH)
-            let barPath = NSBezierPath(roundedRect: barRect, xRadius: 6, yRadius: 6)
-            Palette.heatDotEmpty.setFill()
-            barPath.fill()
+            // 百分比背景条（仅 hover 行显示）：按行占比从左到右填充行底
+            // （复用热力图无用量底点色，深 #262626/浅 210 灰）；常态行无背景
+            if hovered {
+                let pctBarRatio = summary.totalTokens > 0
+                    ? CGFloat(p.tokens) / CGFloat(summary.totalTokens) : 0
+                let barRect = NSRect(x: 0, y: rowY,
+                                     width: bounds.width * pctBarRatio, height: rowH)
+                let barPath = NSBezierPath(roundedRect: barRect, xRadius: 6, yRadius: 6)
+                Palette.heatDotEmpty.setFill()
+                barPath.fill()
+            }
             if hovered {
                 let rect = NSRect(x: 0, y: rowY, width: bounds.width, height: rowH)
                 let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
@@ -988,12 +1027,11 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
                 : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
             stamp(level: level).draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1,
                                      respectFlipped: true, hints: nil)
-            dotCells.append(DotCell(rect: rect, tooltip: c.tooltip))
+            dotCells.append(DotCell(rect: rect, day: c.day, tipTokens: c.tipTokens))
         }
 
         // ── 横坐标月份标签：从网格左缘起，按「网格宽 ÷ 月数」等距分布，文本左对齐 ──
-        let monthFmt = DateFormatter()
-        monthFmt.dateFormat = "M月"
+        let monthFmt = Self.monthAxisFmt
         let axisY = gridTop + 7 * pitch + 4
         let segWidth = (CGFloat(window.cols) * pitch) / CGFloat(Self.activityMonths)
         for offset in 0..<Self.activityMonths {
@@ -1017,14 +1055,17 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     /// 生成热力图全格子（无用量也占位，供底色与 hover）：
-    /// 每日 = 窗口周列 × 7 行逐日；每周 = 窗口周列周合计单行
-    private func activityCells() -> [(col: Int, row: Int, tokens: Int64, tooltip: String)] {
+    /// 每日 = 窗口周列 × 7 行逐日；每周 = 窗口周列周合计单行点亮列内。
+    /// 结果按 (daily, activityMode, 窗口起点) 缓存，draw 重复进入零重算
+    private func activityCells() -> [ActivityCell] {
         guard let summary else { return [] }
-        let cal = Calendar.current
         let window = activityWindow()
+        if let c = activityCellsCache,
+           c.mode == activityMode, c.windowStart == window.start, c.daily == summary.daily {
+            return c.cells
+        }
+        let cal = Calendar.current
         let windowStartTime = window.start.timeIntervalSince1970
-        let dayFmt = DateFormatter()
-        dayFmt.dateFormat = "M月d日"
 
         // 有用量的天 → (列,行) 聚合
         var usage: [Int: Int64] = [:]
@@ -1035,19 +1076,16 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             usage[col * 7 + row, default: 0] += d.tokens
         }
 
-        var cells: [(col: Int, row: Int, tokens: Int64, tooltip: String)] = []
+        var cells: [ActivityCell] = []
         if activityMode == .daily {
             for col in 0..<window.cols {
                 for row in 0..<7 {
                     let day = window.start.addingTimeInterval(TimeInterval((col * 7 + row) * 86400))
                     let t = usage[col * 7 + row] ?? 0
-                    cells.append((col, row, t,
-                                  "\(dayFmt.string(from: day)) \(ZcodeTokenStore.cnCompact(t))"))
+                    cells.append(ActivityCell(col: col, row: row, tokens: t, day: day, tipTokens: t))
                 }
             }
         } else {
-            let rangeFmt = DateFormatter()
-            rangeFmt.dateFormat = "M.d"
             // 每周视图：网格形态与每日一致（7 行 × 周列），不切单行——按周合计点亮列内的点：
             // 周用量越大，列内点亮的点越多（自下而上，周用量/最大周用量 × 7 行向上取整），
             // 点亮的点也越亮（tokens 记周合计，绘制端按最大周用量归一到 1-4 级亮度）
@@ -1061,23 +1099,48 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             for col in 0..<window.cols {
                 let t = weekTotals[col] ?? 0
                 let weekStart = window.start.addingTimeInterval(TimeInterval(col * 7 * 86400))
-                let weekEnd = weekStart.addingTimeInterval(6 * 86400)
-                let tip = "\(rangeFmt.string(from: weekStart))–\(rangeFmt.string(from: weekEnd)) \(ZcodeTokenStore.cnCompact(t))"
                 let lit = t <= 0 || maxWeek <= 0 ? 0
                     : max(1, Int((Double(t) / Double(maxWeek) * 7).rounded(.up)))
                 for row in 0..<7 {
                     let isLit = row >= 7 - lit
-                    cells.append((col, row, isLit ? t : 0, tip))
+                    cells.append(ActivityCell(col: col, row: row, tokens: isLit ? t : 0,
+                                              day: weekStart, tipTokens: t))
                 }
             }
         }
+        activityCellsCache = (summary.daily, activityMode, window.start, cells)
         return cells
+    }
+
+    // 热力图文案格式器（static 复用：DateFormatter 构造含 locale 数据加载，draw/hover
+    // 高频路径不可每次新建；仅本视图主线程使用）
+    private static let monthAxisFmt = makeFmt("M月")      // 月份轴
+    private static let dailyTipFmt = makeFmt("M月d日")    // 每日 hover 提示
+    private static let weeklyTipFmt = makeFmt("M.d")      // 每周 hover 提示（周区间两端）
+
+    private static func makeFmt(_ format: String) -> DateFormatter {
+        let f = DateFormatter()
+        f.dateFormat = format
+        return f
+    }
+
+    /// hover 提示文案（单格现算）：每日 = 「M月d日 用量」；每周 = 「M.d–M.d 用量」
+    /// （cell.day 为该列周一，区间两端各格式化一次）
+    private func dotTooltip(for cell: DotCell) -> String {
+        switch activityMode {
+        case .daily:
+            return "\(Self.dailyTipFmt.string(from: cell.day)) \(ZcodeTokenStore.cnCompact(cell.tipTokens))"
+        case .weekly:
+            let end = cell.day.addingTimeInterval(6 * 86400)
+            return "\(Self.weeklyTipFmt.string(from: cell.day))–\(Self.weeklyTipFmt.string(from: end)) \(ZcodeTokenStore.cnCompact(cell.tipTokens))"
+        }
     }
 
     /// 悬浮提示气泡：锚点圆上方居中（贴顶时改下方），画日期 + 用量
     private func drawTooltip(for cell: DotCell, anchor: NSRect) {
         let font = uiFont(size: 9)
-        let textW = cell.tooltip.size(withAttributes: [.font: font]).width
+        let text = dotTooltip(for: cell)
+        let textW = text.size(withAttributes: [.font: font]).width
         let w = ceil(textW) + 12
         let h: CGFloat = 16
         var x = anchor.midX - w / 2
@@ -1093,7 +1156,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         path.lineWidth = 0.5
         path.stroke()
         let textH = font.boundingRectForFont.height
-        drawText(cell.tooltip, at: NSPoint(x: bubble.minX + 6, y: bubble.minY + (h - textH) / 2),
+        drawText(text, at: NSPoint(x: bubble.minX + 6, y: bubble.minY + (h - textH) / 2),
                  font: font, color: Palette.cardForeground)
     }
 

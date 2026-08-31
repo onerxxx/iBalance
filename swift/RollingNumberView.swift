@@ -165,20 +165,8 @@ final class DigitWheelView: NSView {
 
     /// 设置目标数字。animated=false 直接落位（含槽宽）；true 从当前连续位置向
     /// 目标做一段独立 tween（时长由 rollDuration 按行进格数分配），到点精确停在目标位。
-    /// 目标位置在环绕缓冲区内取「距当前位置最近」的等价位置（如 9→0 走 1 格而不是 9 格）。
-    /// 只允许 [0, 10] 内的等价位置：顶部缓冲 -1 处 strip 完全不覆盖窗口（渲染空白），
-    /// 0→9 改走正面长滚（9 格），9→0 仍走 1 格底缓冲（10）。
     func setDigit(_ d: Int, animated: Bool, rollDuration: CFTimeInterval = 0.9) {
-        let db = Double(d)
-        var best = db
-        var bestDist = abs(db - pos)
-        for delta in [10.0] {   // 只考虑底部缓冲 +10；-10（顶部缓冲 pos=-1）禁用
-            let cand = db + delta
-            if cand >= 0.0 && cand <= 10.0 {
-                let dist = abs(cand - pos)
-                if dist < bestDist { best = cand; bestDist = dist }
-            }
-        }
+        let best = nearestEquivalentTarget(d).target
         if animated {
             targetPos = best
             beginTween(to: best, rollDuration: rollDuration)
@@ -189,6 +177,29 @@ final class DigitWheelView: NSView {
             currentWidth = widthForPosition(pos)
             applyStripOrigin()
         }
+    }
+
+    /// 目标等价位选择：环绕缓冲区内取「距当前位置最近」的等价位置（如 9→0 走 1 格
+    /// 而不是 9 格）。只允许 [0, 10] 内的等价位置：顶部缓冲 -1 处 strip 完全不覆盖
+    /// 窗口（渲染空白），0→9 改走正面长滚（9 格），9→0 仍走 1 格底缓冲（10）。
+    /// setDigit 与 plannedTravelCells 共用本口径，勿单边修改。
+    private func nearestEquivalentTarget(_ d: Int) -> (target: Double, cells: Double) {
+        let db = Double(d)
+        var best = db
+        var bestDist = abs(db - pos)
+        for delta in [10.0] {   // 只考虑底部缓冲 +10；-10（顶部缓冲 pos=-1）禁用
+            let cand = db + delta
+            if cand >= 0.0 && cand <= 10.0 {
+                let dist = abs(cand - pos)
+                if dist < bestDist { best = cand; bestDist = dist }
+            }
+        }
+        return (best, bestDist)
+    }
+
+    /// 只询距离不落位：若此刻 setDigit(d) 将行进的格数（整段式时长归一预算用）
+    func plannedTravelCells(to d: Int) -> Double {
+        nearestEquivalentTarget(d).cells
     }
 
     /// 规划一段 tween：从当前位置出发到 dest，行进 d 格耗时 = rollDuration × d/10。
@@ -349,6 +360,23 @@ final class RollingNumberView: NSView {
     /// 左对齐供 ZCode Token 子面板总计大数字使用（左缘贴版心，与原 drawText 排版一致）
     var alignsLeft = false
 
+    /// 数值前缀图标（Agent 卡积分前的 coin 标记）：伴随视图，不参与 setText 的结构
+    /// 比对与滑移复用，排布时贴最左槽左侧、与数字成组右对齐——数字槽宽逐帧变化时
+    /// 随最左槽平移（固定锚在数值列左缘会与短数字拉开大空隙，故随组内嵌）。
+    /// 图像须 isTemplate（着色随 setTextColor 同步）。nil = 无前缀。
+    var prefixIcon: NSImage? {
+        didSet {
+            guard prefixIcon !== oldValue else { return }
+            prefixIconView.image = prefixIcon
+            prefixIconView.isHidden = prefixIcon == nil
+            invalidateIntrinsicContentSize()
+            needsLayout = true
+        }
+    }
+    private let prefixIconSize: CGFloat = 10
+    private let prefixIconGap: CGFloat = 3
+    private let prefixIconView = NSImageView()
+
     private var mainFont: NSFont = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
     private var prefixFont: NSFont = .monospacedDigitSystemFont(ofSize: 7.8, weight: .semibold)
     private var lineH: CGFloat = 16
@@ -396,7 +424,9 @@ final class RollingNumberView: NSView {
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: slots.reduce(0) { $0 + slotWidth($1) }, height: lineH)
+        var w = slots.reduce(0) { $0 + slotWidth($1) }
+        if prefixIcon != nil { w += prefixIconGap + prefixIconSize }
+        return NSSize(width: w, height: lineH)
     }
 
     init() {
@@ -414,6 +444,8 @@ final class RollingNumberView: NSView {
             baselineProbe.trailingAnchor.constraint(equalTo: trailingAnchor),
             baselineProbe.topAnchor.constraint(equalTo: topAnchor),
         ])
+        prefixIconView.isHidden = true
+        addSubview(prefixIconView)
         setText("—", animated: false)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -467,17 +499,30 @@ final class RollingNumberView: NSView {
     /// 从左移入；变短时整组左移、移出高位列随组滑出后移除（周期切换等用户主动换值；
     /// 打开/后台刷新保持直接落值不变）。
     /// rollDuration：本次滚动/滑移的时长预算，仅 animated=true 时生效。
+    /// totalDuration：整段式时长（开面板补发口径，非 nil 时忽略 rollDuration）——先求本轮
+    /// 最大行进格数，把预算换算成「最长轮恰好占满 totalDuration」，其余车轮按格数等比
+    /// 提前落定（共享角速度、错峰到达的设计不变），整段动画从开始到停下恒为 totalDuration。
     func setText(_ text: String, animated: Bool, rollDuration: CFTimeInterval = 0.9,
-                 slideOnRebuild: Bool = false) {
+                 slideOnRebuild: Bool = false, totalDuration: CFTimeInterval? = nil) {
         endSlide()   // 在途滑移立即落定，防陈旧槽位干扰结构比对
         let structureChanged: Bool
         let chars = Array(text)
         let isDigit = chars.map { $0.isASCII && $0.isNumber }
         if chars.count == slots.count,
            zip(isDigit, slots).allSatisfy({ $0.0 == ($0.1.kind == .digit) }) {
+            var effectiveRoll = rollDuration
+            if animated, let total = totalDuration {
+                var maxCells = 0.0
+                for (i, ch) in chars.enumerated() where isDigit[i] {
+                    if let w = slots[i].view as? DigitWheelView, let d = ch.wholeNumberValue {
+                        maxCells = max(maxCells, w.plannedTravelCells(to: d))
+                    }
+                }
+                if maxCells > 0 { effectiveRoll = total * 10 / maxCells }
+            }
             for (i, ch) in chars.enumerated() {
                 if isDigit[i], let w = slots[i].view as? DigitWheelView, let d = ch.wholeNumberValue {
-                    w.setDigit(d, animated: animated, rollDuration: rollDuration)
+                    w.setDigit(d, animated: animated, rollDuration: effectiveRoll)
                 } else if let t = slots[i].view as? TextSlotView {
                     if t.text != String(ch) {
                         t.text = String(ch)
@@ -516,6 +561,7 @@ final class RollingNumberView: NSView {
     /// 设置整组前景色（hover 提亮/回暗；逐槽传播）
     func setTextColor(_ c: NSColor) {
         textColor = c
+        prefixIconView.contentTintColor = c
         for s in slots {
             if let w = s.view as? DigitWheelView { w.textColor = c }
             else if let t = s.view as? TextSlotView { t.textColor = c }
@@ -709,6 +755,12 @@ final class RollingNumberView: NSView {
                 e.view.frame.origin.x = e.startX + slideDelta * p
             }
         }
+        // 前缀图标贴最左槽左侧（右/左对齐下 slots.first 均为最左槽；滑移期随插值帧同步平移）
+        if prefixIcon != nil, let first = slots.first {
+            prefixIconView.frame = NSRect(x: first.view.frame.minX - prefixIconGap - prefixIconSize,
+                                          y: (lineH - prefixIconSize) / 2,
+                                          width: prefixIconSize, height: prefixIconSize)
+        }
         // TODO(诊断): 槽位坐标 dump（限前 24 次），定位偏右；确认后移除
         Self.posDiagCount += 1
         if Self.posDiagCount <= 24 {
@@ -757,10 +809,21 @@ final class RollingNumberView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // 面板重新可见：解冻挂起中的滚动（进度在隐藏期间未被推进）
-        if window != nil && tickerSuspended {
-            tickerSuspended = false
-            startTicker()
+        if window != nil {
+            // 面板重新可见：解冻挂起中的滚动（进度在隐藏期间未被推进）
+            if tickerSuspended {
+                tickerSuspended = false
+                startTicker()
+            }
+        } else {
+            // 离开窗口即拆 displayLink：NSView.displayLink 强持有 target、本视图又
+            // 强持有 link，唯一解除点原本在 deinit —— 成环后 deinit 永不执行，滚动
+            // 过一次的视图随卡片重建永久滞留（数字 strip 位图每位几十 KB）。
+            // tickerSuspended 保住「隐藏期冻结、回窗口续滚」语义：重新入窗经
+            // startTicker 重建 link。
+            tickerSuspended = true
+            link?.invalidate()
+            link = nil
         }
     }
 
@@ -831,8 +894,4 @@ final class RollingNumberView: NSView {
     }
     private static var perfFrames = 0
     private static var perfCosts: [CFTimeInterval] = []
-
-    deinit {
-        if let l = link { l.remove(from: .main, forMode: .common) }
-    }
 }
