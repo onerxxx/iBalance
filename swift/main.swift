@@ -2,6 +2,18 @@
 // macOS 菜单栏常驻应用（NSStatusItem），实时汇总多平台余额/积分。
 // 不依赖 Python/rumps，编译为单个 .app，内存占用 ~10MB。
 // 配置和缓存存放在 ~/Library/Application Support/com.local.ibalance，App 可自由移动或更新。
+//
+// ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
+// AppDelegate 内部分节   grep "// MARK: -" 一次全列出（菜单栏标题渲染 / 详情面板 / 菜单回调 /
+//                       App 自更新 / 请求编排 / ZCode·Codex 刷新 / Cockpit …）
+// 面板快照组装           makePanelSnapshot()（消费方 panel.update(...)，快照类型在 Panel.swift）
+// 刷新编排               performRefresh(seq:)（多服务并行，各自独立更新 UI）
+// 菜单栏标题渲染         updateTitle(tag:) / updateTitle(immediate:tag:) + TitleDebouncer（去抖）
+// AppDelegate 扩展       签到 CheckinManager.swift / 账号切换 AccountSwitcher.swift / pin 浮窗 PinWindow.swift
+// 服务层（网络查询）      Services/：DeepSeek / BigModelService(智谱) / Qwen / WorkBuddy / Trae / Zcode / Codex
+//
+// ⚠️ 本文件 = 编排层（入口 + 菜单栏 + 定时器 + 请求调度）。
+//    面板视图在 Panel.swift / PanelLayout.swift，控件在 Controls.swift，弹窗在 Dialogs.swift。
 
 import Cocoa
 import UserNotifications
@@ -95,6 +107,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 内容转移中标志：popover 关闭由 pin 转移引发，popoverDidClose 跳过
     /// 「记录事件时间戳 + NSApp.hide」（hide 会连浮动窗一起隐藏）
     var isTransferringPanel = false
+    /// 正在弹系统 NSAlert：popover 关闭由 alert 让路引发，popoverDidClose 跳过
+    /// NSApp.hide（hide 会把刚弹出的 modal alert 一起藏掉 → 弹窗闪退；
+    /// alert 结束后由 presentCheckResultAlert 自行归还焦点）
+    var isPresentingSystemAlert = false
     private var settingsMenu: NSMenu!
     /// 面板最近一次释放拖拽后的平台顺序；面板未拖拽前回退到 UserDefaults。
     private var menuBarPlatformOrder: [String]?
@@ -138,11 +154,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// WB 裂变包重置日（uid → 周期结束时间，副标题显示用）；拉取按小时节流
     private var cacheWbFission: [String: Date] = [:]
     private var wbFissionFetchedAt: Date?
-    var cacheTrae: (limit: Double, used: Double)?
-    /// TRAE 多账号额度缓存：uid → (limit, used)
-    var cacheTraeAccounts: [String: (limit: Double, used: Double)] = [:]
+    var cacheTrae: (limit: Double, used: Double, resetAt: Double)?
+    /// TRAE 多账号额度缓存：uid → (limit, used, resetAt)，resetAt 为订阅包重置戳（0=无订阅包）
+    var cacheTraeAccounts: [String: (limit: Double, used: Double, resetAt: Double)] = [:]
+    /// TRAE 套餐重置点最近采纳时刻（uid → 时间）：resetAt 节流用（≥1h 采纳一次）
+    private var traeResetAtAdoptedAt: [String: Date] = [:]
     /// ZCode 多账号额度缓存：uid → (remain, total, planEndsAt)，remain/total 为 token 数，planEndsAt 为免费套餐到期戳（0=无）
     private var cacheZcodeAccounts: [String: (remain: Double, total: Double, planEndsAt: TimeInterval)] = [:]
+    /// ZCode 账号级失效集合（token 过期/账号无套餐，业务码 401/500）：不判平台刷新失败，
+    /// 仅在卡片悬浮气泡 ID 后挂黄色徽章；每轮刷新重建
+    private var zcodeInvalidUids: Set<String> = []
     /// Codex usage 缓存：uid → (usedPercent, resetAt)
     private var cacheCodexAccounts: [String: (usedPercent: Double, resetAt: TimeInterval)] = [:]
     // 点阵脉冲状态：仅由真实数据刷新（refreshOne*）更新，面板开关 syncPanel 只读不写
@@ -363,7 +384,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             onRefresh()
         }
 
-        // 隐藏调试/演示开关：--show-panel 启动后自动弹出详情面板；--spin-demo 保持「刷新中…」状态（截图调试用）
+        // 隐藏调试/演示开关：--show-panel 启动后自动弹出详情面板；--spin-demo 保持「刷新中…」状态（截图调试用）；
+        // --update-demo 循环演示更新窗口全流程 UI（发现新版→下载→校验→安装，不出网不真替换）
         let spinDemo = CommandLine.arguments.contains("--spin-demo")
         if CommandLine.arguments.contains("--show-panel") || spinDemo {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
@@ -371,11 +393,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 if spinDemo { self?.panelView?.setRefreshing(true) }
             }
         }
+        if CommandLine.arguments.contains("--update-demo") {
+            Logger.log(.refresh, "[update-demo] flag detected: \(CommandLine.arguments)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                Logger.log(.refresh, "[update-demo] firing runUpdateDemo")
+                self?.runUpdateDemo()
+            }
+        }
 
         // Token 用量缓存预热：启动即触发后台构建（此后每 60s 自动重建），
         // 用户 hover 卡片时直接命中缓存，弹面板零等待
         ZcodeTokenStore.fetch { _ in }
         WBTokenStore.fetch { _ in }
+
+        // WB / ZCode 任务状态轮询（本机 SQLite 单行查询，15s 一轮）：
+        // 可见状态变化（含 10 分钟过期归零）时主线程回调同步面板
+        AgentTaskStatusStore.startPolling { [weak self] in
+            self?.syncPanel()
+        }
 
         // 自动签到：启动时检查 + 每小时轮询（本地日期守卫，每天最多一次网络请求）
         startCheckinTimer()
@@ -583,12 +618,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onToggleLightTheme = { [weak self] in self?.onToggleLightTheme() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
         panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
+        panel.onToggleStatusDebugPreview = { [weak self] in self?.onToggleStatusDebugPreview() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onCheckForUpdate = { [weak self] in self?.onCheckForUpdate() }
         panel.onToggleUpdateAutoCheck = { [weak self] in self?.onToggleUpdateAutoCheck() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
         panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
+        panel.onShareWbHistory = { [weak self] in self?.onShareWbHistory() }
         panel.onQuit = { [weak self] in self?.onQuit() }
         // 右上角 pin：置顶常驻——内容转移至无边框 NSPanel 浮动窗口（无箭头、
         // 浮层层级、背景原生拖动）；取消置顶时浮窗直接关闭
@@ -617,8 +654,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         panel.onClickWorkBuddy = { [weak self] in
             guard let self = self else { return }
-            self.openApp(bundleId: "com.workbuddy.workbuddy", missingTitle: "未找到 WorkBuddy 应用",
-                         missingMsg: "未找到 Bundle ID 为 com.workbuddy.workbuddy 的应用，请确认 WorkBuddy 已安装。")
+            self.openApp(bundleId: "com.tencent.workbuddy.mac", missingTitle: "未找到 WorkBuddy 应用",
+                         missingMsg: "未找到 Bundle ID 为 com.tencent.workbuddy.mac 的应用，请确认 WorkBuddy 已安装。")
             self.ensureCurrentAccountInMenuBar(prefix: MenuBarPrefix.wb,
                                                currentUid: WorkBuddyService.authInfo()?.uid)
             self.updateTitle(immediate: true, tag: "card-open-wb")
@@ -799,6 +836,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 记录关闭时正在处理的事件时间戳：transient「面板外点击」关闭时，
         // currentEvent 即该 click（onStatusItemClicked 用它识别同一 click，避免抖动重弹）
         lastCloseEventTime = NSApp.currentEvent?.timestamp ?? 0
+        // 为系统 NSAlert 让路的关闭不 hide：hide 会把刚弹出的 modal alert 一起
+        // 藏掉（弹窗一闪即逝的根因）；alert 结束后自行归还焦点
+        if isPresentingSystemAlert { return }
         NSApp.hide(nil)
     }
 
@@ -840,9 +880,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // 未配置日常额度（usedRatio=0）时隐藏点阵
         dsSnap.hideDots = dsSnap.usedRatio <= 0
-        // 复用 expireText 作为第二行副标题（external-link 图标 + 文本）；
+        // 复用 expireSegments 作为第二行副标题（external-link 图标 + 文本）；
         // 日常额度不再显示，恒为引导文案
-        dsSnap.expireText = "打开Harness"
+        dsSnap.expireSegments = ["打开Harness"]
         s.dsAccounts = [dsSnap]
         // ZhiPu 卡片：智谱 BigModel 可用余额（同多号管线单元素，uid 恒 "zhipu"，
         // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.zhipu）
@@ -857,10 +897,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             zpSnap.pulsing = zhipuPulsingTracker.isPulsing("main")
             zpSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.zhipu, isCurrent: true)
         }
-        zpSnap.expireText = "打开财务中心"
+        zpSnap.expireSegments = ["打开财务中心"]
         s.zhipuAccounts = [zpSnap]
         // Qwen 卡片：千问 Token Plan 周剩余百分比（同多号管线单元素，uid 恒 "qwen"，
-        // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.qwen）；副标题为套餐到期倒计时
+        // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.qwen）；副标题为 7 天限额重置倒计时
         var qwSnap = AccountCardSnapshot(uid: "qwen", nickname: "", isCurrent: true)
         if let q = cacheQwen, q.weekLimit > 0 {
             let pct = q.weekRem / q.weekLimit * 100
@@ -868,12 +908,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             qwSnap.usedRatio = min(1, max(0, 1 - pct / 100))
             qwSnap.pulsing = qwenPulsingTracker.isPulsing("main")
             qwSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.qwen, isCurrent: true)
-            if q.expireAt > 0 {
-                if let text = Self.expireCountdownText(endsAt: q.expireAt, suffix: "后到期") {
-                    qwSnap.expireText = text
+            // 副标题优先 = 7 天限额重置倒计时（同 WB/TRAE resetAt 口径）；
+            // 旧缓存无该字段或重置时刻已过 → 回落原套餐到期倒计时
+            if q.weekResetAt > 0, let text = Self.expireCountdownText(endsAt: q.weekResetAt) {
+                qwSnap.expireSegments = text
+            } else if q.expireAt > 0 {
+                if let text = Self.expireCountdownText(endsAt: q.expireAt) {
+                    qwSnap.expireSegments = text
                 } else {
                     qwSnap.expired = true
-                    qwSnap.expireText = "套餐已到期"
+                    qwSnap.expireSegments = ["套餐已到期"]
                 }
             }
         }
@@ -899,6 +943,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 // 与 orderedMenuBarEntries 同口径：有缓存数据且未被右键隐藏 → 菜单栏有条目
                 snap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.trae + ac.uid, isCurrent: isCurrent)
+                // 套餐重置时间副标题（仅当前账号）：订阅包 next_billing_time 倒计时
+                if isCurrent, c.resetAt > 0 {
+                    snap.expireSegments = Self.expireCountdownText(endsAt: c.resetAt)
+                }
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: UDKey.traeCheckinDate(ac.uid)) == today
             // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）；
@@ -937,9 +985,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
             snap.pulsing = wbPulsingTracker.isPulsing(ac.uid)
+            // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 10 分钟）
+            if isCurrent {
+                snap.taskState = AgentTaskStatusStore.workbuddyVisible
+            }
             // 裂变包重置日副标题（仅当前账号显示）：「裂变包 M-d 重置」
             if isCurrent, let resetAt = cacheWbFission[ac.uid] {
-                snap.expireText = Self.expireCountdownText(endsAt: resetAt.timeIntervalSince1970)
+                snap.expireSegments = Self.expireCountdownText(endsAt: resetAt.timeIntervalSince1970)
             }
             s.wbAccounts.append(snap)
         }
@@ -961,15 +1013,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 // 到期副标题：仅当前账号 + 有免费套餐（Start Plan）时显示，剩余时长 HH:mm（小时可超 24）
                 if isCurrent, c.planEndsAt > 0 {
                     if let text = Self.expireCountdownText(endsAt: c.planEndsAt) {
-                        snap.expireText = text
+                        snap.expireSegments = text
                     } else {
                         // Start Plan 已到期：卡片显示"套餐已到期"（中性灰，2026-08-27 取消红色提示），且不再参与定时刷新
                         snap.expired = true
-                        snap.expireText = "套餐已到期"
+                        snap.expireSegments = ["套餐已到期"]
                     }
                 }
             }
             snap.pulsing = zcodePulsingTracker.isPulsing(ac.uid)
+            // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 10 分钟）
+            if isCurrent {
+                snap.taskState = AgentTaskStatusStore.zcodeVisible
+            }
+            snap.tokenInvalid = zcodeInvalidUids.contains(ac.uid)
             s.zcodeAccounts.append(snap)
         }
         // Codex 多账号 usage 卡片：当前 auth.json 对应账号排首位，昵称固定显示邮箱。
@@ -989,11 +1046,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 snap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.codex + ac.uid, isCurrent: isCurrent)
                 // 到期副标题：仅当前账号显示，剩余时长格式同 ZCode（HH:mm，小时可超 24）
                 if isCurrent, c.resetAt > 0 {
-                    snap.expireText = Self.expireCountdownText(endsAt: c.resetAt) ?? "已到期"
+                    snap.expireSegments = Self.expireCountdownText(endsAt: c.resetAt) ?? ["已到期"]
                 }
             }
             snap.pulsing = codexPulsingTracker.isPulsing(ac.uid)
             s.codexAccounts.append(snap)
+        }
+        // 状态调试预览（设置卡片开关）：按面板 Agent 板块显示序，把三态光环轮派
+        // 前三张实际存在的 Agent 当前账号卡（进行中/完成/中断），覆盖真实状态供预览；
+        // 关闭即恢复：WB/ZCode 回到上方 store 真实值，TRAE/Codex 恒 nil（光环隐藏）。
+        // ⚠ TRAE/Codex 的光环视图在 rebuild 时才挂载（needsStatusRing 判定），
+        //   开关翻转由 Panel.update 检测变化清 uid 缓存强制重建，此处只负责数据
+        s.statusDebugPreview = config.statusDebugPreview
+        if config.statusDebugPreview {
+            let agentIDs = (panelView?.platformOrder ?? BalancePlatform.defaultOrder).filter {
+                panelView?.isAgentPlatform($0) ?? ($0 != "ds" && $0 != "zhipu" && $0 != "qwen")
+            }
+            let debugStates: [AgentTaskState] = [.running, .completed, .interrupted]
+            var slot = 0
+            func assignDebug(_ accounts: inout [AccountCardSnapshot]) {
+                guard slot < debugStates.count,
+                      let i = accounts.firstIndex(where: { $0.isCurrent }) else { return }
+                accounts[i].taskState = debugStates[slot]
+                slot += 1
+            }
+            for pid in agentIDs {
+                switch pid {
+                case "wb": assignDebug(&s.wbAccounts)
+                case "zcode": assignDebug(&s.zcodeAccounts)
+                case "trae": assignDebug(&s.traeAccounts)
+                case "codex": assignDebug(&s.codexAccounts)
+                default: break
+                }
+            }
         }
         // ── 日/周用量（本地差值基线，见 UsageStore；平台行 = 全部账号用量加总）──
         func fmtUsage(_ v: Double, percent: Bool, decimals: Int) -> String {
@@ -1238,6 +1323,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
+    /// 状态调试预览：切换开关（三态光环轮派前三张 Agent 卡演示动画；关闭恢复真实状态）。
+    @objc private func onToggleStatusDebugPreview() {
+        config.statusDebugPreview.toggle()
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
     /// 打开平台开关弹窗：保存后同步右键菜单、自动签到定时器和面板状态。
     @objc private func onManagePlatformToggles() {
         let oldConfig = config
@@ -1319,21 +1411,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Task { await runUpdateFlow(autoCheck: true, today: today) }
     }
 
-    /// 检查 → 确认 → 下载替换完整流程。autoCheck=true 时按静默模式收敛交互：
-    /// 无新版不弹窗、用户点「稍后再说」记 snooze 当日不再打扰；手动检查始终有结果反馈。
+    /// 更新进度窗（手动检查全程复用同一实例；关闭后再开自动重建）
+    private lazy var updateProgressWin = UpdateProgressWindowController()
+    /// 更新流程进行中标志：防止连点磁贴/自动检查与手动检查并发跑两条流程
+    private var updateFlowRunning = false
+
+    /// 检查 → 确认 → 下载替换完整流程。检查阶段（网络连通 + 版本比对）一律在后台
+    /// 静默进行，不出任何窗口；结果呈现按情况分流：
+    /// - 网络故障 / 无最新版本（手动检查）→ NSAlert 终态提示（自动检查保持静默）；
+    /// - 发现新版本（两种流程一致）→ 更新窗口「发现新版本」态展示更新日志（独立
+    ///   文本框），立即更新后窗口展示网络连通 → 版本信息 → 下载 → 校验 → 安装，
+    ///   任一环节失败原地给「重试 / 手动下载 / 关闭」出口。更新窗口全程非模态。
     @MainActor
     private func runUpdateFlow(autoCheck: Bool, today: String = "") async {
+        guard !updateFlowRunning else { return }
+        updateFlowRunning = true
+        defer { updateFlowRunning = false }
         do {
+            // 后台静默检查，不出窗口；fetchLatestRelease 内部 NWPath 离线瞬时判定 + API→atom 源回退
             let rel = try await UpdateService.fetchLatestRelease()
             if autoCheck {
                 UserDefaults.standard.set(today, forKey: UDKey.updateLastCheckDate)
             }
             let current = UpdateService.currentVersion()
             guard UpdateService.isNewer(rel.version, than: current) else {
+                // 手动检查无新版：NSAlert 终态提示，不拉更新窗口
                 if !autoCheck {
-                    presentInfoDialog(title: "已是最新版本",
-                                      info: "当前版本 v\(current)，GitHub Releases 上没有更新的发布。",
-                                      button: "好")
+                    presentCheckResultAlert(title: "已是最新版本",
+                                            message: "当前版本 v\(current)，GitHub Releases 上没有更新的发布。",
+                                            warning: false)
                 }
                 return
             }
@@ -1345,76 +1451,139 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty && !$0.lowercased().contains("sha256") }
                 .joined(separator: "\n")
-            if notes.count > 240 { notes = String(notes.prefix(240)) + "…" }
             if notes.isEmpty { notes = "（发布说明为空）" }
 
-            // 更新确认弹窗：主按钮「立即更新」在右（present 返回其 index），
-            // Esc/关闭与「稍后再说」同义。
-            // ⚠️ 必须 activate + keepPanelAliveDuring 包裹：
-            //   面板 transient 态会把 runModal 里的点击判为「面板外」→ popover 关闭 →
-            //   popoverDidClose 的 NSApp.hide 连坐把 modal 窗藏掉，主线程吊死在永不返回的
-            //   runModal 上（表象＝弹窗突然消失 + App 无窗口卡死）。
+            // 发现新版本：不再弹 DialogShell 模态确认框（runModal 与 popover transient 态
+            // 冲突，弹窗被连坐关闭 + 主线程吊死在永不返回的 runModal 上 → 闪退）。
+            // 改由进度窗直接切「发现新版本」态：更新日志独立滚动文本框 + 立即更新/稍后再说，
+            // 全程非模态，无 runModal。
             NSApp.activate(ignoringOtherApps: true)
-            let shell = DialogShell()
-            shell.addIcon(NSApp.applicationIconImage)
-            shell.addTitle("发现新版本 v\(rel.version)")
-            shell.contentWidth = DialogMetrics.width + 8 + 20
-            shell.addInfo("当前版本 v\(current)。\n\n"
-                + "\(notes)\n\n"
-                + "立即更新将关闭面板并后台下载安装包（约几秒到半分钟），校验通过后自动重启应用。"
-                + "配置保留在 Application Support 目录，不受更新影响。")
-            let idxInstall = shell.addButton("立即更新", keyEquivalent: "\r")
-            shell.addButton("稍后再说")
-            let choice = keepPanelAliveDuring { shell.present() }
-            if choice != idxInstall {
-                if autoCheck { UserDefaults.standard.set(today, forKey: UDKey.updateSnoozeDate) }
-                return
-            }
-            // 确认后先给一句可见的进行中提示再收面板：下载期间 App 无任何窗口的状态
-            // 会被当成「卡死」（下载受网络波动影响，必须让用户知道后台在干活）
-            let busy = DialogShell()
-            busy.addTitle("正在准备更新")
-            busy.addInfo("正在从 GitHub Releases 下载 v\(rel.version)，完成后将自动重启替换为新版。\n\n"
-                + "网络缓慢时可能需要一两分钟；若失败会弹窗告知，当前版本不受任何影响。")
-            busy.addButton("知道了", keyEquivalent: "\r")
-            NSApp.activate(ignoringOtherApps: true)
-            _ = keepPanelAliveDuring { busy.present() }
-            await performInstall(rel)
+            updateProgressWin.showUpdateAvailable(
+                version: rel.version,
+                current: current,
+                notes: notes,
+                onInstall: { [weak self] in
+                    Task { @MainActor in await self?.performInstall(rel) }
+                },
+                onLater: {
+                    if autoCheck { UserDefaults.standard.set(today, forKey: UDKey.updateSnoozeDate) }
+                })
         } catch {
             Logger.log(.refresh, "[update] check failed (auto=\(autoCheck)): \(error.localizedDescription)")
             guard !autoCheck else { return }   // 静默检查失败不打扰
-            presentInfoDialog(title: "检查更新失败", info: error.localizedDescription, button: "好")
+            // 手动检查失败（网络故障等）：NSAlert 终态提示
+            presentCheckResultAlert(title: "检查更新失败",
+                                    message: error.localizedDescription,
+                                    warning: true)
+        }
+    }
+
+    /// 手动检查的结果终态提示（无新版 / 检查失败）：NSAlert。
+    /// ⚠️ 两个连坐陷阱都必须拆掉：
+    /// ① 面板 transient 态会把 runModal 里的点击判为「面板外」→ popover 关闭——
+    ///    所以弹前先 performClose 收起面板；
+    /// ② performClose 触发的 popoverDidClose 里有 NSApp.hide（归还焦点），它会在
+    ///    alert 弹出后送达，把 modal 窗一起藏掉（弹窗一闪即逝）——所以置
+    ///    isPresentingSystemAlert 让 popoverDidClose 跳过 hide，alert 结束后自行归还。
+    private func presentCheckResultAlert(title: String, message: String, warning: Bool) {
+        isPresentingSystemAlert = true
+        defer { isPresentingSystemAlert = false }
+        popoverController?.performClose(nil)
+        floatingPanel?.orderOut(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = warning ? .warning : .informational
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        _ = alert.runModal()
+        // 归还焦点：仅当无其它可见窗口时（避免把更新窗口/浮窗连坐隐藏）
+        if !updateProgressWin.isVisible && !(floatingPanel?.isVisible ?? false) {
+            NSApp.hide(nil)
         }
     }
 
     /// 下载 → SHA256/签名校验 → 暂存到应用同级隐藏目录 → spawn 替换脚本 → 自动重启。
-    /// 任一步失败都未做改动（旧 bundle 完整在位），弹窗说明即可。
+    /// 任一步失败都未做改动（旧 bundle 完整在位）。全程驱动更新窗口（手动检查 /
+    /// 自动检查确认后共用），失败原地给「重试 / 手动下载 / 关闭」出口。
+    /// beginInstall 从发现新版态原地过渡：日志与标题原位保留，窗口零重置。
     @MainActor
     private func performInstall(_ rel: ReleaseInfo) async {
-        popoverController?.performClose(nil)
-        floatingPanel?.orderOut(nil)
+        let win = updateProgressWin
+        win.beginInstall(version: rel.version)
         do {
-            let staged = try await UpdateService.prepareAndStage(rel) { frac in
-                Logger.log(.refresh, "[update] progress \(Int(frac * 100))%")
-            }
+            let staged = try await UpdateService.prepareAndStage(rel, reporter: win.reporter)
+            win.report(UpdateProgress(stage: .install, state: .active, detail: "正在替换并重启…"))
             try UpdateService.installAndRestart(stagedURL: staged)   // 成功则内部 terminate 不再返回
+        } catch UpdateError.cancelled {
+            Logger.log(.refresh, "[update] cancelled by user")
+            win.closeWindow()
         } catch {
             Logger.log(.refresh, "[update] install failed: \(error.localizedDescription)")
             NSApp.activate(ignoringOtherApps: true)
-            presentInfoDialog(title: "更新失败",
-                              info: "下载或校验未完成，本次未做任何改动。\n\n\(error.localizedDescription)",
-                              button: "好")
+            win.showFailure(message: error.localizedDescription) { [weak self] in
+                Task { @MainActor in await self?.performInstall(rel) }
+            }
         }
     }
 
-    /// 轻量信息弹窗：更新检查触发时面板可能未打开，需自行激活 App 再跑模态
-    private func presentInfoDialog(title: String, info: String, button: String) {
-        NSApp.activate(ignoringOtherApps: true)
-        let shell = DialogShell()
-        shell.addTitle(title)
-        shell.addInfo(info)
-        shell.addButton(button, keyEquivalent: "\r")
-        _ = keepPanelAliveDuring { shell.present() }
+    // MARK: - 更新流程 UI 演示（--update-demo）
+
+    /// 循环演示更新窗口全流程 UI（不出网、不真替换）：
+    /// 发现新版 → 立即更新 → 下载（量化进度）→ 校验 → 暂存 → 安装完成
+    /// → 停 2s 回到「发现新版本」态，可反复点「立即更新」调试各状态过渡。
+    /// 点取消 = 结束演示（与真实流程的取消语义一致：关窗）。
+    @MainActor
+    private func runUpdateDemo() {
+        let notes = """
+        · 更新窗口重构：固定尺寸 + Phase 状态机，状态切换零重置零闪烁
+        · 检查更新后台化：无新版/网络故障改用系统弹窗提示
+        · 修复发现新版后弹窗与窗口闪退（runModal 连坐问题）
+        · 修复更新日志文本框选中复制、滚动体验
+        """
+        updateProgressWin.showUpdateAvailable(
+            version: "999.0.0",
+            current: UpdateService.currentVersion(),
+            notes: notes,
+            onInstall: { [weak self] in
+                Task { @MainActor in await self?.runInstallDemo() }
+            },
+            onLater: {})
+    }
+
+    @MainActor
+    private func runInstallDemo() async {
+        let win = updateProgressWin
+        win.beginInstall(version: "999.0.0")
+        // 下载：量化进度 0→1，约 6s（2.25 MB @ 380 KB/s）
+        let total: Int64 = 2_357_248
+        let steps = 24
+        for i in 1...steps {
+            if win.reporter.isCancelled() { win.closeWindow(); return }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            let f = Double(i) / Double(steps)
+            let received = Int64(Double(total) * f)
+            win.report(UpdateProgress(stage: .download, state: .active, fraction: f,
+                                      detail: String(format: "%.1f MB / %.1f MB · 380 KB/s",
+                                                     Double(received) / 1_048_576,
+                                                     Double(total) / 1_048_576),
+                                      received: received, total: total, bytesPerSecond: 380 * 1024))
+        }
+        if win.reporter.isCancelled() { win.closeWindow(); return }
+        // 校验：indeterminate（约 1.2s）
+        win.report(UpdateProgress(stage: .verify, state: .active, detail: "SHA256 + 签名校验中…"))
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        if win.reporter.isCancelled() { win.closeWindow(); return }
+        // 暂存到应用同级（约 0.8s）
+        win.report(UpdateProgress(stage: .stage, state: .active, detail: "暂存到应用同级目录…"))
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        if win.reporter.isCancelled() { win.closeWindow(); return }
+        // 安装：demo 停在满格完成态（不执行真实替换/重启），2s 后回到发现新版态循环
+        win.report(UpdateProgress(stage: .install, state: .done, fraction: 1,
+                                  detail: "演示完成 · 即将回到发现新版态"))
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        if win.reporter.isCancelled() { win.closeWindow(); return }
+        runUpdateDemo()
     }
 
     @objc private func onSetApiKey() {
@@ -1809,10 +1978,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         cacheBigModelCycleStartBalance = c.bigmodelCycleStartBalance
         cacheBigModelUsedRatio = c.bigmodelUsedRatio
         cacheQwen = c.qwen.map { QwenService.Quota(weekRem: $0.weekRem, weekLimit: $0.weekLimit,
-                                                   remainingDays: $0.remainingDays, expireAt: $0.expireAt) }
+                                                   remainingDays: $0.remainingDays, expireAt: $0.expireAt,
+                                                   weekResetAt: $0.weekResetAt ?? 0) }
         if let wb = c.wb { cacheWb = (wb.remain, wb.total) }
         cacheWbAccounts = c.wbAccounts.mapValues { ($0.remain, $0.total) }
-        cacheTraeAccounts = c.traeAccounts.mapValues { ($0.limit, $0.used) }
+        cacheTraeAccounts = c.traeAccounts.mapValues { ($0.limit, $0.used, $0.resetAt) }
         cacheZcodeAccounts = c.zcodeAccounts.mapValues { ($0.remain, $0.total, $0.planEndsAt) }
         cacheCodexAccounts = c.codexAccounts.mapValues { ($0.usedPercent, $0.resetAt) }
         lastUpdatedAt = c.lastUpdatedAt
@@ -1831,9 +2001,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         c.bigmodelCycleStartInflow = cacheBigModelCycleStartInflow
         c.bigmodelCycleStartBalance = cacheBigModelCycleStartBalance
         c.qwen = cacheQwen.map { .init(weekRem: $0.weekRem, weekLimit: $0.weekLimit,
-                                       remainingDays: $0.remainingDays, expireAt: $0.expireAt) }
+                                       remainingDays: $0.remainingDays, expireAt: $0.expireAt,
+                                       weekResetAt: $0.weekResetAt) }
         c.wbAccounts = cacheWbAccounts.mapValues { .init(remain: $0.remain, total: $0.total) }
-        c.traeAccounts = cacheTraeAccounts.mapValues { .init(limit: $0.limit, used: $0.used) }
+        c.traeAccounts = cacheTraeAccounts.mapValues { .init(limit: $0.limit, used: $0.used, resetAt: $0.resetAt) }
         c.zcodeAccounts = cacheZcodeAccounts.mapValues { .init(remain: $0.remain, total: $0.total, planEndsAt: $0.planEndsAt) }
         c.codexAccounts = cacheCodexAccounts.mapValues { .init(usedPercent: $0.usedPercent, resetAt: $0.resetAt) }
         c.lastUpdatedAt = lastUpdatedAt
@@ -2130,6 +2301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         Logger.log(.refresh, "[\(seq)] ZCode: accounts=\(accounts.count)")
+        zcodeInvalidUids.removeAll()   // 账号级失效集合每轮重建
         // 体验套餐（start-plan）JWT 仅当前登录号持有；余额查询时优先于存量 token（多为付费档 API Key）
         let startPlanJWT = ZcodeService.currentStartPlanJWT()
         for (i, ac) in accounts.enumerated() {
@@ -2149,12 +2321,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 每轮真实请求，到期展示交给快照层按最新 planEndsAt 判断
             // 体验套餐优先：账号即当前登录号且存量 token 不是 JWT 时，先用 JWT 查体验套餐
             // （billing/balance），无有效体验套餐（过期/未领取/请求失败）再回落存量 token 口径
-            let r: (remain: Double, total: Double, planEndsAt: TimeInterval)?
+            let r: ZcodeService.BalanceResult
             if let sp = startPlanJWT, sp.uid == ac.uid, sp.token != ac.token {
                 let primary = await Logger.measure("\(acctag).fetchBalance[startPlan]") {
                     await ZcodeService.fetchBalance(token: sp.token)
                 }
-                if let primary, primary.total > 0 {
+                if case .ok(let v) = primary, v.total > 0 {
                     r = primary
                 } else {
                     r = await Logger.measure("\(acctag).fetchBalance") {
@@ -2170,21 +2342,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
                 return
             }
-            guard let r = r else {
-                zcodeFailed = true  // 请求层失败（token 失效或网络错误）
+            switch r {
+            case .ok(let v):
+                guard v.total > 0 else {
+                    // 查询成功但无有效套餐（全部到期）：不判失败，保留旧缓存继续展示「套餐已到期」
+                    Logger.log(.refresh, "\(acctag): no active quota, keep last cache")
+                    zcodePulsingTracker.reset(ac.uid)
+                    continue
+                }
+                cacheZcodeAccounts[ac.uid] = v
+                UsageStore.observe(platform: "zcode", uid: ac.uid, value: v.remain / v.total * 100, increasing: false)
+                _ = zcodePulsingTracker.observe(ac.uid, ratio: (v.total - v.remain) / v.total)
+                Logger.log(.refresh, "\(acctag): OK remain=\(v.remain) total=\(v.total)")
+            case .accountInvalid:
+                // 账号级失效（token 过期 401 / 账号无套餐 500 等）：不判平台刷新失败，
+                // 悬浮气泡 ID 后挂黄色徽章，保留旧缓存
+                zcodeInvalidUids.insert(ac.uid)
+                zcodePulsingTracker.reset(ac.uid)
+                Logger.log(.refresh, "\(acctag): account invalid (token 过期或无套餐), badge only")
+                continue
+            case .networkFailed:
+                // 请求层失败（HTTP 非 200 / 网络/解析错误）：真正的平台级失败
+                zcodeFailed = true
                 Logger.log(.refresh, "\(acctag): request failed, marked failed")
                 continue
             }
-            guard r.total > 0 else {
-                // 查询成功但无有效套餐（全部到期）：不判失败，保留旧缓存继续展示「套餐已到期」
-                Logger.log(.refresh, "\(acctag): no active quota, keep last cache")
-                zcodePulsingTracker.reset(ac.uid)
-                continue
-            }
-            cacheZcodeAccounts[ac.uid] = r
-            UsageStore.observe(platform: "zcode", uid: ac.uid, value: r.remain / r.total * 100, increasing: false)
-            _ = zcodePulsingTracker.observe(ac.uid, ratio: (r.total - r.remain) / r.total)
-            Logger.log(.refresh, "\(acctag): OK remain=\(r.remain) total=\(r.total)")
             // ZCode 没有主账号单独刷新路径，每个账号写入后立即更新菜单栏。
             updateTitle(tag: "zcode-\(i)-\(seq)")
         }
@@ -2286,7 +2468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let mainUid = TraeService.readAuthInfo(storagePath: cfg.traeStoragePath)?.uid ?? ""
         var traeFailed = false
         let mainStart = Date()
-        let mainTrae: (limit: Double, used: Double)? = await Logger.measure("[\(seq)] TRAE.main.fetchCredits") {
+        let mainTrae: (limit: Double, used: Double, resetAt: Double)? = await Logger.measure("[\(seq)] TRAE.main.fetchCredits") {
             await TraeService.fetchCredits(storagePath: cfg.traeStoragePath)
         }
         if let t = mainTrae {
@@ -2296,7 +2478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             cacheTrae = t
             if !mainUid.isEmpty {
-                cacheTraeAccounts[mainUid] = t
+                cacheTraeAccounts[mainUid] = (t.limit, t.used, adoptTraeResetAt(uid: mainUid, candidate: t.resetAt))
                 UsageStore.observe(platform: "trae", uid: mainUid, value: t.used, increasing: true)
                 updatePulsingForTrae(uid: mainUid, limit: t.limit, used: t.used)
             }
@@ -2324,7 +2506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     Logger.log(.refresh, "\(acctag): not owner after fetch, skip writeback")
                     return
                 }
-                cacheTraeAccounts[ac.uid] = r
+                cacheTraeAccounts[ac.uid] = (r.limit, r.used, adoptTraeResetAt(uid: ac.uid, candidate: r.resetAt))
                 UsageStore.observe(platform: "trae", uid: ac.uid, value: r.used, increasing: true)
                 updatePulsingForTrae(uid: ac.uid, limit: r.limit, used: r.used)
                 Logger.log(.refresh, "\(acctag): OK limit=\(r.limit) used=\(r.used) (\(Int(Date().timeIntervalSince(ft0)*1000))ms)")
@@ -2351,6 +2533,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let cs0 = Date()
         await Logger.measure("[\(seq)] TRAE.checkinStatusFill") { await traeCheckinStatusFill() }
         Logger.log(.refresh, "[\(seq)] TRAE.checkinStatusFill done in \(Int(Date().timeIntervalSince(cs0)*1000))ms")
+    }
+
+    /// TRAE 套餐重置点采纳节流（≥1h，与 WB 裂变包同款口径）：
+    /// 积分（limit/used）每轮刷新照常更新；resetAt 仅在首次 / 旧周期已翻转 / 距上次
+    /// 采纳 ≥1h 时才写入新值。套餐数据与积分来自同一全量响应（ide_user_ent_usage
+    /// 无法按参数分离，已实测 require_usage 三种取值响应一致），网络层省不掉，
+    /// 故在数据写入层降低套餐（重置时间）的更新频率。
+    func adoptTraeResetAt(uid: String, candidate: Double) -> Double {
+        let now = Date()
+        let old = cacheTraeAccounts[uid]?.resetAt ?? 0
+        if old > now.timeIntervalSince1970,
+           let last = traeResetAtAdoptedAt[uid],
+           now.timeIntervalSince(last) < 3600 {
+            return old   // 旧周期未翻转且 1h 内已采纳 → 沿用旧值
+        }
+        traeResetAtAdoptedAt[uid] = now
+        return candidate
     }
 
     /// TRAE 脉冲计算：usedRatio = used/limit，上升 → pulsing=true（被消耗）；稳定/回升 → false
@@ -2503,9 +2702,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return 1
     }
 
-    /// 到期倒计时文案（ZCode/Codex 共用）：剩余 > 0 → "x天HH:mm 后到期" / "HH:mm 后到期"（天数与时间间不加间距）；
-    /// 已到期 → nil（由调用方给各自的红色提示文案）
-    private static func expireCountdownText(endsAt: TimeInterval, suffix: String = "后重置") -> String? {
+    /// 到期倒计时文案分段（ZCode/Codex/Qwen/WB/TRAE 共用）：返回 ["剩余","x天","HH:MM"]
+    /// 或 ["剩余","HH:MM"]；已到期 → nil（由调用方给各自的提示文案）。
+    /// 段间 2pt 间距由面板副标题 stack 布局提供（stack.spacing=2），不再用空格字符做间隔。
+    private static func expireCountdownText(endsAt: TimeInterval) -> [String]? {
         let remainSec = endsAt - Date().timeIntervalSince1970
         guard remainSec > 0 else { return nil }
         let total = Int(remainSec)
@@ -2513,9 +2713,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let h = (total % 86400) / 3600
         let m = (total % 3600) / 60
         if days > 0 {
-            return String(format: "%d天%02d:%02d\u{2009}%@", days, h, m, suffix)
+            return ["剩余", "\(days)天", String(format: "%02d:%02d", h, m)]
         }
-        return String(format: "%02d:%02d\u{2009}%@", h, m, suffix)
+        return ["剩余", String(format: "%02d:%02d", h, m)]
     }
 
     /// 通用系统通知通道（余额查询失败 / 切号失败回滚等一次性事件共用）：

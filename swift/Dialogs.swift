@@ -1,6 +1,16 @@
 // Dialogs.swift — iBalance
 // 弹窗统一封装:DialogShell 布局系统 + 各业务弹窗(InputDialog / DeepSeek 设置 / 平台自动化)
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
+//
+// ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
+// 布局常量    DialogMetrics（内容宽 240 / 输入类 280 / 边距 8 / 图标 64，集中处）
+// 统一壳      DialogShell（原生 NSAlert 薄封装；新弹窗一律走它，不要另起 NSAlert）
+// 业务弹窗    InputDialog / DeepSeekSettingsDialog / PlatformAutomationSettingsDialog
+//
+// ⚠️ 新弹窗三件套（血泪坑，详见 AGENT.md 陷阱 #6）：
+//    1) 标题/说明走 messageText + informativeText（系统排版），别自己堆 label；
+//    2) 需要自定义排版的内容放 accessoryView；
+//    3) 按钮用 addButton（第一个添加的在右侧 = 主操作、回车触发），取消按钮绑 Esc。
 
 import Cocoa
 import UserNotifications

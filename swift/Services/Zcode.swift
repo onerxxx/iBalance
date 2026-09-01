@@ -289,13 +289,21 @@ enum ZcodeService {
         token.split(separator: ".").count >= 3
     }
 
+    /// 查询结果三态（v2026.8.31 降级账号级告警）：
+    /// ok = 查询成功（total=0 表示无有效套餐，正常结果，保留旧缓存展示「套餐已到期」）；
+    /// accountInvalid = 业务码报账号级问题（zai code!=0 / bigmodel code 401、500 等：
+    /// token 失效、账号无套餐）——单账号问题不影响平台，不判平台刷新失败，仅记日志；
+    /// networkFailed = HTTP 非 200 / 网络/解析错误——请求层失败，才计入平台失败告警。
+    enum BalanceResult {
+        case ok(remain: Double, total: Double, planEndsAt: TimeInterval)
+        case accountInvalid
+        case networkFailed
+    }
+
     /// 查询指定账号的 Coding Plan 用量，按凭据形态分流：
     /// JWT（zai/bigmodel 免费档）→ zcode.z.ai billing/balance；
     /// API Key（bigmodel 付费档 Lite 等）→ open.bigmodel.cn monitor/usage/quota/limit。
-    /// 返回 nil = 请求层失败（HTTP 非 200 / code 异常 / 网络/解析错误，如 token 失效）；
-    /// 返回 (0, 0, 0) = 查询成功但无有效套餐（全部到期/limits 为空）——对齐 Cockpit：
-    /// code 异常才算错误，空数据是正常结果，由调用方保留旧缓存展示「套餐已到期」。
-    static func fetchBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
+    static func fetchBalance(token: String) async -> BalanceResult {
         if isJWT(token) { return await fetchZaiBalance(token: token) }
         return await fetchBigModelBalance(apiKey: token)
     }
@@ -303,11 +311,11 @@ enum ZcodeService {
     /// zai 渠道：汇总 balances 数组各 entitlement 的 remaining_units / total_units（均为 token 数）。
     /// planEndsAt 为当前生效的免费套餐（Start Plan，plan_id 含 "start"）的到期时间戳（秒），
     /// 无免费套餐时为 0（调用方不显示到期副标题）。
-    private static func fetchZaiBalance(token: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
-        guard let version = zcodeAppVersion, let deviceMid else { return nil }
-        guard var comps = URLComponents(string: balanceURL) else { return nil }
+    private static func fetchZaiBalance(token: String) async -> BalanceResult {
+        guard let version = zcodeAppVersion, let deviceMid else { return .networkFailed }
+        guard var comps = URLComponents(string: balanceURL) else { return .networkFailed }
         comps.queryItems = [URLQueryItem(name: "app_version", value: version)]
-        guard let url = comps.url else { return nil }
+        guard let url = comps.url else { return .networkFailed }
         let (data, status) = await HTTP.requestWithRetry(
             url: url, method: "GET",
             headers: ["Authorization": "Bearer \(token)", "Accept": "application/json",
@@ -315,8 +323,11 @@ enum ZcodeService {
             timeout: 15
         )
         guard status == 200, let data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (json["code"] as? Int) == 0 else { return nil }
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .networkFailed
+        }
+        // zai 体系业务码非 0 = 账号级问题（token 失效等），降级为账号失效，不判平台失败
+        guard (json["code"] as? Int) == 0 else { return .accountInvalid }
         let d = (json["data"] as? [String: Any]) ?? [:]
         let balances = (d["balances"] as? [[String: Any]]) ?? []
         var remain = 0.0
@@ -336,23 +347,25 @@ enum ZcodeService {
                 }
             }
         }
-        return (remain, total, planEndsAt)
+        return .ok(remain: remain, total: total, planEndsAt: planEndsAt)
     }
 
     /// bigmodel 付费 Coding Plan（Lite 等）：data.limits[] 各窗口的 usage/currentValue/remaining。
     /// 数值取 remaining 最小的一条（最紧约束）；planEndsAt 取 nextResetTime 最晚的一条
     ///（月度窗口重置点，语义贴近「到期」副标题；毫秒戳转秒）。
-    private static func fetchBigModelBalance(apiKey: String) async -> (remain: Double, total: Double, planEndsAt: TimeInterval)? {
-        guard let url = URL(string: bigModelQuotaURL) else { return nil }
+    private static func fetchBigModelBalance(apiKey: String) async -> BalanceResult {
+        guard let url = URL(string: bigModelQuotaURL) else { return .networkFailed }
         let (data, status) = await HTTP.requestWithRetry(
             url: url, method: "GET",
             headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"],
             timeout: 15
         )
-        // bigmodel 开放平台业务码为 200（zai 体系是 0），401/403 = key 失效
         guard status == 200, let data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (json["code"] as? Int) == 200 else { return nil }
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .networkFailed
+        }
+        // bigmodel 业务码非 200（401 令牌过期 / 500 无套餐等）= 账号级问题，降级不判平台失败
+        guard (json["code"] as? Int) == 200 else { return .accountInvalid }
         let d = (json["data"] as? [String: Any]) ?? [:]
         let limits = (d["limits"] as? [[String: Any]]) ?? []
         var remain = 0.0
@@ -374,6 +387,6 @@ enum ZcodeService {
                 if planEndsAt == 0 || reset > planEndsAt { planEndsAt = reset }
             }
         }
-        return (remain, total, planEndsAt)
+        return .ok(remain: remain, total: total, planEndsAt: planEndsAt)
     }
 }

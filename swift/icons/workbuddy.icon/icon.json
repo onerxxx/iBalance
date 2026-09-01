@@ -1,0 +1,47 @@
+{
+  "features" : [
+    "refractivity",
+    "specular-location"
+  ],
+  "fill" : "system-dark",
+  "groups" : [
+    {
+      "blur-material" : null,
+      "hidden" : false,
+      "layers" : [
+        {
+          "fill" : "none",
+          "image-name" : "workbuddy 2.svg",
+          "name" : "workbuddy 2",
+          "position" : {
+            "scale" : 64.44,
+            "translation-in-points" : [
+              3,
+              14
+            ]
+          }
+        }
+      ],
+      "refractivity" : {
+        "depth" : 0.270859375,
+        "enabled" : true,
+        "strength" : 0.266953125
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0
+      },
+      "specular" : "inside",
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.3
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

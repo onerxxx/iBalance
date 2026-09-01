@@ -1,7 +1,19 @@
-// ZcodeTokens.swift — ZCode 卡片 hover 子面板：Token 用量统计
-// 数据源 = 本机 ZCode 会话库 ~/.zcode/cli/db/db.sqlite（model_usage 表，每次 LLM 请求一行，
-// 含 input/output/reasoning/cache 拆分）。总计口径 = input + output 相加（与 ZCode
-// computed_total_tokens 一致，reasoning 是 output 子集、cache_read 是 input 子集，均不另加）。
+// TokensPanel.swift — Token 板块通用代码（ZCode / WorkBuddy 共用：卡片 hover 子面板与主面板内嵌板块）
+// ZCode 数据源 = 本机会话库 ~/.zcode/cli/db/db.sqlite（model_usage 表，每次 LLM 请求一行，
+// 含 input/output/reasoning/cache 拆分；WB 数据源在 WbTokens.swift）。总计口径 = input + output
+// 相加（与 ZCode computed_total_tokens 一致，reasoning 是 output 子集、cache_read 是 input 子集，均不另加）。
+//
+// ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
+// 缓存壳         TokenStoreCache（60s 后台重建；fetch 只回缓存，首次无缓存挂起回调主线程补发）
+// 查询 / 聚合     ZcodeTokenStore（SQLite 读取）；数据模型 TokenSummary / TokenDayUsage
+// 周期            TokenPeriod（日/周）+ TokenPeriodWindows
+// 数据源来源       TokensPanelSource（.zcode / .workbuddy：卡片 hover 子面板与主面板内嵌板块共用）
+// 面板视图         TokensPanelView（数值 + 热力图 + hover 气泡）
+// 主面板内嵌挂载    extension BalancePanelView（「Token」板块复用同一个 TokensPanelView）
+//
+// ⚠️ 热力图与 hover 气泡是**自绘**的（draw(_:) 画格子、mouseMoved 按 dotCells 命中测试、
+//    drawTooltip 画气泡）——不是 NSView，不走约束/hover 协议/自动布局。
+//    改气泡样式改 drawTooltip，别去找 tooltip 控件（找不到）。
 import Cocoa
 import SQLite3
 
@@ -12,19 +24,19 @@ import SQLite3
 /// 挂起回调、构建完成后主线程补发（含构建失败 nil，避免每次弹面板反复重试）。
 final class TokenStoreCache {
     private let queue: DispatchQueue
-    private let build: () -> ZcodeTokenSummary?
-    private var cached: (summary: ZcodeTokenSummary?, at: Date)?
-    private var pending: [(ZcodeTokenSummary?) -> Void] = []
+    private let build: () -> TokenSummary?
+    private var cached: (summary: TokenSummary?, at: Date)?
+    private var pending: [(TokenSummary?) -> Void] = []
     private var timer: DispatchSourceTimer?
     private let interval: TimeInterval = 60
 
-    init(label: String, build: @escaping () -> ZcodeTokenSummary?) {
+    init(label: String, build: @escaping () -> TokenSummary?) {
         queue = DispatchQueue(label: label, qos: .userInitiated)
         self.build = build
     }
 
     /// 取汇总：有缓存同步返回（主线程），无缓存挂起待构建完成回调
-    func fetch(completion: @escaping (ZcodeTokenSummary?) -> Void) {
+    func fetch(completion: @escaping (TokenSummary?) -> Void) {
         if let c = cached {
             completion(c.summary)
             return
@@ -59,7 +71,7 @@ enum TokensPanelSource {
     /// 面板首行标题 = 平台名
     var platformName: String { self == .zcode ? "ZCode" : "WorkBuddy" }
     /// 异步取汇总（各数据仓后台每 60s 重建缓存，fetch 只回缓存，主线程回调）
-    func fetch(completion: @escaping (ZcodeTokenSummary?) -> Void) {
+    func fetch(completion: @escaping (TokenSummary?) -> Void) {
         switch self {
         case .zcode: ZcodeTokenStore.fetch(completion: completion)
         case .workbuddy: WBTokenStore.fetch(completion: completion)
@@ -91,13 +103,13 @@ enum TokenPeriodWindows {
 
 /// 单日 token 用量（本地时区当日零点时间戳 + input+output 合计）
 /// Equatable：热力图 cells 缓存按 daily 数组比对失效
-struct ZcodeDayUsage: Equatable {
+struct TokenDayUsage: Equatable {
     let dayStart: TimeInterval
     let tokens: Int64
 }
 
 /// 本机 token 用量汇总（列表行按用量降序；WB 数据源另带模型分组）
-struct ZcodeTokenSummary {
+struct TokenSummary {
     struct ProjectUsage {
         let name: String   // 项目名（会话目录末段）/ 模型名
         let tokens: Int64  // input + output
@@ -110,7 +122,7 @@ struct ZcodeTokenSummary {
     var models: [ProjectUsage] = []
     let requestCount: Int64
     /// 按天用量（词元活动热力图数据源，仅含有用量的天）
-    let daily: [ZcodeDayUsage]
+    let daily: [TokenDayUsage]
     /// 各周期总计词元（5H/1D/1W/1M 首行切换；窗口起点 = TokenPeriodWindows，
     /// 数据仓构建时按当前时刻聚合，60s 重建自然滚动窗口）
     var periodTotals: [TokenPeriod: Int64] = [:]
@@ -124,7 +136,7 @@ enum ZcodeTokenStore {
     ///    immutable 跳过锁与 shm 直读主文件（干净退出后主文件即完整数据，无损失）；
     /// ③ 克隆副本兜底——把 db+-wal+-shm 复制到临时目录（APFS clonefile 秒级）再 immutable
     ///    查询，覆盖辅助文件损坏等罕见态。
-    private static func query() -> ZcodeTokenSummary? {
+    private static func query() -> TokenSummary? {
         let path = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite"
         guard FileManager.default.fileExists(atPath: path) else { return nil }
         if let s = queryDB(path: path, immutable: false) ?? queryDB(path: path, immutable: true) {
@@ -134,7 +146,7 @@ enum ZcodeTokenStore {
     }
 
     /// 按 plain 只读或 immutable URI 打开并聚合；任何失败返回 nil
-    private static func queryDB(path: String, immutable: Bool) -> ZcodeTokenSummary? {
+    private static func queryDB(path: String, immutable: Bool) -> TokenSummary? {
         var db: OpaquePointer?
         if immutable {
             let escaped = path.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlPathAllowed) ?? path
@@ -155,7 +167,7 @@ enum ZcodeTokenStore {
 
     /// 克隆 db 与辅助文件到临时目录后查询（immutable；副本归本进程所有，恢复/建 shm 无障碍）。
     /// APFS 上 copyItem 走 clonefile，近乎零拷贝。
-    private static func querySnapshotCopy(path: String) -> ZcodeTokenSummary? {
+    private static func querySnapshotCopy(path: String) -> TokenSummary? {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ibalance-zcode-\(UUID().uuidString)", isDirectory: true)
         do {
@@ -174,11 +186,11 @@ enum ZcodeTokenStore {
     }
 
     /// 在已打开的连接上跑项目聚合 + 按天聚合 + 周期总计三条 SQL
-    private static func runAggregates(db: OpaquePointer?) -> ZcodeTokenSummary? {
-        var projects: [ZcodeTokenSummary.ProjectUsage] = []
-        var models: [ZcodeTokenSummary.ProjectUsage] = []
+    private static func runAggregates(db: OpaquePointer?) -> TokenSummary? {
+        var projects: [TokenSummary.ProjectUsage] = []
+        var models: [TokenSummary.ProjectUsage] = []
         var requests: Int64 = 0
-        var daily: [ZcodeDayUsage] = []
+        var daily: [TokenDayUsage] = []
         var periodTotals: [TokenPeriod: Int64] = [:]
 
         var stmt: OpaquePointer?
@@ -198,29 +210,48 @@ enum ZcodeTokenStore {
                 requests += sqlite3_column_int64(stmt, 2)
                 // 项目名 = 目录末段（(未知项目) 原样保留）；完整目录随行携带供点击打开
                 let name = dir == "(未知项目)" ? dir : (dir as NSString).lastPathComponent
-                projects.append(ZcodeTokenSummary.ProjectUsage(name: name, tokens: tokens,
+                projects.append(TokenSummary.ProjectUsage(name: name, tokens: tokens,
                                                                path: dir == "(未知项目)" ? nil : dir))
             }
         }
         sqlite3_finalize(stmt)
 
-        // 按模型聚合（口径与 WB 数据源一致：input + output 降序），供「项目/模型」切换
+        // 按模型聚合（口径与 WB 数据源一致：input + output 降序），供「项目/模型」切换；
+        // 大小写变体归并为一行（GLM-5.3-Flash / glm-5.3-flash），展示名优先带大写的写法，
+        // 同档取用量大的写法，全小写时回落小写
         let modelSQL = """
             SELECT model_id,
                    SUM(input_tokens) + SUM(output_tokens)
             FROM model_usage
             GROUP BY model_id
             HAVING SUM(input_tokens) + SUM(output_tokens) > 0
-            ORDER BY 2 DESC
             """
+        // key = 小写模型名；value = (累计词元, 展示名, 展示名写法的词元)
+        var modelAggs: [String: (tokens: Int64, name: String, nameTokens: Int64)] = [:]
         if sqlite3_prepare_v2(db, modelSQL, -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let name = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "(未知模型)"
                 let tokens = sqlite3_column_int64(stmt, 1)
-                models.append(ZcodeTokenSummary.ProjectUsage(name: name, tokens: tokens))
+                let key = name.lowercased()
+                var agg = modelAggs[key] ?? (0, "", -1)
+                agg.tokens += tokens
+                let curUpper = name != key
+                let dispUpper = !agg.name.isEmpty && agg.name != agg.name.lowercased()
+                let replace: Bool
+                if agg.name.isEmpty { replace = true }
+                else if curUpper != dispUpper { replace = curUpper }   // 大写写法优先
+                else { replace = tokens > agg.nameTokens }             // 同档取用量大的
+                if replace {
+                    agg.name = name
+                    agg.nameTokens = tokens
+                }
+                modelAggs[key] = agg
             }
         }
         sqlite3_finalize(stmt)
+        models = modelAggs.values
+            .map { TokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
+            .sorted { $0.tokens > $1.tokens }
 
         // 按天聚合（本地时区日界），供「词元活动」热力图
         let daySQL = """
@@ -237,7 +268,7 @@ enum ZcodeTokenStore {
                 let dayStr = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
                 let tokens = sqlite3_column_int64(stmt, 1)
                 if let day = fmt.date(from: dayStr), tokens > 0 {
-                    daily.append(ZcodeDayUsage(dayStart: day.timeIntervalSince1970, tokens: tokens))
+                    daily.append(TokenDayUsage(dayStart: day.timeIntervalSince1970, tokens: tokens))
                 }
             }
         }
@@ -267,7 +298,7 @@ enum ZcodeTokenStore {
 
         let total = projects.reduce(Int64(0)) { $0 + $1.tokens }
         periodTotals[.all] = total   // All = 全量总计，无窗口
-        return projects.isEmpty ? nil : ZcodeTokenSummary(totalTokens: total, projects: projects,
+        return projects.isEmpty ? nil : TokenSummary(totalTokens: total, projects: projects,
                                                           models: models,
                                                           requestCount: requests, daily: daily.sorted { $0.dayStart < $1.dayStart },
                                                           periodTotals: periodTotals)
@@ -275,7 +306,7 @@ enum ZcodeTokenStore {
 
     /// 异步取汇总：后台每 60s 重建缓存，fetch 只回缓存不触发读取
     private static let cache = TokenStoreCache(label: "ibalance.zcodeTokens") { Self.query() }
-    static func fetch(completion: @escaping (ZcodeTokenSummary?) -> Void) {
+    static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
 
@@ -318,11 +349,15 @@ enum ZcodeTokenStore {
 
 // MARK: - 面板视图（总计词元大数字 + 模型列表 + 词元活动热力图，draw 自绘）
 
-final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
-    var summary: ZcodeTokenSummary? {
+final class TokensPanelView: NSView, PanelScrollHoverSync {
+    var summary: TokenSummary? {
         didSet {
             hoveredListRow = nil
-            syncTotalRoll()
+            metricsDirty = true
+            // 平台切换换值：大数字走整组滑移（旧平台值滚到新值，与周期切换同款）
+            let slide = slideNextTotalRoll
+            slideNextTotalRoll = false
+            syncTotalRoll(slideOnRebuild: slide)
             if oldValue?.totalTokens != summary?.totalTokens
                 || oldValue?.projects.count != summary?.projects.count {
                 invalidateIntrinsicContentSize()
@@ -340,6 +375,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     var monoFontEnabled = false {
         didSet {
             totalRollView.refreshFont()
+            metricsDirty = true   // 字体变了 → 所有文本度量缓存作废
             // 行距随墨迹推导（大数字 ascender 同理）：字体切换后固有高度已变，需失效重排
             invalidateIntrinsicContentSize()
             needsDisplay = true
@@ -347,8 +383,15 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 数据源分流（ZCode=项目 / WorkBuddy=模型）：影响区块标题与行图标
     var source: TokensPanelSource = .zcode {
-        didSet { guard oldValue != source else { return }; needsDisplay = true }
+        didSet {
+            guard oldValue != source else { return }
+            metricsDirty = true   // 平台名宽度随 source 变化
+            needsDisplay = true
+        }
     }
+    /// 平台切换动效置位：下一次 summary 落值时大数字整组滑移（旧平台值滚到新值）。
+    /// 一次性消费；切换后无数据的分支走 setText("—") 不受影响
+    private var slideNextTotalRoll = false
 
     // MARK: 总计周期切换（5H/1D/1W/1M）
 
@@ -375,6 +418,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         didSet {
             guard oldValue != listMode else { return }
             hoveredListRow = nil
+            metricsDirty = true   // 行内容随列表模式变化
             invalidateIntrinsicContentSize()
             needsDisplay = true
             onActivityModeChanged?()   // 复用：切换后同步 popover 尺寸
@@ -404,6 +448,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         didSet {
             guard oldValue != activityMode else { return }
             hoveredDot = nil
+            dotsImagesDirty = true   // 点阵数据变 → 淡变位图重烘
             invalidateIntrinsicContentSize()
             needsDisplay = true
             onActivityModeChanged?()
@@ -419,7 +464,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     /// activityCells() 结果缓存（单槽）：draw 高频（hover 移动/切换动效逐帧重绘），
     /// 输入 = summary.daily + activityMode + 窗口起点，三者不变即整表复用——
     /// 原实现每次 draw 全量重算 182 格并逐格生成日期文案
-    private var activityCellsCache: (daily: [ZcodeDayUsage], mode: ActivityMode,
+    private var activityCellsCache: (daily: [TokenDayUsage], mode: ActivityMode,
                                      windowStart: Date, cells: [ActivityCell])?
     /// 热力图格子（缓存单元）：几何随 pitch/bounds 在 draw 现算，这里只留数据。
     /// tokens = 亮度源（每日 = 当天用量；每周 = 周合计，列内未点亮行记 0）；
@@ -443,7 +488,9 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     static let maxListRows = 4
     /// 项目行点击的文件夹打开应用（用户指定 QSpace Pro；未安装回退系统默认）
     private static let folderOpenerBundleID = "com.jinghaoshe.qspace.pro"
-    private static let contentWidth: CGFloat = 240
+    // 标称版心宽：2026-09-01 随主面板收窄 20pt（240→230）；自绘元素按实际 bounds
+    // 等比适配（热力图点距均分、列表行撑满），仅 intrinsic/未布局回退时用此标称值
+    private static let contentWidth: CGFloat = 230
     /// 列表行距 = 行墨迹高 + 2×rowInset：文字在行带内居中后上下各留 2.5pt，
     /// 行间墨迹空隙恒 5pt，与用量表格（usageRowTop/BottomInset）同源同口径；
     /// Mono 墨迹更高时行距自动放宽
@@ -529,6 +576,8 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         if bounds.width != lastLaidOutWidth {
             lastLaidOutWidth = bounds.width
             dotStamps.removeAll()
+            metricsDirty = true     // 几何变了 → 度量缓存作废
+            dotsImagesDirty = true  // 点阵位图按新几何重烘
             invalidateIntrinsicContentSize()
         }
         totalRollView.frame = NSRect(x: insets.left, y: numberRowY,
@@ -612,9 +661,15 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     private var activityAxisHeight: CGFloat { 4 + labelInkHeight }
     /// 热力图列几何：窗口周列数 + 点距（可用宽均分，正圆 = 点距 - 2）。
     /// 窗口 = 最近 5 个整月：firstMonth = 4 个月前当月 1 号，start = 其所在周的周一，末列 = 今天所在周。
+    /// 热力图窗口日级缓存：窗口锚点跨天才会变（首月 1 号所在周的周一 / 列数），
+    /// 原实现每次调用都做 Calendar 组件运算（draw/pitch/intrinsic 高频路径）
+    private var activityWindowCache: (day: Date, start: Date, cols: Int, firstMonth: Date)?
     private func activityWindow() -> (start: Date, cols: Int, firstMonth: Date) {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
+        if let c = activityWindowCache, cal.isDate(c.day, inSameDayAs: today) {
+            return (c.start, c.cols, c.firstMonth)
+        }
         func monday(of d: Date) -> Date {
             let back = (cal.component(.weekday, from: d) + 5) % 7
             return cal.date(byAdding: .day, value: -back, to: d) ?? d
@@ -627,10 +682,12 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         let start = monday(of: firstOfMonth)
         let todayMonday = monday(of: today)
         let days = cal.dateComponents([.day], from: start, to: todayMonday).day ?? 0
-        return (start, days / 7 + 1, firstOfMonth)
+        let cols = days / 7 + 1
+        activityWindowCache = (today, start, cols, firstOfMonth)
+        return (start, cols, firstOfMonth)
     }
     /// 点距 = 实际版心宽 / 周列数（精确均分，不取整）：网格恰撑满版心，
-    /// 最右点列与模型表的百分比右缘对齐；正圆 = 点距 - 2（格内四周各缩 1pt）。
+    /// 最右点列与模型表的百分比右缘对齐；正圆 = 点距 - 2.5（格内四周各缩 1.25pt）。
     /// 嵌入宽度 ≠ intrinsic 标称宽时按实际 bounds 等比放大（未布局时回退标称宽）
     private var activityPitch: CGFloat {
         let width = bounds.width > 0 ? bounds.width : Self.contentWidth
@@ -640,7 +697,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     override var intrinsicContentSize: NSSize {
         // 行数取当前列表视图（模型视图空数据时回落项目，与 draw 的 showModels 逻辑一致）
-        let active = summary.flatMap { s -> [ZcodeTokenSummary.ProjectUsage] in
+        let active = summary.flatMap { s -> [TokenSummary.ProjectUsage] in
             (listMode == .models && !s.models.isEmpty) ? s.models : s.projects
         } ?? []
         let rows = min(active.count, Self.maxListRows)
@@ -759,6 +816,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        rebuildMetricsIfNeeded()   // 文本度量/月份轴/行文本缓存：数据或字体变化时一次性重建
         let labelFont = makeLabelFont()
         let labelColor = NSColor.secondaryLabelColor
         // 区块标题统一系统灰 = 小表格口径（与列表行同色；切换文案的未选中态仍用次级灰）
@@ -768,25 +826,20 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         let titleFont = makeTitleFont()
         drawText(source.platformName, at: NSPoint(x: insets.left, y: totalLabelTop),
                  font: titleFont, color: titleColor)
-        let nameWidth = (source.platformName as NSString).size(withAttributes: [.font: titleFont]).width
-        drawText("总计", at: NSPoint(x: insets.left + ceil(nameWidth) + 4, y: totalLabelTop),
+        drawText("总计", at: NSPoint(x: insets.left + ceil(cachedNameWidth) + 4, y: totalLabelTop),
                  font: titleFont, color: titleColor)
 
         // ── 首行右侧：周期切换（5H/1D/1W/1M；样式同项目/模型切换：选中主前景/未选次级灰）──
         periodToggleRects = []
-        let pGap: CGFloat = 6
-        let pWidths = TokenPeriod.allCases.map {
-            $0.label.size(withAttributes: [.font: labelFont]).width
-        }
-        let pTotal = pWidths.reduce(0, +) + pGap * CGFloat(TokenPeriod.allCases.count - 1)
-        var px = bounds.width - insets.right - pTotal
+        let pWidths = cachedPeriodWidths
+        var px = bounds.width - insets.right - cachedPeriodTotal
         let pY = totalLabelTop + (titleInkHeight - labelFont.boundingRectForFont.height) / 2
         for (i, p) in TokenPeriod.allCases.enumerated() {
             drawText(p.label, at: NSPoint(x: px, y: pY), font: labelFont,
                      color: period == p ? Palette.cardForeground : labelColor)
             periodToggleRects.append(NSRect(x: px, y: totalLabelTop,
                                             width: pWidths[i], height: titleInkHeight))
-            px += pWidths[i] + pGap
+            px += pWidths[i] + 6
         }
 
         // ── 总计大数字：RollingNumberView 子视图渲染（layout() 定位，summary didSet 驱动滚动）──
@@ -803,8 +856,8 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         modelToggleRect = .zero
         if !allModels.isEmpty {
             let tFont = labelFont
-            let modelW = "模型".size(withAttributes: [.font: tFont]).width
-            let projW = "项目".size(withAttributes: [.font: tFont]).width
+            let modelW = cachedToggleModelW
+            let projW = cachedToggleProjW
             // 切换文案在标题行带内垂直居中（标题 10pt 比切换文案 9pt 高半档）
             let tY = sectionY + (titleInkHeight - tFont.boundingRectForFont.height) / 2
             let mX = bounds.width - insets.right - modelW
@@ -827,7 +880,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             }
         } else if let summary {
             // 行字体 = 用量行同款（小表格口径）：名称/百分比 medium，数值等宽数字；
-            // 切换过渡期按逐行交错进度绘制(自下方 6pt 上移淡入),常态直绘零开销
+            // 切换过渡期按逐行交错进度绘制(行遮罩显影:行带内自下缘上滑入位),常态直绘零开销
             let nameFont = SmallTable.rowFont(mono: monoFontEnabled)
             let valueFont = SmallTable.rowFont(mono: monoFontEnabled, monoDigits: true)
             let pctFont = SmallTable.rowFont(mono: monoFontEnabled)
@@ -849,8 +902,13 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         drawActivitySection(topY: activityTitleTop(rows: projects.count),
                             gridTop: activityGridTop(rows: projects.count),
                             labelFont: labelFont, labelColor: labelColor, titleColor: titleColor)
-        // 行命中框/可点击路径已随本次绘制更新：重挂光标矩形（draw 低频，开销可忽略）
-        window?.invalidateCursorRects(for: self)
+        // 行命中框/可点击路径已随本次绘制更新：光标矩形仅在命中内容实际变化时才
+        // 通知窗口重算（切换动效 42 帧零窗口级重算；原实现每帧无条件 invalidate）
+        if listRowRects != lastCursorRowRects || listRowPaths != lastCursorRowPaths {
+            lastCursorRowRects = listRowRects
+            lastCursorRowPaths = listRowPaths
+            window?.invalidateCursorRects(for: self)
+        }
     }
 
     /// 项目行：文件夹 icon + 项目名（限宽截断）+ token 值 + 百分比；返回行块底部 Y。
@@ -858,10 +916,11 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     /// hover 行（hoveredListRow）背景只显百分比条 + 0.8pt 发丝边框（2026-08-31 用户要求
     /// 去掉用量行同款渐变底、边框保留），文字/icon 仍提亮到 Palette.cardForeground，
     /// 命中框回填 listRowRects 供 mouseMoved 判定。
-    /// rowReveals = 平台切换动效的逐行交错进度（nil = 常态直绘）：每行独立透明度 +
-    /// 自下方 6pt 上移，CG 变换实现、绘制坐标不变、命中框仍按最终几何记录
+    /// rowReveals = 平台切换动效的逐行交错进度（nil = 常态直绘）：每行裁切到行带、
+    /// 内容自「起始全遮最小行程」(行高+墨迹高)/2 上滑显影，淡入全程同步（alpha=rv），
+    /// CG 变换实现、绘制坐标不变、命中框仍按最终几何记录
     @discardableResult
-    private func drawProjectRows(_ projects: [ZcodeTokenSummary.ProjectUsage], summary: ZcodeTokenSummary,
+    private func drawProjectRows(_ projects: [TokenSummary.ProjectUsage], summary: TokenSummary,
                                  topY: CGFloat, nameFont: NSFont, valueFont: NSFont,
                                  pctFont: NSFont, rowReveals: [CGFloat]? = nil) -> CGFloat {
         let pctColWidth: CGFloat = 45
@@ -880,14 +939,22 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
                                                           width: bounds.width, height: rowH) }
         listRowPaths = projects.map { $0.path }
         for (i, p) in projects.enumerated() {
-            // 行级交错（平台切换动效）：逐行独立透明度 + 自下方上移（翻转坐标 +y 向下）
+            // 行级交错（平台切换动效）= 遮罩显影 + 淡入同步：裁切到本行行带上滑入位
+            // （overflow-hidden 式），alpha 恒随 rv 走完整段（曾按 0.4/0.7 提前补满，
+            // easeOutCubic 前段太快淡入 ~140ms 即结束，用户实测读作「没有透明度变化」，
+            // 勿再改回提前补满）。行程 = 起始全遮最小值 (行高+墨迹高)/2：文字顶
+            // (行带内居中后距带底恰为此值) 在 rv=0 时恰好贴住行带下缘；行程小于此值
+            // 上升前必露文字顶缘（10pt 版实测 bug，勿再缩小）
             let rowReveal = rowReveals?[i]
-            if let rv = rowReveal {
+            var rowMasked = false
+            if let rv = rowReveal, rv < 1 {
                 cg?.saveGState()
                 cg?.setAlpha(rv)
-                cg?.translateBy(x: 0, y: (1 - rv) * Self.listRowRise)
+                cg?.clip(to: NSRect(x: 0, y: rowY, width: bounds.width, height: rowH))
+                cg?.translateBy(x: 0, y: (1 - rv) * (rowH + rowInkHeight) / 2)
+                rowMasked = true
             }
-            defer { if rowReveal != nil { cg?.restoreGState() } }
+            defer { if rowMasked { cg?.restoreGState() } }
             let hovered = i == hoveredListRow
             let rowColor: NSColor = hovered ? Palette.cardForeground : SmallTable.textColor
             // 百分比背景条（仅 hover 行显示）：按行占比从左到右填充行底
@@ -921,16 +988,27 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             (p.name as NSString).draw(in: nameRect, withAttributes: [
                 .font: nameFont, .foregroundColor: rowColor, .paragraphStyle: namePs,
             ])
-            let valueText = ZcodeTokenStore.cnCompact(p.tokens)
-            let valueW = valueText.size(withAttributes: [.font: valueFont]).width
+            let valueText: String, valueW: CGFloat
+            if let m = i < cachedRowMetrics.count ? cachedRowMetrics[i] : nil {
+                (valueText, valueW) = (m.value, m.valueW)
+            } else {
+                // 兜底（缓存与行数短暂错位时）：现算，下一帧度量重建即恢复
+                valueText = ZcodeTokenStore.cnCompact(p.tokens)
+                valueW = valueText.size(withAttributes: [.font: valueFont]).width
+            }
             let valueH = valueFont.boundingRectForFont.height
             drawText(valueText, at: NSPoint(x: valueLeft + (valueColWidth - valueW), y: rowY + (rowH - valueH) / 2),
                      font: valueFont, color: rowColor)
             // 百分比一位小数（"69.6%"；各行四舍五入之和可能 ≠100%，属正常舍入误差）
-            let pctValue = summary.totalTokens > 0
-                ? Double(p.tokens) / Double(summary.totalTokens) * 100 : 0
-            let pctText = String(format: "%.1f%%", pctValue)
-            let pctW = pctText.size(withAttributes: [.font: pctFont]).width
+            let pctText: String, pctW: CGFloat
+            if let m = i < cachedRowMetrics.count ? cachedRowMetrics[i] : nil {
+                (pctText, pctW) = (m.pct, m.pctW)
+            } else {
+                let pctValue = summary.totalTokens > 0
+                    ? Double(p.tokens) / Double(summary.totalTokens) * 100 : 0
+                pctText = String(format: "%.1f%%", pctValue)
+                pctW = pctText.size(withAttributes: [.font: pctFont]).width
+            }
             let pctH = pctFont.boundingRectForFont.height
             drawText(pctText, at: NSPoint(x: bounds.width - insets.right - pctW, y: rowY + (rowH - pctH) / 2),
                      font: pctFont, color: rowColor)
@@ -939,7 +1017,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         return rowY
     }
 
-    // MARK: 平台切换动效（交错上移淡入；「总计大数字 + 列表行」上移淡入、
+    // MARK: 平台切换动效（大数字 = 数值滚动；列表行交错遮罩显影；
     // 热力图点阵旧点亮出→新点亮入交叉淡变（0.6s），标题/表头/月份轴静止）
 
     /// 交错节奏(用户指定 2026-08-31,加长时长不适用 Motion.emphasis 0.40 硬顶,同 Motion.roll 口径):
@@ -950,10 +1028,6 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     private static var switchTotalDuration: Double {
         rowDuration + staggerDelay * Double(maxListRows - 1)
     }
-    /// 大数字自下方的上移距离(pt)
-    private static let staggerRise: CGFloat = 10
-    /// 列表行（项目/模型表格）上移距离 = 大数字减 4pt（用户指定 2026-08-31，仅表格行程缩短）
-    private static let listRowRise: CGFloat = 6
     /// 进行中的切换动效起始时刻;nil = 常态直绘
     private var switchTransitionStart: CFTimeInterval?
     private var switchTimer: Timer?
@@ -974,18 +1048,17 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     /// 平台切换动效入口(refreshInlineTokens 在 summary 换新前调用)。
-    /// 大数字 = alpha + layer transform(layout 只改 frame 不碰 transform,与重排无冲突;
-    /// 翻转视图的 backing layer geometryFlipped 同步翻转,+y 即视觉向下),与首行同节奏;
-    /// 列表行在 draw 内按逐行交错进度绘制。系统「减弱动态效果」开启时直接落定不做动效。
+    /// 大数字不再做 alpha+上移：置 slideNextTotalRoll，summary 落值时经 RollingNumberView
+    /// 从旧平台值整组滑移滚到新值（与周期切换同款）；列表行在 draw 内按逐行交错进度绘制。
+    /// 系统「减弱动态效果」开启时直接落定不做行/点阵动效。
     func beginSwitchTransition() {
         switchTimer?.invalidate()
         switchTimer = nil
         stopDotFade()   // 平台切换接管点阵波次，独立波次作废
-        setNumberSwitchVisual(alpha: 1, transform: .identity)
+        slideNextTotalRoll = true   // 大数字：下一次 summary 落值走整组滑移滚动
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         outgoingDots = lastLitDots   // 旧平台点亮出（此时 summary 未清，快照仍是旧数据）
         switchTransitionStart = CACurrentMediaTime()
-        applyNumberSwitchProgress(0)
         let total = Self.switchTotalDuration
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
             guard let self, let start = self.switchTransitionStart else { t.invalidate(); return }
@@ -994,9 +1067,8 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
                 t.invalidate()
                 self.endSwitchTransition()
             } else {
-                self.applyNumberSwitchProgress(elapsed)
                 // 行块动效在 draw 内按当前时刻计算进度,每帧驱动宿主重绘
-                // (大数字是图层属性不需重绘,列表行是 draw 自绘,漏了就整段不动)
+                // (大数字滚动由 RollingNumberView 自管,列表行是 draw 自绘,漏了就整段不动)
                 self.needsDisplay = true
             }
         }
@@ -1007,24 +1079,8 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     private func endSwitchTransition() {
         switchTransitionStart = nil
         outgoingDots.removeAll()
-        setNumberSwitchVisual(alpha: 1, transform: .identity)
+        releaseDotsImages()   // 淡变结束：位图释放，常态回逐点直绘
         needsDisplay = true
-    }
-
-    /// 大数字动效帧:与首行同节奏(单行时长)的透明度 + 上移
-    private func applyNumberSwitchProgress(_ elapsed: CFTimeInterval) {
-        let p = easeOutCubic(min(1, elapsed / Self.rowDuration))
-        setNumberSwitchVisual(alpha: CGFloat(p),
-                              transform: CGAffineTransform(translationX: 0, y: (1 - CGFloat(p)) * Self.staggerRise))
-    }
-
-    private func setNumberSwitchVisual(alpha: CGFloat, transform: CGAffineTransform) {
-        totalRollView.wantsLayer = true
-        totalRollView.alphaValue = alpha
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        totalRollView.layer?.setAffineTransform(transform)
-        CATransaction.commit()
     }
 
     /// 「每日/每周」切换入口：点阵独立重挂旧点亮出→新点亮入（0.6s 双向 ease-in-out），
@@ -1044,6 +1100,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
                 self.dotFadeTimer = nil
                 self.dotFadeStart = nil
                 self.outgoingDots.removeAll()
+                self.releaseDotsImages()   // 淡变结束：位图释放
             } else {
                 self.needsDisplay = true
             }
@@ -1057,6 +1114,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         dotFadeTimer = nil
         dotFadeStart = nil
         outgoingDots.removeAll()
+        releaseDotsImages()   // 中断/重启：位图作废，新 wave 首帧按需重烘
     }
 
     // MARK: 词元活动热力图
@@ -1086,62 +1144,92 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         dailyToggleRect = NSRect(x: dailyX, y: topY, width: dailyW, height: titleInkHeight)
         weeklyToggleRect = NSRect(x: weeklyX, y: topY, width: weeklyW, height: titleInkHeight)
 
-        // ── 点阵（全格子绘制：无用量 = 底色点，有用量 = 渐变亮点；格内四周各缩 1pt）──
+        // ── 点阵（全格子绘制：无用量 = 底色点，有用量 = 渐变亮点；格内四周各缩 1.25pt）──
         dotCells.removeAll()
         let pitch = activityPitch
-        let size = pitch - 2
+        let size = pitch - 2.5
         let gridTop = gridTopAnchor
-        let window = activityWindow()
         let cells = activityCells()
         let maxVal = cells.map(\.tokens).max() ?? 0
-        // 平台切换/每日·每周切换动效：旧点亮出→新点亮入交叉淡变（0.6s 双向 ease-in-out，
-        // 整体同步、无列间交错、不上移）；仅有用量的点亮度点参与，无用量底点恒亮不动；
-        // 常态直绘零开销
+        // 平台切换/每日·每周切换动效：新点阵淡入 + 旧点阵盖顶淡出的交叉溶解（0.6s
+        // 双向 ease-in-out，整体同步、无列间交错、不上移）；仅有用量的点亮度点参与，
+        // 无用量底点恒亮不动；常态逐点直绘，淡变帧走位图合成（性能：3 次整图 blit
+        // 替代 ~364 次逐点 draw）
         let waveStart = switchTransitionStart ?? dotFadeStart
         let waveP: CGFloat = {
             guard let waveStart else { return 1 }
             let t = min(1, max(0, (CACurrentMediaTime() - waveStart) / Self.dotFadeDuration))
             return CGFloat(easeInOutCubic(t))
         }()
+        lastLitDots.removeAll(keepingCapacity: true)
         if waveStart != nil {
+            // 位图合成：新底点整图（恒不透明）+ 新亮点整图（alpha=waveP 淡入）先画，
+            // 旧亮点整图最后画（alpha=out 淡出，盖在新点阵之上）——交叉溶解。旧点
+            // 必须先画会残留边缘带（半透明抗锯齿像素叠半透明无法覆盖，旧点光晕穿透
+            // 新点边缘成「亮边」）；最后画则旧点是整体淡出，无穿透轮廓（2026-09-01）
+            // 命中框 dotCells 与下轮淡出快照 lastLitDots 仍逐格回填（纯算术，无绘制）
+            if dotsImagesDirty || incomingLitImage == nil {
+                let region = NSRect(x: insets.left, y: gridTop,
+                                    width: bounds.width - insets.left - insets.right,
+                                    height: 7 * pitch)
+                rebuildIncomingDotsImages(cells: cells, region: region, maxVal: maxVal)
+                dotsImagesDirty = false
+            }
+            if outgoingDotsImage == nil, !outgoingDots.isEmpty,
+               let baked = renderDotsBitmap(outgoingDots, region: nil) {
+                outgoingDotsImage = baked.image
+                outgoingDotsRegion = baked.region
+            }
+            if let img = incomingEmptyImage {
+                img.draw(in: incomingRegion, from: .zero, operation: .sourceOver,
+                         fraction: 1, respectFlipped: true, hints: nil)
+            }
+            if waveP > 0.004, let img = incomingLitImage {
+                img.draw(in: incomingRegion, from: .zero, operation: .sourceOver,
+                         fraction: waveP, respectFlipped: true, hints: nil)
+            }
             let out = 1 - waveP
-            if out > 0.004 {
-                for d in outgoingDots {
-                    stamp(level: d.level).draw(in: d.rect, from: .zero, operation: .sourceOver,
-                                               fraction: out, respectFlipped: true, hints: nil)
-                }
+            if out > 0.004, let img = outgoingDotsImage {
+                img.draw(in: outgoingDotsRegion, from: .zero, operation: .sourceOver,
+                         fraction: out, respectFlipped: true, hints: nil)
+            }
+            for c in cells {
+                let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + 1.25,
+                                  y: gridTop + CGFloat(c.row) * pitch + 1.25,
+                                  width: size, height: size)
+                let level = (c.tokens <= 0 || maxVal <= 0) ? 0
+                    : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
+                if level > 0 { lastLitDots.append((rect, level)) }
+                dotCells.append(DotCell(rect: rect, day: c.day, tipTokens: c.tipTokens))
+            }
+        } else {
+            // 常态路径：逐点直绘（waveP == 1，等价全亮度）
+            for c in cells {
+                let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + 1.25,
+                                  y: gridTop + CGFloat(c.row) * pitch + 1.25,
+                                  width: size, height: size)
+                let level = (c.tokens <= 0 || maxVal <= 0) ? 0
+                    : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
+                stamp(level: level).draw(in: rect, from: .zero, operation: .sourceOver,
+                                         fraction: level == 0 ? 1 : waveP,
+                                         respectFlipped: true, hints: nil)
+                if level > 0 { lastLitDots.append((rect, level)) }
+                dotCells.append(DotCell(rect: rect, day: c.day, tipTokens: c.tipTokens))
             }
         }
-        lastLitDots.removeAll(keepingCapacity: true)
-        for c in cells {
-            let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + 1,
-                              y: gridTop + CGFloat(c.row) * pitch + 1,
-                              width: size, height: size)
-            let level = (c.tokens <= 0 || maxVal <= 0) ? 0
-                : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
-            stamp(level: level).draw(in: rect, from: .zero, operation: .sourceOver,
-                                     fraction: level == 0 ? 1 : waveP,
-                                     respectFlipped: true, hints: nil)
-            if level > 0 { lastLitDots.append((rect, level)) }
-            dotCells.append(DotCell(rect: rect, day: c.day, tipTokens: c.tipTokens))
-        }
 
-        // ── 横坐标月份标签：从网格左缘起，按「网格宽 ÷ 月数」等距分布，文本左对齐 ──
-        let monthFmt = Self.monthAxisFmt
+        // ── 横坐标月份标签：首尾贴齐网格两端、中间等距（最左锚网格左缘），文本左对齐 ──
+        //（位置与文案已随绘制度量缓存预计算，draw 只读，零 Calendar/Formatter 开销）
         let axisY = gridTop + 7 * pitch + 4
-        let segWidth = (CGFloat(window.cols) * pitch) / CGFloat(Self.activityMonths)
-        for offset in 0..<Self.activityMonths {
-            guard let mStart = Calendar.current.date(byAdding: .month, value: offset,
-                                                     to: window.firstMonth) else { continue }
-            drawText(monthFmt.string(from: mStart),
-                     at: NSPoint(x: insets.left + CGFloat(offset) * segWidth, y: axisY),
-                     font: labelFont, color: labelColor)
+        for (text, x) in cachedMonthLabels {
+            drawText(text, at: NSPoint(x: x, y: axisY), font: labelFont, color: labelColor)
         }
 
         // hover 圆点：外圈高亮环 + 悬浮提示（日期 + 用量，中文量级）
         if let hi = hoveredDot, dotCells.indices.contains(hi) {
             let cell = dotCells[hi]
-            let ring = cell.rect.insetBy(dx: -1.5, dy: -1.5)
+            // 描边居中于路径：外扩半个线宽（0.5pt）→ 环内缘紧贴圆点边缘
+            let ring = cell.rect.insetBy(dx: -0.5, dy: -0.5)
             Palette.heatDotRing.setStroke()
             let path = NSBezierPath(ovalIn: ring)
             path.lineWidth = 1
@@ -1205,6 +1293,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
             }
         }
         activityCellsCache = (summary.daily, activityMode, window.start, cells)
+        dotsImagesDirty = true   // 点阵数据重算 → 淡变位图（如启用）随新数据重烘
         return cells
     }
 
@@ -1260,6 +1349,151 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         text.draw(at: point, withAttributes: [.font: font, .foregroundColor: color])
     }
 
+    // MARK: 绘制度量缓存（性能：动画帧零 size() 实测 / 零 Calendar 运算）
+
+    /// 度量缓存失效标记：summary/source/listMode/monoFont didSet 与 layout() 宽度变化置位，
+    /// draw 头部统一重建。覆盖文本度量全部输入（内容、字体、几何），不随 hover/动效进度变化
+    private var metricsDirty = true
+    private var cachedNameWidth: CGFloat = 0
+    private var cachedPeriodWidths: [CGFloat] = []
+    private var cachedPeriodTotal: CGFloat = 0
+    private var cachedToggleModelW: CGFloat = 0
+    private var cachedToggleProjW: CGFloat = 0
+    private var cachedMonthLabels: [(text: String, x: CGFloat)] = []
+    /// 列表行文本度量：drawProjectRows 逐帧只读（原实现每帧 ≤4 行 × 2 次 size() 实测）
+    private var cachedRowMetrics: [(value: String, valueW: CGFloat,
+                                    pct: String, pctW: CGFloat)] = []
+    /// 光标矩形变化检测（draw 尾部）：命中矩形/路径实际变化才通知窗口重算
+    private var lastCursorRowRects: [NSRect] = []
+    private var lastCursorRowPaths: [String?] = []
+
+    private func rebuildMetricsIfNeeded() {
+        guard metricsDirty else { return }
+        metricsDirty = false
+        let labelFont = makeLabelFont()
+        let titleFont = makeTitleFont()
+        cachedNameWidth = (source.platformName as NSString)
+            .size(withAttributes: [.font: titleFont]).width
+        cachedPeriodWidths = TokenPeriod.allCases.map {
+            ($0.label as NSString).size(withAttributes: [.font: labelFont]).width
+        }
+        let pGap: CGFloat = 6
+        cachedPeriodTotal = cachedPeriodWidths.reduce(0, +)
+            + pGap * CGFloat(TokenPeriod.allCases.count - 1)
+        cachedToggleModelW = ("模型" as NSString).size(withAttributes: [.font: labelFont]).width
+        cachedToggleProjW = ("项目" as NSString).size(withAttributes: [.font: labelFont]).width
+        // 月份轴：Calendar.date(byAdding:) ×5 + DateFormatter 格式化只在重建时执行一次。
+        // 首尾贴齐分布：最左标签锚网格左缘，按最宽文案「10月」恒量预留末档右缘贴网格右缘，
+        // 中间等距——较「网格宽 ÷ 月数」等分加大月间距；预留不随实际月份文案变化，
+        // 五档位置跨月恒定不漂移（gridWidth = cols × pitch 恒等于版心宽，周列数增加亦不影响）
+        let window = activityWindow()
+        let gridWidth = CGFloat(window.cols) * activityPitch
+        var labels: [(text: String, x: CGFloat)] = []
+        for offset in 0..<Self.activityMonths {
+            guard let m = Calendar.current.date(byAdding: .month, value: offset,
+                                               to: window.firstMonth) else { continue }
+            labels.append((Self.monthAxisFmt.string(from: m), 0))
+        }
+        let lastLabelW = ceil(("10月" as NSString)
+            .size(withAttributes: [.font: labelFont]).width)
+        let step = max(0, (gridWidth - lastLabelW) / CGFloat(Self.activityMonths - 1))
+        for i in labels.indices { labels[i].x = insets.left + CGFloat(i) * step }
+        cachedMonthLabels = labels
+        // 列表行数值/百分比文本与宽度
+        let valueFont = SmallTable.rowFont(mono: monoFontEnabled, monoDigits: true)
+        let pctFont = SmallTable.rowFont(mono: monoFontEnabled)
+        if let summary {
+            let showModels = listMode == .models && !summary.models.isEmpty
+            let rows = Array((showModels ? summary.models : summary.projects)
+                .prefix(Self.maxListRows))
+            cachedRowMetrics = rows.map { p in
+                let value = ZcodeTokenStore.cnCompact(p.tokens)
+                let pct = String(format: "%.1f%%", summary.totalTokens > 0
+                    ? Double(p.tokens) / Double(summary.totalTokens) * 100 : 0)
+                return (value,
+                        (value as NSString).size(withAttributes: [.font: valueFont]).width,
+                        pct,
+                        (pct as NSString).size(withAttributes: [.font: pctFont]).width)
+            }
+        } else {
+            cachedRowMetrics = []
+        }
+    }
+
+    // MARK: 点阵交叉淡变位图合成（性能：淡变帧 3 次 blit 替代 ~364 次逐点 draw）
+
+    private var outgoingDotsImage: NSImage?
+    private var outgoingDotsRegion: NSRect = .zero
+    /// 新点阵整图两张：底点（level 0，恒不透明）与亮点（alpha = waveP）
+    private var incomingEmptyImage: NSImage?
+    private var incomingLitImage: NSImage?
+    private var incomingRegion: NSRect = .zero
+    /// 位图失效标记：activityCells 重算 / 几何变化 / 外观变化时置位
+    private var dotsImagesDirty = true
+
+    /// 点阵亮度点整图烘焙（位图像素 = region 尺寸 × 2，点尺寸 = region 原分数尺寸，
+    /// blit 恒 1:1 与直绘几何一致）。region 传 nil 时取点集联合包围盒。位图上下文 y 向上、
+    /// view 翻转坐标 y 向下，逐点做镜像换算，blit 回视图（respectFlipped: true）时几何严格还原。
+    private func renderDotsBitmap(_ dots: [(rect: NSRect, level: Int)],
+                                  region given: NSRect?) -> (image: NSImage, region: NSRect)? {
+        guard !dots.isEmpty else { return nil }
+        var region: NSRect
+        if let given {
+            region = given
+        } else {
+            region = dots[0].rect
+            for d in dots.dropFirst() { region = region.union(d.rect) }
+        }
+        // 按 region 原分数尺寸烘焙：像素 = 尺寸×2 取整，rep.size / NSImage.size = region 原尺寸，
+        // blit 回同尺寸 rect 恒 1:1 无重采样，与逐点直绘路径几何严格一致
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: Int((region.width * scale).rounded()),
+                                         pixelsHigh: Int((region.height * scale).rounded()),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .calibratedRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        rep.size = region.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        for d in dots {
+            let r = NSRect(x: d.rect.minX - region.minX,
+                           y: region.height - (d.rect.maxY - region.minY),
+                           width: d.rect.width, height: d.rect.height)
+            stamp(level: d.level).draw(in: r, from: .zero, operation: .sourceOver,
+                                       fraction: 1, respectFlipped: false, hints: nil)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let cg = rep.cgImage else { return nil }
+        return (NSImage(cgImage: cg, size: region.size), region)
+    }
+
+    /// 新点阵整图两张（底点/亮点分离：底点恒不透明，亮点随 waveP 淡入）
+    private func rebuildIncomingDotsImages(cells: [ActivityCell], region: NSRect, maxVal: Int64) {
+        let pitch = activityPitch
+        let size = pitch - 2.5
+        var empty: [(rect: NSRect, level: Int)] = []
+        var lit: [(rect: NSRect, level: Int)] = []
+        for c in cells {
+            let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + 1.25,
+                              y: region.minY + CGFloat(c.row) * pitch + 1.25,
+                              width: size, height: size)
+            let level = (c.tokens <= 0 || maxVal <= 0) ? 0
+                : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
+            if level == 0 { empty.append((rect, 0)) } else { lit.append((rect, level)) }
+        }
+        incomingEmptyImage = renderDotsBitmap(empty, region: region)?.image
+        incomingLitImage = renderDotsBitmap(lit, region: region)?.image
+        incomingRegion = region
+    }
+
+    /// 释放淡变位图（wave 结束/中断时调用，下次 wave 按需重烘）
+    private func releaseDotsImages() {
+        outgoingDotsImage = nil
+        incomingEmptyImage = nil
+        incomingLitImage = nil
+    }
+
     /// 亮度第 level 级的正圆印章（懒建缓存）：0 = 无用量底色（动态色，浅色外观=浅灰），
     /// 1-4 = 深色 GitHub 暗色绿阶离散色 / 浅色两端点插值。动态色按本视图 effectiveAppearance 解算成实色
     /// 后烘焙（NSImage 位图缓存会定格颜色，主题/浅色开关切换经 viewDidChangeEffectiveAppearance
@@ -1273,7 +1507,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             color = color.usingColorSpace(.deviceRGB) ?? color
         }
-        let size = activityPitch - 2
+        let size = activityPitch - 2.5
         let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
             color.setFill()
             NSBezierPath(ovalIn: NSRect(x: 0, y: 0, width: size, height: size)).fill()
@@ -1327,6 +1561,7 @@ final class ZcodeTokensPanelView: NSView, PanelScrollHoverSync {
     /// 点阵印章（NSImage 绘制块烘焙，无用量底点 = 动态色 heatDotEmpty 浅灰/深灰）同样定格，一并清
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        dotsImagesDirty = true   // 点阵位图定格了旧外观的印章色，需重烘
         if !iconCache.isEmpty || !dotStamps.isEmpty {
             iconCache.removeAll()
             dotStamps.removeAll()
@@ -1370,10 +1605,10 @@ extension BalancePanelView {
 
     // MARK: - 主面板「Token」板块（内嵌 ZCode / WorkBuddy 卡片 hover 同款内容）
 
-    /// 创建唯一的内嵌内容视图并启动低频刷新。与卡片 hover 子面板共用 ZcodeTokensPanelView
+    /// 创建唯一的内嵌内容视图并启动低频刷新。与卡片 hover 子面板共用 TokensPanelView
     /// 与数据仓缓存；显示平台由 refreshInlineTokens 按 Agent 组顶部平台动态解析。
     func setupInlineTokens() {
-        let view = ZcodeTokensPanelView()
+        let view = TokensPanelView()
         view.source = .zcode
         view.monoFontEnabled = monoFontEnabled
         // 左右缩进 8 = 用量行 / 设置卡片内容边界（usageHorizontalInset），内容撑满版心后
@@ -1431,13 +1666,16 @@ extension BalancePanelView {
             var switched = false
             if view.source != source {
                 view.beginSwitchTransition()   // 启动平台切换动效
-                view.summary = nil   // 先清旧平台数据，防标题与数字错位一帧
                 view.source = source
                 switched = true
+                // 注意：不在此清 summary——大数字要从旧平台值滚动到新值（slideNextTotalRoll），
+                // 先清会落 "—" 使滚动起点丢失。无数据的收尾清理由下方 guard else 分支接管
             }
             guard let summary = summary else {
                 // 单次后台构建失败：已有数据则保留展示（本机库/trace 仍在，下一轮重试即恢复），
-                // 避免偶发失败导致整块闪隐 60s；从未拿到过数据才保持隐藏
+                // 避免偶发失败导致整块闪隐 60s；从未拿到过数据才保持隐藏。
+                // 平台切换到无数据源：才清旧平台展示并隐藏
+                if switched { view.summary = nil }
                 if view.summary == nil, !view.isHidden {
                     view.isHidden = true
                     applyInlineTokensVisibility()

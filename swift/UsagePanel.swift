@@ -1,6 +1,18 @@
 // UsagePanel.swift — iBalance
 // 用量板块:UsageRowSnapshot / 一周趋势图与子弹窗 / UsageDots / 面板用量行构建
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
+//
+// ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
+// 数据模型    UsageRowSnapshot（用量行）/ UsageWeekData（一周 7 天数值 + 表头 + 累计）
+// 趋势图      UsageHistoryChartView（**自绘**折线 + 面积 + 今日标注，走 draw(_:)，非控件）
+// 子弹窗      UsageHistoryPopoverController + UsageHistoryPopoverAnchorView
+//             （锚点固定为「用量标题」而非 hover 行，避免换行时错位）
+// 进度条      UsageDots（渐变进度条：灰轨道 + 蓝渐变填充，按剩余比例填充；类名沿用旧点阵）
+// 面板用量行    extension BalancePanelView：makeUsageRow / makeUsageHeaderRow / 列宽计算
+//
+// ⚠️ 自绘层不参与 AppKit 的字体/外观自动传播：Mono 开关与浅色主题由
+//    UsageHistoryPopoverController 的 monoFontEnabled / lightThemeEnabled didSet **显式转发**。
+//    改图表字体或配色，要确认这条转发链还在，别指望动态色自动生效。
 
 import Cocoa
 import CoreImage
@@ -627,40 +639,36 @@ final class UsageHistoryPopoverAnchorView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
-/// 点阵进度：9 个方块横排，已用部分着色，剩余灰色。ratio 表示剩余比例。
-/// pulsing=true 时最右的亮点阵以 2s 周期脉冲闪烁（透明度 0.55 ↔ 1.0 + 峰值白色闪烁，点大小不变），示意额度正在被消耗。
-/// 脉冲状态由外部（makePanelSnapshot）传入，UsageDots 不自行比较，避免被面板操作重置。
+/// 卡片进度条（2026-09-02 由 9 方块点阵改造为渐变进度条，旧实现备份于
+/// backups/UsagePanel.swift.bak-20260902-dots-progressbar）：
+/// 灰色胶囊轨道（Palette.dotsDim）+ 蓝色左→右渐变填充（systemBlue alpha 0.10→0.80），
+/// ratio 表示剩余比例（填充宽 = 轨道宽 × ratio），变化走 0.25s ease-in-out 宽度动画。
+/// pulsing=true 时填充层以 2s 周期透明度呼吸（0.55↔1.0），示意额度正在被消耗。
+/// 脉冲状态由外部（makePanelSnapshot）传入，不自行比较，避免被面板操作重置。
+/// 类名与 API（ratio / pulsing / intrinsicContentSize）沿用 UsageDots，调用点零改动；
+/// 尺寸适配原点阵槽位：固有宽 45.54pt（9×5.06）、槽高 7pt（外部 heightAnchor 固定），
+/// 条高 5.06pt（原方块边长）在槽内垂直居中，胶囊圆角 = 条高/2。
 final class UsageDots: NSView {
-    var ratio: CGFloat = 0 { didSet { updateDots() } }
+    var ratio: CGFloat = 0 { didSet { updateProgress() } }
     var pulsing: Bool = false {
         didSet {
             guard oldValue != pulsing else { return }
             updatePulse()
         }
     }
-    /// 点亮N个点时的颜色：9个点从红→橙红→橙→黄→黄绿→绿算术平均渐变（HSB空间线性插值）
-    /// levelColors[0]=红(1个点亮)，levelColors[8]=绿(9个点亮)
-    private let levelColors: [NSColor] = generateLevelColors()
-    private static func generateLevelColors() -> [NSColor] {
-        let count = 9
-        var colors: [NSColor] = []
-        for i in 0..<count {
-            let t = CGFloat(i) / CGFloat(count - 1) // 0=红, 1=绿
-            let h = t * 0.333 // 红(H:0) → 绿(H:120°=0.333)
-            let s: CGFloat = 0.80
-            let b: CGFloat = 0.92
-            colors.append(NSColor(calibratedHue: h, saturation: s, brightness: b, alpha: 1.0))
-        }
-        return colors
-    }
-    private let dotCount = 9
-    private let dotWidth: CGFloat = 5.06  // 正方形宽高（4.6 × 1.1 ≈ 5.06）
-    private let dotGap: CGFloat = 0.0     // 点间距
-    private let dotRadius: CGFloat = 0.0  // 圆角 0（直角方块）
-    /// 未点亮点的颜色：石墨灰（动态色，浅色主题转浅灰）
-    private static let dotDimColor = Palette.dotsDim
-    private var dotLayers: [CALayer] = []
-    private var lastActiveCount: Int = -1   // 上次亮起点数，-1 = 未初始化
+
+    // ── 尺寸：沿用原点阵口径（9 方块 × 5.06pt = 45.54pt 宽；7pt 槽高由外部约束固定）──
+    private static let barHeight: CGFloat = 5.06
+    private static let barWidth: CGFloat = 9 * 5.06   // 45.54
+    /// 轨道透明度（dotsDim 再乘此系数：深 systemGray@0.75→0.34 / 浅 systemGray→0.45）
+    private static let trackAlpha: CGFloat = 0.45
+    /// 填充蓝（比 systemBlue 更亮的亮蓝 #409CFF，sRGB 所见即所得）
+    private static let brightBlue = NSColor(srgbRed: 0x40/255.0, green: 0x9C/255.0, blue: 0xFF/255.0, alpha: 1)
+
+    /// 灰色背景轨道
+    private let trackLayer = CALayer()
+    /// 蓝色渐变填充
+    private let progressLayer = CAGradientLayer()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -672,95 +680,109 @@ final class UsageDots: NSView {
     }
     private func commonInit() {
         wantsLayer = true
-        setupDotLayersIfNeeded()
+        guard let rootLayer = layer else { return }
+        trackLayer.masksToBounds = true
+        rootLayer.addSublayer(trackLayer)
+        // 左 → 右
+        progressLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        progressLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        progressLayer.masksToBounds = true
+        rootLayer.addSublayer(progressLayer)
+        applyColors()
     }
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        setupDotLayersIfNeeded()
+        // 窗口落定后生效外观才稳定，重着色一次（动态色落 CALayer 会定格外观）
+        applyColors()
     }
-    /// 未点亮底色为动态色经 .cgColor 落盘会定格外观：主题切换时重跑着色
+    /// 动态色（dotsDim / systemBlue）落 CALayer 会定格外观：主题切换时按视图生效外观重着色
+    /// （须走 Palette.borderCGColor 解算，勿直接 .cgColor——面板强制 aqua 与系统外观可能不一致）
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        updateDots()
-    }
-    private func setupDotLayersIfNeeded() {
-        guard dotLayers.isEmpty, let rootLayer = layer else { return }
-        for _ in 0..<dotCount {
-            let l = CALayer()
-            l.cornerRadius = dotRadius
-            l.backgroundColor = Self.dotDimColor.cgColor
-            rootLayer.addSublayer(l)
-            dotLayers.append(l)
-        }
-        layoutDots()
-        updateDots()
+        applyColors()
     }
     override func layout() {
         super.layout()
-        layoutDots()
+        layoutBar()
     }
-    private func layoutDots() {
-        guard !dotLayers.isEmpty else { return }
-        let totalWidth = CGFloat(dotCount) * dotWidth + CGFloat(dotCount - 1) * dotGap
-        let startX = (bounds.width - totalWidth) / 2
-        // 正方形：高度 = 宽度，垂直居中
-        let dotHeight = dotWidth
-        let startY = (bounds.height - dotHeight) / 2
-        let step = dotWidth + dotGap
-        for (i, l) in dotLayers.enumerated() {
-            let x = startX + CGFloat(i) * step
-            // 宽度多 0.25pt 产生微小重叠，消除亚像素抗锯齿导致的视觉缝隙
-            // （非整数像素位置边缘抗锯齿会产生半透明间隙）
-            l.frame = CGRect(x: x, y: startY, width: dotWidth + 0.25, height: dotHeight)
-        }
+    /// 首次布局前 bounds 为零：跳过（intrinsicContentSize 驱动 Auto Layout 随后到位）
+    private func layoutBar() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let barRect = barFrame()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        trackLayer.frame = barRect
+        trackLayer.cornerRadius = barRect.height / 2
+        progressLayer.frame = CGRect(x: 0, y: barRect.minY,
+                                     width: barRect.width * ratio, height: barRect.height)
+        progressLayer.cornerRadius = barRect.height / 2
+        CATransaction.commit()
     }
-    private func updateDots() {
-        guard !dotLayers.isEmpty else { return }
-        let activeCount = ratio > 0 ? Int(ceil(CGFloat(dotCount) * ratio)) : 0
-        // 点亮的点统一着色：activeCount 对应 levelColors[activeCount-1]
-        let activeColor: NSColor? = activeCount > 0 ? levelColors[activeCount - 1] : nil
-        for (i, l) in dotLayers.enumerated() {
-            l.backgroundColor = (i < activeCount ? activeColor : Self.dotDimColor)?.cgColor
-        }
-        // 仅在亮起点数变化时才重设脉冲目标，避免 ratio 微调（activeCount 不变）重置动画周期
-        if lastActiveCount != activeCount {
-            lastActiveCount = activeCount
+    /// 条框：全宽（= 固有宽 45.54）、高 5.06 垂直居中于 7pt 槽
+    private func barFrame() -> CGRect {
+        let h = min(Self.barHeight, bounds.height)
+        return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
+    }
+    /// 轨道/渐变按「视图生效外观」解算落 layer（直接 .cgColor 会定格错主题分支）
+    private func applyColors() {
+        guard trackLayer.superlayer != nil else { return }
+        let blue = Self.brightBlue
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        trackLayer.backgroundColor = Palette.borderCGColor(Palette.dotsDim.withAlphaComponent(Self.trackAlpha), in: self)
+        progressLayer.colors = [
+            Palette.borderCGColor(blue.withAlphaComponent(0.30), in: self),
+            Palette.borderCGColor(blue.withAlphaComponent(0.95), in: self),
+        ]
+        CATransaction.commit()
+    }
+    private func updateProgress() {
+        // 填充跨过零界（0 ↔ >0）时刷新脉冲目标：全空时脉冲无落点，恢复有填充须重挂
+        let hasFill = ratio > 0
+        if hasFill != lastHasFill {
+            lastHasFill = hasFill
             updatePulse()
         }
-    }
-    private func updatePulse() {
-        for l in dotLayers {
-            l.removeAnimation(forKey: "pulseGroup")
-            // 重置为正常状态
-            l.opacity = 1.0
-        }
-        guard pulsing, !dotLayers.isEmpty else { return }
-        let activeCount = ratio > 0 ? Int(ceil(CGFloat(dotCount) * ratio)) : 0
-        guard activeCount > 0 else { return }
-        // 最右亮点阵脉冲：2s 周期，透明度呼吸 + 峰值白色闪烁
-        let target = dotLayers[activeCount - 1]
-        let baseColor = target.backgroundColor ?? NSColor.systemGreen.cgColor
-        let whiteColor = NSColor.white.cgColor
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let barRect = barFrame()
+        let newWidth = barRect.width * ratio
+        let newFrame = CGRect(x: 0, y: barRect.minY, width: newWidth, height: barRect.height)
 
+        // 模型值无动画直落（含首次设置），动画单独挂 presentation 补间
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        progressLayer.frame = newFrame
+        CATransaction.commit()
+
+        // 首帧（无 presentation）从模型值出发无可见跳变，直接返回
+        guard progressLayer.presentation() != nil else { return }
+        // 当前显示中的宽度
+        let currentWidth = progressLayer.presentation()?.frame.width ?? newWidth
+        guard abs(currentWidth - newWidth) > 0.5 else { return }
+        let animation = CABasicAnimation(keyPath: "bounds.size.width")
+        animation.fromValue = currentWidth
+        animation.toValue = newWidth
+        animation.duration = 0.25
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        progressLayer.add(animation, forKey: "progress")
+    }
+    private var lastHasFill = false
+    private func updatePulse() {
+        progressLayer.removeAnimation(forKey: "pulseGroup")
+        progressLayer.opacity = 1.0
+        guard pulsing, ratio > 0 else { return }
+        // 填充层脉冲：2s 周期透明度呼吸（沿用点阵口径 0.55↔1.0）
         let opacityAnim = CAKeyframeAnimation(keyPath: "opacity")
         opacityAnim.values = [0.55, 1.0, 0.55]
         opacityAnim.keyTimes = [0, 0.5, 1.0]
-
-        let colorAnim = CAKeyframeAnimation(keyPath: "backgroundColor")
-        colorAnim.values = [baseColor, whiteColor, baseColor]
-        colorAnim.keyTimes = [0, 0.5, 1.0]
-
-        let group = CAAnimationGroup()
-        group.animations = [opacityAnim, colorAnim]
-        group.duration = 2.0
-        group.repeatCount = .infinity
-        group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        target.add(group, forKey: "pulseGroup")
+        opacityAnim.duration = 2.0
+        opacityAnim.repeatCount = .infinity
+        opacityAnim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        progressLayer.add(opacityAnim, forKey: "pulseGroup")
     }
     override var intrinsicContentSize: NSSize {
-        let w = CGFloat(dotCount) * dotWidth + CGFloat(dotCount - 1) * dotGap
-        // 高度默认返回 7.0pt，实际由外部 heightAnchor 约束决定
-        return NSSize(width: w, height: 7.0)
+        // 宽度沿用点阵口径（9×5.06=45.54）；高度默认 7.0pt，实际由外部 heightAnchor 约束决定
+        return NSSize(width: Self.barWidth, height: 7.0)
     }
 }
 

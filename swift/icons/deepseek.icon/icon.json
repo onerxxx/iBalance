@@ -1,0 +1,137 @@
+{
+  "features" : [
+    "refractivity",
+    "specular-location"
+  ],
+  "fill-specializations" : [
+    {
+      "value" : "system-dark"
+    },
+    {
+      "appearance" : "dark",
+      "value" : "automatic"
+    }
+  ],
+  "groups" : [
+    {
+      "blend-mode-specializations" : [
+        {
+          "value" : "normal"
+        },
+        {
+          "appearance" : "dark",
+          "value" : "normal"
+        },
+        {
+          "appearance" : "tinted",
+          "value" : "normal"
+        }
+      ],
+      "blur-material" : 0.01,
+      "hidden" : false,
+      "layers" : [
+        {
+          "fill" : {
+            "solid" : "display-p3:0.87701,0.91132,1.00000,0.33000"
+          },
+          "hidden" : false,
+          "image-name" : "circle-icon.svg",
+          "name" : "circle-icon",
+          "position" : {
+            "scale" : 1.38,
+            "translation-in-points" : [
+              -288.47395,
+              -180.921875
+            ]
+          }
+        },
+        {
+          "fill" : {
+            "solid" : "display-p3:0.72545,0.80175,1.00000,0.30000"
+          },
+          "glass" : true,
+          "hidden" : false,
+          "image-name" : "circle-line-icon.svg",
+          "name" : "circle-line-icon",
+          "position" : {
+            "scale" : 0.88,
+            "translation-in-points" : [
+              -190.66506249999998,
+              -321.66060000000016
+            ]
+          }
+        }
+      ],
+      "lighting" : "combined",
+      "opacity" : 1,
+      "refractivity" : {
+        "depth" : 0.244140625,
+        "enabled" : true,
+        "strength" : 0.2177734375
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.36
+      },
+      "specular" : "inside",
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.84
+      }
+    },
+    {
+      "blend-mode-specializations" : [
+        {
+          "value" : "normal"
+        },
+        {
+          "appearance" : "dark",
+          "value" : "normal"
+        },
+        {
+          "appearance" : "tinted",
+          "value" : "normal"
+        }
+      ],
+      "blur-material" : 0.02,
+      "hidden" : false,
+      "layers" : [
+        {
+          "fill" : "system-light",
+          "hidden" : false,
+          "image-name" : "deepseek (1).svg",
+          "name" : "deepseek (1)",
+          "position" : {
+            "scale" : 788.88,
+            "translation-in-points" : [
+              35.53370320468662,
+              32.2734375
+            ]
+          }
+        }
+      ],
+      "lighting" : "combined",
+      "opacity" : 1,
+      "refractivity" : {
+        "depth" : 0.1544140625,
+        "enabled" : true,
+        "strength" : 0.47921875
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.64
+      },
+      "specular" : true,
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.46
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

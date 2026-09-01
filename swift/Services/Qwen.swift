@@ -14,6 +14,7 @@ enum QwenService {
         let weekLimit: Double       // 周额度上限
         let remainingDays: Int      // API 回传的剩余自然日（>0=还剩几天，0=今天，负数=已过期）
         let expireAt: TimeInterval  // 套餐到期时间戳（秒），0 = 未知
+        let weekResetAt: TimeInterval  // 7 天限额重置时间戳（秒，usage.per1WeekResetTime），0 = 未知
     }
 
     /// 登录态 Cookie 名与站点（与浏览器站内一致）
@@ -73,24 +74,35 @@ enum QwenService {
         return String(text[r])
     }
 
-    /// 调千问控制台网关 api.json（BroadScopeAspnGateway），返回 data.DataV2.data.data 载荷；失败返回 nil
-    private static func gateway(api: String, dataJson: String, secToken: String, ticket: String) async -> [String: Any]? {
+    /// 网关调用结果：payload 成功；network 网络层失败（超时/断网，status=0，
+    /// 与登录态无关，不得触发清缓存重采）；bad 响应异常（可能登录态失效）
+    private enum GatewayResult {
+        case payload([String: Any])
+        case network
+        case bad
+    }
+
+    /// 调千问控制台网关 api.json（BroadScopeAspnGateway），返回 data.DataV2.data.data 载荷
+    private static func gateway(api: String, dataJson: String, secToken: String, ticket: String) async -> GatewayResult {
         let params = "{\"Api\":\"\(api)\",\"Data\":\(dataJson),\"V\":\"1.0\"}"
         let body = "product=sfm_bailian&action=BroadScopeAspnGateway&sec_token=\(formEncode(secToken))&region=cn-beijing&params=\(formEncode(params))"
-        guard let url = URL(string: "https://cs-data.qianwenai.com/data/api.json?product=sfm_bailian&action=BroadScopeAspnGateway&api=\(formEncode(api))") else { return nil }
+        guard let url = URL(string: "https://cs-data.qianwenai.com/data/api.json?product=sfm_bailian&action=BroadScopeAspnGateway&api=\(formEncode(api))") else { return .bad }
         let (data, status) = await HTTP.request(url: url, method: "POST", headers: [
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "Cookie": "\(cookieName)=\(ticket)",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         ], body: Data(body.utf8), timeout: 15)
+        // status=0：超时/断网等传输层失败——非登录态问题，调用方直接报网络错误，
+        // 不进入「清缓存重采」路径（曾导致超时后再跑一轮 15s，面板「刷新中」卡 30s+）
+        guard status != 0 else { return .network }
         guard status == 200, let data,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let outer = json["data"] as? [String: Any],
               let dataV2 = outer["DataV2"] as? [String: Any],
               let inner = dataV2["data"] as? [String: Any],
-              let payload = inner["data"] as? [String: Any] else { return nil }
-        return payload
+              let payload = inner["data"] as? [String: Any] else { return .bad }
+        return .payload(payload)
     }
 
     // MARK: - 配额查询
@@ -114,15 +126,25 @@ enum QwenService {
             return (nil, true, "未取到 SEC_TOKEN（登录态可能已失效）")
         }
         let cornerstone = "{\"domain\":\"platform.qianwenai.com\",\"consoleSite\":\"QIANWENAI\",\"console\":\"ONE_CONSOLE\",\"xsp_lang\":\"zh-CN\",\"protocol\":\"V2\",\"productCode\":\"p_efm\"}"
-        guard let sub = await gateway(api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription",
-                                      dataJson: "{\"commodityCode\":\"sfm_tokenplansolo_public_cn\",\"cornerstoneParam\":\(cornerstone)}",
-                                      secToken: secToken, ticket: ticket),
-              let quota = await gateway(api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/quota-config",
-                                        dataJson: "{\"cornerstoneParam\":\(cornerstone)}",
-                                        secToken: secToken, ticket: ticket),
-              let usage = await gateway(api: "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
-                                        dataJson: "{\"cornerstoneParam\":\(cornerstone)}",
-                                        secToken: secToken, ticket: ticket) else {
+        let apis: [(name: String, api: String, dataJson: String)] = [
+            ("subscription", "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription",
+             "{\"commodityCode\":\"sfm_tokenplansolo_public_cn\",\"cornerstoneParam\":\(cornerstone)}"),
+            ("quota-config", "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/quota-config",
+             "{\"cornerstoneParam\":\(cornerstone)}"),
+            ("usage", "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+             "{\"cornerstoneParam\":\(cornerstone)}"),
+        ]
+        var payloads: [String: [String: Any]] = [:]
+        for a in apis {
+            switch await gateway(api: a.api, dataJson: a.dataJson, secToken: secToken, ticket: ticket) {
+            case .payload(let p): payloads[a.name] = p
+            case .network: return (nil, false, "配额接口网络超时（\(a.name)）")
+            case .bad: return (nil, true, "配额接口调用失败（登录态可能已失效）")
+            }
+        }
+        guard let sub = payloads["subscription"],
+              let quota = payloads["quota-config"],
+              let usage = payloads["usage"] else {
             return (nil, true, "配额接口调用失败（登录态可能已失效）")
         }
         let specCode = sub["specCode"] as? String ?? "lite"
@@ -138,7 +160,10 @@ enum QwenService {
         guard weekly > 0 else {
             return (nil, false, "周额度为 0（套餐不含周额度）")
         }
+        // 7 天限额重置时间：usage.per1WeekResetTime 毫秒 → 秒
+        let weekResetAt = jsonNum(usage["per1WeekResetTime"]) / 1000.0
         return (Quota(weekRem: weekly * (1 - weekPct), weekLimit: weekly,
-                      remainingDays: remainingDays, expireAt: expireAt), false, "")
+                      remainingDays: remainingDays, expireAt: expireAt,
+                      weekResetAt: weekResetAt), false, "")
     }
 }

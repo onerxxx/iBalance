@@ -8,6 +8,7 @@
 
 - **每次改完 Swift 代码必须编译并重启 App**：`cd swift && ./build.sh` 一条命令完成（编译 + 打包 + 签名 + 自动停旧进程并重启）。仅 `swiftc -typecheck` 通过不算交付——改动要重启后才能在真实 App 里验证与观感确认。
 - **日常代码修改严禁跑 `release.sh` / 不要上传 GitHub Release**：日常迭代验证一律只跑 `build.sh`（fast 模式）编译重启即可。`release.sh` 仅在「真正需要向他人分发新版本」时由用户主动要求执行——它会产生 `-O` 慢编译、消费版本号计数器并向公开仓库发布正式 Release（对外可见、且会触发所有用户 App 的更新提示）。没有用户的明确发版指令就不要碰它。
+- **代码检索优先用 codegraph（`codegraph_explore` MCP 工具），不要上来就 grep/Read 翻文件**：改代码前先 `codegraph_explore` 定位——一次返回目标符号原文（带行号，与磁盘逐字节一致，**当已读用，勿再重复 Read**）+ 调用方 blast radius（callers 分布），比 grep→Read 多轮往返更快更准。索引由 `.codegraph/` 守护进程文件监听自动增量同步，免维护、勿建定时任务；索引异常时删 `.codegraph/` 全量重建即可。grep 只留给 codegraph 不覆盖的场景（非符号文本，如注释/配置键/资源名检索）。
 
 ## 项目概述
 
@@ -50,6 +51,7 @@
 ├── docs/                    # 补充文档：PACKAGING.md（zip 分发校验）、IMPROVEMENTS.md、updater-implementation.md、
 │                            #   card-drag-framework.md、menubar-template-pitfalls.md、native-segmented-control-guide.md、
 │                            #   macos-panel-ui-guide.md、macos-26-appkit-migration.md、UIUX-OPTIMIZATION.md、
+│                            #   core-animation-pitfalls.md（动效踩坑记：animator/presentation/冻结/override 闪退）、
 │                            #   CheckinResultPanelController.swift、iBalance-已损坏说明.html 等
 ├── Inter-4.1/               # Inter Variable 字体源目录
 ├── swift/
@@ -82,7 +84,7 @@
 │   ├── Info.plist           # App 元信息（LSUIElement、ATS 本地网络放行等）
 │   ├── AppIcon.icns         # Finder/Launchpad 图标
 │   ├── .build_state         # 构建计数器（版本号用，勿删）
-│   └── icons/               # SVG（菜单栏 template 图标 + 面板品牌图标）/ PNG / PDF（菜单栏矢量图标）
+│   └── icons/               # SVG（菜单栏 template 图标 + 面板品牌图标）/ PNG / PDF（菜单栏矢量图标）/ workbuddy.icon（Icon Composer 源包，勿直接打包）
 ```
 
 ## 构建与运行
@@ -92,16 +94,83 @@ cd swift && ./build.sh        # 编译全部 .swift 并打包为 ../iBalance.app
 open iBalance.app             # 运行（或双击）
 ```
 
-- build.sh 自动收集 `swift/` 下所有 `.swift`（含 `Services/` 子目录），无需手动列文件。
-- 编译命令核心：`swiftc -parse-as-library -framework Cocoa -framework UserNotifications -framework Security -framework Network -lsqlite3 -target arm64-apple-macos26 *.swift`（`-parse-as-library` 是因为入口用 `@NSApplicationMain` 而非 top-level code）。默认 `-Onone` 快速编译，`./build.sh --release` 用 `-O`。
+- build.sh 自动收集 `swift/` 下所有 `.swift`（含 `Services/` 子目录），无需手动列文件（SwiftPM 按 Package.swift 管理）。
+- 编译命令核心：`swift build --disable-sandbox --package-path swift -c <debug|release> --build-system native`（SwiftPM 增量，产物 `swift/.build/<conf>/iBalance`）。`--disable-sandbox` 必需：macOS 27 + CLT 下 SwiftPM `sandbox_apply` 被拒。默认 debug 快速编译，`./build.sh --release` 用 release（-O + WMO）。
+- **组装 .app 是覆盖式更新，禁止恢复 `rm -rf "$APP_DIR"`**（2026-08-31）：整包删除约 52 个内部文件，触发 WorkBuddy 批量删除保护（阈值 50，`[SAFE_DELETE_BULK_CONFIRM_REQUIRED]`，同会话重试仍失败）。build.sh 保留目录逐个覆盖；过期资源按「本次期望清单」逐个 `rm -f`（正常构建为 0 个）。
 - 版本号自动生成：**`YYYY.M.D.N`**（日期 + 当日构建序号），由 `swift/.build_state` 计数器维护，同日递增、跨日重置；构建时由 PlistBuddy 写入 Info.plist（`CFBundleShortVersionString` = 日期、`CFBundleVersion` = 完整号）。
 - `icons/*` 全量拷贝进 Resources：SVG（菜单栏 template 图标 + 面板品牌图标）、PNG（关于弹窗）、PDF（菜单栏平台矢量图标，优先于同名 SVG 加载）。
 - 产物输出到项目根目录 `iBalance.app/`，与源码目录分离。
-- **build.sh 会先停掉运行中的 iBalance 再组装 bundle**：否则 `open` 只会激活旧实例，新二进制根本没运行。SIGTERM 后循环等进程退出，5s 未退升级 SIGKILL，8s 仍未退则告警继续；结尾 `open` 前再做一次防御性确认。
+- **build.sh 会先停掉运行中的 iBalance 再组装 bundle**：否则 `open` 只会激活旧实例，新二进制根本没运行。SIGTERM 后循环等进程退出，3s 未退升级 SIGKILL，10s 仍未退则告警继续；结尾 `open` 前再做一次防御性确认。重启后路径验证依赖 `ps`，**WorkBuddy 沙箱可能禁止 ps**（"operation not permitted"）——此时脚本会提示「跳过路径验证」并正常结束，不是失败。
 - 打包后用固定自签证书 **`iBalance Local Sign`**（10 年有效，存于登录钥匙串）执行 `codesign --force --sign`。
   **必须保持该签名**：ad-hoc 签名每次编译都变，macOS TCC 按签名识别应用，会导致「完全磁盘访问」等授权每次重建后失效（详见陷阱 #2）。
 - **build.sh 结束时会自动重启 iBalance**（注意：改代码后跑 build 会立即重启正在运行的 App）。
 - **发版（仅用户明确要求时）**：仓库根 `bash release.sh ["更新说明"]` = `build.sh --release` → `ditto -c -k --sequesterRsrc --keepParent` 打 zip → SHA256 写入 Release 正文 → `gh release create v<CFBundleVersion>` 上传。约定：tag 必须为 `v<CFBundleVersion>` 全号；asset 只放一个 zip，文件名 `iBalance-<全版本>.zip`；同日重发需先 `gh release delete <tag> --cleanup-tag -y`。接收方全程无 quarantine（curl/brew/App 内下载均不打标），无需公证即可直接打开。
+
+### Icon Composer 图标资产（.icon → PNG 预导出，2026-08-31）
+
+- `swift/icons/*.icon`（现五包：workbuddy / zcode / deepseek / qwen / trae）是 **Icon Composer 源文件包**（目录：icon.json + Assets/源图）。`.icon` 运行时 `NSImage` **加载不了**，SDK 也没有公开的图标样式（rendition）选择 API，所以 App 内无法按需选 Dark/Clear 变体，只能构建期预导出 PNG。
+- **正解：命令行预导出 PNG**（无需 Xcode，但需安装 Icon Composer.app）。可执行文件在 app 包内：`"/Applications/Icon Composer.app/Contents/Executables/ictool"`（带引号防路径空格；`--help` 看官方用法，`--version` 查版本；**导出成功 = stdout 输出一个 `{ }` 空 JSON 且 exit 0**，失败则打印 `Unknown ...` 报错）。完整语法（枚举值均为传非法值实测报错信息所得）：
+
+  ```bash
+  "/Applications/Icon Composer.app/Contents/Executables/ictool" <源包>.icon \
+    --export-image --output-file <输出>.png \
+    --platform <iOS|macOS|watchOS> --rendition <样式变体> \
+    --width <pt> --height <pt> --scale <1|2> \
+    [--tint-color <0~1>] [--tint-strength <0~1>] \
+    [--design-generation <26|27>]
+  ```
+
+  | 参数 | 必选 | 说明 |
+  |---|---|---|
+  | `<源包>.icon`（位置参数） | ✔ | Icon Composer 源包目录路径 |
+  | `--export-image` | ✔ | 导出子命令（当前唯一，仍须显式给） |
+  | `--output-file` | ✔ | 输出 PNG 完整路径，文件名完全自定。项目命名规范 `<icon>-macOS26-ClearDark-256@1x.png` = 平台+设计代际 / rendition / 逻辑边长 / 像素倍率，见下「现有应用」 |
+  | `--platform` | ✔ | 按目标平台构图（外形遮罩/形状不同）：`iOS` / `macOS` / `watchOS`（watchOS 需源包声明 circles 组，本项目不用） |
+  | `--rendition` | ✔ | 样式变体，六选一：`Default` / `Dark` / `TintedLight` / `TintedDark` / `ClearLight` / `ClearDark`。面板品牌卡特例恒取 `ClearDark` |
+  | `--width` / `--height` | ✔ | 输出逻辑边长（pt），与 `--scale` 相乘得像素尺寸：实测 `--width 256 --height 256 --scale 2` 出 **512×512 px**（@2x）。面板资产口径 = 256×256 @1x |
+  | `--scale` | ✔ | 像素倍率（1 或 2），对应文件名 `@1x` / `@2x` 后缀 |
+  | `--tint-color` | 可选 | 仅对 `Tinted*` 两个 rendition 有意义（官方示例值 `0.25`，0~1 归一数值；具体色相映射未实测）。其余 rendition 省略 |
+  | `--tint-strength` | 可选 | Tinted 着色强度（官方示例值 `0.75`）。其余 rendition 省略 |
+  | `--design-generation` | 可选，**务必显式写** | `26` 或 `27`——苹果两代图标设计语言（对应 Icon Composer 界面 Effects 区的 "Design Generation" 单选）。缺省时的默认值未知且可能随系统升级漂移，项目资产恒为 26，命令一律带 `--design-generation 26`，勿依赖默认 |
+
+  具体示例（与仓库现有五张资产同参）：
+  ```bash
+  "/Applications/Icon Composer.app/Contents/Executables/ictool" swift/icons/qwen.icon \
+    --export-image --output-file swift/icons/qwen-macOS26-ClearDark-256@1x.png \
+    --platform macOS --rendition ClearDark --width 256 --height 256 --scale 1 --design-generation 26
+  ```
+  - 产物 PNG 会被 build.sh 现有 `cp icons/*` 自动打包进 Resources；换样式/尺寸改参数重跑覆盖同名文件即可（旧 workbuddy 多版本共存于 icons/ 供回切的做法见下）。
+- 现有应用（2026-09-01 起统一走 `PanelLayout.brandClearDarkImages` 表，按 CardStyle.icon 图标名查表，`balanceContentRow` 命中即用；**非 template、不着色**；静态缓存 + copy 设尺寸；表里没有/资产缺失回退原 SVG template）：
+  - WorkBuddy Agent 卡 = `workbuddy-macOS26-ClearDark-256@1x.png`（macOS ClearDark 256@1x，`--design-generation 26`）。旧版 iOS/Dark 变体与 `workbuddy-cleardark.png` 已于 2026-09-01 从 icons/ 清理，需要时按上面命令改参数重导。
+  - ZCode + ZhiPu 卡 = `zcode-macOS26-ClearDark-256@1x.png`（源包 `swift/icons/zcode.icon`，图标名 "zhipu" 两卡共用故同时生效）。
+  - DeepSeek 卡 = `deepseek-macOS26-ClearDark-256@1x.png`（源包 `swift/icons/deepseek.icon`，图标名 "deepseek" 仅该卡使用）。
+  - Qwen 卡 = `qwen-macOS26-ClearDark-256@1x.png`（源包 `swift/icons/qwen.icon`，图标名 "qwen" 仅该卡使用；原 qwen.svg 保留作资产缺失回退）。
+  - TRAE 卡 = `trae.png`（源包 `swift/icons/trae.icon`，ictool 同参导出后简化命名，不再跟 `*-macOS26-ClearDark-256@1x` 命名式；图标名 "trae-color" 仅该卡使用，原 trae-color.svg 保留作回退）。
+  - 若需其他样式（如浅色面板 ClearLight），改 `--platform/--rendition` 重导后换表里的资源名即可。
+
+## 🎨 UI 数值口径（改面板 UI 前先看）
+
+用户调 UI 习惯给具体 pt 值（"副标题改 9pt"、"icon 减 2pt"）。**先确认该数值是常量还是散落硬编码**：
+
+| 项目 | 权威位置 | 当前值 |
+|---|---|---|
+| 主标题 / 数值字号 | `Palette.cardTitleFontSize`（Panel.swift） | 13 |
+| 副标题（到期/剩余分段）/ 其余账号积分 chip / 气泡积分行 | `Palette.cardSubFontSize`（Panel.swift） | 9 |
+| 卡片 icon 尺寸（全部平台统一） | `CardStyle.iconSize` / `monoIconSize` | 24 / 20.47 |
+| row1 / row2 行高、两行 spacing | `PanelLayout.balanceContentRow` | 16 / 12 / 2 |
+| 卡片上下内边距 | `rebuildAccountCards` 的 cardPadTop/Bottom | 6 / 6（2026-09-01：5.5 → 6） |
+| 图标列容器宽 | `PanelLayout.balanceContentRow` 的 iconContainer.widthAnchor | 25pt（2026-09-01：24.47 → 25，写死不随 iconSize 变） |
+| 昵称（副标题右侧）字号 | `PanelLayout.balanceContentRow` | 10 |
+| 昵称（含签到徽章）最大宽 | `NickBadgeTextField` 构建处（Panel.swift） | ≤ 90 |
+| 设置行副标题最大宽 | `statusDebugSub`（Panel.swift） | ≤ 90 |
+| popover 面板宽度 | `updateContentSize`（Panel.swift） | `max(230, fittingSize.width - 20)` |
+| 浮窗（pin）宽度 | `PinWindow` + config `floating_panel_width` | `max(config, 转移时面板宽)`，clamp [240, 480] |
+
+规则：
+- **有常量的改常量**，改完顺手把散落的数字一起换掉（别留两份）；没有常量的高频数值（如某行距被反复调）就地提炼成常量。
+- 数值类注释**不要写行号**（行号必漂移），写符号名，用 grep 定位。
+- 面板坐标系有实测翻转语义等一堆坑，见 `.workbuddy/memory/MEMORY.md`。
+- **面板宽度类改动的隐藏坑（2026-09-01 实测）**：popover 宽度按 `fittingSize` 拟合，但 fittingSize 按**理想宽**算——hidden 视图的约束照样参与（Codex 卡隐藏时其邮箱昵称 195pt 仍把面板撑到 250）、长文本 label 布局时被截断但 fittingSize 仍按完整宽。对策：长 label 一律加 `widthAnchor ≤ N` 上限约束。详见 `.workbuddy/memory/MEMORY.md` 的 fittingSize 虚高陷阱。
 
 ## ⚠️ 关键陷阱（必读）
 
@@ -125,7 +194,10 @@ open iBalance.app             # 运行（或双击）
 ### 3. LSUIElement 面板激活陷阱
 
 LSUIElement 应用默认非活跃，NSPopover 首帧按「非活跃」渲染玻璃材质会整体偏暗，且 `.transient` 行为不生效（点面板外不收起）。
-修复范式（Panel.swift `show()`）：弹出前 `NSApp.activate(ignoringOtherApps: true)`、弹出后 `makeKey()`；`popoverDidClose` 里 `NSApp.hide` 归还焦点（弹系统设置菜单等场景用 `suppressHideOnClose` 跳过）；并用事件时间戳防「点图标关掉后同一次点击立刻重弹」的抖动。
+修复范式（Panel.swift `show()`）：弹出前 `NSApp.activate(ignoringOtherApps: true)`、弹出后 `makeKey()`；`popoverDidClose` 里 `NSApp.hide` 归还焦点；并用事件时间戳防「点图标关掉后同一次点击立刻重弹」的抖动。
+
+**`popoverDidClose` 里 `NSApp.hide` 是 App 级的**（2026-09-01 核）：任何导致 popover 关闭的操作都会把整个 App 一起隐藏。当前只有 `isTransferringPanel` 一个早退分支（pin 转移专用）。
+→ **打开任何独立窗口前必须抑制这次 hide**，否则新窗口刚显示就被连带隐藏（典型：从面板打开 SwiftUI 设置窗口）。做法是加一个 `suppressHideOnClose` 标志位（窗口关闭时复位），该标志位当前**尚未实现**——见 `plans/005` 的 R1。
 
 ### 4. AppKit 旋转锚点陷阱
 

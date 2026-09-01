@@ -1,0 +1,45 @@
+{
+  "features" : [
+    "refractivity"
+  ],
+  "fill" : "system-dark",
+  "groups" : [
+    {
+      "hidden" : false,
+      "layers" : [
+        {
+          "fill" : "system-light",
+          "glass" : true,
+          "image-name" : "qwen.png",
+          "name" : "qwen",
+          "position" : {
+            "scale" : 1.2,
+            "translation-in-points" : [
+              -1.1368683772161603e-13,
+              -1.1368683772161603e-13
+            ]
+          }
+        }
+      ],
+      "refractivity" : {
+        "depth" : 0.104921875,
+        "enabled" : true,
+        "strength" : 0.171484375
+      },
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.96
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.21
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

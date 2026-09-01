@@ -18,8 +18,10 @@ enum ProcessUtil {
             .map { Int($0.processIdentifier) }
     }
 
-    /// 杀掉应用主进程：SIGTERM 等 0.8s（正常约 600ms 退出），超时对残留 SIGKILL 强杀（最坏 < 1s）。
-    /// 仿 Cockpit Tools：只杀主进程，Electron 主进程退出自动回收子进程。
+    /// 杀掉应用主进程：SIGTERM 等 1.5s（WorkBuddy 5.4.7 退出流程含遥测打点，0.8s 内
+    /// 经常退不完；正常约 600ms 退出则 round 1 直接返回，不影响耗时），超时对残留
+    /// SIGKILL 强杀。⚠️ 强杀会让 Electron 单实例锁残留，调用方重启前须清锁
+    /// （WorkBuddyService.clearElectronSingletonLocks），否则新实例被误判静默退出。
     /// label 仅用于日志前缀（"WorkBuddy" / "TRAE" / "ZCode"）。
     static func killMainProcesses(bundleId: String, label: String) {
         let tCollect = Date()
@@ -30,8 +32,8 @@ enum ProcessUtil {
             return
         }
         sendSignal(pids, SIGTERM)
-        Logger.log(.switchAccount, "[iBalance] \(label) SIGTERM sent, waiting up to 0.8s...")
-        if waitPidsExit(pids, timeout: 0.8) {
+        Logger.log(.switchAccount, "[iBalance] \(label) SIGTERM sent, waiting up to 1.5s...")
+        if waitPidsExit(pids, timeout: 1.5) {
             Logger.log(.switchAccount, "[iBalance] \(label) all pids exited (round 1)")
             return
         }
@@ -65,5 +67,45 @@ enum ProcessUtil {
     static func isRunning(_ pid: Int) -> Bool {
         if kill(pid_t(pid), 0) == 0 { return true }
         return errno == EPERM
+    }
+
+    /// 按可执行文件完整路径收集该应用的全部 Electron 进程 PID（含 prewarm / daemon /
+    /// sidecar / serve 等子进程）。NSRunningApplication 只登记各 app 的主进程，Electron
+    /// 子进程不在其中——主进程被切号杀掉后它们会变孤儿进程残留（实测 `--prewarm`
+    /// 守护能存活多次切号），让 LaunchServices 误判「应用仍在运行」，紧随其后的 open
+    /// 被路由到死实例而不启动新进程。用 pgrep -f 匹配完整路径，避免命令行关键词误伤。
+    static func allElectronPids(executablePath: String) -> [Int] {
+        let task = Process()
+        task.launchPath = "/usr/bin/pgrep"
+        task.arguments = ["-f", executablePath]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do { try task.run() } catch { return [] }
+        task.waitUntilExit()
+        guard let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) else {
+            return []
+        }
+        return out.split(separator: "\n").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    /// 清理应用残留的 Electron 进程（孤儿子进程/守护）：SIGTERM 等 1.5s，超时 SIGKILL。
+    /// 返回清理后仍存活的进程数（0 = 干净）。切号时在 open 重启前调用，确保旧实例
+    /// 彻底终结、LaunchServices 完成注销，新实例 open 才能可靠启动。
+    static func cleanupRemainingElectronProcesses(executablePath: String, label: String) -> Int {
+        let pids = allElectronPids(executablePath: executablePath)
+        guard !pids.isEmpty else { return 0 }
+        Logger.log(.switchAccount, "[iBalance] \(label) orphan electron pids: \(pids)")
+        sendSignal(pids, SIGTERM)
+        if waitPidsExit(pids, timeout: 1.5) {
+            Logger.log(.switchAccount, "[iBalance] \(label) orphans exited after SIGTERM")
+            return 0
+        }
+        let alive = pids.filter { isRunning($0) }
+        guard !alive.isEmpty else { return 0 }
+        sendSignal(alive, SIGKILL)
+        let exited = waitPidsExit(alive, timeout: 1.0)
+        Logger.log(.switchAccount, "[iBalance] \(label) orphans SIGKILL done, exited=\(exited)")
+        return exited ? 0 : alive.filter { isRunning($0) }.count
     }
 }

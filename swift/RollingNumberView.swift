@@ -402,27 +402,6 @@ final class RollingNumberView: NSView {
 
     override var isFlipped: Bool { true }
 
-    // —— 菜单栏显隐渐变标记：与平台 icon / 卡片主标题同一套 MenuBarFadeMask 参数，
-    //    蒙版相对单位随 bounds 高度自适应，mask 与左溢裁剪（masksToBounds）互不影响 ——
-    private lazy var menuBarFade = MenuBarFadeMask(host: self)
-    var usesMenuBarFade: Bool {
-        get { menuBarFade.usesFade }
-        set { menuBarFade.usesFade = newValue }
-    }
-    /// 墨迹区间：以内部同字体基线探针的官方读数（baselineOffsetFromBottom）+
-    /// 字体度量推导——探针恒挂 self.top（flipped），主行槽与车轮同一排版口径
-    private var lastInkFontKey = ""
-    private func updateInkRange() {
-        guard bounds.height > 0 else { return }
-        let key = "\(mainFont.fontName)|\(Int(mainFont.pointSize))"
-        guard lastInkFontKey != key else { return }
-        lastInkFontKey = key
-        let pf = baselineProbe.frame                       // flipped：minY = 自顶距离
-        let base = bounds.height - (pf.minY + pf.height - baselineProbe.baselineOffsetFromBottom)
-        menuBarFade.inkRange = (base + mainFont.descender, base + mainFont.ascender)
-        menuBarFade.refreshAnchors()
-    }
-
     override var intrinsicContentSize: NSSize {
         var w = slots.reduce(0) { $0 + slotWidth($1) }
         if prefixIcon != nil { w += prefixIconGap + prefixIconSize }
@@ -559,6 +538,11 @@ final class RollingNumberView: NSView {
     private static var rebuildLogCount = 0
 
     /// 设置整组前景色（hover 提亮/回暗；逐槽传播）
+    /// - animated: true = Motion.hover(0.25s) display-link 逐帧 RGB 插值淡变
+    ///   （chip hover 积分让位/复原动效）。自绘槽位不走 AppKit 动画，颜色渐变只能
+    ///   逐帧重绘：动态色先按视图生效外观解算成 RGB 参与插值，落定帧写回原始
+    ///   动态色（主题切换着色不受影响）；window 为空（卡片离屏）直接落值不空转。
+    /// 设置整组前景色（chip hover 积分让位/复原；逐槽传播，瞬时切换不走动画）
     func setTextColor(_ c: NSColor) {
         textColor = c
         prefixIconView.contentTintColor = c
@@ -774,8 +758,6 @@ final class RollingNumberView: NSView {
 
     override func layout() {
         super.layout()
-        menuBarFade.syncLayout()
-        updateInkRange()
         relayoutSlots()
         // TODO(诊断): 上游几何 dump（限前 8 次），定位偏右；确认后移除
         if Self.posDiagCount <= 8, let row1 = superview {

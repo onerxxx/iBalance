@@ -1,6 +1,21 @@
-// Controls.swift — iBalance
-// 自绘控件:MiniSwitch / HoverCard / ActionTileButton 等(自包含)
+// Controls.swift — iBalance 自绘控件库（自包含，不依赖业务类型）
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
+//
+// ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
+// 开关          MiniSwitch（原生 NSSwitch .mini 视觉缩 0.81）/ MonoCharSwitch（Mono 模式字符开关）
+//               SwitchRowTapHandler（整行点击手势的 target，必须被行强持有否则失效）
+// 下拉          CompactPopUpButton（9pt 字号）
+// 卡片容器       HoverCard（hover 渐变 + 整卡 hitTest 接管）/ ActionTileButton（操作磁贴，继承 HoverCard）
+// 行容器         HoverRowView（hover 提亮背景+文本）/ SubAccountItemView（其余账号 chip，点击切号）
+// 图标按钮       HoverIconButton / RefreshIconButton（刷新自转，CAAnimationDelegate）
+// 玻璃与遮罩      TintedVisualEffectView（面板玻璃，继承面板遮罩色）/ TintOverlayView
+// 滚动提示层      ScrollFadeHint（顶/底缘渐隐，参数 FadeHintParams，config.json 的 fade_hint_* 可覆盖）
+// pin 浮窗 resize  PanelResizeHandle（浮窗自绘把手；**仅高度可调**，宽度恒等于起拖宽）
+// hover 协议      PanelScrollHoverSync（滚动时同步 hover 状态）/ HoverEnterValidation
+// 签到结果模型     CheckinRowState / CheckinInfoItem / CheckinResultRow（渲染在 Dialogs.swift）
+//
+// ⚠️ hover 类控件在面板滚动时必须同步状态 → 实现 PanelScrollHoverSync。
+//    改 hover 逻辑先确认是否需要滚动同步，否则滚动后会残留高亮。
 
 import Cocoa
 import CoreImage
@@ -247,6 +262,8 @@ final class SubAccountItemView: NSStackView {
     var nickname = ""
     /// 积分文本（hover 子面板第二行,与卡片数值同源）
     var valueText = ""
+    /// 令牌失效/账号无套餐（账号级问题）：hover 气泡 ID 行末挂黄色警示徽章
+    var tokenInvalid = false
     /// hover 进出回调（面板侧弹/收昵称子面板;进出有 0.3s 延迟防扫过闪烁）
     var onTipToggle: ((Bool) -> Void)?
     /// hover 即时翻转回调（setHovered 状态真变化时触发,无 tooltip 延迟;
@@ -311,15 +328,46 @@ final class SubAccountItemView: NSStackView {
             : NSColor.black.withAlphaComponent(0.08)
     }
 
+    /// 离场下沉期间冻结背景写入。mouseExited 中 setHovered(false) 与离场块同拍执行，
+    /// 其 0.25s 背景淡出快于 chip 整体淡出，不冻结会「背景先化掉、裸文本在下沉」。
+    /// 旧实现钉 presentation 当前值：presentation 在未提交帧拿不到时回退读 model——
+    /// 而 model 已被先行的 setHovered(false) 改成默认色，禁用动作写入等于把背景
+    /// 一帧拍灭（「背景瞬间消失」根因）。现改为纯标志位：冻结期间 applyState 跳过
+    /// 背景写入，model 保持离场前颜色（在途背景动画自然播完，终点即 model 值），
+    /// 背景只随 chip 整体 alpha 淡出。配合 mouseExited 先离场块、后熄 hover 的顺序。
+    private var backgroundFrozen = false
+
+    func freezeBackground() {
+        backgroundFrozen = true
+    }
+
+    /// 换入路径解除冻结（离场被代际取消、未走 resetVisualState 的场景），
+    /// 并按当前 hover 态重铺背景（此刻 chip 在淡入起点，重铺不可见）
+    func unfreezeBackground() {
+        guard backgroundFrozen else { return }
+        backgroundFrozen = false
+        applyState(animated: false)
+    }
+
+    /// 冻结复位：落藏后恢复默认背景/文本色（供下一轮换入）
+    func resetVisualState() {
+        backgroundFrozen = false
+        isHovered = false
+        applyState(animated: false)
+    }
+
     /// 背景与文本/图标色随 hover 切换：背景走 CATransaction（图层属性），
     /// 文本/图标走 NSAnimationContext animator（非图层属性），时长统一 Motion.hover
     private func applyState(animated: Bool) {
         let bg = isHovered ? Self.bgHover : Self.bgDefault
         let fg = isHovered ? Palette.cardForeground : NSColor.systemGray
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(animated ? Motion.hover : 0)
-        layer?.backgroundColor = bg.cgColor
-        CATransaction.commit()
+        // 背景冻结期间跳过背景写入（离场下沉中，背景只随 chip 整体 alpha 淡出）
+        if !backgroundFrozen {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(animated ? Motion.hover : 0)
+            layer?.backgroundColor = bg.cgColor
+            CATransaction.commit()
+        }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = animated ? Motion.hover : 0
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -866,6 +914,29 @@ class HoverCard: NSView, PanelScrollHoverSync {
     private let hoverEffectLayer = CALayer()
     /// hover 背景层：统一 hover 渐变（Palette.hoverGradient*）
     private let hoverGradientLayer = CAGradientLayer()
+    /// 平台卡强背景位图层（hoverGradientOverride 非空时生效）：承载「中心纯色 + 四边
+    /// 10pt 渐隐」的 RGBA 位图（premultiplied，颜色与渐隐 alpha 一次画进像素）。
+    /// CAGradientLayer 只有单方向线性渐变，四边等距渐隐须逐像素距离场绘制；
+    /// 常驻 hoverEffectLayer、盖在渐变层之上，override 为空（非平台卡）时 contents 恒 nil。
+    private let hoverBitmapLayer = CALayer()
+    /// 位图缓存键：像素尺寸 + 外观（内容与两者绑定，未变则跳过重绘）
+    private var hoverBitmapKey: (w: Int, h: Int, dark: Bool)?
+    /// 自定义 hover 渐变（Agent/API 平台卡套用 Palette.cardHoverStrong 强背景；
+    /// nil = 默认共用渐变 Palette.hoverGradient，余额卡/磁贴/折叠标题条/用量条不受影响）。
+    /// 设置后即按当前外观重解算落色（dwell 进度填充/mask 动画复用同一层，行为不变）
+    var hoverGradientOverride: [NSColor]? = nil {
+        didSet {
+            guard hoverGradientOverride != oldValue else { return }
+            // 平台卡：渐变层让位图（hoverBitmapLayer）独当背景。若渐变层仍显示，
+            // 位图边缘渐隐露出的就是同色渐变层 → 四边渐隐视觉上被吞掉（"没生效"）。
+            // 位图边缘 alpha→0 处露出卡片自身背景（kCardBackground），渐隐才可见。
+            hoverGradientLayer.isHidden = hoverGradientOverride != nil
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                self.hoverGradientLayer.colors =
+                    (self.hoverGradientOverride ?? Palette.hoverGradient).map { $0.cgColor }
+            }
+        }
+    }
 
     var dragContentLayer: CALayer? { dragContentView?.layer }
 
@@ -982,11 +1053,93 @@ class HoverCard: NSView, PanelScrollHoverSync {
 
     private func setupHoverGradient() {
         wantsLayer = true
-        // 统一 hover 渐变背景：Palette.hoverGradient*（余额卡片/磁贴/折叠标题条/用量条目共用）
-        hoverGradientLayer.colors = Palette.hoverGradient.map { $0.cgColor }
+        // 默认共用淡渐变；Agent/API 平台卡经 hoverGradientOverride 覆盖为强背景
+        // （init 阶段 override 恒 nil，此处恒为默认值，覆盖由 didSet 重解算落色）
+        hoverGradientLayer.colors = (hoverGradientOverride ?? Palette.hoverGradient).map { $0.cgColor }
         hoverEffectLayer.opacity = 0
+        // 位图层在上、渐变层在下：平台卡位图（中心纯色+边缘渐隐）盖住渐变层；
+        // 非平台卡位图 contents 恒 nil，透明不遮
         hoverEffectLayer.addSublayer(hoverGradientLayer)
+        hoverEffectLayer.addSublayer(hoverBitmapLayer)
         layer?.addSublayer(hoverEffectLayer)
+    }
+
+    /// 平台卡强背景位图（RGBA premultiplied）：颜色（黑/白 80% 按外观解析）与渐隐 alpha
+    /// 一次写入像素。alpha = smoothstep(d / Palette.cardHoverEdgeFade)，d = 到「圆角矩形
+    /// 边缘」的 signed distance（内部为正）。角部沿圆弧法线等距收缩，渐隐等值线与卡片
+    /// 圆角（Palette.cardCornerRadius）完全平行，无直角 L 形等值线与圆弧冲突的"重叠感"。
+    /// ⚠️ 不能用灰度无 alpha 图当 CALayer.mask：mask 读 alpha 通道，无 alpha 通道 = 全不透明，
+    /// 渐隐会整个消失。必须把 alpha 画进像素本身。
+    private func renderHoverBitmap(wp: Int, hp: Int, scale: CGFloat, size: CGSize, dark: Bool) -> CGImage? {
+        guard let ctx = CGContext(data: nil, width: wp, height: hp, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                                    | CGBitmapInfo.byteOrder32Big.rawValue),
+              let data = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let c = (dark ? Palette.cardHoverStrongDark : Palette.cardHoverStrongBright)
+                .usingColorSpace(.deviceRGB)
+            c?.getRed(&r, green: &g, blue: &b, alpha: &a)
+        }
+        let W = size.width, H = size.height
+        let f = min(Palette.cardHoverEdgeFade, W / 2, H / 2)
+        let rad = min(Palette.cardCornerRadius, W / 2, H / 2)
+        let cx = W / 2, cy = H / 2
+        for y in 0..<hp {
+            let py = CGFloat(y) / scale
+            for x in 0..<wp {
+                let px = CGFloat(x) / scale
+                // 到圆角矩形边缘的 signed distance（内部为正）= iq sdRoundBox 取负：
+                // sdRoundBox = outside + inside - rad（内部为负）→ 取负得 rad - outside - inside。
+                // ⚠️ 误写成 `+ inside`（inside 恒 ≤0）会让「qx≤-r 且 qy≤-r」的中央区域 d<0 →
+                // 卡片中部出现一条横向透明带（H 接近 4r 时最窄，实测 H=41/r=10 → 1pt 透明条）。
+                let qx = abs(px - cx) - (W / 2 - rad)
+                let qy = abs(py - cy) - (H / 2 - rad)
+                let ox = max(qx, 0), oy = max(qy, 0)
+                let d = rad - sqrt(ox * ox + oy * oy) - min(max(qx, qy), 0)
+                let t = min(max(d / f, 0), 1)
+                let s = t * t * (3 - 2 * t) // smoothstep：边缘柔和、中心稳定
+                let i = (y * wp + x) * 4
+                if dark {
+                    // 暗色主题：边缘 20% 透明白 → 中心黑 80%（premultiplied 线性插值）。
+                    // 边缘 premult RGB = 白×0.2 = 0.2、alpha 0.2；中心 = 黑×0.8 = 0、alpha 0.8。
+                    let alpha = Palette.cardHoverEdgeWhiteAlpha + (a - Palette.cardHoverEdgeWhiteAlpha) * s
+                    let p = Palette.cardHoverEdgeWhiteAlpha * (1 - s)
+                    data[i] = UInt8(p * 255)
+                    data[i + 1] = UInt8(p * 255)
+                    data[i + 2] = UInt8(p * 255)
+                    data[i + 3] = UInt8(alpha * 255)
+                } else {
+                    // 浅色主题：边缘透明 → 中心白 80%（原行为）
+                    let alpha = s * a
+                    data[i] = UInt8(r * 255 * alpha)
+                    data[i + 1] = UInt8(g * 255 * alpha)
+                    data[i + 2] = UInt8(b * 255 * alpha)
+                    data[i + 3] = UInt8(alpha * 255)
+                }
+            }
+        }
+        return ctx.makeImage()
+    }
+
+    /// 平台卡位图按需重绘：尺寸或外观变化才重画（菜单栏面板 Retina 恒定 2x）。
+    private func updateHoverBitmapIfNeeded() {
+        guard hoverGradientOverride != nil else { return }
+        let size = hoverEffectLayer.bounds.size
+        let scale: CGFloat = 2
+        let wp = Int(size.width * scale), hp = Int(size.height * scale)
+        guard wp > 0, hp > 0 else { return }
+        let dark = effectiveAppearance.isDark
+        let key = (w: wp, h: hp, dark: dark)
+        if let cached = hoverBitmapKey, cached == key { return }
+        hoverBitmapKey = key
+        if let img = renderHoverBitmap(wp: wp, hp: hp, scale: scale, size: size, dark: dark) {
+            hoverBitmapLayer.contents = img
+            hoverBitmapLayer.contentsScale = scale
+        } else {
+            NSLog("[HoverCard] bitmap render FAILED")
+        }
     }
 
     /// 子层 frame 不随 AutoLayout 同步，布局时手动贴满 bounds（圆角由父 layer masksToBounds 裁出）
@@ -994,6 +1147,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
         super.layout()
         hoverEffectLayer.frame = bounds
         hoverGradientLayer.frame = hoverEffectLayer.bounds
+        hoverBitmapLayer.frame = hoverEffectLayer.bounds
+        updateHoverBitmapIfNeeded()
         let pts = Palette.gradientEndpoints(angleDeg: Palette.hoverGradientAngleDeg, in: bounds)
         hoverGradientLayer.startPoint = pts.start
         hoverGradientLayer.endPoint = pts.end
@@ -1003,7 +1158,13 @@ class HoverCard: NSView, PanelScrollHoverSync {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            self.hoverGradientLayer.colors = Palette.hoverGradient.map { $0.cgColor }
+            self.hoverGradientLayer.colors =
+                (self.hoverGradientOverride ?? Palette.hoverGradient).map { $0.cgColor }
+        }
+        // 位图颜色随外观解析：外观变化不一定触发 layout，这里直接置脏重绘
+        if hoverGradientOverride != nil {
+            hoverBitmapKey = nil
+            updateHoverBitmapIfNeeded()
         }
     }
 
@@ -1091,25 +1252,31 @@ class HoverCard: NSView, PanelScrollHoverSync {
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
-        // 真实离开=位置在项外全部熄灭;几何变化补发的 exit（dwell 卡）位置仍在卡内,
-        // 按位置重算即停在原项上（光标未动,高亮不该丢）
-        syncInteractiveHover(at: event)
         // dwell 卡：几何变化补发的 exit 其事件位置仍在卡内（陈旧坐标），忽略——
         // 否则确认切换引发高度变化后进度被打回重跑；自造事件（syncHoverState，
-        // window=nil）是 hitTest 权威判定，照常退出
+        // window=nil）是 hitTest 权威判定，照常退出。此路径仅按位置重算 hover 项，
+        // 光标未动高亮不该丢
         if hoverDwellDuration != nil, event.window != nil,
-           bounds.contains(convert(event.locationInWindow, from: nil)) { return }
+           bounds.contains(convert(event.locationInWindow, from: nil)) {
+            syncInteractiveHover(at: event)
+            return
+        }
+        // 先走离场视觉（onHover(false) → chip 冻结背景）再熄 chip hover：
+        // 反过来 setHovered(false) 的背景淡出会先于冻结启动，chip 下沉期间
+        // 背景快速化掉（「裸文本在下沉」的旧根因）
         performHoverExitVisuals()
+        syncInteractiveHover(at: event)
     }
 
-    /// 启动 hover 确认进度：hover 渐变层挂左锚 mask，bounds.width 0→满 线性填充；
-    /// 满时模型值落定 + 触发 onHoverConfirmed。
+    /// 启动 hover 确认进度：hover 效果层挂左锚 mask，bounds.width 0→满 线性填充；
+    /// 满时模型值落定 + 触发 onHoverConfirmed。mask 挂在 hoverEffectLayer（而非渐变层），
+    /// 平台卡位图层同在容器内，进度填充对整层生效。
     /// mask 带 16pt 高斯模糊：进度前缘软羽化（mask alpha 参与滤镜渲染），
     /// 取消冻结/满宽落定均沿用同一 mask,行为不变。
     private func startHoverDwell(duration: CFTimeInterval) {
         hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
-        let w = hoverGradientLayer.bounds.width
-        let h = hoverGradientLayer.bounds.height
+        let w = hoverEffectLayer.bounds.width
+        let h = hoverEffectLayer.bounds.height
         guard w > 0, h > 0 else { return }
         let mask = CALayer()
         mask.anchorPoint = CGPoint(x: 0, y: 0.5)
@@ -1123,7 +1290,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
         CATransaction.setDisableActions(true)
         hoverEffectLayer.opacity = 1
         mask.bounds = CGRect(x: 0, y: 0, width: 0, height: h)
-        hoverGradientLayer.mask = mask
+        hoverEffectLayer.mask = mask
         CATransaction.commit()
         let anim = CABasicAnimation(keyPath: "bounds.size.width")
         anim.fromValue = 0
@@ -1163,7 +1330,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
         dwellWork?.cancel()
         dwellWork = nil
         dwellConfirmed = false
-        guard let mask = hoverGradientLayer.mask else { return }
+        guard let mask = hoverEffectLayer.mask else { return }
         let current = (mask.presentation()?.bounds ?? mask.bounds).width
         CATransaction.begin()
         CATransaction.setDisableActions(true)

@@ -88,20 +88,24 @@ enum WorkBuddyService {
     // MARK: 账号切换（写 auth 文件 + 重启 WorkBuddy Desktop）
 
     /// 将指定账号的凭据写入 workbuddy-desktop.info，然后杀掉并重启 WorkBuddy Desktop。
-    /// 仿 Cockpit Tools 的切号流程：杀进程 → 写认证 → 重启。
+    /// 仿 Cockpit Tools 的切号流程：杀进程 → 写认证 → 同步共享 → 重启。
     /// 返回 false = 写入失败已回滚（auth 文件未被改动，重启恢复原账号，应用不会停留在「被杀」状态）。
     static func switchAccount(_ account: WBAccount) -> Bool {
         let t0 = Date()
         Logger.log(.switchAccount, "[iBalance] switchAccount start: uid=\(account.uid) nickname=\(account.nickname)")
         // 1. 杀掉 WorkBuddy Desktop 主进程（按 bundle id 精确定位，仿 Cockpit 只杀主进程）
-        ProcessUtil.killMainProcesses(bundleId: "com.workbuddy.workbuddy", label: "WorkBuddy")
+        ProcessUtil.killMainProcesses(bundleId: "com.tencent.workbuddy.mac", label: "WorkBuddy")
         // 2. 写入 auth 文件
         guard writeAuthFile(account) else {
             Logger.log(.switchAccount, "[iBalance] writeAuthFile FAILED, rollback: restart with original account")
             restartWorkBuddy()
             return false
         }
-        // 3. 重启 WorkBuddy Desktop
+        // 3. 同步共享：此时 WorkBuddy 已死、auth 已指向新账号，时机天然安全。
+        //    把全部会话归属转移到新账号 + 记忆广播（详见 WbShare.swift），静默执行，只记日志。
+        let share = WbShareSync.perform(targetUid: account.uid, nicknameByUid: [:])
+        Logger.log(.switchAccount, "[wb-share] on-switch: uid=\(account.uid) moved=\(share.movedSessions) memorySynced=\(share.memorySynced) err=\(share.error ?? "none")")
+        // 4. 重启 WorkBuddy Desktop
         restartWorkBuddy()
         Logger.log(.switchAccount, "[iBalance] switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
         return true
@@ -170,15 +174,87 @@ enum WorkBuddyService {
         }
     }
 
-    /// 重启 WorkBuddy Desktop
-    /// 仿 Cockpit Tools：open -n -a WorkBuddy --args --new-window
-    /// -n = 强制新实例，--new-window = 新窗口
-    private static func restartWorkBuddy() {
+    /// WorkBuddy (Electron) 的 userData 目录，单实例锁文件所在处
+    private static let wbUserDataDir = NSHomeDirectory() + "/.workbuddy/app"
+
+    /// WorkBuddy 可执行文件完整路径（pgrep 匹配用，清理孤儿 Electron 进程）
+    private static let wbExecutablePath = "/Applications/WorkBuddy.app/Contents/MacOS/Electron"
+
+    /// 清理 WorkBuddy (Electron) 单实例锁残留：SIGKILL 强杀主进程后
+    /// SingletonLock/SingletonCookie/SingletonSocket 不会自动清理，且进程在僵尸期
+    /// kill(pid,0) 仍判存活 → 紧随其后的 open 被单实例锁误判「已有实例」，
+    /// 新实例静默退出（App 不启动，无任何业务日志）。只删锁文件，不碰业务数据。
+    static func clearElectronSingletonLocks() {
+        let fm = FileManager.default
+        for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+            let p = (wbUserDataDir as NSString).appendingPathComponent(name)
+            if fm.fileExists(atPath: p) {
+                try? fm.removeItem(atPath: p)
+                Logger.log(.switchAccount, "[iBalance] cleared stale singleton lock: \(name)")
+            }
+        }
+    }
+
+    /// 重启 WorkBuddy Desktop（切号与同步共享复用）
+    /// 注意：不能带 `--args --new-window`——2026-08-30 后的 WorkBuddy 新版不认识该参数，
+    /// 收到后进程启动即退出。也不能带 `-n`——旧进程死后残留单实例锁 + 僵尸期误判
+    /// 「已有实例」，新实例会静默退出（2026-09-01 实测 App 起不来的根因，见
+    /// clearElectronSingletonLocks）。
+    /// 流程：清锁 → 清残留 Electron 进程（孤儿 prewarm/daemon 会让 LaunchServices 误判
+    /// 「仍在运行」，open 被路由到死实例，2026-09-01 二次实测）→ 按 bundle id open →
+    /// 5s 内验证主进程出现（实测冷启动 open→AppStartup 基线 3.5-4.5s，2s 窗口会误判
+    /// 「没起来」而重复 open 造成叠加延迟）→ 未出现则清锁 + 清残留 + 重试一次。
+    static func restartWorkBuddy() {
+        clearElectronSingletonLocks()
+        ProcessUtil.cleanupRemainingElectronProcesses(executablePath: wbExecutablePath, label: "WorkBuddy")
+        openWorkBuddy()
+        // 验证启动：5s 内主进程应出现（锁误判/LS 路由失败时 open 成功但进程不出现，此步能发现）
+        let deadline = Date().addingTimeInterval(5.0)
+        while Date() < deadline {
+            if !ProcessUtil.mainPids(bundleId: "com.tencent.workbuddy.mac").isEmpty { return }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        Logger.log(.switchAccount, "[iBalance] WorkBuddy not running after open, cleaning and retrying")
+        clearElectronSingletonLocks()
+        ProcessUtil.cleanupRemainingElectronProcesses(executablePath: wbExecutablePath, label: "WorkBuddy")
+        openWorkBuddy()
+    }
+
+    /// 启动 WorkBuddy 前清理污染 Electron/LaunchServices 的环境变量。
+    /// iBalance 由 WorkBuddy 拉起时会继承其 CLI 模式环境：ELECTRON_RUN_AS_NODE=1、
+    /// NODE_OPTIONS=--require …shim、__CFBundleIdentifier=com.local.ibalance、
+    /// XPC_SERVICE_NAME、全套 WORKBUDDY_*。这些变量若泄漏给 `open` 启动的新实例：
+    /// ① ELECTRON_RUN_AS_NODE=1 → WorkBuddy 以 Node 模式启动，无窗口、无 AppStartup
+    ///    打点、0.5s 内 exit(0) 秒退（2026-09-01 实测「界面没开到就闪退」根因，
+    ///    与系统日志 launchd 终止退出码 0 吻合）；
+    /// ② __CFBundleIdentifier / XPC_SERVICE_NAME 污染 → LaunchServices 实例归属判断错乱；
+    /// ③ WORKBUDDY_USER_DATA_DIR / WORKBUDDY_STARTUP_PID 等强制旧实例的路径/归属。
+    /// 参照 cockpit-tools sanitize_macos_gui_launch_env 的做法。
+    private static func sanitizedLaunchEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let toxicKeys: Set<String> = [
+            "NODE_OPTIONS", "NODE_PATH", "NODE_ENV",
+            "ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ASAR",
+            "ELECTRON_FORCE_WINDOW_MENU_BAR", "ELECTRON_NO_ATTACH_CONSOLE",
+            "__CFBundleIdentifier", "XPC_SERVICE_NAME",
+            "npm_config_prefix", "npm_config_devdir",
+        ]
+        for key in toxicKeys { env.removeValue(forKey: key) }
+        // WorkBuddy 注入的运行时变量（userData/config/startup pid 等）一律清除，
+        // 让新实例按默认逻辑重新解析路径与实例归属
+        for key in env.keys where key.hasPrefix("WORKBUDDY_") {
+            env.removeValue(forKey: key)
+        }
+        return env
+    }
+
+    private static func openWorkBuddy() {
         let task = Process()
         task.launchPath = "/usr/bin/open"
-        task.arguments = ["-n", "-a", "WorkBuddy", "--args", "--new-window"]
+        task.arguments = ["-b", "com.tencent.workbuddy.mac"]
+        task.environment = sanitizedLaunchEnvironment()
         do { try task.run() } catch {
-            Logger.log(.switchAccount, "[iBalance] restart WorkBuddy failed: \(error.localizedDescription)")
+            Logger.log(.switchAccount, "[iBalance] open WorkBuddy failed: \(error.localizedDescription)")
         }
     }
 

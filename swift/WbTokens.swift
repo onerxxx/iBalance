@@ -26,7 +26,7 @@ enum WBTokenStore {
         let dayStart: TimeInterval?   // 本地时区当日零点；startedAt 缺失/不可解析为 nil
     }
 
-    /// 模型聚合行（大小写归并后的展示名 = 累计用量最大的原始写法）
+    /// 模型聚合行（大小写归并后的展示名 = 优先带大写的原始写法，同档取用量最大的）
     private struct ModelAgg {
         var tokens: Int64 = 0
         var calls: Int64 = 0
@@ -61,11 +61,11 @@ enum WBTokenStore {
     }
 
     /// 异步取汇总：后台每 60s 重建缓存，fetch 只回缓存不触发读取
-    static func fetch(completion: @escaping (ZcodeTokenSummary?) -> Void) {
+    static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
 
-    private static func query() -> ZcodeTokenSummary? {
+    private static func query() -> TokenSummary? {
         loadDiskCacheIfNeeded()
         let dir = NSHomeDirectory() + "/.workbuddy/traces"
         guard let walker = FileManager.default.enumerator(
@@ -112,7 +112,14 @@ enum WBTokenStore {
             var agg = models[key] ?? ModelAgg()
             agg.tokens += c.tokens
             agg.calls += c.calls
-            if c.tokens > agg.nameTokens {
+            // 展示名优先带大写的写法（与 ZCode 数据源同口径），同档取用量大的，全小写回落小写
+            let curUpper = c.model != key
+            let dispUpper = !agg.name.isEmpty && agg.name != agg.name.lowercased()
+            let replace: Bool
+            if agg.name.isEmpty { replace = true }
+            else if curUpper != dispUpper { replace = curUpper }
+            else { replace = c.tokens > agg.nameTokens }
+            if replace {
                 agg.name = c.model
                 agg.nameTokens = c.tokens
             }
@@ -132,20 +139,20 @@ enum WBTokenStore {
 
         let projectRows = projects
             .filter { $0.value > 0 }
-            .map { ZcodeTokenSummary.ProjectUsage(name: $0.key, tokens: $0.value,
+            .map { TokenSummary.ProjectUsage(name: $0.key, tokens: $0.value,
                                                   path: projectPaths[$0.key]) }
             .sorted { $0.tokens > $1.tokens }
         guard !projectRows.isEmpty else { return nil }
         let modelRows = models.values
             .filter { $0.tokens > 0 }
-            .map { ZcodeTokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
+            .map { TokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
             .sorted { $0.tokens > $1.tokens }
         let total = projectRows.reduce(Int64(0)) { $0 + $1.tokens }
         periodTotals[.all] = total   // All = 全量总计，无窗口
         let daily = dailyMap
-            .map { ZcodeDayUsage(dayStart: $0.key, tokens: $0.value) }
+            .map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
-        return ZcodeTokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
+        return TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
                                  requestCount: requests, daily: daily, periodTotals: periodTotals)
     }
 

@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="ZF9VwfLEaT2fr0rH7Kb2k8" data-dm-ref="1">
+
+<head data-page-node-id="X7ReH3QdrQ2KDHMtu28A2i">
+  <meta charset="UTF-8" data-page-node-id="FUG2gEjmHjvfZTvf2oUlBu">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="HHMsxbGQenrbnq1NGHhSLX">
+  <title>状态光晕 · 5 种风格对比</title>
+  <style>
+    :root {
+      --bg: #000000;
+      --card: #212124;
+      --line: rgba(255, 255, 255, .07);
+      --text: #e8e8ea;
+      --sub: #9a9aa0;
+      --mono: ui-monospace, "SF Mono", Menlo, monospace;
+      --run: rgb(115, 199, 255);
+      /* 0.45,0.78,1.0 */
+      --done: rgb(115, 242, 141);
+      /* 0.45,0.95,0.55 */
+      --fail: rgb(255, 158, 102);
+      /* 1,0.62,0.40 */
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.6 -apple-system, "PingFang SC", sans-serif;
+      padding: 32px 24px 64px;
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      font-size: 20px;
+      margin-bottom: 4px;
+    }
+
+    .lead {
+      color: var(--sub);
+      margin-bottom: 20px;
+    }
+
+    .bar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 24px;
+    }
+
+    .bar button {
+      background: #2c2c30;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .bar button:hover {
+      background: #38383d;
+    }
+
+    .bar .note {
+      color: var(--sub);
+      font-size: 12px;
+    }
+
+    .row {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px 20px;
+      margin-bottom: 14px;
+    }
+
+    .row-head {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 4px;
+    }
+
+    .row-head h2 {
+      font-size: 15px;
+    }
+
+    .tag {
+      font-size: 11px;
+      padding: 1px 8px;
+      border-radius: 99px;
+    }
+
+    .tag.cur {
+      background: rgba(255, 90, 90, .15);
+      color: #ff8f8f;
+    }
+
+    .tag.rec {
+      background: rgba(115, 242, 141, .14);
+      color: #7df09a;
+    }
+
+    .desc {
+      color: var(--sub);
+      font-size: 12.5px;
+      margin-bottom: 14px;
+    }
+
+    .params {
+      font: 11px/1.7 var(--mono);
+      color: #79a;
+      margin-top: 12px;
+      white-space: pre-wrap;
+    }
+
+    .samples {
+      display: flex;
+      gap: 34px;
+    }
+
+    .sample {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .sample .label {
+      font-size: 11px;
+      color: var(--sub);
+    }
+
+    .slot {
+      position: relative;
+      width: 56px;
+      height: 56px;
+      display: grid;
+      place-items: center;
+    }
+
+    .icon {
+      position: relative;
+      z-index: 2;
+      width: 48px;
+      height: 48px;
+      border-radius: 10.6px;
+      background: linear-gradient(145deg, #3b3b41, #26262b);
+      border: 1px solid rgba(255, 255, 255, .14);
+      display: grid;
+      place-items: center;
+      font: 600 22px/1 var(--mono);
+      color: #cfcfd4;
+    }
+
+    .glow {
+      position: absolute;
+      inset: 0;
+      margin: auto;
+      width: 53px;
+      height: 53px;
+      border-radius: 11.6px;
+      filter: blur(3px);
+      z-index: 1;
+    }
+
+    .run {
+      background: var(--run);
+    }
+
+    .done {
+      background: var(--done);
+    }
+
+    .fail {
+      background: var(--fail);
+    }
+
+    /* ── A 现状复刻：峰值 1.4 被 clamp → 亮部平台期（CSS opacity>1 同样截断，忠实还原）── */
+    .gA {
+      animation: pulseA 2s ease-in-out infinite;
+    }
+
+    @keyframes pulseA {
+
+      0%,
+      100% {
+        opacity: .7
+      }
+
+      50% {
+        opacity: 1.4
+      }
+    }
+
+    /* ── B 柔和呼吸（推荐）：opacity+scale，吸短呼长不对称，峰值 0.95 不触顶 ── */
+    .gB {
+      animation: pulseB 2.6s cubic-bezier(.37, 0, .63, 1) infinite;
+      will-change: transform, opacity;
+    }
+
+    @keyframes pulseB {
+
+      0%,
+      100% {
+        opacity: .45;
+        transform: scale(1);
+      }
+
+      38% {
+        opacity: .95;
+        transform: scale(1.07);
+      }
+    }
+
+    /* ── C 雷达涟漪：常态柔光 + 双 ring 错相扩散消散 ── */
+    .gC {
+      opacity: .55;
+      animation: coreC 2.6s ease-in-out infinite;
+    }
+
+    @keyframes coreC {
+
+      0%,
+      100% {
+        opacity: .45
+      }
+
+      50% {
+        opacity: .7
+      }
+    }
+
+    .ring {
+      position: absolute;
+      inset: 0;
+      margin: auto;
+      width: 53px;
+      height: 53px;
+      border-radius: 11.6px;
+      border: 3px solid currentColor;
+      z-index: 1;
+      opacity: 0;
+      filter: blur(1px);
+      animation: ripple 2.6s cubic-bezier(.2, .6, .3, 1) infinite;
+    }
+
+    .ring.r2 {
+      animation-delay: -1.3s;
+    }
+
+    @keyframes ripple {
+      0% {
+        transform: scale(.92);
+        opacity: .75
+      }
+
+      70% {
+        opacity: .12
+      }
+
+      100% {
+        transform: scale(1.85);
+        opacity: 0
+      }
+    }
+
+    .c-run {
+      color: var(--run)
+    }
+
+    .c-done {
+      color: var(--done)
+    }
+
+    .c-fail {
+      color: var(--fail)
+    }
+
+    /* ── D 心跳双搏：警示感强，适合"中断"；三态可分节奏 ── */
+    .gD {
+      animation: beat 2.2s linear infinite;
+      will-change: transform, opacity;
+    }
+
+    @keyframes beat {
+
+      0%,
+      6%,
+      18%,
+      34%,
+      100% {
+        opacity: .5;
+        transform: scale(1);
+      }
+
+      10% {
+        opacity: 1;
+        transform: scale(1.1);
+      }
+
+      26% {
+        opacity: .85;
+        transform: scale(1.05);
+      }
+    }
+
+    /* ── E 静谧微光：极缓极浅，几乎不可察觉的存活感，适合嫌闪的人 ── */
+    .gE {
+      animation: calm 4.2s ease-in-out infinite;
+    }
+
+    @keyframes calm {
+
+      0%,
+      100% {
+        opacity: .5;
+        transform: scale(1)
+      }
+
+      50% {
+        opacity: .72;
+        transform: scale(1.02)
+      }
+    }
+
+    /* 状态切换过渡演示（各风格通用的 #4 修复：色交叉淡入出 0.35s）*/
+    .swap-slot .glow {
+      transition: background .35s ease, opacity .35s ease;
+    }
+
+    .paused * {
+      animation-play-state: paused !important;
+    }
+
+    .hint {
+      font-size: 11.5px;
+      color: #8888;
+      margin-top: 8px;
+    }
+  </style>
+  <title data-page-node-id="aH924lSNY74e0jjGJTb4Bd" data-pnid-children="5USmY6WUDAbOBofKBC1tUi"
+    style="box-sizing:border-box;margin:0;padding:0">状态光晕 · 5 种风格对比</title>
+  <style id="__dm_no_drag_style__">
+    * {
+      -webkit-user-drag: none !important;
+    }
+  </style>
+  <style id="__dm_bindable_badge_style__">
+    [data-sp-bindable="database"] {
+      outline: 1px dashed #0088ff;
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+
+    [data-sp-bindable="database"] * {
+      pointer-events: none !important;
+      transition: none !important;
+      animation: none !important;
+    }
+
+    [data-sp-bindable="database"] {
+      transition: none !important;
+      animation: none !important;
+    }
+  </style>
+</head>
+
+<body data-page-node-id="nlCQT63zbAxEcnDrVvthRS" style="">
+  <div class="wrap" data-page-node-id="vBV6pHJBVkHtUqRM6xXw0U">
+    <h1 data-page-node-id="Ix6qvsIELArIF6gW1xPAfK">卡片 icon 状态光晕 · 风格对比</h1>
+    <p class="lead" data-page-node-id="MMqoFE2xCw4OpwlvcljmrI">同一形状（圆角方形、0.22 连续曲率圆角、三态亮色）。顶部 ★ 定稿区 = 当前线上实现（3×）；X 行 =
+      雷达扫描候选风格（3×）；A–E 为最初五方案（2×）。每行三态：进行中 / 完成 / 中断。</p>
+    <div class="bar" data-page-node-id="aOvTDd3vMc9ekejWZk59H7">
+      <button id="toggle" data-page-node-id="EJ3jEF2YeGMogvU2NsbVAo">⏸ 暂停全部</button>
+      <button id="swap" data-page-node-id="kweZddS1zW98Vqnn84fQxE">▶ 演示状态切换（G2 行）</button>
+      <span class="note" data-page-node-id="nFFlZQ3kAGquZx84Iq2xlx">G2 行右侧样例在循环蓝→绿→橙，验证「切换颜色交叉过渡」的观感</span>
+    </div>
+
+    <!-- ★ 定稿：当前 Swift 实现（3× 放大） -->
+    <style>
+      /* 定稿 3× 放大区（--k 缩放因子：尺寸/模糊/描边/圆角同倍放大，keyframe scale 与分辨率无关） */
+      .hero {
+        border-color: rgba(115, 242, 141, .25);
+      }
+
+      .hero .samples {
+        --k: 3;
+        gap: 72px;
+        padding: 40px 0 56px;
+      }
+
+      .hero .slot.big {
+        width: calc(28px * var(--k));
+        height: calc(28px * var(--k));
+      }
+
+      .hero .icon.big {
+        width: calc(24px * var(--k));
+        height: calc(24px * var(--k));
+        border-radius: calc(5.3px * var(--k));
+        font-size: calc(11px * var(--k));
+      }
+
+      .hero .glow,
+      .hero .ring {
+        width: calc(26.5px * var(--k));
+        height: calc(26.5px * var(--k));
+        border-radius: calc(5.8px * var(--k));
+      }
+
+      .hero .glow {
+        filter: blur(calc(1px * var(--k)));
+      }
+
+      .hero .ring {
+        border-width: calc(2.5px * var(--k));
+        filter: blur(calc(0.5px * var(--k)));
+      }
+
+      /* 柔光打底：opacity 0↔0.6，两头快中间慢（升段 easeOut 急离谷缓近峰 / 降段 easeIn 峰驻急沉），
+       1.5s（周期减半，涟漪两拍对一波），相位提前 0.45s（负 delay = 已播进行态接入） */
+      @keyframes coreF {
+        0% {
+          opacity: 0;
+          animation-timing-function: cubic-bezier(0, 0, .58, 1);
+        }
+
+        50% {
+          opacity: .6;
+          animation-timing-function: cubic-bezier(.42, 1, 1, 1);
+        }
+
+        100% {
+          opacity: 0;
+        }
+      }
+
+      .coreF {
+        animation: coreF 1.5s linear infinite -0.45s;
+      }
+
+      /* 涟漪：scale .92→1.57 + opacity .75→0，3s cubic(.2,.6,.3,1)，第二圈错相 -1.5s。
+         模糊走独立轨道 rippleBlurF（若塞进同一 keyframes 会把 scale/opacity 缓动曲线截成两段产生拐点） */
+      @keyframes rippleF {
+        0% {
+          transform: scale(.92);
+          opacity: .75
+        }
+
+        100% {
+          transform: scale(1.57);
+          opacity: 0
+        }
+      }
+
+      /* 末段 0.5s（2.5s→3s，83.33%→100%）模糊 0.5→2.5pt 线性递增——消散尾迹化开、不显"突然消失" */
+      @keyframes rippleBlurF {
+        0%, 83.33% {
+          filter: blur(calc(0.5px * var(--k)))
+        }
+
+        100% {
+          filter: blur(calc(2.5px * var(--k)))
+        }
+      }
+
+      .hero .ring {
+        animation: rippleF 3s cubic-bezier(.2, .6, .3, 1) infinite,
+                   rippleBlurF 3s linear infinite;
+      }
+
+      /* 中断心跳：7 帧双搏（demo D 节拍），1.6s linear，opacity+scale 双轨，无涟漪 */
+      @keyframes hbOp {
+
+        0%,
+        6% {
+          opacity: .6
+        }
+
+        10% {
+          opacity: 1
+        }
+
+        18% {
+          opacity: .6
+        }
+
+        26% {
+          opacity: .85
+        }
+
+        34%,
+        100% {
+          opacity: .6
+        }
+      }
+
+      @keyframes hbSc {
+
+        0%,
+        6% {
+          transform: scale(1)
+        }
+
+        10% {
+          transform: scale(1.1)
+        }
+
+        18% {
+          transform: scale(1)
+        }
+
+        26% {
+          transform: scale(1.05)
+        }
+
+        34%,
+        100% {
+          transform: scale(1)
+        }
+      }
+
+      .hbF {
+        animation: hbOp 1.6s linear infinite, hbSc 1.6s linear infinite;
+      }
+    </style>
+    <div class="row hero" data-page-node-id="RPPqV7zHpMZdYFhEDOjpA8">
+
+
+
+
+    </div>
+
+    <!-- X 光晕旋转（雷达扫描） -->
+    <style>
+      /* X · 雷达扫描：静态弱底光 + conic-gradient 亮头顺时针旋转，拖尾铺满整圈 360°、头后硬断。
+       ⚠ 颜色必须写死 rgba——color-mix()/currentColor 在渐变里解析失败会让整条 background
+       失效，只剩底光 → 看起来"动画是静止的"（2026-09-01 实测教训） */
+      .xrow {
+        border-color: rgba(115, 199, 255, .25);
+      }
+
+      .xrow .samples {
+        --k: 3;
+        gap: 72px;
+        padding: 40px 0 56px;
+      }
+
+      .xrow .slot.big {
+        width: calc(28px * var(--k));
+        height: calc(28px * var(--k));
+      }
+
+      .xrow .icon.big {
+        width: calc(24px * var(--k));
+        height: calc(24px * var(--k));
+        border-radius: calc(5.3px * var(--k));
+        font-size: calc(11px * var(--k));
+      }
+
+      .xrow .base {
+        position: absolute;
+        inset: 0;
+        margin: auto;
+        width: calc(31.8px * var(--k));
+        height: calc(31.8px * var(--k));
+        border-radius: calc(7px * var(--k));
+        filter: blur(calc(1px * var(--k)));
+        z-index: 1;
+        opacity: .10;
+      }
+
+      /* 两层分工适配方形 icon：外层 = 静止的圆角方块（与柔光同形）overflow 裁切；
+       内层 ::before = 覆盖对角线的大圆盘（31.8×√2≈45）载 conic 光束自转。
+       → 亮头沿方形边缘巡扫、四角不留黑洞；若让方框整体旋转则是"光斑在转"不是"光在扫"。
+       ⚠ 颜色写死 rgba（color-mix/currentColor 解析失败 = background 整条失效） */
+      .xrow .sweep {
+        position: absolute;
+        inset: 0;
+        margin: auto;
+        width: calc(31.8px * var(--k));
+        height: calc(31.8px * var(--k));
+        border-radius: calc(7px * var(--k));
+        z-index: 1;
+        overflow: hidden;
+        filter: blur(calc(1px * var(--k)));
+      }
+
+      .xrow .sweep::before {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: calc(45px * var(--k));
+        height: calc(45px * var(--k));
+        margin-left: calc(-22.5px * var(--k));
+        margin-top: calc(-22.5px * var(--k));
+        transform-origin: 50% 50%;
+        will-change: transform;
+        animation: sweep 2.4s linear infinite;
+      }
+
+      /* 亮头在弧尾 360°——拖尾铺满整圈，仅在头后硬断；停点按 300→360 等比外扩（×1.2） */
+      .c-run .sweep::before {
+        background: conic-gradient(from -360deg,
+            rgba(115, 199, 255, 0) 0deg, rgba(115, 199, 255, .04) 96deg,
+            rgba(115, 199, 255, .12) 180deg, rgba(115, 199, 255, .42) 252deg,
+            rgba(115, 199, 255, .75) 312deg, rgba(115, 199, 255, .92) 348deg,
+            rgba(115, 199, 255, 1) 360deg);
+      }
+
+      .c-done .sweep::before {
+        background: conic-gradient(from -360deg,
+            rgba(115, 242, 141, 0) 0deg, rgba(115, 242, 141, .04) 96deg,
+            rgba(115, 242, 141, .12) 180deg, rgba(115, 242, 141, .42) 252deg,
+            rgba(115, 242, 141, .75) 312deg, rgba(115, 242, 141, .92) 348deg,
+            rgba(115, 242, 141, 1) 360deg);
+      }
+
+      .c-fail .sweep::before {
+        background: conic-gradient(from -360deg,
+            rgba(255, 158, 102, 0) 0deg, rgba(255, 158, 102, .04) 96deg,
+            rgba(255, 158, 102, .12) 180deg, rgba(255, 158, 102, .42) 252deg,
+            rgba(255, 158, 102, .75) 312deg, rgba(255, 158, 102, .92) 348deg,
+            rgba(255, 158, 102, 1) 360deg);
+      }
+
+      @keyframes sweep {
+        from {
+          transform: rotate(0deg)
+        }
+
+        to {
+          transform: rotate(360deg)
+        }
+      }
+    </style>
+
+
+    <!-- A 现状 -->
+    <div class="row" data-page-node-id="eSKSwfFDJxn4PLnAqu6CQW" style="background-color: rgb(0, 0, 0);">
+      <div class="row-head" data-page-node-id="LzaqHhMheCDVWRSGQyAHkz">
+        <h2 data-page-node-id="3tCNX5PTIEXVlStJlJdIYN">A · 现状复刻</h2><span class="tag cur"
+          data-page-node-id="sOLLMfTrHPgygPFKAwdFy2">问题版</span>
+      </div>
+      <div class="desc" data-page-node-id="gCTIeECrWVSp6M0rAciL3h">opacity 0.7→1.4→0.7，峰值被截断成平台——亮相"死平"，观感像灯泡调光而非呼吸。
+      </div>
+      <div class="samples" data-page-node-id="kzAnfsJ3QGQViGHX84ml0J">
+        <div class="sample" data-page-node-id="KWCVz3cNDA4AF01WHqEaOQ">
+          <div class="slot" data-page-node-id="54TphqHU27awyXs7uTbCl4">
+            <div class="glow run gA" data-page-node-id="lDRYS5R7BKD37GAzxzSTTu"></div>
+            <div class="icon" data-page-node-id="4i43r9ceAF1Aid2WqzE4M4">W</div>
+          </div><span class="label" data-page-node-id="QHYlFp754yGnx8tO0SPFHQ">进行中</span>
+        </div>
+        <div class="sample" data-page-node-id="n3dqlktndTEvXHlbD8NIxJ">
+          <div class="slot" data-page-node-id="69CBAOFwFL98d2Lay36BRT">
+            <div class="glow done gA" data-page-node-id="L0gwfsukTgqV803BwqYDot"></div>
+            <div class="icon" data-page-node-id="g3x9ULfqIQpImHEkWC1ELo">W</div>
+          </div><span class="label" data-page-node-id="pFu93HN74bWyDNitjYp0lk">完成</span>
+        </div>
+        <div class="sample" data-page-node-id="XQdtEPgUzM4nQvllh7V71P">
+          <div class="slot" data-page-node-id="qOeLr6yaIWtveufncNnLur">
+            <div class="glow fail gA" data-page-node-id="gqMbgoWGTT1HJDPBIRj6bU"></div>
+            <div class="icon" data-page-node-id="5C0IXgFHEis00JKW9SS4li">W</div>
+          </div><span class="label" data-page-node-id="6Ctk3SJituUMqKEqiyc5pt">中断</span>
+        </div>
+      </div>
+      <div class="params" data-page-node-id="aPl7ui3G7YCOSL7SlHnsBD">pulse: opacity [0.7, 1.4, 0.7] ⚠ clamp→1.0 平台期 |
+        2.0s easeInOut 对称</div>
+    </div>
+
+    <!-- B 柔和呼吸 -->
+    <div class="row" data-page-node-id="423GnErYkzNq9fZq8HATLg" style="background-color: rgb(0, 0, 0);">
+      <div class="row-head" data-page-node-id="YGb1U9FGQpnyNMy0kbTdDP">
+        <h2 data-page-node-id="Jn9GYOexQlbLEglCo8RAZk">B · 柔和呼吸</h2><span class="tag rec"
+          data-page-node-id="UyOJiA6xCqOVSC69rz52Pn">推荐 · 默认态</span>
+      </div>
+      <div class="desc" data-page-node-id="CRWND5G4a7CSa1GkvxuAAf">opacity + 体积（scale 1→1.07）双通道；吸气 38% 呼气 62% 的不对称节律；峰值
+        0.95 不触顶，保留完整弧线。最像"在干活"。</div>
+      <div class="samples" data-page-node-id="7w0msM92EFkO1AeWYSGpHo">
+        <div class="sample" data-page-node-id="GaS85ENQlic00E8xB9SvON">
+          <div class="slot" data-page-node-id="PvP2uCF83Ae5frPzqXja0h">
+            <div class="glow run gB" data-page-node-id="ZldFPlHx7bHGVqMdTm2uRP"></div>
+            <div class="icon" data-page-node-id="Dom8sPkHsqjmtlblSp7BDU">W</div>
+          </div><span class="label" data-page-node-id="19eRPapdHcgwhBhPB22ce2">进行中</span>
+        </div>
+        <div class="sample" data-page-node-id="pxpe4uKpKJTzrD6QaLkWGw">
+          <div class="slot swap-slot" data-page-node-id="uGFT56NfSU5bvUp0Bjakds">
+            <div class="glow gB" id="swapGlow" style="background:var(--run)" data-page-node-id="8Ec3STAvffDrfpqc6apmS2">
+            </div>
+            <div class="icon" data-page-node-id="GxJkVH3cZHN40wAGrf0cLQ">W</div>
+          </div><span class="label" data-page-node-id="gsC3KRzQGRdWgXd62BwDu9">切换演示</span>
+        </div>
+        <div class="sample" data-page-node-id="5I8LenhrzWMvEBMRBHCKUk">
+          <div class="slot" data-page-node-id="PL9qV8iHxCQfnKwPs7sRCt">
+            <div class="glow fail gB" data-page-node-id="YncaBemvlVAtDHw2uIFJo5"></div>
+            <div class="icon" data-page-node-id="LG7XIZDwn9ofeHdUKjMMq3">W</div>
+          </div><span class="label" data-page-node-id="STTrq2rPkVAvn4SHS1BV4b">中断</span>
+        </div>
+      </div>
+      <div class="params" data-page-node-id="iwLmJkJwGEYmfD8ca1J9ua">2.6s cubic-bezier(.37,0,.63,1) | opacity .45↔.95 |
+        scale 1↔1.07</div>
+    </div>
+
+    <!-- C 雷达涟漪 -->
+    <div class="row" data-page-node-id="4TuSDDhoR9Ud2S6wVWHJuk" style="background-color: rgb(0, 0, 0);">
+      <div class="row-head" data-page-node-id="4YEqhrWc7XOo4Rg6ocSGHA">
+        <h2 data-page-node-id="F3XzOCshcsUAsvMzrjNmcW">C · 雷达涟漪</h2><span class="tag rec"
+          data-page-node-id="yYT78VV7EGtvPfWR4cnHaM">推荐 · 强调"进行中"</span>
+      </div>
+      <div class="desc" data-page-node-id="1Rz67iyxEv8BCs1AgxHxOU">常态柔光打底 + 两圈错相光波向外扩散消散。方向感最强、最有"任务在推进"的语义，但视觉动静也最大。
+      </div>
+      <div class="samples" data-page-node-id="oMj8SOmdNhUdtE8RRGL9BJ">
+        <div class="sample" data-page-node-id="ZXd380jm5lQDi01vvE6Qe7">
+          <div class="slot c-run" data-page-node-id="fD6vCDSDebXiZrZZXDru2l">
+            <div class="glow run gC" data-page-node-id="IaoK7NX3hWUkSMC4krzWBp"></div>
+            <div class="ring r1" data-page-node-id="3cQTJX6vJ1mE1SlORMP8tY"></div>
+            <div class="ring r2" data-page-node-id="MPaBeK9VpCDnzVe5ts0Vxa"></div>
+            <div class="icon" data-page-node-id="z3P5ozmbTr7CieKT6n9qtJ">W</div>
+          </div><span class="label" data-page-node-id="mND0dpyiTRr8feVevXMgqD">进行中</span>
+        </div>
+        <div class="sample" data-page-node-id="RR2ybCTgyLEBhscywf2dSZ">
+          <div class="slot c-done" data-page-node-id="zaR02UH7ZIRUetqWRjwHB4">
+            <div class="glow done gC" data-page-node-id="mF4zu6HlyQNNCmRhMNRccV"></div>
+            <div class="ring r1" data-page-node-id="CPX1eaaHVpdrqu9FKYsELX"></div>
+            <div class="ring r2" data-page-node-id="1WOUGZ1m7HzqLWz3omSinr"></div>
+            <div class="icon" data-page-node-id="YF7XySJdCDSNAXPKdmDUid">W</div>
+          </div><span class="label" data-page-node-id="JsgE5fF7LEy8yj8TtBntsC">完成</span>
+        </div>
+        <div class="sample" data-page-node-id="JO02CAsCXiEdXDBRoyycp8">
+          <div class="slot c-fail" data-page-node-id="wJCABRNm7p0rXlCQjEi2QT">
+            <div class="glow fail gC" data-page-node-id="CaRLUAFWQ6eALIYs9G4k3A"></div>
+            <div class="ring r1" data-page-node-id="7GQQDAiM9PXtyJ5EnPhtDa"></div>
+            <div class="ring r2" data-page-node-id="cG5CiBmeMAaYQQsviYYBKj"></div>
+            <div class="icon" data-page-node-id="NDdCftXctOgPxdgPxf1s0P">W</div>
+          </div><span class="label" data-page-node-id="YVqDtIpvNL0IDB6jeilvSa">中断</span>
+        </div>
+      </div>
+      <div class="params" data-page-node-id="M1c2uM1ygwGbYPllvTo8Yj">core: opacity .45↔.7 4s | ring: scale .92→1.85 +
+        fade 2.6s ×2 错相 1.3s</div>
+    </div>
+
+    <!-- D 心跳 -->
+    <div class="row" data-page-node-id="Y1DzeIJBHByCJcfUrZSTIm" style="background-color: rgb(0, 0, 0);">
+      <div class="row-head" data-page-node-id="vqEjINsnEXh9WE38gQhEgc">
+        <h2 data-page-node-id="XYHZ3XRpmaDjvnrx9xGKUQ">D · 心跳双搏</h2>
+      </div>
+      <div class="desc" data-page-node-id="d2DZkgsWfhiAiSBkEWY5WF">lub-dub 双击节律，唤醒/警示感最强。适合只给「中断」态用（配合更快的
+        1.4s），进行中用它会焦虑。</div>
+      <div class="samples" data-page-node-id="4HKr8QM9qgrfsHf6KDI9IJ">
+        <div class="sample" data-page-node-id="2G1M0bGU5MU1aV2IBZlyCf">
+          <div class="slot" data-page-node-id="r3S0gGlljd7LBMA4nx8xKm">
+            <div class="glow run gD" style="animation-duration:2.6s" data-page-node-id="ayhduc191ToVwoBZ7dKHCk"></div>
+            <div class="icon" data-page-node-id="Rismm0gLu8lojAVAEsO5JV">W</div>
+          </div><span class="label" data-page-node-id="PGh1LPQTvkDrcofjOdHVht">进行中(缓)</span>
+        </div>
+        <div class="sample" data-page-node-id="2cnhxU0KA0L4hdkG9sH3rB">
+          <div class="slot" data-page-node-id="7irYUMqvlANX77qao3eDfJ">
+            <div class="glow done gD" style="animation-duration:2.6s" data-page-node-id="vUPcNRaqUkqXMGPUVoyMDz"></div>
+            <div class="icon" data-page-node-id="M5Xd8awkIskPitf1DkN84A">W</div>
+          </div><span class="label" data-page-node-id="bpKpNIetPJpHHjhlGvEfwb">完成(缓)</span>
+        </div>
+        <div class="sample" data-page-node-id="CQQmF4ZeZaMgmlnBAVOliO">
+          <div class="slot" data-page-node-id="ZzSHOfutZa1wFLQlQegEeG">
+            <div class="glow fail gD" style="animation-duration:1.4s" data-page-node-id="qLp4fGwniHK9mFv4aUdIIO"></div>
+            <div class="icon" data-page-node-id="ncGgMkt80NURUnD7fGCXje">W</div>
+          </div><span class="label" data-page-node-id="KQFx7lZ40T0mxivk7yOGBT">中断(急)</span>
+        </div>
+      </div>
+      <div class="params" data-page-node-id="2Y5DHsdnCUhdq7hpc7LRGk">beat 2.2s linear | 双峰 scale 1.1/1.05 | 中断态 duration
+        减半</div>
+    </div>
+
+    <!-- E 静谧 -->
+    <div class="row" data-page-node-id="aAQzIgLYpjO3snGQDsXfbh" style="background-color: rgb(0, 0, 0);">
+      <div class="row-head" data-page-node-id="esSJ8eVbAe8bH7znuYT9nz">
+        <h2 data-page-node-id="4jjRpcDakMFf2lvAUNqA3V">E · 静谧微光</h2>
+      </div>
+      <div class="desc" data-page-node-id="1xSuWdUyPrPbmiR11ixXSU">4.2s 超缓、振幅极小（opacity .5↔.72 / scale
+        1↔1.02），余光里"活着"、注视时几乎不闪。低打扰优先选它。</div>
+      <div class="samples" data-page-node-id="HNqDXEe31pA0Ev0nreyMba">
+        <div class="sample" data-page-node-id="Mjg3SS1vUxXnUgXZcTK8Sp">
+          <div class="slot" data-page-node-id="rIm2d3S1HH8zDs3BGCRAvG">
+            <div class="glow run gE" data-page-node-id="YQAF1AdC3gfVhiJOdTYUUV"></div>
+            <div class="icon" data-page-node-id="ETIPf0bTrpYYEYEMpUtige">W</div>
+          </div><span class="label" data-page-node-id="oXKg9S1M6zNglt9gFiHUHr">进行中</span>
+        </div>
+        <div class="sample" data-page-node-id="qj4KkarJHAAXwYQrAwuPf1">
+          <div class="slot" data-page-node-id="KrQKvDI02o1rvd1UdTk4fq">
+            <div class="glow done gE" data-page-node-id="de8bAI9SQwFHm8CfERGYjS"></div>
+            <div class="icon" data-page-node-id="k9dJI7sjOpQFxTgsadli99">W</div>
+          </div><span class="label" data-page-node-id="nGlweEVY4MyhhmIhv2qpS7">完成</span>
+        </div>
+        <div class="sample" data-page-node-id="ymIeAHIMVzG3DxoFWqez7H">
+          <div class="slot" data-page-node-id="CP7LscFgkbyZzSGVc6K8TY">
+            <div class="glow fail gE" data-page-node-id="oTx9PI9RUJgFC85HQnEFS7"></div>
+            <div class="icon" data-page-node-id="rgPeY7tJAQe4PnAon5QNi5">W</div>
+          </div><span class="label" data-page-node-id="XaqtT7NZ27JIy14d8Z6vGv">中断</span>
+        </div>
+      </div>
+      <div class="params" data-page-node-id="HaktKrMa6jHjJI14nt7CSE">4.2s ease-in-out | opacity .5↔.72 | scale 1↔1.02
+      </div>
+    </div>
+
+    <p class="hint" data-page-node-id="5LYMIJGlwecjTbJza7rmo8">通用补充（无论选哪种都建议一起落）：#4 状态切换交叉过渡 0.35s + 消失淡出 0.3s；#5
+      分态节奏——进行中最快、完成态静止或 6s+、中断态用 D 的急拍。</p>
+    <div data-page-node-id="KKLgueyZXU4GDrOunuMNce" class="row hero"
+      style="box-sizing: border-box; margin: 0px 0px 14px; padding: 18px 20px; background: rgb(0, 0, 0); border: 1px solid rgba(115, 242, 141, 0.25); border-radius: 14px;">
+      <div data-page-node-id="8YxO7FYpm94hse5BuaapMW" class="row-head"
+        style="box-sizing:border-box;margin:0;padding:0;display:flex;align-items:baseline;gap:10px;margin-bottom:4px">
+        <h2 data-page-node-id="fEVMHiMBSoMUjynn3CNXuz" style="box-sizing:border-box;margin:0;padding:0;font-size:15px">★
+          定稿 · 涟漪版（当前线上实现）</h2><span data-page-node-id="jCJUaGp6EWNH5zNOsM3VOu" class="tag rec"
+          style="box-sizing:border-box;margin:0;padding:1px 8px;font-size:11px;border-radius:99px;background:rgba(115,242,141,.14);color:#7df09a">3×
+          放大预览</span>
+      </div>
+      <div data-page-node-id="dfZ2A9J8Vl1INriLYB4tkL" class="desc"
+        style="box-sizing:border-box;margin:0;padding:0;color:#9a9aa0;font-size:12.5px;margin-bottom:14px">
+        打底 = 静谧纯 opacity 呼吸（0↔0.6，两头快曲线：急升 → 峰上驻留 → 急沉，暗相一掠而过；1.5s 快拍、相位提前 0.45s，尺寸静态）；
+        进行 / 完成 = 双圈涟漪（0.92→1.57 扩散淡出，0.5pt 模糊描边，错相半周期）；中断 = 光晕本体心跳双搏 1.6s（涟漪收起）。
+      </div>
+      <div data-page-node-id="rghF1U81SmjAnGIGPoAlWS" class="samples"
+        style="box-sizing:border-box;margin:0;padding:40px 0 56px;display:flex;gap:72px">
+        <div data-page-node-id="2iFpgnMZsa408bBazlOlEC" class="sample"
+          style="box-sizing:border-box;margin:0;padding:0;display:flex;flex-direction:column;align-items:center;gap:8px">
+          <div data-page-node-id="TB3QeHFWBt7rEiQD2YDLyO" class="slot big c-run"
+            style="box-sizing:border-box;margin:0;padding:0;position:relative;width:calc(28px*var(--k));height:calc(28px*var(--k));display:grid;place-items:center;color:rgb(115,199,255)">
+            <div data-page-node-id="058LWHRZerkfJOLWASLvpH" class="glow run coreF"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));filter:blur(calc(1px*var(--k)));z-index:1;background:rgb(115,199,255);animation:coreF 1.5s linear infinite -0.45s">
+            </div>
+            <div data-page-node-id="7LFxAHkpUVKT9NGAFsIUrm" class="ring"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));border:3px solid currentColor;z-index:1;opacity:0;animation:rippleF 3s cubic-bezier(.2,.6,.3,1) infinite, rippleBlurF 3s linear infinite;border-width:calc(2.5px*var(--k))">
+            </div>
+            <div data-page-node-id="kFCZ3PbvXwfWzgzFgaKeY1" class="ring"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));border:3px solid currentColor;z-index:1;opacity:0;animation:rippleF 3s cubic-bezier(.2,.6,.3,1) infinite, rippleBlurF 3s linear infinite;border-width:calc(2.5px*var(--k));animation-delay:-1.5s">
+            </div>
+            <div data-page-node-id="oxNWqf5MSGl7hdFdReXhHP" class="icon big"
+              style="box-sizing:border-box;margin:0;padding:0;position:relative;z-index:2;width:calc(24px*var(--k));height:calc(24px*var(--k));border-radius:calc(5.3px*var(--k));background:linear-gradient(145deg,#3b3b41,#26262b);border:1px solid rgba(255,255,255,.14);display:grid;place-items:center;font:600 22px/1 ui-monospace,"
+              sf="" mono",menlo,monospace;color:#cfcfd4;font-size:calc(11px*var(--k))"="">W</div>
+          </div><span data-page-node-id="B7XWyLBSeTqP4NnYYCsilD" class="label"
+            style="box-sizing:border-box;margin:0;padding:0;font-size:11px;color:#9a9aa0">进行中 · 涟漪</span>
+        </div>
+        <div data-page-node-id="f0nnItMGX3sBsXf69rTbbC" class="sample"
+          style="box-sizing:border-box;margin:0;padding:0;display:flex;flex-direction:column;align-items:center;gap:8px">
+          <div data-page-node-id="Dtz2F3Wo2oFPom7YdPJxKU" class="slot big c-done"
+            style="box-sizing:border-box;margin:0;padding:0;position:relative;width:calc(28px*var(--k));height:calc(28px*var(--k));display:grid;place-items:center;color:rgb(115,242,141)">
+            <div data-page-node-id="rxftpzusvXZAsCdFMxh6B3" class="glow done coreF"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));filter:blur(calc(1px*var(--k)));z-index:1;background:rgb(115,242,141);animation:coreF 1.5s linear infinite -0.45s">
+            </div>
+            <div data-page-node-id="1b5uOmn7t5hCzW1lMJaxc0" class="ring"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));border:3px solid currentColor;z-index:1;opacity:0;animation:rippleF 3s cubic-bezier(.2,.6,.3,1) infinite, rippleBlurF 3s linear infinite;border-width:calc(2.5px*var(--k))">
+            </div>
+            <div data-page-node-id="wvBTwNxEqNyrpRMvnCFQ4n" class="ring"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));border:3px solid currentColor;z-index:1;opacity:0;animation:rippleF 3s cubic-bezier(.2,.6,.3,1) infinite, rippleBlurF 3s linear infinite;border-width:calc(2.5px*var(--k));animation-delay:-1.5s">
+            </div>
+            <div data-page-node-id="LA39n1N2Lc5HV4wVayN8mc" class="icon big"
+              style="box-sizing:border-box;margin:0;padding:0;position:relative;z-index:2;width:calc(24px*var(--k));height:calc(24px*var(--k));border-radius:calc(5.3px*var(--k));background:linear-gradient(145deg,#3b3b41,#26262b);border:1px solid rgba(255,255,255,.14);display:grid;place-items:center;font:600 22px/1 ui-monospace,"
+              sf="" mono",menlo,monospace;color:#cfcfd4;font-size:calc(11px*var(--k))"="">W</div>
+          </div><span data-page-node-id="HGfjc6ZMH11bnaed9TzW6E" class="label"
+            style="box-sizing:border-box;margin:0;padding:0;font-size:11px;color:#9a9aa0">完成 · 涟漪</span>
+        </div>
+        <div data-page-node-id="OjUGV6PjF08uRK8NzHDz0c" class="sample"
+          style="box-sizing:border-box;margin:0;padding:0;display:flex;flex-direction:column;align-items:center;gap:8px">
+          <div data-page-node-id="7c5Wq4xcRTg7CZaa1skh9X" class="slot big c-fail"
+            style="box-sizing:border-box;margin:0;padding:0;position:relative;width:calc(28px*var(--k));height:calc(28px*var(--k));display:grid;place-items:center;color:rgb(255,158,102)">
+            <div data-page-node-id="B7UFwj7FuFkmwc8v4H75d6" class="glow fail hbF"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));filter:blur(calc(1px*var(--k)));z-index:1;background:rgb(255,158,102);animation:hbOp 1.6s linear infinite,hbSc 1.6s linear infinite">
+            </div>
+            <div data-page-node-id="fJUGtI3nvXFFg5FUfI33uS" class="icon big"
+              style="box-sizing:border-box;margin:0;padding:0;position:relative;z-index:2;width:calc(24px*var(--k));height:calc(24px*var(--k));border-radius:calc(5.3px*var(--k));background:linear-gradient(145deg,#3b3b41,#26262b);border:1px solid rgba(255,255,255,.14);display:grid;place-items:center;font:600 22px/1 ui-monospace,"
+              sf="" mono",menlo,monospace;color:#cfcfd4;font-size:calc(11px*var(--k))"="">W</div>
+          </div><span data-page-node-id="jJp6h1QKn8yIWG5zeoEiDl" class="label"
+            style="box-sizing:border-box;margin:0;padding:0;font-size:11px;color:#9a9aa0">中断 · 心跳 1.6s</span>
+        </div>
+      </div>
+      <div data-page-node-id="5lNHZFeivVJrgYCNIN9drv" class="params"
+        style="box-sizing:border-box;margin:0;padding:0;font:11px/1.7 ui-monospace," sf=""
+        mono",menlo,monospace;color:#79a;margin-top:12px;white-space:pre-wrap"="">core : opacity [0,.6,0] 1.5s | 升
+        easeOut · 降 easeIn | 相位 -0.45s（提前） | blur 1pt
+        ripple : scale .92→1.57 + opacity .75→0 | 3s cubic(.2,.6,.3,1) ×2 错相 1.5s | border 2.5pt blur 0.5pt（末 0.5s 渐增至 2.5pt）
+        heart : (仅中断) op .6→1→.6→.85→.6 · scale 1→1.1→1→1.05→1 | 7 帧 1.6s linear | 无涟漪</div>
+    </div>
+    <div data-page-node-id="xbG6AkcqK1GXBExU74WJWW" class="row xrow"
+      style="box-sizing: border-box; margin: 0px 0px 14px; padding: 18px 20px; background: rgb(0, 0, 0); border: 1px solid rgba(115, 199, 255, 0.25); border-radius: 14px;">
+      <div data-page-node-id="3SXyVVmWjmS6hB7F7LFb5X" class="row-head"
+        style="box-sizing:border-box;margin:0;padding:0;display:flex;align-items:baseline;gap:10px;margin-bottom:4px">
+        <h2 data-page-node-id="1AkMvq6nKdEmAF2KdTbHtq" style="box-sizing:border-box;margin:0;padding:0;font-size:15px">X
+          · 光晕旋转（雷达扫描）</h2><span data-page-node-id="qRnfjDElv0L1WemGewKXmz" class="tag rec"
+          style="box-sizing:border-box;margin:0;padding:1px 8px;font-size:11px;border-radius:99px;background:rgba(115,242,141,.14);color:#7df09a">新增风格
+          · 3× 放大</span>
+      </div>
+      <div data-page-node-id="2zIuAHYegoa8pjHXrXGW7G" class="desc"
+        style="box-sizing:border-box;margin:0;padding:0;color:#9a9aa0;font-size:12.5px;margin-bottom:14px">
+        静态弱底光（opacity .10）+ 亮头光束在<b data-page-node-id="JbP6n8PlyaCMzyXLsXCbGF"
+          style="box-sizing:border-box;margin:0;padding:0">静止的圆角方裁切框</b>内顺时针巡扫，彗尾铺满整圈 360°、仅亮头处硬断。
+        载光束的圆盘按对角线放大到 1.41×，扫到四边四角都不留空洞——贴合方形 icon 的"雷达扫过"，2.4s 一圈匀速。
+      </div>
+      <div data-page-node-id="xbgmBkvY4JqbQioH96XYdO" class="samples"
+        style="box-sizing:border-box;margin:0;padding:40px 0 56px;display:flex;gap:72px">
+        <div data-page-node-id="yoIMFXH8Nfe1VMjmL8iHGv" class="sample"
+          style="box-sizing:border-box;margin:0;padding:0;display:flex;flex-direction:column;align-items:center;gap:8px">
+          <div data-page-node-id="uhK51KXFKzLexDYyzZG9mK" class="slot big c-run"
+            style="box-sizing:border-box;margin:0;padding:0;position:relative;width:calc(28px*var(--k));height:calc(28px*var(--k));display:grid;place-items:center;color:rgb(115,199,255)">
+            <div data-page-node-id="HE05VrjBisMQTdlEwMr7nD" class="base run"
+              style="box-sizing:border-box;margin:auto;padding:0;background:rgb(115,199,255);position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));filter:blur(calc(1px*var(--k)));z-index:1;opacity:.10">
+            </div>
+            <div data-page-node-id="fu4wyiES34OAWcOvJXBmek" class="sweep"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));z-index:1;overflow:hidden;filter:blur(calc(1px*var(--k)))">
+            </div>
+            <div data-page-node-id="lEL8DpwBR7LRAaltNS6Ko0" class="icon big"
+              style="box-sizing:border-box;margin:0;padding:0;position:relative;z-index:2;width:calc(24px*var(--k));height:calc(24px*var(--k));border-radius:calc(5.3px*var(--k));background:linear-gradient(145deg,#3b3b41,#26262b);border:1px solid rgba(255,255,255,.14);display:grid;place-items:center;font:600 22px/1 ui-monospace,"
+              sf="" mono",menlo,monospace;color:#cfcfd4;font-size:calc(11px*var(--k))"="">W</div>
+          </div><span data-page-node-id="ygGQe1QUZ4actABsOnb6HS" class="label"
+            style="box-sizing:border-box;margin:0;padding:0;font-size:11px;color:#9a9aa0">进行中</span>
+        </div>
+        <div data-page-node-id="EW4GtXiq9wQOiuNVY6gSY1" class="sample"
+          style="box-sizing:border-box;margin:0;padding:0;display:flex;flex-direction:column;align-items:center;gap:8px">
+          <div data-page-node-id="NIKhXUBp8THoWfx5qDA9Cl" class="slot big c-done"
+            style="box-sizing:border-box;margin:0;padding:0;position:relative;width:calc(28px*var(--k));height:calc(28px*var(--k));display:grid;place-items:center;color:rgb(115,242,141)">
+            <div data-page-node-id="xsOdfFTE8i59OTCswmeepS" class="base done"
+              style="box-sizing:border-box;margin:auto;padding:0;background:rgb(115,242,141);position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));filter:blur(calc(1px*var(--k)));z-index:1;opacity:.10">
+            </div>
+            <div data-page-node-id="X46RuOsUb2evBXYWNTcjtM" class="sweep"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));z-index:1;overflow:hidden;filter:blur(calc(1px*var(--k)))">
+            </div>
+            <div data-page-node-id="ErM7F5E9C5aZNQP6tvBLR4" class="icon big"
+              style="box-sizing:border-box;margin:0;padding:0;position:relative;z-index:2;width:calc(24px*var(--k));height:calc(24px*var(--k));border-radius:calc(5.3px*var(--k));background:linear-gradient(145deg,#3b3b41,#26262b);border:1px solid rgba(255,255,255,.14);display:grid;place-items:center;font:600 22px/1 ui-monospace,"
+              sf="" mono",menlo,monospace;color:#cfcfd4;font-size:calc(11px*var(--k))"="">W</div>
+          </div><span data-page-node-id="ZXEhVcTpziChsjDmE2xLNJ" class="label"
+            style="box-sizing:border-box;margin:0;padding:0;font-size:11px;color:#9a9aa0">完成</span>
+        </div>
+        <div data-page-node-id="6wbXIcmJQgF1up8IKpzoGQ" class="sample"
+          style="box-sizing:border-box;margin:0;padding:0;display:flex;flex-direction:column;align-items:center;gap:8px">
+          <div data-page-node-id="vaibidXxbbGsShDCAsUIrE" class="slot big c-fail"
+            style="box-sizing:border-box;margin:0;padding:0;position:relative;width:calc(28px*var(--k));height:calc(28px*var(--k));display:grid;place-items:center;color:rgb(255,158,102)">
+            <div data-page-node-id="0NuWVavEqCeZwm9d11LwUx" class="base fail"
+              style="box-sizing:border-box;margin:auto;padding:0;background:rgb(255,158,102);position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));filter:blur(calc(1px*var(--k)));z-index:1;opacity:.10">
+            </div>
+            <div data-page-node-id="5WG5IlbgFGoLY6vFSn6Nj6" class="sweep"
+              style="box-sizing:border-box;margin:auto;padding:0;position:absolute;inset:0;width:calc(26.5px*var(--k));height:calc(26.5px*var(--k));border-radius:calc(5.8px*var(--k));z-index:1;overflow:hidden;filter:blur(calc(1px*var(--k)))">
+            </div>
+            <div data-page-node-id="VcY1NzPlyxjRPJvKTg5zft" class="icon big"
+              style="box-sizing:border-box;margin:0;padding:0;position:relative;z-index:2;width:calc(24px*var(--k));height:calc(24px*var(--k));border-radius:calc(5.3px*var(--k));background:linear-gradient(145deg,#3b3b41,#26262b);border:1px solid rgba(255,255,255,.14);display:grid;place-items:center;font:600 22px/1 ui-monospace,"
+              sf="" mono",menlo,monospace;color:#cfcfd4;font-size:calc(11px*var(--k))"="">W</div>
+          </div><span data-page-node-id="fYj9AaFCE1liuyp9e4h2fM" class="label"
+            style="box-sizing:border-box;margin:0;padding:0;font-size:11px;color:#9a9aa0">中断</span>
+        </div>
+      </div>
+      <div data-page-node-id="cgF7AwaoABDTq9n85eOvwt" class="params"
+        style="box-sizing:border-box;margin:0;padding:0;font:11px/1.7 ui-monospace," sf=""
+        mono",menlo,monospace;color:#79a;margin-top:12px;white-space:pre-wrap"="">sweep : 外层圆角方 overflow 裁切（静止）+ 内层
+        1.41× 圆盘载 conic 光束 rotate 2.4s linear
+        尾 : 360° 满圈（rgba 写死，.04@96° → .12@180° → .42@252° → .75@312° → .92@348° → 1@360°，亮头处硬断）| blur 1pt | base .10
+      </div>
+    </div>
+  </div>
+  <script>
+    const wrap = document.querySelector('.wrap');
+    document.getElementById('toggle').onclick = (e) => {
+      wrap.classList.toggle('paused');
+      e.target.textContent = wrap.classList.contains('paused') ? '▶ 继续全部' : '⏸ 暂停全部';
+    };
+    const g = document.getElementById('swapGlow');
+    const seq = ['var(--run)', 'var(--done)', 'var(--fail)'];
+    let i = 0, timer = null;
+    document.getElementById('swap').onclick = (e) => {
+      if (timer) { clearInterval(timer); timer = null; e.target.textContent = '▶ 演示状态切换（G2 行）'; return; }
+      e.target.textContent = '⏸ 停止切换';
+      timer = setInterval(() => { i = (i + 1) % 3; g.style.background = seq[i]; }, 1800);
+    };
+  </script>
+
+
+</body>
+
+</html>

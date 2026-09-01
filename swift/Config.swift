@@ -165,6 +165,9 @@ struct AppConfig: Codable {
     var valueScrollPreviewEnabled: Bool = false
     /// 自动检查更新（GitHub Releases 启动静默检查；手动「检查更新」磁贴不受此开关限制）
     var updateAutoCheck: Bool = true
+    /// 状态调试预览开关：true = 三态光环演示——按 Agent 平台序轮派
+    /// 进行中/完成/中断到前三张 Agent 卡（WB/ZCode/TRAE/Codex 中实际存在者），预览动画效果
+    var statusDebugPreview: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
     var fadeHintBandHeight: Double = 54
     var fadeHintHighlightAlpha: Double = -0.6
@@ -215,6 +218,7 @@ struct AppConfig: Codable {
         case lightThemeEnabled = "light_theme_enabled"
         case monoFontEnabled = "mono_font_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
+        case statusDebugPreview = "status_debug_preview"
         case updateAutoCheck = "update_auto_check"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
@@ -267,6 +271,7 @@ struct AppConfig: Codable {
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
         updateAutoCheck = try c.decodeIfPresent(Bool.self, forKey: .updateAutoCheck) ?? true
+        statusDebugPreview = try c.decodeIfPresent(Bool.self, forKey: .statusDebugPreview) ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
         fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55
@@ -476,7 +481,28 @@ enum UDKey {
 struct BalanceCache: Codable {
     struct DsAmount: Codable { let symbol: String, totalRaw: String, total: Double }
     struct WbAmount: Codable { let remain: Double, total: Double }
-    struct TraeAmount: Codable { let limit: Double, used: Double }
+    /// TRAE 单账号额度快照：resetAt 为订阅包 next_billing_time（套餐重置戳，0=无订阅包）
+    struct TraeAmount: Codable {
+        let limit: Double
+        let used: Double
+        let resetAt: Double
+
+        init(limit: Double, used: Double, resetAt: Double) {
+            self.limit = limit
+            self.used = used
+            self.resetAt = resetAt
+        }
+
+        /// 旧缓存（无 resetAt 字段）解码为 0，维持「无订阅包」显示口径
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            limit = try c.decodeIfPresent(Double.self, forKey: .limit) ?? 0
+            used = try c.decodeIfPresent(Double.self, forKey: .used) ?? 0
+            resetAt = try c.decodeIfPresent(Double.self, forKey: .resetAt) ?? 0
+        }
+
+        enum CodingKeys: String, CodingKey { case limit, used, resetAt }
+    }
     struct ZcodeAmount: Codable { let remain: Double, total: Double, planEndsAt: TimeInterval }
     struct CodexAmount: Codable { let usedPercent: Double, resetAt: TimeInterval }
 
@@ -491,7 +517,8 @@ struct BalanceCache: Codable {
     var bigmodelCycleStartInflow: Double?
     var bigmodelCycleStartBalance: Double?
     /// Qwen（千问 Token Plan）周额度快照（重启后秒显，随下一轮刷新覆盖）
-    struct QwenAmount: Codable { let weekRem: Double; let weekLimit: Double; let remainingDays: Int; let expireAt: Double }
+    /// weekResetAt = 7 天限额重置时间戳（秒）；可选兼容旧缓存（缺字段解码为 nil）
+    struct QwenAmount: Codable { let weekRem: Double; let weekLimit: Double; let remainingDays: Int; let expireAt: Double; let weekResetAt: Double? }
     var qwen: QwenAmount?
     var wbAccounts: [String: WbAmount] = [:]
     var traeAccounts: [String: TraeAmount] = [:]

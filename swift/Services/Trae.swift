@@ -83,8 +83,10 @@ enum TraeService {
         return token
     }
 
-    /// 用指定 token 查询 TRAE 积分（多账号场景：每个账号独立查询）
-    static func fetchCreditsForToken(_ token: String) async -> (limit: Double, used: Double)? {
+    /// 用指定 token 查询 TRAE 积分（多账号场景：每个账号独立查询）。
+    /// resetAt = 订阅包（如会员连续包月）的 next_billing_time（套餐周期重置点，秒级时间戳；
+    /// 无订阅包时为 0，调用方不显示重置副标题）。取所有包中的最大值（签到/邀请包该字段恒 0）。
+    static func fetchCreditsForToken(_ token: String) async -> (limit: Double, used: Double, resetAt: Double)? {
         guard let url = URL(string: "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage?require_usage=true&req_source=2") else { return nil }
         let (respData, status) = await HTTP.requestWithRetry(url: url, headers: [
             "Authorization": "Cloud-IDE-JWT \(token)",
@@ -96,17 +98,21 @@ enum TraeService {
 
         var totalLimit: Double = 0
         var totalUsed: Double = 0
+        var resetAt: Double = 0
         for pack in resp.user_entitlement_pack_list ?? [] {
             let limit = pack.entitlement_base_info?.quota?.credits_limit?.value ?? 0
             let used = pack.usage?.credits_amount?.value ?? 0
             totalLimit += limit
             totalUsed += used
+            if let nbt = pack.next_billing_time?.value, nbt > resetAt {
+                resetAt = nbt
+            }
         }
-        return (totalLimit, totalUsed)
+        return (totalLimit, totalUsed, resetAt)
     }
 
-    /// 查询 TRAE 积分，成功返回 (limit, used)。失败返回 nil。
-    static func fetchCredits(storagePath: String) async -> (limit: Double, used: Double)? {
+    /// 查询 TRAE 积分，成功返回 (limit, used, resetAt)。失败返回 nil。
+    static func fetchCredits(storagePath: String) async -> (limit: Double, used: Double, resetAt: Double)? {
         guard let token = getToken(storagePath: storagePath) else { return nil }
         return await fetchCreditsForToken(token)
     }
@@ -120,6 +126,7 @@ enum TraeService {
             struct Usage: Decodable { let credits_amount: FlexibleDouble? }
             let entitlement_base_info: Base?
             let usage: Usage?
+            let next_billing_time: FlexibleDouble?
         }
         let user_entitlement_pack_list: [Pack]?
     }

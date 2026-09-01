@@ -1,6 +1,21 @@
 // PanelLayout.swift — iBalance
 // 面板布局构建:build() 主装配 + 卡片/设置行/操作磁贴等行构建器
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
+//
+// ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
+// 主装配      build()（面板所有区段的组装入口；改整体结构先读它）
+// 卡片容器     addCard(rows:to:...)（圆角背景 + hover + 点击/右键/拖拽回调都在这挂）
+// 卡片内容     balanceContentRow(...)（两行：标题+数值 / 副标题+点阵）
+//              ⚠️ **卡片字号·行高·icon 列宽的数值权威就在这一个方法里**（字号走 Palette 常量）
+// 设置行      switchRow(title:sub:sw:)（原生 NSSwitch 与 Mono 字符开关同框切换）
+// 行包裹      wrapHoverRow（给任意行加 hover 背景 + pointingHand 光标）
+// 动效        playCharBlurTransition / crossfade / staggerRiseIn / applySwitchVisuals
+// 指示点      CardMenuBarDotView（菜单栏显隐圆点，按生效外观解算 cardForeground）
+// 工具        symbolImage / makeFailureBadge / stretchSpacer
+//            （原 refreshAnchors/syncLayout 属已删的 MenuBarFadeMask，勿再找）
+//
+// ⚠️ 本文件是 extension BalancePanelView = Panel.swift 同一类型拆出的「布局部分」。
+//    状态与数据在 Panel.swift，行的数值在这里——改数值来这里，改状态机去 Panel.swift。
 
 import Cocoa
 import CoreImage
@@ -61,8 +76,10 @@ extension BalancePanelView {
 
     func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        // 宽度下限 240（浮窗 resize 最小宽）；独立（未挂到窗口）时 fittingSize 也能解出高度
-        widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+        // 宽度下限 230（2026-09-01 随主面板收窄 20pt，与 popover 解算下限对齐）；
+        // 浮窗 resize 最小宽 240 由 PanelResizeHandle.minWidth 独立管理，与此无关。
+        // 独立（未挂到窗口）时 fittingSize 也能解出高度
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 230).isActive = true
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -320,6 +337,8 @@ extension BalancePanelView {
         monoSwitch.action = #selector(monoFontToggled)
         valuePreviewSwitch.target = self
         valuePreviewSwitch.action = #selector(valueScrollPreviewToggled)
+        statusDebugSwitch.target = self
+        statusDebugSwitch.action = #selector(statusDebugPreviewToggled)
         updateAutoSwitch.target = self
         updateAutoSwitch.action = #selector(updateAutoCheckToggled)
         // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 原生下拉菜单
@@ -364,6 +383,7 @@ extension BalancePanelView {
             // 「滚动预览」暂时隐藏（2026-08-28）：恢复时把 switchRow 加回此处，
             // 并同步恢复下方 valuePreviewSub.isHidden = false
             // switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),
+            switchRow(title: "状态调试", sub: statusDebugSub, sw: statusDebugSwitch),
             switchRow(title: "自动检查更新", sub: nil, sw: updateAutoSwitch),
         ].map {
             let hover = wrapHoverRow($0)
@@ -374,6 +394,7 @@ extension BalancePanelView {
         }
         // 副标题默认隐藏（switchRow 内统一设置），静态文案行直接显示
         // valuePreviewSub.isHidden = false
+        statusDebugSub.isHidden = false
         // 「设置」标题：可折叠标题条（hover 余额卡片样式，点击折叠整个设置卡片）
         var settingCollapseTargets: [NSView] = []
         let settingTitle = collapsibleSectionTitle(name: "设置", key: UDKey.settingsSectionCollapsed,
@@ -402,6 +423,8 @@ extension BalancePanelView {
         let codexAddBtn = ActionTileButton(bundleIcon: "codex", title: "添加账号", target: self, action: #selector(addCodexAccountTapped), svgIconSize: 16.05)
         checkinBtn.target = self
         checkinBtn.action = #selector(manualCheckinTapped)
+        wbShareBtn.target = self
+        wbShareBtn.action = #selector(shareWbHistoryTapped)
 
         let cockpitBtn = ActionTileButton(symbol: "gauge.with.needle", title: "Cockpit", target: self, action: #selector(openCockpitTapped))
         // Key/额度磁贴：DeepSeek + ZhiPu 设置弹窗统一入口，icon 用 SF Symbol 钥匙
@@ -418,6 +441,7 @@ extension BalancePanelView {
             deepSeekSettingsBtn,
             checkinBtn,
             ActionTileButton(symbol: "list.bullet.rectangle", title: "签到历史", target: self, action: #selector(checkinHistoryTapped)),
+            wbShareBtn,
             platformTogglesBtn,
             checkUpdateBtn,
             aboutBtn,
@@ -429,6 +453,7 @@ extension BalancePanelView {
         zcodeAddBtn.toolTip = "添加 ZCode 账号（JSON 导入）"
         codexAddBtn.toolTip = "添加 Codex 账号（JSON 导入 ~/.codex/auth.json）"
         deepSeekSettingsBtn.toolTip = "配置 DeepSeek API Key、日常额度与 ZhiPu Token"
+        wbShareBtn.toolTip = "将全部历史会话与记忆同步给当前登录的 WorkBuddy 账号（切换账号后可再次执行）"
         platformTogglesBtn.toolTip = "管理各平台刷新、自动签到、卡片与用量显示开关"
         checkUpdateBtn.toolTip = "检查 GitHub Releases 上的新版本（发现后可直接更新重启）"
         let buildVer = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
@@ -677,20 +702,49 @@ extension BalancePanelView {
         return hc
     }
 
+    /// 品牌「macOS 26 ClearDark」图标资产（ictool 从 *.icon 源包预导出的 PNG，
+    /// macOS 平台 ClearDark rendition 256@1x，--design-generation 26 设计语言）。
+    /// Icon Composer 的 .icon 源包 NSImage 无法运行时加载、也无公开变体选择 API，
+    /// 故构建期按 rendition 导出 PNG 随 Resources 分发；保持原色非 template。
+    /// 表里没有的条目（资产缺失，如旧 bundle）由调用方回退 SVG template。
+    /// 键 = CardStyle.icon 图标名；ZCode 与 ZhiPu 共用 "zhipu" 品牌图标名，两卡同时生效。
+    private static let brandClearDarkImages: [String: NSImage] = {
+        var images: [String: NSImage] = [:]
+        for (iconName, resource) in [
+            "workbuddy": "workbuddy-macOS26-ClearDark-256@1x",
+            "zhipu": "zcode-macOS26-ClearDark-256@1x",
+            "deepseek": "deepseek-macOS26-ClearDark-256@1x",
+            "qwen": "qwen-macOS26-ClearDark-256@1x",
+            "trae-color": "trae",  // 资产已简化命名 trae.png（导出参数与其他 ClearDark 卡一致）
+        ] {
+            guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
+                  let img = NSImage(contentsOf: url) else { continue }
+            img.isTemplate = false
+            images[iconName] = img
+        }
+        return images
+    }()
+
     /// 余额卡片内容行：左大 icon + 中间纵向（标题/签到信息）+ 右纵向（额度值/点阵）
-    /// 三列撑满整行：icon 26pt / middle ≥ 70% / right 40pt
+    /// 三列撑满整行：icon 24pt（2026-08-31 全平台统一） / middle ≥ 70% / right 40pt
     /// 中间内容垂直居中；点阵进度放右侧额度值下方（DeepSeek 无点阵）
     /// failureBadge：外部创建的签到失败角标视图，叠加在 icon 右上角（显隐由调用方控制）
-    /// monoSize：Mono 模式 ASCII icon 标称尺寸（缺省 = imgSize 即不微调场景）。
-    /// SVG 微调（imageSize）与 Mono 标称解耦：像素字母各平台等大，SVG 保持视觉微调
-    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 20.47, imageSize: CGFloat? = nil, monoSize: CGFloat? = nil, iconTopAligned: Bool = false, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .semibold, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, valuePrefixIcon: String? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil) -> NSView {
+    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 24, imageSize: CGFloat? = nil, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .medium, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, valuePrefixIcon: String? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil, menuBarDotRef: ((NSView) -> Void)? = nil, statusRingRef: ((CardTaskStatusRingView) -> Void)? = nil) -> NSView {
         var imgSize = imageSize ?? iconSize
-        // 左：大 icon（固定列宽 = iconSize + 4，image 居中显示，imageSize 可独立缩小）；
-        // premadeIconView 由外部传入（多号卡片用 MenuBarFadeIconView 以支持菜单栏渐变标记）
+        // 左：大 icon（统一图标列宽 = 25pt，2026-09-01 用户指定；
+        // 约束写死不随 iconSize 变；image 在列内居中显示，imageSize 可独立缩小）；
+        // premadeIconView 由外部传入（多号卡片预建 icon 视图，普通 NSImageView 即可）
         let iconView = premadeIconView ?? NSImageView()
-        iconView.image = bundleIcon(iconName, size: imgSize) ?? symbolImage("app.fill", size: imgSize)
-        iconView.image?.isTemplate = true
-        iconView.contentTintColor = iconTint
+        // 品牌卡特例（WorkBuddy / ZCode+ZhiPu / DeepSeek）：macOS 26 ClearDark 品牌图（整图自带配色，保持原色非 template 不着色）
+        if let clearDark = Self.brandClearDarkImages[iconName] {
+            let scaled = clearDark.copy() as! NSImage
+            scaled.size = NSSize(width: imgSize, height: imgSize)
+            iconView.image = scaled
+        } else {
+            iconView.image = bundleIcon(iconName, size: imgSize) ?? symbolImage("app.fill", size: imgSize)
+            iconView.image?.isTemplate = true
+            iconView.contentTintColor = iconTint
+        }
         iconView.imageScaling = .scaleProportionallyDown
         iconView.setContentHuggingPriority(.required, for: .horizontal)
         iconView.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -700,20 +754,50 @@ extension BalancePanelView {
         // 拖拽由外层 HoverCard 接管，因此整张卡片而非仅 icon 可触发排序。
         let iconContainer = NSView()
         iconContainer.translatesAutoresizingMaskIntoConstraints = false
-        iconContainer.addSubview(iconView)
-        let iconCenterY = iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor)
-        let iconCenterX = iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor)
-        if iconTopAligned && imgSize < iconSize {
-            iconCenterY.constant = -(iconSize - imgSize) / 2 - 4 + 8
-            iconCenterX.constant = 4
+        if let ringRef = statusRingRef {
+            // 任务状态发光底层（WB / ZCode 当前账号卡）：撑满 iconContainer（尽可能大），
+            // icon 叠加其上居中；menuBarDot / 失败角标仍锚定 iconView，位置不变
+            let ring = CardTaskStatusRingView()
+            ring.translatesAutoresizingMaskIntoConstraints = false
+            iconContainer.addSubview(ring)
+            iconContainer.addSubview(iconView)
+            NSLayoutConstraint.activate([
+                ring.leadingAnchor.constraint(equalTo: iconContainer.leadingAnchor),
+                ring.trailingAnchor.constraint(equalTo: iconContainer.trailingAnchor),
+                ring.topAnchor.constraint(equalTo: iconContainer.topAnchor),
+                ring.bottomAnchor.constraint(equalTo: iconContainer.bottomAnchor),
+                iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
+                iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
+                // 统一图标列宽（不再随各平台 iconSize 变化）：所有卡标题严格左对齐
+                iconContainer.widthAnchor.constraint(equalToConstant: 25),
+            ])
+            ringRef(ring)
+        } else {
+            iconContainer.addSubview(iconView)
+            NSLayoutConstraint.activate([
+                iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
+                // 统一图标列宽（不再随各平台 iconSize 变化）：所有卡标题严格左对齐；
+                // 各图标视觉尺寸差异（SVG 留白不同）由 CardStyle.iconSize 单独补偿
+                iconContainer.widthAnchor.constraint(equalToConstant: 25),
+                iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
+            ])
         }
+
+        // 菜单栏显隐指示点：icon 底边下方 2pt，居中；显示在菜单栏时由调用方点亮（syncPanel）。
+        // 直径 3.6pt 圆点，cardForeground 跟随卡片前景色（2026-08-31 用户要求弃用白色）；
+        // 颜色由 CardMenuBarDotView 在 layout 时按生效外观解算（动态色直落 .cgColor 会定格外观）
+        let menuBarDot = CardMenuBarDotView()
+        menuBarDot.translatesAutoresizingMaskIntoConstraints = false
+        menuBarDot.isHidden = true
+        iconContainer.addSubview(menuBarDot)
         NSLayoutConstraint.activate([
-            iconCenterX,
-            // 统一图标列宽（不再随各平台 iconSize 变化）：所有卡标题严格左对齐；
-            // 各图标视觉尺寸差异（SVG 留白不同）由 CardStyle.iconSize 单独补偿
-            iconContainer.widthAnchor.constraint(equalToConstant: 24.47),
-            iconCenterY,
+            menuBarDot.widthAnchor.constraint(equalToConstant: 3.6),
+            menuBarDot.heightAnchor.constraint(equalToConstant: 3.6),
+            menuBarDot.centerXAnchor.constraint(equalTo: iconView.centerXAnchor),
+            menuBarDot.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 2),
         ])
+        menuBarDotRef?(menuBarDot)
+
         // 签到失败角标：贴 icon 右上角（跟随 iconView 偏移），默认隐藏由调用方按需显示
         if let badge = failureBadge {
             badge.translatesAutoresizingMaskIntoConstraints = false
@@ -728,16 +812,16 @@ extension BalancePanelView {
         }
 
         // 标题行：nameLabel（平台名，Palette.cardForeground）+ 可选 nickLabel（昵称，systemGray 石墨灰）
-        // FadeableTextField：支持菜单栏显隐渐变标记（与 icon 同一套蒙版参数）
+        // FadeableTextField：wantsLayer 承载 hover 字重动画
         let nameLabel = FadeableTextField(labelWithString: name)
-        registerFont(nameLabel, size: 13, weight: titleWeight)
+        registerFont(nameLabel, size: Palette.cardTitleFontSize, weight: titleWeight)
         nameLabel.textColor = textColor
         // 暴露 nameLabel 给调用方（如 hover 字重动画驱动）
         titleLabelRef?(nameLabel)
         nameLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         // 平台标题优先保持完整，昵称在有限空间内使用省略号
         nameLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        // 13.5pt 字体需要略高于字号本身的行框，避免字形下沿被裁切。
+        // 13pt 字体需要略高于字号本身的行框（+3），避免字形下沿被裁切。
         nameLabel.heightAnchor.constraint(equalToConstant: 16).isActive = true
 
         let titleRow: NSView
@@ -856,7 +940,8 @@ extension BalancePanelView {
         let content = NSStackView(views: contentViews)
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 2
+        // 主副标题行间距 = 数值↔点阵间距（同一竖向 stack）：2 → 1（2026-08-31 用户要求 -1pt）
+        content.spacing = 1
         content.distribution = .fill
         content.setContentHuggingPriority(.defaultLow, for: .horizontal)
         content.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -876,9 +961,9 @@ extension BalancePanelView {
 
         let row = NSStackView(views: [iconContainer, contentContainer])
         row.orientation = .horizontal
-        // icon 列↔标题区间距 8→5（2026-08-31 用户要求左侧整带统一 -3pt；
+        // icon 列↔标题区间距：8→5（2026-08-31 用户要求左侧整带统一 -3pt）→ 6.5（同日 +1.5pt 回调；
         // 不动卡片 horizontalPadding 以免右缘数值/点阵列同步位移）
-        row.spacing = 5
+        row.spacing = 6.5
         row.alignment = .centerY   // icon 与内容垂直居中
         // .fill：iconContainer 有 required 固定宽约束保持原宽，
         // contentContainer（低拥抱优先级）撑满剩余宽度到行尾，数值/点阵才能右对齐贴边
@@ -1038,14 +1123,20 @@ extension BalancePanelView {
             return
         }
 
+        // 从当前**表现层**透明度起播（可打断动画标准写法）：上一次淡出/淡入在途时
+        // 再次触发，从视觉现状无缝接管；若强制复位 1/0，快速进出会看到 alpha 回弹闪跳。
+        // 模型值可能与在途 animator 动画的表现值脱节，读 presentation 才是权威。
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         outgoing.isHidden = false
-        outgoing.alphaValue = 1
         incoming.isHidden = false
-        incoming.alphaValue = 0
+        outgoing.alphaValue = CGFloat(outgoing.layer?.presentation()?.opacity ?? Float(outgoing.alphaValue))
+        incoming.alphaValue = CGFloat(incoming.layer?.presentation()?.opacity ?? Float(incoming.alphaValue))
+        CATransaction.commit()
         NSAnimationContext.runAnimationGroup({ context in
             // 与 playCharBlurTransition 同周期同曲线：透明度与模糊聚焦严格同步
             context.duration = 0.35
-            context.timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1/3, 1, 1) // ease-out cubic
+            context.timingFunction = Motion.easeOutCubic
             outgoing.animator().alphaValue = 0
             incoming.animator().alphaValue = 1
         }, completionHandler: { [weak outgoing, weak incoming] in
@@ -1060,25 +1151,28 @@ extension BalancePanelView {
     /// （行间 0.1s / 单行 0.4s / 上移 10pt，用户指定，豁免 Motion.emphasis 0.40 硬顶）。
     /// 视图非 flipped：起点在终位下方 10pt（-y 平移）上移 + 淡入；
     /// 减弱动态效果：直接落定仅复位透明度。
-    func staggerRiseIn(_ views: [NSView]) {
+    /// isCancelled：每次延迟块触发前轮询（换入↔换出代际守卫由调用方闭包），
+    /// 序列中途被打断时剩余块不再启动，避免「容器已在淡出、内容还在各自入场」。
+    func staggerRiseIn(_ views: [NSView], isCancelled: (() -> Bool)? = nil) {
         guard !shouldReduceMotion else {
             for v in views { v.alphaValue = 1 }
             return
         }
-        let rise: CGFloat = 10
+        let rise = Motion.chipStagger.riseOffset
         for (i, v) in views.enumerated() {
             v.wantsLayer = true
             v.alphaValue = 0
             if let layer = v.layer {
+                layer.removeAnimation(forKey: "staggerSink")   // 清掉在途/残留的离场下沉动画（forwards 会压住 presentation）
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 layer.transform = CATransform3DMakeTranslation(0, -rise, 0)
                 CATransaction.commit()
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.1) { [weak v] in
-                guard let v else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * Motion.chipStagger.riseGap) { [weak v] in
+                guard let v, isCancelled?() != true else { return }
                 NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.4
+                    ctx.duration = Motion.chipStagger.riseDuration
                     ctx.timingFunction = Motion.easeOutStrong
                     v.animator().alphaValue = 1
                 }
@@ -1086,7 +1180,7 @@ extension BalancePanelView {
                 let anim = CABasicAnimation(keyPath: "transform.translation.y")
                 anim.fromValue = -rise
                 anim.toValue = 0
-                anim.duration = 0.4
+                anim.duration = Motion.chipStagger.riseDuration
                 anim.timingFunction = Motion.easeOutStrong
                 layer.add(anim, forKey: "staggerRise")
                 // model 立即归位（presentation 覆盖期间播完即无缝停在终位）
@@ -1094,6 +1188,73 @@ extension BalancePanelView {
                 CATransaction.setDisableActions(true)
                 layer.transform = CATransform3DIdentity
                 CATransaction.commit()
+            }
+        }
+    }
+
+    /// 交错下沉淡出（Agent 卡其余账号条离场，staggerRiseIn 的镜像）：从当前表现值接管
+    /// （含被打断的在途入场动画），各 chip 依次（0.06s/格）视觉下移 14pt + 淡出 0.35s。
+    /// isCancelled：每块启动前轮询（换入重启时调用方代际校验），剩余块不再启动。
+    /// onAllFinished：全部块自然播完（未被取消）后回调一次，调用方落藏/复位；
+    /// 被取消时不回调——复位责任归新一轮换入路径。
+    func staggerSinkOut(_ views: [NSView], isCancelled: (() -> Bool)? = nil,
+                        onAllFinished: (() -> Void)? = nil) {
+        guard !shouldReduceMotion, !views.isEmpty else {
+            for v in views { v.alphaValue = 0 }
+            onAllFinished?()
+            return
+        }
+        // 视图非 flipped：-y = 视觉下方（与 staggerRiseIn 入场 -rise 起步同口径），下沉为负
+        let sink = -Motion.chipStagger.sinkOffset
+        let per = Motion.chipStagger.sinkDuration
+        let gap = Motion.chipStagger.sinkGap
+        var pending = views.count
+        var allCancelled = false
+        for (i, v) in views.enumerated() {
+            v.wantsLayer = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * gap) { [weak v] in
+                pending -= 1
+                if isCancelled?() == true { allCancelled = true }
+                guard let v, !allCancelled else {
+                    if pending == 0, !allCancelled { onAllFinished?() }
+                    return
+                }
+                let layer = v.layer
+                // alpha 从表现层接管：rise 在途被打断时 model 已是 1、表现值 ~0.5，
+                // 直接起播会先弹回全亮再淡出（crossfade 同款标准写法）
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                v.alphaValue = CGFloat(v.layer?.presentation()?.opacity ?? Float(v.alphaValue))
+                CATransaction.commit()
+                NSAnimationContext.runAnimationGroup({ ctx in
+                    ctx.duration = per
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                    v.animator().alphaValue = 0
+                })
+                if let layer {
+                    let anim = CABasicAnimation(keyPath: "transform.translation.y")
+                    // 平移 y 在 m42（m32 恒 0，旧写法接管在途动画会跳回 0 起点）
+                    anim.fromValue = layer.presentation()?.transform.m42 ?? 0
+                    anim.toValue = sink
+                    anim.duration = per
+                    anim.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                    anim.isRemovedOnCompletion = false
+                    anim.fillMode = .forwards
+                    layer.add(anim, forKey: "staggerSink")
+                    // model 立即落到下沉终位（presentation 覆盖期间播完即无缝停住）
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    layer.transform = CATransform3DMakeTranslation(0, sink, 0)
+                    CATransaction.commit()
+                }
+                if pending == 0 {
+                    // 等最后一块动画播完（per）再回调落藏——回调时机在启动点会提前
+                    // per 秒掐断淡出（0.06s 即 isHidden，正是「离场立即被打断」的根因）
+                    DispatchQueue.main.asyncAfter(deadline: .now() + per) {
+                        guard !allCancelled, isCancelled?() != true else { return }
+                        onAllFinished?()
+                    }
+                }
             }
         }
     }
@@ -1234,49 +1395,393 @@ extension BalancePanelView {
         return img
     }
 
-    /// 多号账号卡 icon：未显示在菜单栏的账号叠加垂直透明渐变 mask
-    /// （视觉底部 80% 可见 → 顶部 25% 可见，从下到上由亮到暗），区别于「已上菜单栏」的完整 icon。
-    /// 蒙版逻辑在 MenuBarFadeMask（与卡片主标题/积分数值共用同一套渐变参数），本类只是薄壳。
-    final class MenuBarFadeIconView: NSImageView {
-        private lazy var fade = MenuBarFadeMask(host: self)
-        /// true = 未上菜单栏 → icon 应用渐变；false = 完整显示
-        var usesMenuBarFade: Bool {
-            get { fade.usesFade }
-            set { fade.usesFade = newValue }
-        }
-        override init(frame frameRect: NSRect) {
-            super.init(frame: frameRect)
-            wantsLayer = true
-        }
-        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-        override func layout() {
-            super.layout()
-            fade.syncLayout()
-        }
-    }
-
-    /// 支持同一菜单栏渐变标记的文本 label（余额卡片主标题）：wantsLayer + 挂 MenuBarFadeMask，
-    /// 接口与 icon 一致（usesMenuBarFade）。行框高 16pt 由外部约束固定，hover 字重动画
-    /// 只改字形宽度不改行框。墨迹区间由官方基线读数推导（见 updateInkRange）。
+    /// 余额卡片主标题 label：wantsLayer 承载 hover 字重动画（只改字形宽度不改行框）。
+    /// 行框高 16pt 由外部约束固定；原菜单栏渐变蒙版已随小白点指示替代而移除（2026-08-31）。
     final class FadeableTextField: NSTextField {
-        private lazy var fade = MenuBarFadeMask(host: self)
-        var usesMenuBarFade: Bool {
-            get { fade.usesFade }
-            set { fade.usesFade = newValue }
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
         }
-        private var lastInkFontKey = ""
-        /// 墨迹区间 = 官方基线读数（baselineOffsetFromBottom，AppKit cell 排版的唯一权威，
-        /// 对 linebox 超出 bounds 的裁剪场景依然正确）+ 字体度量：
-        /// low 含 descender、high 取 ascender——宁多盖 1pt 渐变淡尾也不在字形顶部露白条。
-        private func updateInkRange() {
-            guard let f = font, bounds.height > 0 else { return }
-            let key = "\(f.fontName)|\(Int(f.pointSize))"
-            guard lastInkFontKey != key else { return }
-            lastInkFontKey = key
-            let base = baselineOffsetFromBottom
-            fade.inkRange = (base + f.descender, base + f.ascender)
-            fade.refreshAnchors()
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    }
+
+    /// Agent 卡任务状态发光底层（icon 下方垫底）——按态分风格：
+    /// ① 进行中 = X · 光晕旋转（雷达扫描，范例 plans/status-glow-versions.html X 行）：
+    ///    静态弱底光（opacity .10）+ 静止圆角方裁切框（masksToBounds）内，
+    ///    1.41×（√2 对角）圆盘载 conic 彗尾光束顺时针匀速自转（2.4s linear）；
+    ///    进行中态几何整体放大 10%（底光/裁切框/圆盘同心 side×1.10，layout 按 taskState 分支）；
+    ///    彗尾铺满整圈 360°、仅亮头处硬断；彗尾 alpha 为提亮档
+    ///    （.14/.32/.68/.92/.98，范例原档 .04/.12/.42/.75/.92）+ 亮带向尾侧展宽 9°（≈2pt 弧长）；
+    ///    2pt 高斯模糊挂**裁切框父层**（sweepBlur）：blur 与 masksToBounds 同层时弥散边
+    ///    会被自家裁剪吃掉（先糊后裁=视觉无模糊），父层壳才能先裁后糊（CSS filter 语义）；
+    ///    ⚠ 贴图镜像后 alpha 沿顺时针爬升 → 盘体负向旋转（屏幕顺时针，用户定案）才「头前尾后」；
+    /// ② 完成 = 「雷达涟漪」风格：柔光呼吸 + 双圈涟漪错相扩散（详见下方常量注释）；
+    /// ③ 中断 = 信号断续（故障感：闪烁掉线 + X/Y 双轴 ±3pt 抖动），无涟漪。
+    /// 三态色：进行中=蓝 / 完成=绿 / 中断=橙红；nil = 全隐藏（仅占位）。
+    /// 颜色为动态色，layout 时按生效外观解算（同 CardMenuBarDotView 口径）；
+    /// reduceMotion 时只留静态柔光（两界中值），涟漪/扫描不铺。
+    final class CardTaskStatusRingView: NSView, CAAnimationDelegate {
+        /// 柔光呼吸两界（用户调档：峰值 0.6 → 0.45，2026-09-01）；呼吸与涟漪同拍（period）
+        static let coreLow: Float = 0.0
+        static let coreHigh: Float = 0.45
+        static let period: CFTimeInterval = 3.0
+        /// 进行中态（X 扫描）圆角：7pt 用户指定（2026-09-01），独立于完成/中断的 side×0.22 等比口径
+        static let runningCornerRadius: CGFloat = 7
+        /// 完成态（双圈涟漪）圆角：7pt 用户指定（2026-09-01，先 +0.4 偏置到 6.34 再直接定为 7），
+        /// 独立于中断态的 side×0.22
+        static let completedCornerRadius: CGFloat = 7
+
+        var taskState: AgentTaskState? {
+            didSet {
+                guard oldValue != taskState else { return }
+                needsLayout = true
+            }
         }
+
+        /// 柔光载体（icon 之下）：纯色圆角块 + 高斯模糊 = 柔和光晕
+        private let glow = CALayer()
+        /// 涟漪双圈：同色描边、无填充，scale+opacity 扩散（完成态）
+        private let ring1 = CALayer()
+        private let ring2 = CALayer()
+        /// X 雷达扫描（进行中）：外层 = 静止圆角方裁切框（overflow 裁切口径）
+        private let sweepClip = CALayer()
+        /// X 雷达扫描：模糊壳 = 裁切框的父层。2pt 高斯模糊挂这里而非 sweepClip 自身——
+        /// CALayer 的 masksToBounds 会裁掉本层 filter 的弥散输出（先糊后裁），视觉上等于没加；
+        /// 挂父层才「先裁圆角方、再整体柔化」，等价 CSS 元素 overflow:hidden + filter:blur（2026-09-01 实测修复）
+        private let sweepBlur = CALayer()
+        /// X 雷达扫描：内层 = 1.41× 对角圆盘，载 conic 彗尾光束自转（contents = 贴图）
+        private let sweepDisc = CALayer()
+        /// 彗尾贴图缓存键（尺寸变化时重渲染）
+        private var sweepImageKey: String?
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+            if let blur = CIFilter(name: "CIGaussianBlur") {
+                blur.setValue(1, forKey: kCIInputRadiusKey)
+                glow.filters = [blur]
+            }
+            glow.opacity = Self.coreLow
+            for ring in [ring1, ring2] {
+                // 涟漪描边 4.75 → 3.75pt（2026-09-02 用户要求 -1pt 两圈同步）
+                ring.borderWidth = 3.75
+                ring.backgroundColor = NSColor.clear.cgColor
+                // 涟漪描边高斯模糊 0.5 → 1.5pt（2026-09-02 用户要求 +1pt，边缘更柔）（每层独立滤镜实例）
+                if let blur = CIFilter(name: "CIGaussianBlur") {
+                    blur.setValue(1.5, forKey: kCIInputRadiusKey)
+                    ring.filters = [blur]
+                }
+            }
+            // 连续曲率圆角（超椭圆，同 macOS/iOS 图标口径）——CALayer 默认 .circular 是圆弧角
+            glow.cornerCurve = .continuous
+            ring1.cornerCurve = .continuous
+            ring2.cornerCurve = .continuous
+            sweepClip.cornerCurve = .continuous
+            // 裁切框：内容溢出裁掉（光束只在圆角方内可见）；模糊挂父层 sweepBlur（见其注释）
+            sweepClip.masksToBounds = true
+            if let blur = CIFilter(name: "CIGaussianBlur") {
+                blur.setValue(2, forKey: kCIInputRadiusKey)
+                sweepBlur.filters = [blur]
+            }
+            layer?.addSublayer(glow)
+            layer?.addSublayer(sweepBlur)
+            sweepBlur.addSublayer(sweepClip)
+            layer?.addSublayer(ring1)
+            layer?.addSublayer(ring2)
+            sweepClip.addSublayer(sweepDisc)
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func layout() {
+            super.layout()
+            guard bounds.width > 1, bounds.height > 1 else { return }
+            // 与 icon 同形的圆角正方形：居中、边长取图标列宽、圆角比例 0.22（app 图标口径），
+            // 外扩 3pt 让 halo 更明显。涟漪圈与柔光同基准方（scale 动画向外扩散）
+            let inset: CGFloat = 0.5
+            let side = min(bounds.width, bounds.height) - inset * 2 + 3
+            // 视觉补偿上移 1pt 已移除（2026-09-01 用户要求去掉状态层向上偏移）
+            let rect = CGRect(x: (bounds.width - side) / 2,
+                              y: (bounds.height - side) / 2,
+                              width: side, height: side)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            // 进行中态整体放大 10%（2026-09-01 用户要求）：底光/扫描框/圆盘同心扩至 side×1.10；
+            // 中断态整体放大 5%（2026-09-02 用户要求，由 15% 收敛）；完成保持原尺寸
+            let stateScale: CGFloat = taskState == .running ? 1.10
+                                    : taskState == .interrupted ? 1.05 : 1.0
+            let boxSide = side * stateScale
+            let boxRect = CGRect(x: (bounds.width - boxSide) / 2,
+                                 y: (bounds.height - boxSide) / 2,
+                                 width: boxSide, height: boxSide)
+            glow.frame = boxRect
+            // 圆角：进行中 7pt / 完成 7pt（各自独立常量）；中断态 boxSide×0.22
+            //（随放大底数走，形状比例与未放大时一致）
+            let corner = taskState == .running ? Self.runningCornerRadius
+                        : taskState == .completed ? Self.completedCornerRadius
+                        : boxSide * 0.22
+            glow.cornerRadius = corner
+            for layer in [ring1, ring2] {
+                layer.frame = rect
+                layer.cornerRadius = corner
+            }
+            CATransaction.commit()
+            if let state = taskState {
+                let color = Self.color(for: state, in: self)
+                glow.backgroundColor = color
+                ring1.borderColor = color
+                ring2.borderColor = color
+                // X 扫描：模糊壳外扩 6pt（≥2×blur 半径）给弥散边留渲染空间；
+                // 裁切框在壳坐标系内回移 6pt，屏幕位置与柔光同基准方。
+                // 光束圆盘按对角线放大 √2，自转扫到四角不留空洞
+                sweepBlur.frame = boxRect.insetBy(dx: -6, dy: -6)
+                sweepClip.frame = CGRect(x: 6, y: 6, width: boxSide, height: boxSide)
+                sweepClip.cornerRadius = Self.runningCornerRadius
+                let discSide = boxSide * 1.4142
+                sweepDisc.frame = CGRect(x: (boxSide - discSide) / 2, y: (boxSide - discSide) / 2,
+                                         width: discSide, height: discSide)
+                if state == .running {
+                    let key = "sweep-\(Int(discSide * 2))"
+                    if key != sweepImageKey {
+                        sweepDisc.contents = Self.cometTailImage(color: color, pixels: Int(discSide * 2))
+                        sweepImageKey = key
+                    }
+                }
+                glow.isHidden = false
+                let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                // 进行中 = X 雷达扫描 / 完成 = 双圈涟漪 / 中断 = 信号断续（动画见 restartAnimationsIfNeeded）
+                sweepBlur.isHidden = state != .running || reduceMotion
+                sweepClip.isHidden = state != .running || reduceMotion
+                let ripple = state == .completed && !reduceMotion
+                ring1.isHidden = !ripple
+                ring2.isHidden = !ripple
+            } else {
+                glow.isHidden = true
+                sweepBlur.isHidden = true
+                sweepClip.isHidden = true
+                ring1.isHidden = true
+                ring2.isHidden = true
+            }
+            restartAnimationsIfNeeded()
+        }
+
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            needsLayout = true
+        }
+
+        /// 视图（重新）进入窗口后动画不会自动续播：接管挂载时机重铺
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            restartAnimationsIfNeeded()
+        }
+
+        /// 重铺全部动画（按态分流）：
+        /// 进行/完成 = 柔光呼吸 + 双圈涟漪（错相半周期）；中断 = 光晕信号断续（无涟漪）。
+        /// 无状态/无窗口/reduceMotion 时收回静态态（glow 钉两界中值、圈隐藏）。
+        private func restartAnimationsIfNeeded() {
+            glow.removeAnimation(forKey: "taskGlowPulse")
+            glow.removeAnimation(forKey: "taskHeartbeat")
+            glow.removeAnimation(forKey: "taskGlitchY")
+            ring1.removeAnimation(forKey: "taskRipple")
+            ring2.removeAnimation(forKey: "taskRipple")
+            sweepDisc.removeAnimation(forKey: "taskSweep")
+            guard let state = taskState, window != nil else { return }
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                glow.opacity = (Self.coreLow + Self.coreHigh) / 2
+                return
+            }
+            if state == .running {
+                // X 雷达扫描：底光静态弱亮（范例 base opacity .10，不呼吸），光束匀速自转
+                glow.opacity = 0.10
+                addSweep()
+                return
+            }
+            if state == .interrupted {
+                addGlitchSignal()
+                return
+            }
+            // 完成态：静谧微光打底：opacity 呼吸 1.5s（period/2，涟漪两拍对一波）。
+            // 光晕尺寸保持静态——缩放的光晕方块会被误读为"从中心扩散的第三圈涟漪"（2026-09-01 实测）
+            let pulse = CAKeyframeAnimation(keyPath: "opacity")
+            pulse.values = [Self.coreLow, Self.coreHigh, Self.coreLow]
+            pulse.keyTimes = [0, 0.5, 1.0]
+            pulse.duration = Self.period / 2
+            pulse.repeatCount = .infinity
+            // 两头快中间慢：升段 easeOut（急速离谷、近峰放缓）+ 降段 easeIn（峰上驻留、
+            // 急速回落）→ 亮相是宽平台、暗相一掠而过，脉冲节奏感（keyframe 逐段曲线数组）
+            pulse.timingFunctions = [
+                CAMediaTimingFunction(name: .easeOut),
+                CAMediaTimingFunction(name: .easeIn),
+            ]
+            // 负 beginTime = 以"已播 0.45s 进行态"接入循环（相位提前 0.45s，重铺时无静默段）
+            pulse.beginTime = CACurrentMediaTime() - 0.45
+            glow.add(pulse, forKey: "taskGlowPulse")
+            addRipple(to: ring1, phase: 0)
+            addRipple(to: ring2, phase: Self.period / 2)
+        }
+
+        /// 中断态 = 信号断续（故障感）：稳亮段中穿插两次「掉线」——
+        /// 掉线时 opacity 近乎瞬时砸落（84ms 内）、伴随 X/Y 双轴各 ±3pt 抖动，
+        /// 随即弹回；两次掉线间隔不均（30%→52%→70%），读作「连接时断时续」。
+        /// 归位不再精确回中：每次弹回落到 ±2pt 内随机偏移上（2026-09-02 用户要求），
+        /// 单周期播完经 animationDidStop 重新随机续播 → 每周期落点都不同，
+        /// 末落点存 glitchSettleX/Y 作为下周期起点，衔接无跳变。
+        /// 动画只挂 glow（icon 不参与）；周期 2.8s，幅度克制不干扰阅读。
+        /// 2026-09-02 用户要求替换原心跳双搏（demo D 风格）；同日抖动扩为双轴 ±3pt。
+        private var glitchSettleX: CGFloat = 0
+        private var glitchSettleY: CGFloat = 0
+
+        private func addGlitchSignal() {
+            let period: CFTimeInterval = 2.8
+            // 信号闪烁（2026-09-02 用户定档：稳亮 opacity 0.7，谷值保掉线感）：
+            // 掉线谷 0.06~0.12 近瞬时降、近瞬时回，
+            // 相邻 keyTimes 差 0.03 ≈ 84ms，linear 曲线模拟信号「啪」断；
+            // 70%-80% 处是长掉线：短暂回亮一拍再彻底熄灭，抖线感
+            let flicker = CAKeyframeAnimation(keyPath: "opacity")
+            flicker.values = [0.7, 0.7, 0.08, 0.7, 0.7, 0.12, 0.7,
+                              0.7, 0.06, 0.35, 0.06, 0.7, 0.7]
+            flicker.keyTimes = [0, 0.30, 0.33, 0.36, 0.52, 0.55, 0.58,
+                                0.70, 0.73, 0.76, 0.80, 0.84, 1.0]
+            flicker.duration = period
+            flicker.repeatCount = .infinity
+            flicker.timingFunction = CAMediaTimingFunction(name: .linear)
+            glow.add(flicker, forKey: "taskGlowPulse")
+            // 双轴抖动（2026-09-02 用户要求：X/Y 各 ±3pt 峰值，掉线点逐一对齐）：
+            // 归位点（原精确 0）替换为 ±2pt 随机落点；Y 轴与 X 轴反向/异幅错开
+            // → 位移轨迹走「之字」更立体；每段 easeOut（快速离位、平滑回位）。
+            // shakeX 单周期播完（repeatCount 1）触发委托续播，实现每周期重新随机
+            let restX1 = CGFloat.random(in: -2...2)
+            let restX2 = CGFloat.random(in: -2...2)
+            let restX3 = CGFloat.random(in: -2...2)
+            let restY1 = CGFloat.random(in: -2...2)
+            let restY2 = CGFloat.random(in: -2...2)
+            let restY3 = CGFloat.random(in: -2...2)
+            let shakeKeyTimes: [NSNumber] = [0, 0.30, 0.31, 0.325, 0.34, 0.355, 0.36,
+                                             0.52, 0.53, 0.545, 0.56, 0.565, 0.58,
+                                             0.70, 0.71, 0.725, 0.74, 0.755, 0.77, 0.775, 1.0]
+            let shakeEase = Array(repeating: CAMediaTimingFunction(name: .easeOut),
+                                  count: shakeKeyTimes.count - 1)
+            let shakeX = CAKeyframeAnimation(keyPath: "transform.translation.x")
+            shakeX.values = [glitchSettleX, glitchSettleX, -3, 3, -2, 2, restX1, restX1,
+                             3, -3, 2, -2, restX2, restX2,
+                             -3, 3, -2, 2, -1, restX3, restX3]
+            shakeX.keyTimes = shakeKeyTimes
+            shakeX.duration = period
+            shakeX.repeatCount = 1
+            shakeX.timingFunctions = shakeEase
+            shakeX.delegate = self
+            glow.add(shakeX, forKey: "taskHeartbeat")
+            let shakeY = CAKeyframeAnimation(keyPath: "transform.translation.y")
+            shakeY.values = [glitchSettleY, glitchSettleY, 2, -3, 2, -1.5, restY1, restY1,
+                             -2, 3, -2, 1.5, restY2, restY2,
+                             2, -3, 2, -1.5, 1, restY3, restY3]
+            shakeY.keyTimes = shakeKeyTimes
+            shakeY.duration = period
+            shakeY.repeatCount = 1
+            shakeY.timingFunctions = shakeEase
+            glow.add(shakeY, forKey: "taskGlitchY")
+            glitchSettleX = restX3
+            glitchSettleY = restY3
+        }
+
+        /// 掉线单周期播完（finished=true）→ 重新随机归位落点续播下一周期；
+        /// 主动移除（态切换/重排）触发 finished=false，交回 restartAnimationsIfNeeded 分管
+        func animationDidStop(_ anim: CAAnimation, finished flag: Bool) {
+            guard flag, taskState == .interrupted, window != nil else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            addGlitchSignal()
+            CATransaction.commit()
+        }
+
+        /// 单圈涟漪：scale 0.92→1.57 + opacity 淡出（keyframe：起泡清晰、外缘提前衰减），group 错相（负 beginTime = 已播进行态）
+        private func addRipple(to ring: CALayer, phase: CFTimeInterval) {
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 0.92
+            scale.toValue = 1.554 // 2026-09-01 用户要求整体 scale 上限 +10%（1.413 → 1.554，起泡 0.92 不变）
+            // 外边缘透明度降低（2026-09-01 用户要求）：原线性 0.75→0 扩散到外圈仍有余亮；
+            // keyframe 提前衰减——起泡段保持清晰 0.75，中段 0.6，外圈 0.22，
+            // 归零提前到 78% 扩散处（原 100%），最后 1/4 扩散纯隐形、外缘干净消失
+            let fade = CAKeyframeAnimation(keyPath: "opacity")
+            fade.values = [0.75, 0.6, 0.22, 0.0]
+            fade.keyTimes = [0, 0.35, 0.6, 0.78]
+            let group = CAAnimationGroup()
+            group.animations = [scale, fade]
+            group.duration = Self.period
+            group.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.6, 0.3, 1)
+            group.repeatCount = .infinity
+            group.beginTime = CACurrentMediaTime() - phase
+            ring.add(group, forKey: "taskRipple")
+        }
+
+        /// X 雷达扫描：光束圆盘匀速自转一圈（2.4s linear，同范例）。
+        /// 方向定案（2026-09-01 用户目检二次修正）：屏幕**顺时针**扫。
+        /// 贴图已镜像（alpha 沿顺时针爬升、彗尾拖在逆时针侧），盘体**负向**旋转（-2π）头前尾后。
+        private func addSweep() {
+            let spin = CABasicAnimation(keyPath: "transform.rotation")
+            spin.fromValue = 0
+            spin.toValue = -CGFloat.pi * 2
+            spin.duration = 2.4
+            spin.repeatCount = .infinity
+            sweepDisc.add(spin, forKey: "taskSweep")
+        }
+
+        /// 彗尾 conic 光束贴图：全圈 360° alpha 爬升、仅亮头处硬断。
+        /// alpha 档位（2026-09-01 两轮上调）：范例原档 .04/.12/.42/.75/.92 →
+        /// 加粗档 .08/.22/.55/.85/.95 → 提亮档 .14/.32/.68/.92/.98；
+        /// 加粗 2pt = 亮带向尾侧展宽 9°（前四档前移、头侧 348°/360° 锚定）。
+        /// 贴图按 (1-loc, alpha) 镜像：alpha 沿**顺时针**爬升（亮头后拖尾），配合 -2π 旋转头前尾后。
+        /// pixels = 贴图边长像素（2x 渲染保证清晰）；颜色用调用方已按外观解算的 CGColor。
+        /// ⚠ 必须用纯 CGContext 位图（makeImage）——NSImage lockFocus 未 unlock 前
+        /// cgImage(forProposedRect:) 恒返回 nil，contents 落空 = 整层不可见（2026-09-01 实测踩坑）
+        private static func cometTailImage(color: CGColor, pixels: Int) -> CGImage? {
+            let comps = color.components ?? [0, 0, 0, 1]
+            guard comps.count >= 3 else { return nil }
+            let (r, g, b) = (comps[0], comps[1], comps[2])
+            // 提亮档：各段 alpha 上调（.08/.22/.55/.85/.95 → .14/.32/.68/.92/.98），头 1.0/尾 0 不变；
+            // 加粗 2pt（≈9° 弧）：亮带向尾侧展宽——头侧锚点 348°/360° 钉死，仅前四个档位前移 9°
+            // ⚠ 五档等量平移只是旋转渐变、不改任何带宽（2026-09-01 踩坑，视觉零变化）
+            let stops: [(loc: CGFloat, alpha: CGFloat)] = [
+                (0, 0), (87.0 / 360, 0.14), (171.0 / 360, 0.32), (243.0 / 360, 0.68),
+                (303.0 / 360, 0.92), (348.0 / 360, 0.98), (1, 1),
+            ]
+            // 镜像到顺时针爬升：特征 (loc, a) → (1-loc, a)，硬断仍在 loc 0/1 回绕处
+            let mirrored = stops.map { (loc: 1 - $0.loc, alpha: $0.alpha) }
+                .sorted { $0.loc < $1.loc }
+            var components: [CGFloat] = []
+            components.reserveCapacity(mirrored.count * 4)
+            for m in mirrored {
+                components.append(contentsOf: [r, g, b, m.alpha])
+            }
+            let cs = CGColorSpaceCreateDeviceRGB()
+            guard let gradient = CGGradient(colorSpace: cs, colorComponents: components,
+                                            locations: mirrored.map { $0.loc }, count: mirrored.count),
+                  let ctx = CGContext(data: nil, width: pixels, height: pixels,
+                                      bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+            CGContextDrawConicGradient(ctx, gradient, CGPoint(x: CGFloat(pixels) / 2, y: CGFloat(pixels) / 2), 0)
+            return ctx.makeImage()
+        }
+
+        private static func color(for state: AgentTaskState, in view: NSView) -> CGColor {
+            let ns: NSColor
+            switch state {
+            // 进行中蓝（2026-09-01 提亮一档：115/199/255 → 140/214/255）
+            case .running: ns = NSColor(calibratedRed: 0.55, green: 0.84, blue: 1.0, alpha: 1)
+            case .completed: ns = NSColor(calibratedRed: 0.45, green: 0.95, blue: 0.55, alpha: 1)
+            // 中断橙红（2026-09-02 用户要求故障态换橙红 #FF7333 → #FF4514 → 更亮更红 #FF3300）：
+            // 与进行中蓝 140/214/255、完成绿 115/242/140 形成色相对比
+            case .interrupted: ns = NSColor(calibratedRed: 1, green: 0.20, blue: 0, alpha: 1)
+            }
+            return Palette.borderCGColor(ns, in: view)
+        }
+    }
+
+    /// 菜单栏显隐指示点（icon 下方 2pt 的 3.6pt 圆点）：
+    /// 颜色 = cardForeground 按「视图生效外观」解算——动态色直取 .cgColor 会定格
+    /// 创建时外观（浅色主题开关强制面板 aqua 时会拿错分支），故在 layout 时重设，
+    /// 外观变化经 viewDidChangeEffectiveAppearance 触发重排刷新。
+    final class CardMenuBarDotView: NSView {
         override init(frame frameRect: NSRect) {
             super.init(frame: frameRect)
             wantsLayer = true
@@ -1284,170 +1789,13 @@ extension BalancePanelView {
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
         override func layout() {
             super.layout()
-            fade.syncLayout()
-            updateInkRange()
+            layer?.cornerRadius = bounds.width / 2
+            layer?.backgroundColor = Palette.borderCGColor(Palette.cardForeground, in: self)
+        }
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            needsLayout = true
         }
     }
 
-}
-
-/// 菜单栏显隐标记蒙版（右键卡片「在菜单栏显示」切换的视觉载体）：垂直透明渐变裁剪层，
-/// 自下而上由亮到暗（底部 80% → 顶部 25% 可见），把「未上菜单栏」渲染成半褪视觉。
-/// 余额卡片的 icon、主标题、积分数值三处共用同一套渐变色参数；mask 恒铺满宿主 bounds
-/// 且锚点全是相对单位，随各自内容高度自适应（icon 22pt 方形 / 标题数值 16pt 行框节奏一致）。
-/// v2 锚点动画（自 MenuBarFadeIconView 平移）：colors/locations 固定不变，显隐切换只动画
-/// 渐变锚点对 (startPoint, endPoint)（带长恒 3 = bounds 高度 ×3）——
-/// 开 = startPoint.y -1（中段渐变对齐内容）；关 = 0（上段纯白对齐，渐变带移出上方）。
-/// 锚点平移即「半透明从内容底部往上移入/移出」（0.25s easeInEaseOut）。
-final class MenuBarFadeMask {
-    private let fadeLayer = CAGradientLayer()
-    private unowned var host: NSView?
-    private var installed = false
-    private let anchorDuration: CFTimeInterval = 0.25
-    /// true = 未上菜单栏 → 应用渐变；false = 完整显示
-    var usesFade = false {
-        didSet {
-            guard oldValue != usesFade else { return }
-            transition(animated: true)
-        }
-    }
-    init(host: NSView) {
-        self.host = host
-        // 六段色标：上段纯白 / 中段渐变（底部 0.8 → 顶部 0.25）/ 下段纯白；
-        // 同 location 双停靠点形成硬边界
-        fadeLayer.colors = [
-            NSColor.white.cgColor,
-            NSColor.white.cgColor,
-            NSColor.white.withAlphaComponent(0.8).cgColor,
-            NSColor.white.withAlphaComponent(0.25).cgColor,
-            NSColor.white.cgColor,
-            NSColor.white.cgColor,
-        ]
-        let third = NSNumber(value: 1.0 / 3.0)
-        let twoThirds = NSNumber(value: 2.0 / 3.0)
-        fadeLayer.locations = [NSNumber(value: 0), third, third, twoThirds, twoThirds, NSNumber(value: 1)]
-    }
-    /// 墨迹区间（pt，自宿主 bounds 底部向上计；nil = 跟随整个 bounds，icon 场景）。
-    /// 渐变段（locations 1/3–2/3，0.8→0.25）将精确映射到 [low, high]，字形外的
-    /// 行框留白自动落在两端纯白段。由文本宿主以基线读数 + 字体度量推导填入
-    /// （见 InkRangeMetrics）——离屏快照实测证明各字体行盒差异大且 cell 会裁剪，
-    /// 静态猜数必错（曾测出 WorkBuddy 墨迹仅 6.5pt 的假象）。
-    var inkRange: (low: CGFloat, high: CGFloat)?
-    /// inkRange 更新后按当前开关状态重新落锚（目标未变则为空操作；有变化平滑滑动）
-    func refreshAnchors() {
-        guard installed else { return }   // 未挂载时首次挂载自然使用最新值
-        let s = anchorSlots()
-        slideAnchor(to: usesFade ? s.grad : s.above, s.k)
-    }
-    /// 按 inkRange 解锚点槽位（单位 = bounds 高度）。几何推导：
-    /// 轴长 3k（k = high−low）、t=1/3 ↦ lo、t=2/3 ↦ hi ⇒ grad = lo−k；
-    /// 关终点 = max(hi, 1−k)（保证白色硬边界不出窗）；开起点 = lo−3k（带沉到墨迹底下之外）
-    private func anchorSlots() -> (grad: CGFloat, above: CGFloat, below: CGFloat, k: CGFloat) {
-        let B = host?.bounds.height ?? 0
-        guard B > 0 else { return (-1, 1, -3, 1) }
-        if let r = inkRange {
-            let lo = min(max(r.low / B, 0), 0.95)
-            let hi = min(max(r.high / B, lo + 0.05), 1)
-            let k = hi - lo
-            return (lo - k, max(hi, 1 - k), lo - 3 * k, k)
-        }
-        return (-1, 1, -3, 1)   // icon：全高 = 墨迹（k=1），与原版完全一致
-    }
-    /// 锚点几何（slot 标量 + 单位 k → CA 两点）。宿主 layer 坐标经 AppKit 翻转
-    /// 补偿跟随 view.isFlipped：非翻转宿主（icon/主标题）layer y 向上；翻转宿主
-    /// （RollingNumberView isFlipped）layer y 向下——后者必须换算否则渐变与
-    /// 滑动方向整体上下颠倒。等效换算（对任意 k 成立）：start = (0.5, 1-s)、
-    /// end = start − 3k（轴反向自下而上），可逐 t 推导证明与正向配置视觉逐点相等。
-    private func anchorPoints(_ s: CGFloat, _ k: CGFloat) -> (CGPoint, CGPoint) {
-        if let host, host.isFlipped {
-            let sy = 1 - s
-            return (CGPoint(x: 0.5, y: sy), CGPoint(x: 0.5, y: sy - 3 * k))
-        }
-        return (CGPoint(x: 0.5, y: s), CGPoint(x: 0.5, y: s + 3 * k))
-    }
-    private func applyAnchor(_ s: CGFloat, _ k: CGFloat) {
-        let pts = anchorPoints(s, k)
-        fadeLayer.startPoint = pts.0
-        fadeLayer.endPoint = pts.1
-    }
-    /// 宿主 layout 时调用：首次挂载 + 尺寸同步（mask 恒铺满 bounds，仅尺寸变化时更新）
-    func syncLayout() {
-        guard let host, host.bounds.height > 0 else { return }
-        let s = anchorSlots()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        if !installed {
-            host.layer?.mask = fadeLayer
-            applyAnchor(usesFade ? s.grad : s.above, s.k)
-            installed = true
-        }
-        fadeLayer.frame = host.bounds
-        CATransaction.commit()
-    }
-    private func transition(animated: Bool) {
-        guard let host, host.bounds.height > 0 else { return }   // 布局未定时由宿主 layout() 首挂
-        let s = anchorSlots()
-        if !installed {
-            // 首次挂载（rebuild 后 apply 阶段）：直接就位，不播动画
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            host.layer?.mask = fadeLayer
-            fadeLayer.frame = host.bounds
-            applyAnchor(usesFade ? s.grad : s.above, s.k)
-            CATransaction.commit()
-            installed = true
-            return
-        }
-        if !animated {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            fadeLayer.removeAnimation(forKey: "maskAnchorStart")
-            fadeLayer.removeAnimation(forKey: "maskAnchorEnd")
-            applyAnchor(usesFade ? s.grad : s.above, s.k)
-            CATransaction.commit()
-            return
-        }
-        if usesFade {
-            // 开：先无动画瞬移到下方纯白位（与任意完整态视觉等价，无跳变），
-            // 再上滑进入渐变位——半透明从内容底部往上移入
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            fadeLayer.removeAnimation(forKey: "maskAnchorStart")
-            fadeLayer.removeAnimation(forKey: "maskAnchorEnd")
-            applyAnchor(s.below, s.k)
-            CATransaction.commit()
-            slideAnchor(to: s.grad, s.k)
-        } else {
-            // 关：从渐变位上滑到上方纯白位——恢复同样从内容底部往上移入
-            slideAnchor(to: s.above, s.k)
-        }
-    }
-    /// 显式锚点平移动画（startPoint/endPoint 同步）：起点取当前呈现位置，
-    /// 快速反复切换不跳变；model 直达目标（disableActions），呈现由动画驱动。
-    /// 端点一律经 anchorPoints 换算，翻转宿主上滑动方向才与非翻转宿主一致
-    private func slideAnchor(to s: CGFloat, _ k: CGFloat) {
-        let fromStartY = fadeLayer.presentation()?.startPoint.y ?? fadeLayer.startPoint.y
-        // 呈现值回到 slot 标量：按宿主取向反解（flipped: start.y = 1 - slot）
-        let fromSlot = (host?.isFlipped == true) ? 1 - fromStartY : fromStartY
-        guard fromSlot != s else { return }
-        let fromPts = anchorPoints(fromSlot, k)
-        let toPts = anchorPoints(s, k)
-        let startAnim = CABasicAnimation(keyPath: "startPoint")
-        startAnim.fromValue = NSValue(point: fromPts.0)
-        startAnim.toValue = NSValue(point: toPts.0)
-        let endAnim = CABasicAnimation(keyPath: "endPoint")
-        endAnim.fromValue = NSValue(point: fromPts.1)
-        endAnim.toValue = NSValue(point: toPts.1)
-        for anim in [startAnim, endAnim] {
-            anim.duration = anchorDuration
-            anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            anim.isRemovedOnCompletion = true
-        }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        applyAnchor(s, k)
-        CATransaction.commit()
-        fadeLayer.add(startAnim, forKey: "maskAnchorStart")
-        fadeLayer.add(endAnim, forKey: "maskAnchorEnd")
-    }
 }

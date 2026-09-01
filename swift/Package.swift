@@ -13,7 +13,7 @@ let package = Package(
             exclude: [
                 "Info.plist", "config.json", "build.sh", "AppIcon.icns",
                 "icons", "fonts",
-                "scratch_mask_anim_test.swift", "scratch_tmp_render_test.swift",
+                "scratch_tmp_render_test.swift",
                 "RollingNumberView.swift.orig", "RollingNumberView.swift.tmp_orig",
             ],
             // main.swift 保留 @main 入口（swiftc 时代同参数）：SPM 对 main.swift 默认

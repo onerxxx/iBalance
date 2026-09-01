@@ -1,6 +1,19 @@
 // CheckinManager.swift — iBalance
 // 签到域:错峰自动签到(WB/TRAE)、手动签到编排、签到历史与定时器
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
+//
+// ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
+// 内部分节    grep "// MARK: -"：WorkBuddy 自动签到 / 自动签到合并开关 / 手动签到 /
+//             签到历史 / 签到定时器 / 签到历史记录
+// 账号收集    traeCheckinAccounts() / wbCheckinAccounts()
+// 自动签到    wbAutoCheckinIfNeeded(force:) / traeAutoCheckinIfNeeded(force:)（错峰 + 退避）
+// 状态填充    wbCheckinStatusFill() / traeCheckinStatusFill()
+// 定时器      startCheckinTimer() / stopCheckinTimer() / updateAutoCheckinMenuTitle()
+// 结果行模型    CheckinRowState / CheckinInfoItem / CheckinResultRow（在 Controls.swift，渲染在弹窗里）
+//
+// ⚠️ 本文件是 extension AppDelegate（签到域）；网络请求在 Services/Trae.swift · WorkBuddy.swift。
+// ⚠️ **风控退避**：连续失败会写入退避时间（riskDate / failDate），下轮跳过。
+//    改签到重试逻辑前必须先读退避判定段，否则容易写成打平台的死循环。
 
 import Cocoa
 import UserNotifications
@@ -698,11 +711,11 @@ extension AppDelegate {
                 if ac.uid == mainUid {
                     if let credits = await TraeService.fetchCredits(storagePath: config.traeStoragePath) {
                         cacheTrae = credits
-                        cacheTraeAccounts[ac.uid] = credits
+                        cacheTraeAccounts[ac.uid] = (credits.limit, credits.used, adoptTraeResetAt(uid: ac.uid, candidate: credits.resetAt))
                         updateTitle()
                     }
                 } else if let r = await TraeService.fetchCreditsForToken(tk) {
-                    cacheTraeAccounts[ac.uid] = r
+                    cacheTraeAccounts[ac.uid] = (r.limit, r.used, adoptTraeResetAt(uid: ac.uid, candidate: r.resetAt))
                 }
                 // 签到成功通知（每号独立 identifier，避免互相覆盖）
                 let content = UNMutableNotificationContent()
