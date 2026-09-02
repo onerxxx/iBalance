@@ -2,6 +2,7 @@
   "fill" : "system-dark",
   "groups" : [
     {
+      "blur-material" : null,
       "layers" : [
         {
           "fill" : {

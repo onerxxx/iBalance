@@ -36,6 +36,9 @@ iBalance-已损坏说明.html
 swift/.build/
 /.build/
 
+# SwiftPM native 增量构建缓存（build.sh --build-system native 产物）
+swift/.build-native/
+
 # Impeccable 本地设计上下文（工具产物，不入库）
 .impeccable.md
 

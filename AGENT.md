@@ -6,7 +6,7 @@
 
 ## ⚠️ Agent 工作流铁律
 
-- **每次改完 Swift 代码必须编译并重启 App**：`cd swift && ./build.sh` 一条命令完成（编译 + 打包 + 签名 + 自动停旧进程并重启）。仅 `swiftc -typecheck` 通过不算交付——改动要重启后才能在真实 App 里验证与观感确认。
+- **每次改完代码默认不要编译或重启 App**：完成修改后直接汇报变更即可；只有用户明确要求编译、构建、运行或验证时，才执行 `cd swift && ./build.sh` 或相应检查命令。
 - **日常代码修改严禁跑 `release.sh` / 不要上传 GitHub Release**：日常迭代验证一律只跑 `build.sh`（fast 模式）编译重启即可。`release.sh` 仅在「真正需要向他人分发新版本」时由用户主动要求执行——它会产生 `-O` 慢编译、消费版本号计数器并向公开仓库发布正式 Release（对外可见、且会触发所有用户 App 的更新提示）。没有用户的明确发版指令就不要碰它。
 - **代码检索优先用 codegraph（`codegraph_explore` MCP 工具），不要上来就 grep/Read 翻文件**：改代码前先 `codegraph_explore` 定位——一次返回目标符号原文（带行号，与磁盘逐字节一致，**当已读用，勿再重复 Read**）+ 调用方 blast radius（callers 分布），比 grep→Read 多轮往返更快更准。索引由 `.codegraph/` 守护进程文件监听自动增量同步，免维护、勿建定时任务；索引异常时删 `.codegraph/` 全量重建即可。grep 只留给 codegraph 不覆盖的场景（非符号文本，如注释/配置键/资源名检索）。
 
@@ -95,7 +95,7 @@ open iBalance.app             # 运行（或双击）
 ```
 
 - build.sh 自动收集 `swift/` 下所有 `.swift`（含 `Services/` 子目录），无需手动列文件（SwiftPM 按 Package.swift 管理）。
-- 编译命令核心：`swift build --disable-sandbox --package-path swift -c <debug|release> --build-system native`（SwiftPM 增量，产物 `swift/.build/<conf>/iBalance`）。`--disable-sandbox` 必需：macOS 27 + CLT 下 SwiftPM `sandbox_apply` 被拒。默认 debug 快速编译，`./build.sh --release` 用 release（-O + WMO）。
+- 编译命令核心：`swift build --disable-sandbox --package-path swift -c <debug|release> --build-system native`（SwiftPM 增量，产物 `swift/.build/<conf>/iBalance`）。`build.sh` 会把 Clang/Swift 模块缓存统一放到项目 `swift/.build/module-cache/` 内，避免沙箱环境无法写入用户级 Clang cache，同时保留 SwiftPM 原有 scratch 目录以维持增量构建状态。`--disable-sandbox` 必需：macOS 27 + CLT 下 SwiftPM `sandbox_apply` 被拒。默认 debug 快速编译，`./build.sh --release` 用 release（-O + WMO）。
 - **组装 .app 是覆盖式更新，禁止恢复 `rm -rf "$APP_DIR"`**（2026-08-31）：整包删除约 52 个内部文件，触发 WorkBuddy 批量删除保护（阈值 50，`[SAFE_DELETE_BULK_CONFIRM_REQUIRED]`，同会话重试仍失败）。build.sh 保留目录逐个覆盖；过期资源按「本次期望清单」逐个 `rm -f`（正常构建为 0 个）。
 - 版本号自动生成：**`YYYY.M.D.N`**（日期 + 当日构建序号），由 `swift/.build_state` 计数器维护，同日递增、跨日重置；构建时由 PlistBuddy 写入 Info.plist（`CFBundleShortVersionString` = 日期、`CFBundleVersion` = 完整号）。
 - `icons/*` 全量拷贝进 Resources：SVG（菜单栏 template 图标 + 面板品牌图标）、PNG（关于弹窗）、PDF（菜单栏平台矢量图标，优先于同名 SVG 加载）。

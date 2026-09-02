@@ -3,21 +3,29 @@
     "refractivity",
     "specular-location"
   ],
-  "fill" : "system-dark",
+  "fill" : "system-light",
   "groups" : [
     {
       "blur-material" : null,
       "hidden" : false,
       "layers" : [
         {
-          "fill" : "none",
+          "fill-specializations" : [
+            {
+              "value" : "system-dark"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "system-light"
+            }
+          ],
           "image-name" : "workbuddy 2.svg",
           "name" : "workbuddy 2",
           "position" : {
             "scale" : 64.44,
             "translation-in-points" : [
-              3,
-              14
+              8,
+              7
             ]
           }
         }
@@ -33,7 +41,7 @@
       },
       "specular" : "inside",
       "translucency" : {
-        "enabled" : false,
+        "enabled" : true,
         "value" : 0.3
       }
     }

@@ -22,9 +22,9 @@
         }
       ],
       "refractivity" : {
-        "depth" : 0.104921875,
+        "depth" : 0.1435546875,
         "enabled" : true,
-        "strength" : 0.171484375
+        "strength" : 0.123515625
       },
       "shadow" : {
         "kind" : "neutral",
@@ -32,7 +32,7 @@
       },
       "translucency" : {
         "enabled" : true,
-        "value" : 0.21
+        "value" : 0.3
       }
     }
   ],

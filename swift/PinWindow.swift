@@ -26,8 +26,12 @@ extension AppDelegate {
               let vc = popover.contentViewController,
               let popWindow = vc.view.window else { return }
         // 用内容视图自身的屏幕位置定位浮窗：popover 窗口 frame 含箭头/阴影边距，
-        // 直接套用会向左上偏移；无边框浮窗内容铺满窗口，与原内容像素级重合
-        let viewFrame = popWindow.convertToScreen(vc.view.convert(vc.view.bounds, to: nil))
+        // 直接套用会向左上偏移；无边框浮窗内容铺满窗口，与原内容像素级重合。
+        // ⚠️ 满尺寸内容（hasFullSizeContent）下 vc.view 铺满整个 popover 窗口、含顶部
+        // 三角箭头带，必须取安全区矩形（= popover 正文区）：直接拿 bounds 会把浮窗
+        // 撑高、内容上移一个箭头带的高度。浮窗无箭头，安全区 == bounds，自动等价。
+        let safeFrame = vc.view.safeAreaRect
+        let viewFrame = popWindow.convertToScreen(vc.view.convert(safeFrame, to: nil))
         let targetScreen = popWindow.screen ?? NSScreen.main
         // 恢复上次保存的浮窗尺寸（未记录时用面板当前尺寸），clamp 到上下限与屏幕
         let savedSize = restoredFloatingPanelSize(default: viewFrame.size, screen: targetScreen)

@@ -29,15 +29,33 @@ if [[ "${1:-}" == "--release" ]]; then
 fi
 
 echo "==> 编译源文件（SwiftPM 增量，配置：${SPM_CONF}，模式：${BUILD_MODE}）"
+# Clang 模块缓存落在项目的 .build（已被 .gitignore 忽略）中，
+# 避免沙箱环境无法写入 ~/.cache/clang；SwiftPM 原有 scratch 目录保持不变，
+# 以免破坏已有增量构建状态。
+MODULE_CACHE_DIR="$SCRIPT_DIR/.build/module-cache"
+mkdir -p "$MODULE_CACHE_DIR"
+export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR"
+
+# -Xswiftc 负责目标源码编译；CLANG_MODULE_CACHE_PATH 还覆盖 SwiftPM 编译
+# Package.swift manifest 时触发的 Clang/SwiftShims 模块缓存。
+SWIFT_BUILD_ARGS=(
+    --disable-sandbox
+    --package-path "$SCRIPT_DIR"
+    -c "$SPM_CONF"
+    --build-system native
+    -Xswiftc -module-cache-path
+    -Xswiftc "$MODULE_CACHE_DIR"
+)
+
 # -explicit-module-build 不用：小项目固定开销大（SDK 预构建 55s、无改动仍 14s）
 # --build-system native：显式指定 llbuild 后端（新版 SwiftPM 默认 XCBuild 后端在
 # Swift 6.4-dev 上报 "Unknown error parsing property list"，native 稳定且增量更快）
 # --disable-sandbox：macOS 27 + CLT 下 SwiftPM 的 sandbox_apply 被拒
 #（"sandbox-exec: sandbox_apply: Operation not permitted"），manifest 解析直接失败；
 # 官方开关，仅跳过 SwiftPM 的插件沙箱，不影响产物
-swift build --disable-sandbox --package-path "$SCRIPT_DIR" -c "$SPM_CONF" --build-system native
+swift build "${SWIFT_BUILD_ARGS[@]}"
 # 产物路径由 SwiftPM 管理（swift/.build/<conf>/iBalance）；show-bin-path 不触发构建
-BIN_DIR="$(swift build --disable-sandbox --package-path "$SCRIPT_DIR" -c "$SPM_CONF" --build-system native --show-bin-path)"
+BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)"
 
 # 先停掉旧 iBalance 再覆盖 bundle：旧进程还在跑时改写 bundle，open 只会激活旧实例，
 # 新二进制根本没运行。SIGTERM + 1.0s 优雅退出，随后循环等 pgrep 为空，超时升级 SIGKILL，

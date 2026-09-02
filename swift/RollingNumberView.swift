@@ -75,6 +75,10 @@ final class DigitWheelView: NSView {
     /// 单格行高（滚动步长 = 一格）：ascender - descender + leading
     private var cellH: CGFloat { ceil(font.ascender - font.descender + font.leading) }
 
+    /// 落定数字（滚动期间恒定取目标值）：外部按字符求墨迹空档用，
+    /// 恒定值保证 chip 右缘在滚动全程不抖（落定即精确值）
+    var displayDigit: Int { ((Int(round(targetPos)) % 10) + 10) % 10 }
+
     /// 当前槽宽：从连续滚动位置计算出的数字 advance。
     /// 非等宽字体下，1→8 滚动时宽度也随滚动进度连续变化；
     /// 等宽字体下自然变成恒定宽度。
@@ -373,8 +377,11 @@ final class RollingNumberView: NSView {
             needsLayout = true
         }
     }
-    private let prefixIconSize: CGFloat = 10
-    private let prefixIconGap: CGFloat = 3
+    /// 常规态前缀图标边长（chip 态切 ChipStyle.iconSize 与子账号按钮统一；面板按此
+    /// 尺寸烘焙 2× 图像，chip 态只缩小绘制——放大糊、缩小清晰；离开 hover 复原此值）
+    static let baseIconSize: CGFloat = 10
+    private var prefixIconSize: CGFloat = RollingNumberView.baseIconSize
+    private let prefixIconGap: CGFloat = ChipStyle.iconTextGap
     private let prefixIconView = NSImageView()
 
     private var mainFont: NSFont = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
@@ -383,6 +390,80 @@ final class RollingNumberView: NSView {
     private var prefixLineH: CGFloat = 10
     private var digitWidth: CGFloat = 8   // 仅诊断日志用（字体等宽性验证）
     private var textColor: NSColor = Palette.cardForeground
+
+    // —— 基础字体档（configure 注入）：chip 态切走、退出态复原的复原锚点 ——
+    private var baseSize: CGFloat = 13
+    private var baseWeight: NSFont.Weight = .semibold
+    private var baseLineH: CGFloat = 16
+
+    // —— 当前账号积分 hover chip（2026-09-02 用户定稿）——
+    // 账号条换入时点亮：贴「前缀 icon + 数字组」实际边缘的圆角背景（不占 65pt 定宽），
+    // 配色复用 ChipStyle（浅色主题反转同口径）。
+    private let chipLayer = CALayer()
+    private var isChipActive = false
+    /// chip hover 态：背景在 ChipStyle.bgDefault/bgHover 两档间切换（与子账号按钮同款两档）
+    private var isChipHovered = false
+
+    /// 点亮/熄灭积分 chip。熄灭复原基础字体档 + cardForeground；
+    /// chip hover 让位走 setDimmed（自动按激活态选正确复原色）
+    func setChipActive(_ on: Bool) {
+        guard isChipActive != on || (on && chipLayer.backgroundColor == nil) else { return }
+        isChipActive = on
+        // 字体切子账号 chip 同款（ChipStyle 统一规格），退出回基础档
+        specSize = on ? ChipStyle.fontSize : baseSize
+        specWeight = on ? ChipStyle.fontWeight : baseWeight
+        // 图标同步切 chip 档（与子账号按钮同尺寸），退出复原常规档边长
+        prefixIconSize = on ? ChipStyle.iconSize : Self.baseIconSize
+        refreshFont()
+        relayoutSlots()
+        invalidateIntrinsicContentSize()
+        resolveChipColor()
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.25)
+        chipLayer.isHidden = false
+        chipLayer.opacity = on ? 1 : 0
+        CATransaction.commit()
+        setTextColor(on ? ChipStyle.fgMain : Palette.cardForeground)
+    }
+
+    /// chip hover 让位/复原：dim 系统灰；复原按激活态回 chip 前景或常规前景
+    func setDimmed(_ dim: Bool) {
+        setTextColor(dim ? .systemGray
+                        : (isChipActive ? ChipStyle.fgMain : Palette.cardForeground))
+    }
+
+    /// chip 点亮时的命中区域（chipLayer frame 转换到 target 视图坐标系）；未点亮返回 nil。
+    /// chip 是 CALayer 无自有 tracking：光标是否悬停在积分按钮上由所在卡片的
+    /// mouseMoved/enter/exit 统一换算判定（HoverCard.chipHitRectProvider 消费）
+    func chipHitRect(in target: NSView) -> NSRect? {
+        guard isChipActive, !chipLayer.isHidden else { return nil }
+        return target.convert(chipLayer.frame, from: self)
+    }
+
+    /// chip hover 反馈：背景切 ChipStyle.bgHover 档（0.85 不透明度保留反馈差），
+    /// 离开复原 bgDefault；时长与卡片 hover 背景一致（Motion.hover）。仅点亮态可见
+    func setChipHovered(_ on: Bool) {
+        guard isChipHovered != on else { return }
+        isChipHovered = on
+        guard isChipActive else { return }
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(Motion.hover)
+        resolveChipColor()
+        CATransaction.commit()
+    }
+
+    /// 动态色经 .cgColor 落盘定格外观：主题切换时重解算（仅激活时可见，未激活等下次点亮）
+    private func resolveChipColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.chipLayer.backgroundColor =
+                (self.isChipHovered ? ChipStyle.bgHover : ChipStyle.bgDefault).cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        if isChipActive { resolveChipColor() }
+    }
 
     private enum SlotKind { case digit, prefix, plain }
     private struct Slot {
@@ -405,7 +486,9 @@ final class RollingNumberView: NSView {
     override var intrinsicContentSize: NSSize {
         var w = slots.reduce(0) { $0 + slotWidth($1) }
         if prefixIcon != nil { w += prefixIconGap + prefixIconSize }
-        return NSSize(width: w, height: lineH)
+        // 高度取基础档行高：chip 态字体缩小行高变小，但视图高度保持 16（row1 基线
+        // 探针/标题基线约束稳定，标题不随 hover 态跳动）；槽位在 relayoutSlots 垂直居中
+        return NSSize(width: w, height: max(lineH, baseLineH))
     }
 
     init() {
@@ -413,6 +496,10 @@ final class RollingNumberView: NSView {
         // 左溢裁剪：复刻原右对齐 label 超宽时裁掉左侧（数值尾部优先可见）的边界行为
         wantsLayer = true
         layer?.masksToBounds = true
+        chipLayer.cornerRadius = ChipStyle.cornerRadius
+        chipLayer.isHidden = true
+        chipLayer.opacity = 0
+        layer?.insertSublayer(chipLayer, at: 0)   // 垫底：子视图槽位（含各自 layer）在其上
         baselineProbe.isHidden = true
         baselineProbe.font = mainFont
         baselineProbe.cell?.wraps = false
@@ -424,6 +511,8 @@ final class RollingNumberView: NSView {
             baselineProbe.topAnchor.constraint(equalTo: topAnchor),
         ])
         prefixIconView.isHidden = true
+        // 图像按常规态边长烘焙，chip 态缩小绘制（frame 由 prefixIconSize 逐帧给出）
+        prefixIconView.imageScaling = .scaleProportionallyUpOrDown
         addSubview(prefixIconView)
         setText("—", animated: false)
     }
@@ -431,6 +520,8 @@ final class RollingNumberView: NSView {
 
     /// 面板注入字体规格与提供器（uiFont：Mono/Inter/系统 + 等宽数字策略）
     func configure(size: CGFloat, weight: NSFont.Weight, fontProvider: @escaping FontProvider) {
+        baseSize = size          // 基础档：chip 态退出的复原锚点
+        baseWeight = weight
         specSize = size
         specWeight = weight
         self.fontProvider = fontProvider
@@ -443,15 +534,19 @@ final class RollingNumberView: NSView {
     /// Mono/Inter 开关切换后就地刷新字体（不重建槽位，滚动状态保留）。
     /// 数字槽宽由 wheel 按新字体重算（rebuildCells 内落位）。
     func refreshFont() {
-        mainFont = fontProvider(specSize, specWeight, true)
+        // chip 态用子账号 chip 同款字体（9pt semibold、非 mono）；常规态走基础档（mono 等宽数字）
+        mainFont = fontProvider(specSize, specWeight, !isChipActive)
         // ¥/$ 前缀：60% 字号 semibold（对齐原 applyValueText 富文本策略，不用等宽数字）
         prefixFont = fontProvider(specSize * 0.6, .semibold, false)
         lineH = ceil(mainFont.ascender - mainFont.descender + mainFont.leading)
         prefixLineH = ceil(prefixFont.ascender - prefixFont.descender + prefixFont.leading)
         digitWidth = DigitWheelView.tabularWidth(mainFont)
-        baselineProbe.font = mainFont
+        // 基线探针恒用基础档字体：对外 firstBaselineAnchor 稳定，标题行不随 chip 态跳动
+        let probeFont = fontProvider(baseSize, baseWeight, true)
+        baseLineH = ceil(probeFont.ascender - probeFont.descender + probeFont.leading)
+        baselineProbe.font = probeFont
         probeHeightC?.isActive = false
-        let hc = baselineProbe.heightAnchor.constraint(equalToConstant: lineH)
+        let hc = baselineProbe.heightAnchor.constraint(equalToConstant: baseLineH)
         hc.isActive = true
         probeHeightC = hc
         for i in slots.indices {
@@ -697,6 +792,28 @@ final class RollingNumberView: NSView {
         relayoutSlots()
     }
 
+    /// 槽位末字符的墨迹右空档（数字槽取落定数字；静态槽取自身文本）
+    private func trailingInkGap(_ s: Slot) -> CGFloat {
+        if let w = s.view as? DigitWheelView {
+            return ChipStyle.trailingInkGap(String(w.displayDigit), font: w.font)
+        }
+        if let t = s.view as? TextSlotView {
+            return ChipStyle.trailingInkGap(t.text, font: t.font)
+        }
+        return 0
+    }
+
+    /// 槽位首字符的墨迹左空档（同上，供无前缀图标时回补左侧）
+    private func leadingInkGap(_ s: Slot) -> CGFloat {
+        if let w = s.view as? DigitWheelView {
+            return ChipStyle.inkBearings(String(w.displayDigit), font: w.font).lsb
+        }
+        if let t = s.view as? TextSlotView {
+            return ChipStyle.inkBearings(t.text, font: t.font).lsb
+        }
+        return 0
+    }
+
     /// 槽位当前宽度：数字槽直接读 wheel.currentWidth；静态槽使用字符 advance。
     private func slotWidth(_ s: Slot) -> CGFloat {
         (s.view as? DigitWheelView)?.currentWidth ?? s.width
@@ -714,9 +831,15 @@ final class RollingNumberView: NSView {
         // 移出列随组平移）——所有铺布局路径（layout/setText/ticker）统一走这里，
         // 滑移中间态不会被任何一次重排打回终点（闪动根因）
         let p = slideProgress()
+        // chip 态垂直居中：字体缩小后行高 < 视图高（intrinsic 恒取基础档），槽位整体
+        // 下移半个差值；常规态 lineH == bounds.height，yShift = 0 行为不变
+        let yShift = max(0, (bounds.height - lineH) / 2)
         // 左对齐：左缘锚 0（原 drawText 的 pen 位置），正向逐槽排布；
-        // 右对齐：右缘锚 bounds−cellTextPadding，逆向排布（超宽左溢裁掉）
-        var x = alignsLeft ? 0 : bounds.width - cellTextPadding
+        // 右对齐：右缘锚 bounds−右留白，逆向排布（超宽左溢裁掉）。
+        // chip 态右留白抬到 hPadding：视图定宽 65 且 masksToBounds，右缘不留够内边距
+        // 的话 chip 背景右侧会被裁掉（左右内缩进不对称），故整组左移让 chip 完整入界
+        let rightInset = isChipActive ? max(cellTextPadding, ChipStyle.hPadding) : cellTextPadding
+        var x = alignsLeft ? 0 : bounds.width - rightInset
         for s in alignsLeft ? slots : slots.reversed() {
             let w = slotWidth(s)
             var fx: CGFloat
@@ -732,7 +855,7 @@ final class RollingNumberView: NSView {
                 let startX = slideStarts[id] ?? (fx - slideDelta)
                 fx = startX + (fx - startX) * p
             }
-            s.view.frame = NSRect(x: fx, y: s.yOff, width: w, height: s.height)
+            s.view.frame = NSRect(x: fx, y: s.yOff + yShift, width: w, height: s.height)
         }
         if p < 1 {
             for e in slideExits {
@@ -742,8 +865,26 @@ final class RollingNumberView: NSView {
         // 前缀图标贴最左槽左侧（右/左对齐下 slots.first 均为最左槽；滑移期随插值帧同步平移）
         if prefixIcon != nil, let first = slots.first {
             prefixIconView.frame = NSRect(x: first.view.frame.minX - prefixIconGap - prefixIconSize,
-                                          y: (lineH - prefixIconSize) / 2,
+                                          y: yShift + (lineH - prefixIconSize) / 2,
                                           width: prefixIconSize, height: prefixIconSize)
+        }
+        // 积分 chip 贴内容组边缘（含前缀 icon）：左右内边距走 ChipStyle.hPadding
+        // （与子账号 chip 同口径），高度 = 当前行高（chip 态 9pt 行高 ≈12 与子账号
+        // chip 同款），随槽位逐帧重算。
+        // ⚠️ 贴的是 **墨迹边缘** 不是槽位（advance）边缘：末位字符的 rsb（≈0.7pt，
+        // 末位「1」时 1.27pt）若算进内缩进，右视觉内缩进会比左侧图标侧大一圈
+        // （图标是按墨迹紧裁位图，空档≈0）——右侧内缩去 rsb 后左右等距。
+        if !slots.isEmpty {
+            var minX = slots.map { $0.view.frame.minX }.min() ?? 0
+            if !prefixIconView.isHidden { minX = min(minX, prefixIconView.frame.minX) }
+            let maxX = slots.map { $0.view.frame.maxX }.max() ?? bounds.width
+            let trailGap = max(0, (slots.last.map { trailingInkGap($0) } ?? 0) - 0.2)
+            // 左侧：图标墨迹填满 frame（紧裁缩放）→ 空档 0；无图标时按首字符 lsb 回补
+            let leadGap = prefixIconView.isHidden ? (slots.first.map { leadingInkGap($0) } ?? 0) : 0
+            let inkMinX = minX + leadGap
+            let inkMaxX = maxX - trailGap
+            chipLayer.frame = NSRect(x: inkMinX - ChipStyle.hPadding, y: yShift,
+                                     width: (inkMaxX - inkMinX) + ChipStyle.hPadding * 2, height: lineH)
         }
         // TODO(诊断): 槽位坐标 dump（限前 24 次），定位偏右；确认后移除
         Self.posDiagCount += 1

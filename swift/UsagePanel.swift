@@ -44,8 +44,8 @@ struct UsageRowSnapshot: Equatable {
 final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     var row: UsageRowSnapshot? {
         didSet {
-            // 跨行切换（hover 到别的平台）时周浏览页复位到本周
-            if oldValue != row { weekOffset = 0 }
+            // 同一平台的数据刷新不应打断当前周浏览；切换到其他平台时才复位。
+            if oldValue?.platform != row?.platform { weekOffset = 0 }
             needsDisplay = true
         }
     }
@@ -621,6 +621,11 @@ final class UsageHistoryPopoverController: NSViewController {
         chartView.row = row
     }
 
+    /// 离开用量表格后清理周浏览状态；表格内部刷新/重绘期间保持当前选择。
+    func resetWeekSelection() {
+        chartView.weekOffset = 0
+    }
+
     private func applyPanelBackground() {
         guard isViewLoaded else { return }
         // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
@@ -1071,9 +1076,13 @@ extension BalancePanelView {
     }
 
     /// 面板内容重建或 popover 关闭时清理趋势图窗口与 hover 状态。
-    func dismissUsageHistoryPopover() {
+    /// 内容重建可能只是同一张表的数据刷新，此时保留当前周页；真正离开面板时才复位。
+    func dismissUsageHistoryPopover(resetWeekSelection: Bool = true) {
         usageHistoryCloseTask?.cancel()
         usageHistoryCloseTask = nil
+        if resetWeekSelection {
+            usageHistoryController?.resetWeekSelection()
+        }
         usageHistoryPopover?.close()
         usageHistoryRowHovered = false
         usageHistoryChartHovered = false

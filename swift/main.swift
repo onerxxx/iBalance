@@ -112,6 +112,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// alert 结束后由 presentCheckResultAlert 自行归还焦点）
     var isPresentingSystemAlert = false
     private var settingsMenu: NSMenu!
+    /// 菜单栏按钮原生右键菜单：仅保留编译、刷新、退出
+    private var statusContextMenu: NSMenu!
     /// 面板最近一次释放拖拽后的平台顺序；面板未拖拽前回退到 UserDefaults。
     private var menuBarPlatformOrder: [String]?
     private var lastUpdatedAt = ""
@@ -120,6 +122,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 进行中的刷新任务：onRefresh 触发时先取消旧任务，保证同一时刻只有一个刷新在跑
     private var refreshTask: Task<Void, Never>?
+    /// header 快速编译桥接进程：负责把命令交给 Terminal
+    private var quickBuildProcess: Process?
     /// 刷新序号（递增）：日志中关联 onRefresh / performRefresh / refreshOne*
     var refreshSeq: Int64 = 0
     /// updateTitle 去抖：180ms 窗口内多次调用合并为一次，避免刷新过程中每账号回调
@@ -350,8 +354,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // ⚠️ 不能给 statusItem.menu 赋值：menu 非 nil 时左键会被系统直接弹菜单，
         // button 的 action 根本不触发。故 menu 置 nil，右键在 action 里手动 popUp。
         settingsMenu = menu
+        let contextMenu = NSMenu()
+        func contextMenuItem(_ title: String, action: Selector) -> NSMenuItem {
+            NSMenuItem(title: title, action: action, keyEquivalent: "")
+        }
+        contextMenu.addItem(contextMenuItem("🔨  编译", action: #selector(onQuickBuildFromMenu)))
+        contextMenu.addItem(contextMenuItem("🔄  刷新", action: #selector(onRefresh)))
+        contextMenu.addItem(contextMenuItem("🚪  退出", action: #selector(onQuit)))
+        for item in contextMenu.items { item.target = self }
+        statusContextMenu = contextMenu
         statusItem.button?.target = self
         statusItem.button?.action = #selector(onStatusItemClicked)
+        // 默认 NSStatusBarButton 只发送左键 action；显式开启右键抬起事件，
+        // 让 onStatusItemClicked 能进入原生 context menu 分支。
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem.menu = nil
 
         // 菜单栏前景色随屏幕聚焦状态变化；macOS 27 不总会主动重绘，手动监听刷新
@@ -406,7 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ZcodeTokenStore.fetch { _ in }
         WBTokenStore.fetch { _ in }
 
-        // WB / ZCode 任务状态轮询（本机 SQLite 单行查询，15s 一轮）：
+        // WB / ZCode / Codex 任务状态轮询（本机 SQLite/JSONL 单行采样，5s 一轮）：
         // 可见状态变化（含 10 分钟过期归零）时主线程回调同步面板
         AgentTaskStatusStore.startPolling { [weak self] in
             self?.syncPanel()
@@ -568,6 +584,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 左键点击 → 切换详情面板；右键 → 手动弹出设置菜单。
     @objc private func onStatusItemClicked(_ sender: Any?) {
+        if NSApp.currentEvent?.type == .rightMouseUp || NSApp.currentEvent?.type == .rightMouseDown {
+            guard let event = NSApp.currentEvent, let button = statusItem.button else { return }
+            NSMenu.popUpContextMenu(statusContextMenu, with: event, for: button)
+            return
+        }
         // 置顶浮动窗打开时：点击图标 = 关闭浮窗并复位 pin（与点击关闭 popover 语义一致），
         // 关闭后归还焦点（同 popoverDidClose）
         if let fp = floatingPanel, fp.isVisible {
@@ -576,10 +597,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             floatingPanelVC = nil
             panelView?.resetPin()
             NSApp.hide(nil)
-            return
-        }
-        if NSApp.currentEvent?.type == .rightMouseDown {
-            settingsMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: 0), in: statusItem.button)
             return
         }
         if popoverController?.isShown == true {
@@ -613,6 +630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onAddCodexAccount = { [weak self] in self?.onAddCodexAccount() }
         panel.onSetInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
         panel.onManualRefresh = { [weak self] in self?.onRefresh() }
+        panel.onQuickBuild = { [weak self] in self?.startQuickBuild() }
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onToggleLightTheme = { [weak self] in self?.onToggleLightTheme() }
@@ -627,6 +645,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
         panel.onShareWbHistory = { [weak self] in self?.onShareWbHistory() }
         panel.onQuit = { [weak self] in self?.onQuit() }
+        panel.onOpenGitHub = {
+            NSWorkspace.shared.open(URL(string: "https://github.com/onerxxx/iBalance")!)
+        }
         // 右上角 pin：置顶常驻——内容转移至无边框 NSPanel 浮动窗口（无箭头、
         // 浮层层级、背景原生拖动）；取消置顶时浮窗直接关闭
         panel.onTogglePin = { [weak self] in self?.togglePanelPin() }
@@ -704,8 +725,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 浅色 Liquid Glass，文本走 Palette 动态色自动转黑灰
         popover.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
                                                       gradientOn: config.panelGradientEnabled)
-        // 注：曾用 hasFullSizeContent=true 让背景延伸盖住箭头实现「箭头同色」，
-        // 但该模式会放大 AppKit resize 的重新锚定噪声（折叠/展开时面板左右抖动），已回滚。
+        // 满尺寸内容（macOS 14+）：内容视图铺满整个 popover 窗口，顶边伸进系统三角
+        // 箭头区，header 的毛玻璃即可一直铺到三角里，箭头与 header 同色（否则箭头是
+        // 系统玻璃、header 是自定义玻璃，交界处有色差）。
+        // 代价：内容必须锚 safeAreaLayoutGuide（箭头带由 AppKit 写进 safeAreaInsets），
+        // 且 preferredContentSize 要额外加回箭头带高度——两处都在 BalancePanelViewController。
+        // 浮窗无箭头，safeAreaInsets 恒 0，同一套代码自动等价。
+        popover.hasFullSizeContent = true
         let panelVC = BalancePanelViewController(panel: panel)
         panelVC.fadeHintParams = Self.fadeHintParams(from: config)
         // 浮窗 resize 拖动结束：持久化尺寸到 config.json，下次 pin 时恢复
@@ -716,8 +742,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ConfigStore.save(self.config)
         }
         popover.contentViewController = panelVC
-        // 面板自带 320 内在宽度，直接按约束解出真实高度，避免零尺寸 popover
-        popover.contentSize = panel.fittingSize
+        // 占位尺寸避免零尺寸 popover（宽 = 面板宽度唯一值）；正式尺寸由 showPanel
+        // 用 preferredContentSize（含箭头带高度）覆盖
+        popover.contentSize = NSSize(width: BalancePanelViewController.panelWidth,
+                                     height: panel.fittingSize.height)
         popoverController = popover
         panelView = panel
     }
@@ -985,7 +1013,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
             snap.pulsing = wbPulsingTracker.isPulsing(ac.uid)
-            // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 10 分钟）
+            // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 5 分钟）
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.workbuddyVisible
             }
@@ -1022,7 +1050,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.pulsing = zcodePulsingTracker.isPulsing(ac.uid)
-            // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 10 分钟）
+            // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 5 分钟）
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.zcodeVisible
             }
@@ -1050,13 +1078,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.pulsing = codexPulsingTracker.isPulsing(ac.uid)
+            // Codex Desktop/CLI 的 rollout 事件流：仅当前账号挂接 Agent 三态光环。
+            if isCurrent {
+                snap.taskState = AgentTaskStatusStore.codexVisible
+            }
             s.codexAccounts.append(snap)
         }
         // 状态调试预览（设置卡片开关）：按面板 Agent 板块显示序，把三态光环轮派
         // 前三张实际存在的 Agent 当前账号卡（进行中/完成/中断），覆盖真实状态供预览；
-        // 关闭即恢复：WB/ZCode 回到上方 store 真实值，TRAE/Codex 恒 nil（光环隐藏）。
-        // ⚠ TRAE/Codex 的光环视图在 rebuild 时才挂载（needsStatusRing 判定），
-        //   开关翻转由 Panel.update 检测变化清 uid 缓存强制重建，此处只负责数据
+        // 关闭即恢复：WB/ZCode/Codex 回到上方 store 真实值，TRAE 恒 nil（光环隐藏）。
+        // 光环视图全平台挂载，开关翻转由 Panel.update 清 uid 缓存重置调试动画实例，
+        // 此处只负责写入调试数据。
         s.statusDebugPreview = config.statusDebugPreview
         if config.statusDebugPreview {
             let agentIDs = (panelView?.platformOrder ?? BalancePlatform.defaultOrder).filter {
@@ -1259,6 +1291,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// 菜单栏原生右键菜单的“编译”入口。
+    @objc private func onQuickBuildFromMenu(_ sender: Any?) {
+        startQuickBuild()
+    }
+
     /// 子菜单单选切换刷新间隔（tag = 秒数：60 / 180 / 300）
     @objc private func onToggleRefreshInterval(_ sender: NSMenuItem) {
         applyRefreshInterval(TimeInterval(sender.tag))
@@ -1356,6 +1393,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func onQuit() {
         NSApp.terminate(nil)
+    }
+
+    /// 从项目 swift/ 目录打开 Terminal 执行快速编译脚本。
+    /// build.sh 自身负责编译、打包、签名、停止旧实例并重启新 App；
+    /// 编译成功后由 Terminal 自己关闭窗口，失败时保留窗口方便查看错误输出。
+    private func startQuickBuild() {
+        guard quickBuildProcess?.isRunning != true else {
+            Logger.log(.refresh, "[quick-build] already running, ignored")
+            return
+        }
+        let buildDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let script = buildDirectory.appendingPathComponent("build.sh")
+        guard FileManager.default.isExecutableFile(atPath: script.path) else {
+            Logger.log(.refresh, "[quick-build] build.sh not executable: \(script.path)")
+            return
+        }
+
+        let command = """
+        cd \"\(buildDirectory.path)\" && ./build.sh
+        build_status=$?
+        if [ \"$build_status\" -eq 0 ]; then
+            osascript -e 'tell application \"Terminal\" to close front window'
+        fi
+        exit \"$build_status\"
+        """
+        let escapedCommand = command
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let appleScript = """
+        tell application "Terminal"
+            activate
+            do script "\(escapedCommand)"
+        end tell
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", appleScript]
+        let nullOutput = FileHandle(forWritingAtPath: "/dev/null")
+        process.standardOutput = nullOutput
+        process.standardError = nullOutput
+        process.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async {
+                guard let self, self.quickBuildProcess === process else { return }
+                self.quickBuildProcess = nil
+                Logger.log(.refresh, "[quick-build] finished status=\(process.terminationStatus)")
+            }
+        }
+
+        do {
+            try process.run()
+            quickBuildProcess = process
+            Logger.log(.refresh, "[quick-build] opened Terminal for: \(script.path); closes on success")
+        } catch {
+            Logger.log(.refresh, "[quick-build] open Terminal failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - 滚动提示层参数
@@ -2391,8 +2484,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         var accounts = cfg.codexAccounts
+        var currentAccountUID: String?
         // auth.json 是当前登录态的权威来源；登录切换后自动更新对应账号 token/email。
         if case .success(let current) = CodexService.importCurrentAccount() {
+            currentAccountUID = current.uid
             if let idx = accounts.firstIndex(where: { $0.uid == current.uid }) {
                 accounts[idx] = current
                 if let configIdx = config.codexAccounts.firstIndex(where: { $0.uid == current.uid }) {
@@ -2420,15 +2515,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             }
             let acctag = "[\(seq)] Codex[\(i)/\(accounts.count)] uid=\(account.uid)"
-            guard let usage = await Logger.measure("\(acctag).fetchUsage", {
+            var usage = await Logger.measure("\(acctag).fetchUsage", {
                 await CodexService.fetchUsage(token: account.token,
                                               fallbackUid: account.uid,
                                               fallbackEmail: account.email)
-            }) else {
-                if ownsRefresh(seq) {   // 只在仍是 owner 时标记失败，避免污染新 seq
+            })
+            if usage == nil {
+                // 账号可能已在另一个 Codex 实例重新登录：扫描候选 home，按 UID 获取新凭据后只重试一次。
+                Logger.log(.refresh, "\(acctag): fetchUsage failed, scanning Codex homes for refreshed credentials")
+                if let refreshed = CodexService.reimportAccount(uid: account.uid),
+                   refreshed.token != account.token {
+                    accounts[i] = refreshed
+                    if let configIdx = config.codexAccounts.firstIndex(where: { $0.uid == account.uid }) {
+                        config.codexAccounts[configIdx] = refreshed
+                        ConfigStore.save(config)
+                    }
+                    Logger.log(.refresh, "\(acctag): refreshed credentials found, retrying fetchUsage once")
+                    let retryAccount = refreshed
+                    usage = await Logger.measure("\(acctag).fetchUsage.retry", {
+                        await CodexService.fetchUsage(token: retryAccount.token,
+                                                      fallbackUid: retryAccount.uid,
+                                                      fallbackEmail: retryAccount.email)
+                    })
+                } else {
+                    Logger.log(.refresh, "\(acctag): no newer credentials found in Codex homes")
+                }
+            }
+            guard let usage else {
+                // 子账号失效不影响平台级刷新提示；当前登录账号失败才提示用户。
+                let isSubAccount = currentAccountUID.map { $0 != account.uid } ?? false
+                if ownsRefresh(seq), !isSubAccount {   // 只在仍是 owner 且为主账号时标记失败
                     failed = true
                 }
-                Logger.log(.refresh, "\(acctag): fetchUsage returned nil (FAILED)")
+                Logger.log(.refresh, "\(acctag): fetchUsage returned nil (\(isSubAccount ? "subaccount failure ignored" : "FAILED"))")
                 continue
             }
             guard ownsRefresh(seq) else {

@@ -38,6 +38,10 @@ extension BalancePanelView {
               let representation = card.bitmapImageRepForCachingDisplay(in: card.bounds) else { return nil }
         // 先缓存拖动开始时的真实外观，让幽灵保留大卡片当前的 hover 样式；
         // 原卡片随后才会切成无 hover 占位，避免两者同时显示 hover 背景。
+        // hover 背景是 CALayer 子层，拖动起手时先强制提交布局/绘制，避免截图拿到旧状态。
+        card.layoutSubtreeIfNeeded()
+        card.displayIfNeeded()
+        card.layer?.displayIfNeeded()
         card.cacheDisplay(in: card.bounds, to: representation)
         let image = NSImage(size: card.bounds.size)
         image.addRepresentation(representation)
@@ -98,6 +102,9 @@ extension BalancePanelView {
 
         // 必须在锁住 hover 之前截图：幽灵保留按下瞬间的大卡片 hover 外观，
         // 原卡片则继续留在排序流中并切成无 hover 占位。
+        // 快速按下拖动时 mouseEntered 的 hover 动画可能尚未完成，先同步补齐
+        // hover 背景，确保拖动中的卡片始终有明确的提亮反馈。
+        hoverCard?.prepareDragSnapshotAppearance()
         var ghostReady = false
         if let image = makeDragSnapshot(of: ghostSourceView) {
             let ghost = NSImageView(frame: ghostFrame)

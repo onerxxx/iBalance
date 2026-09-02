@@ -5,7 +5,7 @@
   ],
   "fill-specializations" : [
     {
-      "value" : "system-dark"
+      "value" : "system-light"
     },
     {
       "appearance" : "dark",
@@ -65,9 +65,9 @@
       "lighting" : "combined",
       "opacity" : 1,
       "refractivity" : {
-        "depth" : 0.244140625,
+        "depth" : 0.2775390625,
         "enabled" : true,
-        "strength" : 0.2177734375
+        "strength" : 0.230546875
       },
       "shadow" : {
         "kind" : "neutral",
@@ -97,7 +97,15 @@
       "hidden" : false,
       "layers" : [
         {
-          "fill" : "system-light",
+          "fill-specializations" : [
+            {
+              "value" : "system-dark"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "system-light"
+            }
+          ],
           "hidden" : false,
           "image-name" : "deepseek (1).svg",
           "name" : "deepseek (1)",
@@ -124,7 +132,7 @@
       "specular" : true,
       "translucency" : {
         "enabled" : true,
-        "value" : 0.46
+        "value" : 0.3
       }
     }
   ],

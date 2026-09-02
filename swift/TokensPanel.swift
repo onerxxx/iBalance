@@ -1,4 +1,4 @@
-// TokensPanel.swift — Token 板块通用代码（ZCode / WorkBuddy 共用：卡片 hover 子面板与主面板内嵌板块）
+// TokensPanel.swift — Token 板块通用代码（ZCode / WorkBuddy / Codex 共用：卡片 hover 子面板与主面板内嵌板块）
 // ZCode 数据源 = 本机会话库 ~/.zcode/cli/db/db.sqlite（model_usage 表，每次 LLM 请求一行，
 // 含 input/output/reasoning/cache 拆分；WB 数据源在 WbTokens.swift）。总计口径 = input + output
 // 相加（与 ZCode computed_total_tokens 一致，reasoning 是 output 子集、cache_read 是 input 子集，均不另加）。
@@ -7,7 +7,7 @@
 // 缓存壳         TokenStoreCache（60s 后台重建；fetch 只回缓存，首次无缓存挂起回调主线程补发）
 // 查询 / 聚合     ZcodeTokenStore（SQLite 读取）；数据模型 TokenSummary / TokenDayUsage
 // 周期            TokenPeriod（日/周）+ TokenPeriodWindows
-// 数据源来源       TokensPanelSource（.zcode / .workbuddy：卡片 hover 子面板与主面板内嵌板块共用）
+// 数据源来源       TokensPanelSource（.zcode / .workbuddy / .codex：卡片 hover 子面板与主面板内嵌板块共用）
 // 面板视图         TokensPanelView（数值 + 热力图 + hover 气泡）
 // 主面板内嵌挂载    extension BalancePanelView（「Token」板块复用同一个 TokensPanelView）
 //
@@ -63,18 +63,26 @@ final class TokenStoreCache {
     }
 }
 
-/// Token 子面板数据源分流：ZCode 与 WorkBuddy 共用同一面板视图，仅数据仓/区块标题/行图标不同
+/// Token 子面板数据源分流：ZCode、WorkBuddy、Codex 共用同一面板视图，仅数据仓/区块标题/行图标不同
 enum TokensPanelSource {
     case zcode
     case workbuddy
+    case codex
 
     /// 面板首行标题 = 平台名
-    var platformName: String { self == .zcode ? "ZCode" : "WorkBuddy" }
+    var platformName: String {
+        switch self {
+        case .zcode: return "ZCode"
+        case .workbuddy: return "WorkBuddy"
+        case .codex: return "Codex"
+        }
+    }
     /// 异步取汇总（各数据仓后台每 60s 重建缓存，fetch 只回缓存，主线程回调）
     func fetch(completion: @escaping (TokenSummary?) -> Void) {
         switch self {
         case .zcode: ZcodeTokenStore.fetch(completion: completion)
         case .workbuddy: WBTokenStore.fetch(completion: completion)
+        case .codex: CodexTokenStore.fetch(completion: completion)
         }
     }
 }
@@ -118,7 +126,7 @@ struct TokenSummary {
     }
     let totalTokens: Int64
     let projects: [ProjectUsage]
-    /// 按模型分组（仅 WB 数据源填充；ZCode 库无此聚合，空 = 列表不显示「模型」切换）
+    /// 按模型分组（WB / Codex 数据源填充；ZCode 库无此聚合，空 = 列表不显示「模型」切换）
     var models: [ProjectUsage] = []
     let requestCount: Int64
     /// 按天用量（词元活动热力图数据源，仅含有用量的天）
@@ -381,7 +389,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             needsDisplay = true
         }
     }
-    /// 数据源分流（ZCode=项目 / WorkBuddy=模型）：影响区块标题与行图标
+    /// 数据源分流（ZCode=项目 / WorkBuddy、Codex=模型）：影响区块标题与行图标
     var source: TokensPanelSource = .zcode {
         didSet {
             guard oldValue != source else { return }
@@ -395,8 +403,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     // MARK: 总计周期切换（5H/1D/1W/1M）
 
-    /// 大数字当前周期口径（默认 All，与改版前常显的全量总计一致）
-    var period: TokenPeriod = .all {
+    /// 大数字当前周期口径（默认 7d，2026-09-02 用户指定；打开面板即 7 天滚动窗总计）
+    var period: TokenPeriod = .d7 {
         didSet {
             guard oldValue != period else { return }
             needsDisplay = true
@@ -488,9 +496,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     static let maxListRows = 4
     /// 项目行点击的文件夹打开应用（用户指定 QSpace Pro；未安装回退系统默认）
     private static let folderOpenerBundleID = "com.jinghaoshe.qspace.pro"
-    // 标称版心宽：2026-09-01 随主面板收窄 20pt（240→230）；自绘元素按实际 bounds
-    // 等比适配（热力图点距均分、列表行撑满），仅 intrinsic/未布局回退时用此标称值
-    private static let contentWidth: CGFloat = 230
+    // 标称版心宽：仅未布局/尺寸未落时回退用，不参与实际宽度解算——布局后热力图
+    // 点距均分、列表行撑满等自绘元素全部按实际 bounds 自适应（列宽随宽等比缩放）
+    private static let contentWidth: CGFloat = 260
     /// 列表行距 = 行墨迹高 + 2×rowInset：文字在行带内居中后上下各留 2.5pt，
     /// 行间墨迹空隙恒 5pt，与用量表格（usageRowTop/BottomInset）同源同口径；
     /// Mono 墨迹更高时行距自动放宽
@@ -536,8 +544,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 标签墨迹高度（9pt 小注释）
     private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
-    /// 区块标题字体（「平台名 总计」「项目」「词元活动」）：与用量表头同款（小表格口径）
+    /// 区块标题字体（「项目」「词元活动」）：与用量表头同款（小表格口径）
     private func makeTitleFont() -> NSFont { SmallTable.titleFont(mono: monoFontEnabled) }
+    /// 首行「平台名 总计」标题字体：同字号降一档字重（semibold → medium，2026-09-02 用户指定）
+    private func makeHeaderTitleFont() -> NSFont {
+        SmallTable.font(size: SmallTable.titleSize, weight: .medium, mono: monoFontEnabled)
+    }
     /// 标题墨迹高度（10pt semibold）
     private var titleInkHeight: CGFloat { ceil(makeTitleFont().boundingRectForFont.height) }
     /// 列表行墨迹高度（小表格行字体 10pt medium）
@@ -686,13 +698,25 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         activityWindowCache = (today, start, cols, firstOfMonth)
         return (start, cols, firstOfMonth)
     }
-    /// 点距 = 实际版心宽 / 周列数（精确均分，不取整）：网格恰撑满版心，
-    /// 最右点列与模型表的百分比右缘对齐；正圆 = 点距 - 2.5（格内四周各缩 1.25pt）。
-    /// 嵌入宽度 ≠ intrinsic 标称宽时按实际 bounds 等比放大（未布局时回退标称宽）
-    private var activityPitch: CGFloat {
+    /// 版心可用宽：点距与点阵间隙共用同一宽度源（未布局时回退标称宽），
+    /// 保证「点:隙:格」比例永远同源等比
+    private var activityAvail: CGFloat {
         let width = bounds.width > 0 ? bounds.width : Self.contentWidth
-        let avail = width - insets.left - insets.right
-        return max(6, avail / CGFloat(activityWindow().cols))
+        return width - insets.left - insets.right
+    }
+    /// 点距 = 实际版心可用宽 / 周列数（精确均分，不取整）：网格恰撑满版心，
+    /// 最右点列与模型表的百分比右缘对齐
+    private var activityPitch: CGFloat {
+        max(6, activityAvail / CGFloat(activityWindow().cols))
+    }
+    /// 点阵间隙比例（间隙 ÷ 版心可用宽）：锚定 2026-09-03 调定观感
+    /// （面板 280 / 可用宽 202pt 时间隙 2.1pt，即 2026-09-02「格内四周各缩 1.05」的比例）。
+    /// 间隙随可用宽等比缩放（点径 = 点距 − 间隙），任意宽度（面板定宽/浮窗 resize）下
+    /// 点:隙:格比例恒定不漂移
+    private static let dotGapPerAvail: CGFloat = 2.1 / 202
+    /// 当前宽度下的点阵间隙（相邻圆之间的空隙 = 格内两侧各半隙）
+    private var activityDotGap: CGFloat {
+        activityAvail * Self.dotGapPerAvail
     }
 
     override var intrinsicContentSize: NSSize {
@@ -822,8 +846,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         // 区块标题统一系统灰 = 小表格口径（与列表行同色；切换文案的未选中态仍用次级灰）
         let titleColor = SmallTable.textColor
 
-        // ── 首行：平台名 + 总计（标题样式同用量表头，两段间留 4pt 间距）──
-        let titleFont = makeTitleFont()
+        // ── 首行：平台名 + 总计（字重比区块标题低一档，两段间留 4pt 间距）──
+        let titleFont = makeHeaderTitleFont()
         drawText(source.platformName, at: NSPoint(x: insets.left, y: totalLabelTop),
                  font: titleFont, color: titleColor)
         drawText("总计", at: NSPoint(x: insets.left + ceil(cachedNameWidth) + 4, y: totalLabelTop),
@@ -1144,10 +1168,11 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         dailyToggleRect = NSRect(x: dailyX, y: topY, width: dailyW, height: titleInkHeight)
         weeklyToggleRect = NSRect(x: weeklyX, y: topY, width: weeklyW, height: titleInkHeight)
 
-        // ── 点阵（全格子绘制：无用量 = 底色点，有用量 = 渐变亮点；格内四周各缩 1.25pt）──
+        // ── 点阵（全格子绘制：无用量 = 底色点，有用量 = 渐变亮点；格内四周各缩半隙）──
         dotCells.removeAll()
         let pitch = activityPitch
-        let size = pitch - 2.5
+        let gap = activityDotGap
+        let size = pitch - gap
         let gridTop = gridTopAnchor
         let cells = activityCells()
         let maxVal = cells.map(\.tokens).max() ?? 0
@@ -1194,8 +1219,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
                          fraction: out, respectFlipped: true, hints: nil)
             }
             for c in cells {
-                let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + 1.25,
-                                  y: gridTop + CGFloat(c.row) * pitch + 1.25,
+                let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + gap / 2,
+                                  y: gridTop + CGFloat(c.row) * pitch + gap / 2,
                                   width: size, height: size)
                 let level = (c.tokens <= 0 || maxVal <= 0) ? 0
                     : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
@@ -1205,8 +1230,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         } else {
             // 常态路径：逐点直绘（waveP == 1，等价全亮度）
             for c in cells {
-                let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + 1.25,
-                                  y: gridTop + CGFloat(c.row) * pitch + 1.25,
+                let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + gap / 2,
+                                  y: gridTop + CGFloat(c.row) * pitch + gap / 2,
                                   width: size, height: size)
                 let level = (c.tokens <= 0 || maxVal <= 0) ? 0
                     : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
@@ -1371,7 +1396,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         guard metricsDirty else { return }
         metricsDirty = false
         let labelFont = makeLabelFont()
-        let titleFont = makeTitleFont()
+        // 平台名宽度按首行标题字体测量（与 draw 处同一字体，「总计」落位才对齐）
+        let titleFont = makeHeaderTitleFont()
         cachedNameWidth = (source.platformName as NSString)
             .size(withAttributes: [.font: titleFont]).width
         cachedPeriodWidths = TokenPeriod.allCases.map {
@@ -1471,12 +1497,13 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 新点阵整图两张（底点/亮点分离：底点恒不透明，亮点随 waveP 淡入）
     private func rebuildIncomingDotsImages(cells: [ActivityCell], region: NSRect, maxVal: Int64) {
         let pitch = activityPitch
-        let size = pitch - 2.5
+        let gap = activityDotGap
+        let size = pitch - gap
         var empty: [(rect: NSRect, level: Int)] = []
         var lit: [(rect: NSRect, level: Int)] = []
         for c in cells {
-            let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + 1.25,
-                              y: region.minY + CGFloat(c.row) * pitch + 1.25,
+            let rect = NSRect(x: insets.left + CGFloat(c.col) * pitch + gap / 2,
+                              y: region.minY + CGFloat(c.row) * pitch + gap / 2,
                               width: size, height: size)
             let level = (c.tokens <= 0 || maxVal <= 0) ? 0
                 : min(4, 1 + Int(Double(c.tokens) / Double(maxVal) * 3.999))
@@ -1507,7 +1534,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             color = color.usingColorSpace(.deviceRGB) ?? color
         }
-        let size = activityPitch - 2.5
+        let size = activityPitch - activityDotGap
         let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
             color.setFill()
             NSBezierPath(ovalIn: NSRect(x: 0, y: 0, width: size, height: size)).fill()
@@ -1581,11 +1608,11 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
 }
 
-// MARK: - BalancePanelView 接线（ZCode / WorkBuddy 卡片 hover 切换内嵌 Token 板块）
+// MARK: - BalancePanelView 接线（ZCode / WorkBuddy / Codex 卡片 hover 切换内嵌 Token 板块）
 
 extension BalancePanelView {
 
-    /// Agent 卡 hover 确认（ZCode / WorkBuddy）：HoverCard 进度填充撑满 1s 后回调，
+    /// Agent 卡 hover 确认（ZCode / WorkBuddy / Codex）：HoverCard 进度填充撑满 1s 后回调，
     /// 主面板 Token 板块切换为该平台内容，切换动效在 refreshInlineTokens 统一处理。
     /// 快速掠过不进入此回调（dwell 已取消）。同平台重复确认经 refreshInlineTokens
     /// 去重（view.source 未变则无高度变化，无几何反馈振荡）。
@@ -1603,7 +1630,7 @@ extension BalancePanelView {
         refreshInlineTokens()
     }
 
-    // MARK: - 主面板「Token」板块（内嵌 ZCode / WorkBuddy 卡片 hover 同款内容）
+    // MARK: - 主面板「Token」板块（内嵌 ZCode / WorkBuddy / Codex 卡片 hover 同款内容）
 
     /// 创建唯一的内嵌内容视图并启动低频刷新。与卡片 hover 子面板共用 TokensPanelView
     /// 与数据仓缓存；显示平台由 refreshInlineTokens 按 Agent 组顶部平台动态解析。
@@ -1622,19 +1649,20 @@ extension BalancePanelView {
         // 通知 VC 按新内容高度重算面板尺寸
         view.onActivityModeChanged = { [weak self] in self?.onContentChanged?() }
         tokenContentStack.addArrangedSubview(view)
-        // 显式等宽撑满版心：intrinsic 标称宽 240 仅供 hover 弹窗定尺寸，主面板按卡片实际宽拉伸
+        // 显式等宽撑满版心：intrinsic 标称宽 260 仅供 hover 弹窗定尺寸，主面板按卡片实际宽拉伸
         view.widthAnchor.constraint(equalTo: tokenContentStack.widthAnchor).isActive = true
         inlineTokenView = view
         // 启动即无条件预热两个数据仓：App 启动阶段账号卡片尚未建好，「顶部平台」暂时
         // 解析不出，若只按解析结果取数会连带跳过预热 → 首次开面板要现等后台构建，板块延迟出现
         TokensPanelSource.zcode.fetch { _ in }
         TokensPanelSource.workbuddy.fetch { _ in }
+        TokensPanelSource.codex.fetch { _ in }
         refreshInlineTokens()
         startInlineTokensRefreshTimer()
     }
 
     /// Token 板块跟随的平台：hover 中的 Agent 卡片优先；未 hover 时 = Agent 组最顶上的
-    /// 可见卡片容器。该平台无 Token 数据源（Codex/TRAE）或组为空时返回 nil（板块整体隐藏）。
+    /// 可见卡片容器。TRAE 暂无本地 Token 数据源，Codex 从 ~/.codex/sessions 读取。
     private var inlineTokensSource: TokensPanelSource? {
         if let hover = hoverTokensSource { return hover }
         guard let group = balanceGroupContainer else { return nil }
@@ -1642,6 +1670,7 @@ extension BalancePanelView {
             guard let id = platformCards.first(where: { $0.value === container })?.key else { continue }
             if id == BalancePlatform.zcode.rawValue { return .zcode }
             if id == BalancePlatform.workBuddy.rawValue { return .workbuddy }
+            if id == BalancePlatform.codex.rawValue { return .codex }
             return nil
         }
         return nil

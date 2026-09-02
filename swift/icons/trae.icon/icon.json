@@ -1,9 +1,18 @@
 {
-  "fill" : "system-dark",
+  "fill" : "system-light",
   "groups" : [
     {
       "layers" : [
         {
+          "fill-specializations" : [
+            {
+              "value" : "system-dark"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "system-light"
+            }
+          ],
           "image-name" : "trae-color.svg",
           "name" : "trae-color",
           "position" : {

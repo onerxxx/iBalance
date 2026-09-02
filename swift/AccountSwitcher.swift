@@ -170,28 +170,60 @@ extension AppDelegate {
         }
     }
 
-    // MARK: - Codex 添加账号（JSON 导入）
+    // MARK: - Codex 添加账号（轮询相关目录批量导入）
 
-    /// 从 ~/.codex/auth.json 导入当前登录账号；邮箱直接作为卡片昵称。
+    /// 按 cockpit-tools-main 同款策略：轮询默认 CODEX_HOME + 多实例 userDataDir +
+    /// 运行态进程 CODEX_HOME + cockpit 受管 homes + ~/.codex* / Application Support 候选目录，
+    /// 从中导入还未被加入 iBalance 的 Codex 账号；已存在者仅刷新本地凭据。
     @objc func onAddCodexAccount() {
-        var msg: String
+        let batch = CodexService.importDiscoverableAccounts(
+            existingUids: Set(config.codexAccounts.map { $0.uid })
+        )
         var success = false
-        var isExisting = false
-        switch CodexService.importCurrentAccount() {
-        case .success(let account):
-            if let idx = config.codexAccounts.firstIndex(where: { $0.uid == account.uid }) {
-                config.codexAccounts[idx] = account
-                isExisting = true
+        let addedCount = batch.added.count
+        let refreshedCount = batch.refreshed.count
+        var msg: String
+        if addedCount == 0, refreshedCount == 0, !batch.skippedErrors.isEmpty {
+            // 真实报错：无有效账号
+            if batch.skippedErrors.count == 1 {
+                msg = "扫描到 1 个目录但无法导入：\n\(batch.skippedErrors[0])"
             } else {
-                config.codexAccounts.append(account)
+                msg = "未找到任何可导入的 Codex 账号（\(batch.skippedErrors.count) 个目录读取失败）"
+            }
+        } else if addedCount == 0, refreshedCount == 0 {
+            msg = "轮询相关目录未发现新的 Codex 账号；请先在 Codex 中登录对应账号"
+        } else {
+            // 应用新增 + 刷新
+            for acc in batch.added { config.codexAccounts.append(acc) }
+            for acc in batch.refreshed {
+                if let idx = config.codexAccounts.firstIndex(where: { $0.uid == acc.uid }) {
+                    config.codexAccounts[idx] = acc
+                }
             }
             ConfigStore.save(config)
-            msg = isExisting
-                ? "账号 \(account.email) 已存在，已更新本机凭据"
-                : "已添加账号 \(account.email)（共 \(config.codexAccounts.count) 个 Codex 账号）"
             success = true
-        case .failure(let err):
-            msg = err
+
+            let emails = (batch.added.map { $0.email } + batch.refreshed.map { "\($0.email) (已更新凭据)" })
+                .prefix(6)
+                .joined(separator: "\n• ")
+            let more = (batch.added.count + batch.refreshed.count) > 6
+                ? "\n等共 \(batch.added.count + batch.refreshed.count) 个账号"
+                : ""
+            let summary = ["本次新增 \(addedCount) 个 Codex 账号，刷新 \(refreshedCount) 个已有账号凭据。",
+                           "（共 \(config.codexAccounts.count) 个 Codex 账号）",
+                           "",
+                           "• \(emails)\(more)",
+            ].joined(separator: "\n")
+            msg = summary
+            if !batch.skippedErrors.isEmpty {
+                msg += "\n\n⚠️ \(batch.skippedErrors.count) 个目录无有效凭据（已忽略）："
+                for e in batch.skippedErrors.prefix(3) {
+                    msg += "\n  · \(e)"
+                }
+                if batch.skippedErrors.count > 3 {
+                    msg += "\n  · …等共 \(batch.skippedErrors.count) 条"
+                }
+            }
         }
         syncPanel()
 
@@ -202,7 +234,17 @@ extension AppDelegate {
             icon.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
             shell.addIcon(icon)
         }
-        shell.addTitle(success ? (isExisting ? "账号已存在" : "添加账号成功") : "添加账号失败")
+        let title: String
+        if addedCount > 0, refreshedCount > 0 {
+            title = "新增并刷新 Codex 账号"
+        } else if addedCount > 0 {
+            title = "添加 Codex 账号成功"
+        } else if refreshedCount > 0 {
+            title = "已刷新 Codex 账号凭据"
+        } else {
+            title = "未发现新的 Codex 账号"
+        }
+        shell.addTitle(success ? title : "未发现可导入的 Codex 账号")
         shell.addInfo(msg)
         shell.addButton("好", keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }

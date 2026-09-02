@@ -20,6 +20,71 @@
 import Cocoa
 import CoreImage
 
+/// Agent 卡副标题的可用空间不足时，在右侧渐隐，避免被子账号按钮条硬截断。
+private final class SubtitleFadeView: NSView {
+    private let contentView: NSView
+    private let fadeMask = CAGradientLayer()
+
+    init(contentView: NSView) {
+        self.contentView = contentView
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.masksToBounds = true
+        fadeMask.colors = [NSColor.white.cgColor,
+                           NSColor.white.cgColor,
+                           NSColor.clear.cgColor]
+        fadeMask.locations = [0, 0.72, 1]
+        addSubview(contentView)
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            contentView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            contentView.topAnchor.constraint(equalTo: topAnchor),
+            contentView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        // 每次布局重新测量，支持副标题文本随余额刷新变长/变短。
+        let shouldFade = contentView.intrinsicContentSize.width > bounds.width + 0.5
+        if shouldFade {
+            fadeMask.frame = bounds
+            layer?.mask = fadeMask
+        } else {
+            layer?.mask = nil
+        }
+    }
+}
+
+/// 1pt 分割线：动态色（深色白@10% / 浅色黑@8%），走 draw(_:) 而非 layer
+/// 背景色——CALayer 的 backgroundColor 在外观切换后不会重新解算动态色。
+final class PanelSeparatorView: NSView {
+    /// 线宽（pt）
+    static let thickness: CGFloat = 1
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // 纯自绘，不要 layer（layer 背景色不跟随外观）
+        wantsLayer = false
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Palette.headerSeparatorColor.setFill()
+        NSBezierPath(rect: bounds).fill()
+    }
+}
+
 extension BalancePanelView {
 
     // MARK: - 布局构建
@@ -76,10 +141,13 @@ extension BalancePanelView {
 
     func build() {
         translatesAutoresizingMaskIntoConstraints = false
-        // 宽度下限 230（2026-09-01 随主面板收窄 20pt，与 popover 解算下限对齐）；
-        // 浮窗 resize 最小宽 240 由 PanelResizeHandle.minWidth 独立管理，与此无关。
+        // 宽度下限随面板宽度唯一值推导（document 宽 = VC.panelWidth − 容器缩进×2）：
+        // fittingSize 在该宽度下解出内容自然高（宽度本身不再由 fittingSize 反推）。
+        // 浮窗 resize 最小宽 240 由 PanelResizeHandle.minWidth 独立管理（窗口口径），与此无关。
         // 独立（未挂到窗口）时 fittingSize 也能解出高度
-        widthAnchor.constraint(greaterThanOrEqualToConstant: 230).isActive = true
+        widthAnchor.constraint(greaterThanOrEqualToConstant:
+            BalancePanelViewController.panelWidth
+                - BalancePanelViewController.contentHorizontalInset * 2).isActive = true
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -91,10 +159,74 @@ extension BalancePanelView {
         usageHistoryPositionAnchor.translatesAutoresizingMaskIntoConstraints = true
         usageHistoryPositionAnchor.alphaValue = 0
         addSubview(usageHistoryPositionAnchor)
+
+        // ── 顶部 header：更新时间严格居中，和 footer 使用同一高度 ──
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+        // header 背景层：与面板容器同款毛玻璃（material/遮罩配色由 VC 同步），
+        // 视觉上就是面板背景本身、没有独立色块，但仍是实心的——滚动时内容
+        // 从 header 下方穿过也不会透到「更新于」和按钮背后。
+        headerBackdropView = TintedVisualEffectView()
+        updatedLabel.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(updatedLabel)
+        let quickBuildBtn = HoverIconButton()
+        quickBuildBtn.image = symbolImage("hammer", size: 11)
+        quickBuildBtn.normalTintColor = Palette.panelHeaderContentColor
+        quickBuildBtn.target = self
+        quickBuildBtn.action = #selector(quickBuildTapped)
+        quickBuildBtn.toolTip = "快速编译（后台静默执行）"
+        quickBuildBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(quickBuildBtn)
+        let quitBtn = HoverIconButton()
+        quitBtn.image = symbolImage("power", size: 11)
+        quitBtn.normalTintColor = Palette.panelHeaderContentColor
+        quitBtn.hoverTintColor = .systemRed
+        quitBtn.target = self
+        quitBtn.action = #selector(quitTapped)
+        quitBtn.toolTip = "退出 iBalance"
+        quitBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(quitBtn)
+        let headerSeparator = PanelSeparatorView()
+        headerSeparator.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(headerSeparator)
+        let panelBarHeight: CGFloat = 20
+        let panelTopPadding: CGFloat = 6
+        headerView = header
         NSLayoutConstraint.activate([
+            updatedLabel.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+            updatedLabel.centerYAnchor.constraint(equalTo: header.topAnchor,
+                                                  constant: panelTopPadding + panelBarHeight / 2),
+            updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: panelBarHeight),
+            quickBuildBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            quickBuildBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            // 距容器缘 = 容器缩进 + 正文缩进 7，与 root 内容左右缘对齐（见下方 root 约束）
+            quickBuildBtn.trailingAnchor.constraint(
+                equalTo: header.trailingAnchor,
+                constant: -(BalancePanelViewController.contentHorizontalInset + 7)),
+            quickBuildBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
+            quitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            quitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            quitBtn.leadingAnchor.constraint(
+                equalTo: header.leadingAnchor,
+                constant: BalancePanelViewController.contentHorizontalInset + 7),
+            quitBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
+            // ── header 下缘分割线：贴 header 底边，通栏 ──
+            headerSeparator.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            headerSeparator.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            headerSeparator.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            headerSeparator.heightAnchor.constraint(equalToConstant: PanelSeparatorView.thickness),
+        ])
+
+        NSLayoutConstraint.activate([
+            // 左右正文缩进 7pt（原始口径）。满尺寸内容下被系统吃掉的左右边距带由
+            // VC 容器层统一补回（BalancePanelViewController.contentHorizontalInset
+            // = 9（2026-09-03 四次调整 16→8→13→9），scrollView 左右约束），9+7=16pt
+            // 视觉口径，本层不重复承担边距替代。
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
-            root.topAnchor.constraint(equalTo: topAnchor, constant: 14),
+            // header 总高度保持 30pt；header 内部上边距不变，API 标题上方间距单独收紧 4pt。
+            root.topAnchor.constraint(equalTo: topAnchor,
+                                      constant: BalancePanelView.headerHeight + 4),
         // 底部用 ≤：root 顶锚、保持内容自然高度（永不被拉伸）。footer 已移出 root、
         // 单独贴 panel 底部，故 root 底部预留 footer(20)+底边距(11)+最小间隙(10)=41pt，
         // 避免与贴底 footer 重叠；浮窗拖高时多出的高度自然成为 root 与 footer 间的空白
@@ -103,7 +235,7 @@ extension BalancePanelView {
         rootBottomCap?.isActive = true
         rootViewRef = root
 
-        // 底部更新时间标签启用 layer 供脉冲动效使用
+        // header 更新时间标签启用 layer 供脉冲动效使用
         updatedLabel.wantsLayer = true
 
         // ── 离线横幅 ──
@@ -276,7 +408,6 @@ extension BalancePanelView {
         // 只显示 Agent 组最顶上平台的 Token；可折叠。顶部平台无 Token 数据源或无数据时整块隐藏）──
         var tokenCollapseTargets: [NSView] = []
         let tokenTitle = collapsibleSectionTitle(name: "Token", key: UDKey.tokenSectionCollapsed,
-                                                 titleWeight: .semibold,
                                                  targets: { tokenCollapseTargets })
         root.addArrangedSubview(tokenTitle)
         pinFullWidth(tokenTitle, in: root)
@@ -305,7 +436,6 @@ extension BalancePanelView {
         // ── 日/周用量区块（可折叠；行内容随快照重建）──
         var usageCollapseTargets: [NSView] = []
         let usageTitle = collapsibleSectionTitle(name: "用量", key: UDKey.usageSectionCollapsed,
-                                                 titleWeight: .semibold,
                                                  targets: { usageCollapseTargets })
         root.addArrangedSubview(usageTitle)
         pinFullWidth(usageTitle, in: root)
@@ -509,58 +639,56 @@ extension BalancePanelView {
         actionCard.isHidden = actionsCollapsed
         root.setCustomSpacing(actionsCollapsed ? 6 : 0, after: actionTitle)
 
-        // ── 底部：更新时间（严格水平居中）+ 退出按钮（贴右）──
+        // ── 底部：退出按钮（贴右）──
         // pin 按钮（挂 API 标题行尾，面板首行标题）：属性在此配置，布局见 apiTitle 段
         pinBtn.image = symbolImage("pin", size: 11)
         pinBtn.target = self
         pinBtn.action = #selector(pinTapped)
         pinBtn.toolTip = "置顶面板（置顶后可自由拖动）"
-        // 拖动示意条：绝对定位在面板顶部（root top padding 14pt）上方的留白带内居中
-        addSubview(dragGrabber)
+        // 拖动示意条：固定在 header 上方留白带内居中
+        header.addSubview(dragGrabber)
         dragGrabber.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             dragGrabber.widthAnchor.constraint(equalToConstant: 36),
             dragGrabber.heightAnchor.constraint(equalToConstant: 4),
-            dragGrabber.centerXAnchor.constraint(equalTo: centerXAnchor),
-            dragGrabber.topAnchor.constraint(equalTo: topAnchor, constant: 11),
+            dragGrabber.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+            dragGrabber.topAnchor.constraint(equalTo: header.topAnchor, constant: panelTopPadding + 3),
         ])
 
         updatedLabel.font = .systemFont(ofSize: 9, weight: .regular)
-        updatedLabel.textColor = .systemGray
-        let quitBtn = HoverIconButton()
-        quitBtn.image = symbolImage("power", size: 11)
-        quitBtn.target = self
-        quitBtn.action = #selector(quitTapped)
-        quitBtn.toolTip = "退出 iBalance"
-        // 用 Auto Layout 让 updatedLabel 严格居中、quitBtn 贴右，避免 spacer 造成的偏移
-        // ⚠️ 子控件必须显式关闭 translatesAutoresizingMaskIntoConstraints，否则 Auto Layout 约束
-        //    被忽略、控件堆在 footer 左上角 {0,0}（updatedLabel 宽度退化成 intrinsicContentSize）
+        updatedLabel.textColor = Palette.panelHeaderContentColor
+        let githubBtn = HoverIconButton()
+        if let githubImage = bundleIcon("github", size: 11) {
+            githubImage.isTemplate = true
+            githubBtn.image = githubImage
+        } else {
+            githubBtn.image = symbolImage("globe", size: 11)
+        }
+        githubBtn.normalTintColor = Palette.panelHeaderContentColor
+        githubBtn.target = self
+        githubBtn.action = #selector(openGitHubTapped)
+        githubBtn.toolTip = "打开 iBalance GitHub 项目"
         let footer = NSView()
         footer.translatesAutoresizingMaskIntoConstraints = false
-        updatedLabel.translatesAutoresizingMaskIntoConstraints = false
-        quitBtn.translatesAutoresizingMaskIntoConstraints = false
-        footer.addSubview(updatedLabel)
-        footer.addSubview(quitBtn)
+        githubBtn.translatesAutoresizingMaskIntoConstraints = false
+        footer.addSubview(githubBtn)
         // footer 移出 root、直接挂 panel 并贴底：root 用 ≤ 底约束保持内容自然高度
         // （永不被拉伸），浮窗拖高时多出的高度成为 root 与 footer 间的空白，footer 始终贴底。
-        // 宽度与 root 对齐（左右各内缩 7pt），底部留 11pt 边距（与原 root 底边距一致）
+        // 宽度与 root 对齐（左右各内缩 7pt 正文缩进；容器层缩进由 VC scrollView
+        // 统一表达，不在此重复），底部留 11pt 边距
         addSubview(footer)
         // 固定 footer 高度，避免子控件 intrinsicContentSize 变化时重新布局导致错位
-        let footerHeight: CGFloat = 20
         NSLayoutConstraint.activate([
-            footer.heightAnchor.constraint(equalToConstant: footerHeight),
+            footer.heightAnchor.constraint(equalToConstant: panelBarHeight),
             footer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
-            updatedLabel.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
-            updatedLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
-            updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: footerHeight),
-            quitBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
-            quitBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            githubBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+            githubBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             // 容器固定 22×22（HoverIconButton.buttonSize）；无边框按钮，
             // hover 时自绘大圆角淡白背景（圆角与卡片统一）
-            quitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
-            quitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            githubBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            githubBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
         ])
     }
 
@@ -569,7 +697,7 @@ extension BalancePanelView {
     /// 有点击、右键或拖拽回调时卡片使用 HoverCard；设置/操作卡片用普通 NSView。
     /// bottomPadding: 卡片底部内边距（默认 7，操作卡片可减小以消除与 footer 间的空白）
     @discardableResult
-    func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, onDragStarted: ((NSPoint) -> Void)? = nil, onDragChanged: ((NSPoint) -> Void)? = nil, onDragEnded: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true, centerRows: Bool = false) -> NSView {
+    func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, onDragStarted: ((NSPoint) -> Void)? = nil, onDragChanged: ((NSPoint) -> Void)? = nil, onDragEnded: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, trailingPadding: CGFloat? = nil, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true, centerRows: Bool = false, hoverGradientOverride: [NSColor]? = nil) -> NSView {
         var all = rows
         if let t = title {
             all.insert(sectionTitleRow(name: t, color: titleColor), at: 0)
@@ -592,6 +720,9 @@ extension BalancePanelView {
         let card: NSView
         if onClick != nil || onRightClick != nil || onDragStarted != nil {
             let hc = HoverCard()
+            // 强背景必须在卡片加入面板层级前配置，避免初始化阶段的默认 60° 渐变
+            // 被首次 layout / display / 拖拽截图捕获。
+            hc.hoverGradientOverride = hoverGradientOverride
             hc.onClick = onClick
             hc.onRightClick = onRightClick
             hc.onDragStarted = onDragStarted
@@ -622,7 +753,9 @@ extension BalancePanelView {
         root.addArrangedSubview(card)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: horizontalPadding),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -horizontalPadding),
+            // trailingPadding 独立档（nil = 跟随 horizontalPadding）：余额卡片右缩进单独收紧
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor,
+                                            constant: -(trailingPadding ?? horizontalPadding)),
             stack.topAnchor.constraint(equalTo: card.topAnchor, constant: topPadding),
             stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -bottomPadding),
             card.widthAnchor.constraint(equalTo: root.widthAnchor),
@@ -630,10 +763,10 @@ extension BalancePanelView {
         return card
     }
 
-    /// 分组标题行：标题，12pt bold + systemGray（石墨灰），左对齐，固定行高 24pt
+    /// 分组标题行：标题，13pt semibold + systemGray（石墨灰），左对齐，固定行高 24pt
     private func sectionTitleRow(name: String, color: NSColor = .systemGray) -> NSStackView {
         let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 12, weight: .bold)
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
         label.textColor = color
         let row = NSStackView(views: [label])
         row.orientation = .horizontal
@@ -648,10 +781,10 @@ extension BalancePanelView {
     /// 标题文字左对齐余额标题（内边距 8），箭头（▸ 折叠 / ▾ 展开）靠右贴卡片内边界。
     /// targets 闭包返回随折叠一起隐藏的视图（build 在区块内容创建后才会填充，闭包按引用取最新值）；
     /// 初始折叠态由 build 在填完 targets 后自行应用（isHidden + 间距）。
-    private func collapsibleSectionTitle(name: String, key: String, titleWeight: NSFont.Weight = .bold,
+    private func collapsibleSectionTitle(name: String, key: String,
                                          targets: @escaping () -> [NSView]) -> HoverCard {
         let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 12, weight: titleWeight)
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
         label.textColor = .systemGray
         let chevron = NSImageView()
         chevron.contentTintColor = .systemGray
@@ -702,20 +835,23 @@ extension BalancePanelView {
         return hc
     }
 
-    /// 品牌「macOS 26 ClearDark」图标资产（ictool 从 *.icon 源包预导出的 PNG，
-    /// macOS 平台 ClearDark rendition 256@1x，--design-generation 26 设计语言）。
+    /// 品牌「macOS 27 ClearDark」图标资产（ictool 从 *.icon 源包预导出的 PNG，
+    /// macOS 平台 ClearDark rendition 256@1x，--design-generation 27 设计语言）。
     /// Icon Composer 的 .icon 源包 NSImage 无法运行时加载、也无公开变体选择 API，
     /// 故构建期按 rendition 导出 PNG 随 Resources 分发；保持原色非 template。
     /// 表里没有的条目（资产缺失，如旧 bundle）由调用方回退 SVG template。
     /// 键 = CardStyle.icon 图标名；ZCode 与 ZhiPu 共用 "zhipu" 品牌图标名，两卡同时生效。
     private static let brandClearDarkImages: [String: NSImage] = {
         var images: [String: NSImage] = [:]
+        // 资产统一按「平台名.png」命名（macOS27 ClearDark 256@1x 重导出）；
+        // 键名与资源名不一致的仅两处：ZCode/ZhiPu 共用 "zhipu"、TRAE 卡 icon 名为 "trae-color"。
         for (iconName, resource) in [
-            "workbuddy": "workbuddy-macOS26-ClearDark-256@1x",
-            "zhipu": "zcode-macOS26-ClearDark-256@1x",
-            "deepseek": "deepseek-macOS26-ClearDark-256@1x",
-            "qwen": "qwen-macOS26-ClearDark-256@1x",
-            "trae-color": "trae",  // 资产已简化命名 trae.png（导出参数与其他 ClearDark 卡一致）
+            "workbuddy": "workbuddy",
+            "zhipu": "zcode",
+            "deepseek": "deepseek",
+            "qwen": "qwen",
+            "trae-color": "trae",
+            "codex": "codex",
         ] {
             guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
                   let img = NSImage(contentsOf: url) else { continue }
@@ -791,8 +927,8 @@ extension BalancePanelView {
         menuBarDot.isHidden = true
         iconContainer.addSubview(menuBarDot)
         NSLayoutConstraint.activate([
-            menuBarDot.widthAnchor.constraint(equalToConstant: 3.6),
-            menuBarDot.heightAnchor.constraint(equalToConstant: 3.6),
+            menuBarDot.widthAnchor.constraint(equalToConstant: 3.2),
+            menuBarDot.heightAnchor.constraint(equalToConstant: 3.2),
             menuBarDot.centerXAnchor.constraint(equalTo: iconView.centerXAnchor),
             menuBarDot.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 2),
         ])
@@ -857,9 +993,10 @@ extension BalancePanelView {
         // 基线对齐用视图内置探针（同字体隐藏 label 的 firstBaselineAnchor）
         registerRollingNumber(valueView, size: 13, weight: valueWeight)
         valueView.setTextColor(textColor)
-        // 数值前缀图标（Agent 卡积分前的 coin）：贴数字左侧、随槽位右对齐成组
+        // 数值前缀图标（Agent 卡积分前的 coin）：贴数字左侧、随槽位右对齐成组。
+        // 按常规态边长烘焙（2× 光栅），chip 态由视图缩小绘制，离开 hover 无损复原
         if let pfx = valuePrefixIcon {
-            valueView.prefixIcon = Self.trimmedBundleSvgIcon(pfx, size: 10)
+            valueView.prefixIcon = Self.trimmedBundleSvgIcon(pfx, size: RollingNumberView.baseIconSize)
         }
         valueView.setContentHuggingPriority(.required, for: .horizontal)
         valueView.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -880,7 +1017,8 @@ extension BalancePanelView {
             // 常规数值宽度下左侧有富余，不会与数字字形重叠
             titleRow.trailingAnchor.constraint(lessThanOrEqualTo: valueView.leadingAnchor,
                                                constant: nickLabel != nil ? 8 : -4),
-            valueView.trailingAnchor.constraint(equalTo: row1.trailingAnchor),
+            // 数值容器右锚 +0.7pt（2026-09-02 用户要求向右偏移，视觉更贴卡片内边界）
+            valueView.trailingAnchor.constraint(equalTo: row1.trailingAnchor, constant: 0.7),
             valueView.centerYAnchor.constraint(equalTo: row1.centerYAnchor),
             row1.heightAnchor.constraint(equalToConstant: 16),
         ])
@@ -891,14 +1029,18 @@ extension BalancePanelView {
         let row2 = NSView()
         row2.translatesAutoresizingMaskIntoConstraints = false
         var row2HasContent = false
+        var subtitleFadeView: SubtitleFadeView?
         if let info = info {
             info.setContentHuggingPriority(.required, for: .horizontal)
             info.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             info.translatesAutoresizingMaskIntoConstraints = false
-            row2.addSubview(info)
+            let subtitle = hoverSubStrip == nil ? nil : SubtitleFadeView(contentView: info)
+            subtitleFadeView = subtitle
+            let subtitleView = subtitle ?? info
+            row2.addSubview(subtitleView)
             NSLayoutConstraint.activate([
-                info.leadingAnchor.constraint(equalTo: row2.leadingAnchor),
-                info.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
+                subtitleView.leadingAnchor.constraint(equalTo: row2.leadingAnchor),
+                subtitleView.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
             ])
             row2HasContent = true
         }
@@ -921,6 +1063,11 @@ extension BalancePanelView {
                 strip.trailingAnchor.constraint(equalTo: row2.trailingAnchor),
                 strip.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
             ])
+            if let subtitleFadeView {
+                // 副标题最多占到子账号条左缘；超出部分由 SubtitleFadeView 渐隐。
+                subtitleFadeView.trailingAnchor.constraint(equalTo: strip.leadingAnchor,
+                                                            constant: -3).isActive = true
+            }
         }
         // row2 高度由内容撑开（取 info 和 dots 中较高的）
         if row2HasContent {
@@ -941,7 +1088,8 @@ extension BalancePanelView {
         content.orientation = .vertical
         content.alignment = .leading
         // 主副标题行间距 = 数值↔点阵间距（同一竖向 stack）：2 → 1（2026-08-31 用户要求 -1pt）
-        content.spacing = 1
+        // → 0（2026-09-02 用户要求贴紧，保留 content.spacing 参数）
+        content.spacing = 0
         content.distribution = .fill
         content.setContentHuggingPriority(.defaultLow, for: .horizontal)
         content.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -1148,8 +1296,8 @@ extension BalancePanelView {
     }
 
     /// 交错上移入场（Agent 卡其余账号条 chip 用）：节奏 = Token 平台切换动效同口径
-    /// （行间 0.1s / 单行 0.4s / 上移 10pt，用户指定，豁免 Motion.emphasis 0.40 硬顶）。
-    /// 视图非 flipped：起点在终位下方 10pt（-y 平移）上移 + 淡入；
+    /// （行间 0.1s / 单行 0.4s / 上移 6pt，豁免 Motion.emphasis 0.40 硬顶）。
+    /// 视图非 flipped：起点在终位下方 6pt（-y 平移）上移 + 淡入；
     /// 减弱动态效果：直接落定仅复位透明度。
     /// isCancelled：每次延迟块触发前轮询（换入↔换出代际守卫由调用方闭包），
     /// 序列中途被打断时剩余块不再启动，避免「容器已在淡出、内容还在各自入场」。
@@ -1339,9 +1487,11 @@ extension BalancePanelView {
     static func trimmedBundleSvgIcon(_ name: String, size: CGFloat) -> NSImage? {
         guard let url = Bundle.main.url(forResource: name, withExtension: "svg"),
               let src = NSImage(contentsOf: url) else { return nil }
-        // 以 2× 光栅化，像素充足；NSBitmapImageRep 绘制保证 SVG 矢量按指定像素落地
-        let scale: CGFloat = 2
-        let px = max(1, Int(ceil(size * scale)))
+        // 光栅画布下限 32px：小图标（<16pt）固定 2× 画布太小，alpha>0 墨迹阈值会把
+        // 边缘行列吃掉（coin 在 16px 画布量出 14×12、20px 量出 16×16，量测失真且
+        // 上屏变上采样发糊）；≥32px 量测稳定、上屏恒为降采样（更锐）。
+        // 大图标（≥16pt）2× 画布本就 ≥32px，行为不变
+        let px = max(32, Int(ceil(size * 2)))
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
                                          isPlanar: false, colorSpaceName: .deviceRGB,
@@ -1363,20 +1513,34 @@ extension BalancePanelView {
         }
         let w = cg.width, h = cg.height, bpr = cg.bytesPerRow
         var minX = w, maxX = -1, minY = h, maxY = -1
+        // 阈值 64（25%）：alpha>0 会把不可见的 AA 边缘行/列量进 bbox（32px 画布比
+        // 低分辨率多出一两行），icon 可见实体相对 bbox 下沉 → 视觉偏下；按可见度
+        // 收紧 bbox，各尺寸光栅量出的墨迹几何才一致
         for y in 0..<h {
-            for x in 0..<w where buf[y * bpr + x * 4 + 3] > 0 {
+            for x in 0..<w where buf[y * bpr + x * 4 + 3] > 64 {
                 if x < minX { minX = x }
                 if x > maxX { maxX = x }
                 if y < minY { minY = y }
                 if y > maxY { maxY = y }
             }
         }
-        guard maxX >= minX, maxY >= minY,
-              let cropped = cg.cropping(to: CGRect(x: minX, y: minY,
-                                                   width: maxX - minX + 1, height: maxY - minY + 1))
+        guard maxX >= minX, maxY >= minY else { return nil }
+        // 裁剪框向外补齐到偶数像素：奇数边裁剪会得到非整 pt 位图（如 15px→7.5pt），
+        // 放进 size×size 视图触发缩放 + 居中亚像素重采样（子账号 coin 静止发糊根因）。
+        // 2× 光栅下偶数边 = 位图与设备像素 1:1 对齐；外扩优先（补 1px 透明，不损失
+        // 墨迹采样），两侧都无余量（奇数光栅且墨迹贴满边）时保持原样
+        var cx = minX, cy = minY, cw = maxX - minX + 1, ch = maxY - minY + 1
+        if cw % 2 == 1 {
+            if cx > 0 { cx -= 1; cw += 1 } else if maxX + 1 < w { cw += 1 }
+        }
+        if ch % 2 == 1 {
+            if cy > 0 { cy -= 1; ch += 1 } else if maxY + 1 < h { ch += 1 }
+        }
+        guard let cropped = cg.cropping(to: CGRect(x: cx, y: cy,
+                                                   width: cw, height: ch))
         else { return nil }
         // 像素 → 点：以墨迹最大边对齐 size（保持长宽比；tabler 图标近正方形 → ≈ size×size）
-        let inkW = CGFloat(maxX - minX + 1), inkH = CGFloat(maxY - minY + 1)
+        let inkW = CGFloat(cw), inkH = CGFloat(ch)
         let maxDim = max(inkW, inkH)
         let out = NSImage(cgImage: cropped,
                           size: NSSize(width: inkW / maxDim * size,
@@ -1408,7 +1572,7 @@ extension BalancePanelView {
     /// Agent 卡任务状态发光底层（icon 下方垫底）——按态分风格：
     /// ① 进行中 = X · 光晕旋转（雷达扫描，范例 plans/status-glow-versions.html X 行）：
     ///    静态弱底光（opacity .10）+ 静止圆角方裁切框（masksToBounds）内，
-    ///    1.41×（√2 对角）圆盘载 conic 彗尾光束顺时针匀速自转（2.4s linear）；
+    ///    1.41×（√2 对角）圆盘载 conic 彗尾光束顺时针匀速自转（3.2s linear）；
     ///    进行中态几何整体放大 10%（底光/裁切框/圆盘同心 side×1.10，layout 按 taskState 分支）；
     ///    彗尾铺满整圈 360°、仅亮头处硬断；彗尾 alpha 为提亮档
     ///    （.14/.32/.68/.92/.98，范例原档 .04/.12/.42/.75/.92）+ 亮带向尾侧展宽 9°（≈2pt 弧长）；
@@ -1416,15 +1580,26 @@ extension BalancePanelView {
     ///    会被自家裁剪吃掉（先糊后裁=视觉无模糊），父层壳才能先裁后糊（CSS filter 语义）；
     ///    ⚠ 贴图镜像后 alpha 沿顺时针爬升 → 盘体负向旋转（屏幕顺时针，用户定案）才「头前尾后」；
     /// ② 完成 = 「雷达涟漪」风格：柔光呼吸 + 双圈涟漪错相扩散（详见下方常量注释）；
-    /// ③ 中断 = 信号断续（故障感：闪烁掉线 + X/Y 双轴 ±3pt 抖动），无涟漪。
+    /// ③ 中断 = 信号断续（故障感：闪烁掉线 + 随机缩放闪动），无位移、无涟漪。
     /// 三态色：进行中=蓝 / 完成=绿 / 中断=橙红；nil = 全隐藏（仅占位）。
     /// 颜色为动态色，layout 时按生效外观解算（同 CardMenuBarDotView 口径）；
     /// reduceMotion 时只留静态柔光（两界中值），涟漪/扫描不铺。
     final class CardTaskStatusRingView: NSView, CAAnimationDelegate {
+        /// API 卡（DS/ZhiPu/Qwen）脉冲驱动态：taskState 由进度条闪烁（额度消耗脉冲）点亮
+        /// 进行中；进行中态的颜色/动画代码完全复用，仅状态层全链路挂移除饱和度滤镜
+        ///（灰阶保留亮度），与 Agent 任务态的彩色光环区分
+        var pulseDriven = false {
+            didSet {
+                guard oldValue != pulseDriven else { return }
+                applyDesaturationFilters()
+            }
+        }
         /// 柔光呼吸两界（用户调档：峰值 0.6 → 0.45，2026-09-01）；呼吸与涟漪同拍（period）
         static let coreLow: Float = 0.0
         static let coreHigh: Float = 0.45
         static let period: CFTimeInterval = 3.0
+        /// 进行中态（X 扫描）转一圈的时间：1.6s
+        static let runningPeriod: CFTimeInterval = 1.6
         /// 进行中态（X 扫描）圆角：7pt 用户指定（2026-09-01），独立于完成/中断的 side×0.22 等比口径
         static let runningCornerRadius: CGFloat = 7
         /// 完成态（双圈涟漪）圆角：7pt 用户指定（2026-09-01，先 +0.4 偏置到 6.34 再直接定为 7），
@@ -1434,12 +1609,18 @@ extension BalancePanelView {
         var taskState: AgentTaskState? {
             didSet {
                 guard oldValue != taskState else { return }
+                // 状态切换后清理中断态残留的缩放 transform，避免下一次进入时继承旧状态。
+                if taskState != .interrupted || oldValue != .interrupted {
+                    resetGlitchTransform()
+                }
                 needsLayout = true
             }
         }
 
         /// 柔光载体（icon 之下）：纯色圆角块 + 高斯模糊 = 柔和光晕
         private let glow = CALayer()
+        /// icon 光晕基础模糊；中断态在此基础上增加 2pt
+        private var glowBlur: CIFilter?
         /// 涟漪双圈：同色描边、无填充，scale+opacity 扩散（完成态）
         private let ring1 = CALayer()
         private let ring2 = CALayer()
@@ -1460,6 +1641,7 @@ extension BalancePanelView {
             if let blur = CIFilter(name: "CIGaussianBlur") {
                 blur.setValue(1, forKey: kCIInputRadiusKey)
                 glow.filters = [blur]
+                glowBlur = blur
             }
             glow.opacity = Self.coreLow
             for ring in [ring1, ring2] {
@@ -1491,6 +1673,18 @@ extension BalancePanelView {
             sweepClip.addSublayer(sweepDisc)
         }
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        /// 有色层挂 CIColorControls(saturation=0) 实现移除饱和度：柔光/双涟漪层
+        ///（各自已有高斯模糊，追加进同数组，滤镜实例每层独立）+ 扫描模糊壳
+        ///（filters 作用于层内容含子层，彗尾贴图一并去饱和）。
+        /// 颜色与动画完全复用进行中态代码，滤镜只在显示端收饱和度
+        private func applyDesaturationFilters() {
+            for l in [glow, ring1, ring2, sweepBlur] {
+                guard let f = CIFilter(name: "CIColorControls") else { continue }
+                f.setValue(0, forKey: kCIInputSaturationKey)
+                l.filters = (l.filters ?? []) + [f]
+            }
+        }
 
         override func layout() {
             super.layout()
@@ -1525,6 +1719,8 @@ extension BalancePanelView {
                 layer.cornerRadius = corner
             }
             CATransaction.commit()
+            // 中断态 icon 光晕增加 2pt 模糊（1pt → 3pt）；无状态/其它状态恢复基础值。
+            glowBlur?.setValue(taskState == .interrupted ? 3 : 1, forKey: kCIInputRadiusKey)
             if let state = taskState {
                 let color = Self.color(for: state, in: self)
                 glow.backgroundColor = color
@@ -1580,11 +1776,14 @@ extension BalancePanelView {
         /// 无状态/无窗口/reduceMotion 时收回静态态（glow 钉两界中值、圈隐藏）。
         private func restartAnimationsIfNeeded() {
             glow.removeAnimation(forKey: "taskGlowPulse")
-            glow.removeAnimation(forKey: "taskHeartbeat")
-            glow.removeAnimation(forKey: "taskGlitchY")
+            glow.removeAnimation(forKey: "taskGlitchScale")
             ring1.removeAnimation(forKey: "taskRipple")
             ring2.removeAnimation(forKey: "taskRipple")
             sweepDisc.removeAnimation(forKey: "taskSweep")
+            // 视图离窗后也会复用同一个状态层；没有窗口时清理中断态残留的 transform。
+            if taskState != .interrupted || window == nil {
+                resetGlitchTransform()
+            }
             guard let state = taskState, window != nil else { return }
             if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                 glow.opacity = (Self.coreLow + Self.coreHigh) / 2
@@ -1621,15 +1820,18 @@ extension BalancePanelView {
         }
 
         /// 中断态 = 信号断续（故障感）：稳亮段中穿插两次「掉线」——
-        /// 掉线时 opacity 近乎瞬时砸落（84ms 内）、伴随 X/Y 双轴各 ±3pt 抖动，
-        /// 随即弹回；两次掉线间隔不均（30%→52%→70%），读作「连接时断时续」。
-        /// 归位不再精确回中：每次弹回落到 ±2pt 内随机偏移上（2026-09-02 用户要求），
-        /// 单周期播完经 animationDidStop 重新随机续播 → 每周期落点都不同，
-        /// 末落点存 glitchSettleX/Y 作为下周期起点，衔接无跳变。
+        /// opacity 近乎瞬时闪断，并同步做随机缩放闪动；不再产生任何 X/Y 位移。
+        /// 两次掉线间隔不均（30%→52%→70%），周期播完重新随机缩放，避免机械重复。
         /// 动画只挂 glow（icon 不参与）；周期 2.8s，幅度克制不干扰阅读。
-        /// 2026-09-02 用户要求替换原心跳双搏（demo D 风格）；同日抖动扩为双轴 ±3pt。
-        private var glitchSettleX: CGFloat = 0
-        private var glitchSettleY: CGFloat = 0
+        /// 2026-09-02 用户要求移除中断态位移动效，仅保留随机缩闪。
+        /// 清除中断态缩放，并同步清理 CALayer model transform。
+        /// 仅在状态复位/离窗时调用；连续中断周期之间保留动画连续性。
+        private func resetGlitchTransform() {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            glow.setAffineTransform(.identity)
+            CATransaction.commit()
+        }
 
         private func addGlitchSignal() {
             let period: CFTimeInterval = 2.8
@@ -1646,42 +1848,20 @@ extension BalancePanelView {
             flicker.repeatCount = .infinity
             flicker.timingFunction = CAMediaTimingFunction(name: .linear)
             glow.add(flicker, forKey: "taskGlowPulse")
-            // 双轴抖动（2026-09-02 用户要求：X/Y 各 ±3pt 峰值，掉线点逐一对齐）：
-            // 归位点（原精确 0）替换为 ±2pt 随机落点；Y 轴与 X 轴反向/异幅错开
-            // → 位移轨迹走「之字」更立体；每段 easeOut（快速离位、平滑回位）。
-            // shakeX 单周期播完（repeatCount 1）触发委托续播，实现每周期重新随机
-            let restX1 = CGFloat.random(in: -2...2)
-            let restX2 = CGFloat.random(in: -2...2)
-            let restX3 = CGFloat.random(in: -2...2)
-            let restY1 = CGFloat.random(in: -2...2)
-            let restY2 = CGFloat.random(in: -2...2)
-            let restY3 = CGFloat.random(in: -2...2)
-            let shakeKeyTimes: [NSNumber] = [0, 0.30, 0.31, 0.325, 0.34, 0.355, 0.36,
-                                             0.52, 0.53, 0.545, 0.56, 0.565, 0.58,
-                                             0.70, 0.71, 0.725, 0.74, 0.755, 0.77, 0.775, 1.0]
-            let shakeEase = Array(repeating: CAMediaTimingFunction(name: .easeOut),
-                                  count: shakeKeyTimes.count - 1)
-            let shakeX = CAKeyframeAnimation(keyPath: "transform.translation.x")
-            shakeX.values = [glitchSettleX, glitchSettleX, -3, 3, -2, 2, restX1, restX1,
-                             3, -3, 2, -2, restX2, restX2,
-                             -3, 3, -2, 2, -1, restX3, restX3]
-            shakeX.keyTimes = shakeKeyTimes
-            shakeX.duration = period
-            shakeX.repeatCount = 1
-            shakeX.timingFunctions = shakeEase
-            shakeX.delegate = self
-            glow.add(shakeX, forKey: "taskHeartbeat")
-            let shakeY = CAKeyframeAnimation(keyPath: "transform.translation.y")
-            shakeY.values = [glitchSettleY, glitchSettleY, 2, -3, 2, -1.5, restY1, restY1,
-                             -2, 3, -2, 1.5, restY2, restY2,
-                             2, -3, 2, -1.5, 1, restY3, restY3]
-            shakeY.keyTimes = shakeKeyTimes
-            shakeY.duration = period
-            shakeY.repeatCount = 1
-            shakeY.timingFunctions = shakeEase
-            glow.add(shakeY, forKey: "taskGlitchY")
-            glitchSettleX = restX3
-            glitchSettleY = restY3
+            // 随机缩闪：与掉线时间点对齐，但不改变位置；每周期重新抽样，避免机械重复。
+            let shrink1 = CGFloat.random(in: 0.78...0.90)
+            let shrink2 = CGFloat.random(in: 0.82...0.94)
+            let shrink3 = CGFloat.random(in: 0.72...0.88)
+            let shrink4 = CGFloat.random(in: 0.80...0.92)
+            let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+            scale.values = [1, 1, shrink1, 1, 1, shrink2, 1,
+                            1, shrink3, shrink4, shrink3, 1, 1]
+            scale.keyTimes = flicker.keyTimes
+            scale.duration = period
+            scale.repeatCount = 1
+            scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            scale.delegate = self
+            glow.add(scale, forKey: "taskGlitchScale")
         }
 
         /// 掉线单周期播完（finished=true）→ 重新随机归位落点续播下一周期；
@@ -1714,14 +1894,14 @@ extension BalancePanelView {
             ring.add(group, forKey: "taskRipple")
         }
 
-        /// X 雷达扫描：光束圆盘匀速自转一圈（2.4s linear，同范例）。
+        /// X 雷达扫描：光束圆盘匀速自转一圈（1.6s linear）。
         /// 方向定案（2026-09-01 用户目检二次修正）：屏幕**顺时针**扫。
         /// 贴图已镜像（alpha 沿顺时针爬升、彗尾拖在逆时针侧），盘体**负向**旋转（-2π）头前尾后。
         private func addSweep() {
             let spin = CABasicAnimation(keyPath: "transform.rotation")
             spin.fromValue = 0
             spin.toValue = -CGFloat.pi * 2
-            spin.duration = 2.4
+            spin.duration = Self.runningPeriod
             spin.repeatCount = .infinity
             sweepDisc.add(spin, forKey: "taskSweep")
         }
