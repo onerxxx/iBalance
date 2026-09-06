@@ -146,7 +146,7 @@ open iBalance.app             # 运行（或双击）
   - DeepSeek 卡 = `deepseek-macOS26-ClearDark-256@1x.png`（源包 `swift/icons/deepseek.icon`，图标名 "deepseek" 仅该卡使用）。
   - Qwen 卡 = `qwen-macOS26-ClearDark-256@1x.png`（源包 `swift/icons/qwen.icon`，图标名 "qwen" 仅该卡使用；原 qwen.svg 保留作资产缺失回退）。
   - TRAE 卡 = `trae.png`（源包 `swift/icons/trae.icon`，ictool 同参导出后简化命名，不再跟 `*-macOS26-ClearDark-256@1x` 命名式；图标名 "trae-color" 仅该卡使用，原 trae-color.svg 保留作回退）。
-  - 若需其他样式（如浅色面板 ClearLight），改 `--platform/--rendition` 重导后换表里的资源名即可。
+  - **浅色主题（2026-09-06 起）**：六包（含 codex）各导 `macOS27 Default` → `<平台>-light.png`（简化命名，同 codex/trae 式），命令同上换 `--rendition Default --design-generation 27`（初版误用 ClearLight 已重导为 Default）。深/浅装载走 `PanelLayout.brandDarkImages/brandLightImages` + `brandIconImage(_:dark:)`（按生效外观选版、缺资产回退另一版再回退 SVG）；外观切换时就地换图（iconView identifier 标签 `brandIcon:<键>`，见 viewDidChangeEffectiveAppearance），不重建卡片。
 
 ## 🎨 UI 数值口径（改面板 UI 前先看）
 

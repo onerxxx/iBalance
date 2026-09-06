@@ -39,7 +39,9 @@ private final class SubtitleFadeView: NSView {
         contentView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             contentView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            contentView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            // 内容只钉前缘（2026-09-06 定案）：视图宽度可随外部约束自由收窄，超宽部分
+            // 由 masksToBounds 裁切 + layout() 渐隐 mask 淡出。任何形式的尾随钉扎
+            // （= 或 ≤）都会让视图宽度被内容自然宽托底，「渐隐让位」失效并反压账号条。
             contentView.topAnchor.constraint(equalTo: topAnchor),
             contentView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
@@ -169,14 +171,16 @@ extension BalancePanelView {
         headerBackdropView = TintedVisualEffectView()
         updatedLabel.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(updatedLabel)
-        let quickBuildBtn = HoverIconButton()
-        quickBuildBtn.image = symbolImage("hammer", size: 11)
-        quickBuildBtn.normalTintColor = Palette.panelHeaderContentColor
-        quickBuildBtn.target = self
-        quickBuildBtn.action = #selector(quickBuildTapped)
-        quickBuildBtn.toolTip = "快速编译（后台静默执行）"
-        quickBuildBtn.translatesAutoresizingMaskIntoConstraints = false
-        header.addSubview(quickBuildBtn)
+        // 右上角按钮：开关浅色主题（2026-09-06 用户指定替换原快速编译按钮；
+        // 与设置行「浅色主题」开关同管线，翻转后走同一回调）
+        let themeBtn = HoverIconButton()
+        themeBtn.image = symbolImage("circle.lefthalf.filled", size: 11)
+        themeBtn.normalTintColor = Palette.panelHeaderContentColor
+        themeBtn.target = self
+        themeBtn.action = #selector(headerLightThemeTapped)
+        themeBtn.toolTip = "开关浅色主题"
+        themeBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(themeBtn)
         let quitBtn = HoverIconButton()
         quitBtn.image = symbolImage("power", size: 11)
         quitBtn.normalTintColor = Palette.panelHeaderContentColor
@@ -197,18 +201,19 @@ extension BalancePanelView {
             updatedLabel.centerYAnchor.constraint(equalTo: header.topAnchor,
                                                   constant: panelTopPadding + panelBarHeight / 2),
             updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: panelBarHeight),
-            quickBuildBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
-            quickBuildBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
-            // 距容器缘 = 容器缩进 + 正文缩进 7，与 root 内容左右缘对齐（见下方 root 约束）
-            quickBuildBtn.trailingAnchor.constraint(
+            themeBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            themeBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            // 距容器缘 = 容器缩进 + 正文缩进 7 + 2.6（2026-09-06 用户「header 左右缩进增加2pt」
+            // 后再「再增加0.6pt」，原 +7 与 root 内容左右缘对齐）
+            themeBtn.trailingAnchor.constraint(
                 equalTo: header.trailingAnchor,
-                constant: -(BalancePanelViewController.contentHorizontalInset + 7)),
-            quickBuildBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
+                constant: -(BalancePanelViewController.contentHorizontalInset + 9.6)),
+            themeBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
             quitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             quitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             quitBtn.leadingAnchor.constraint(
                 equalTo: header.leadingAnchor,
-                constant: BalancePanelViewController.contentHorizontalInset + 7),
+                constant: BalancePanelViewController.contentHorizontalInset + 9.6),
             quitBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
             // ── header 下缘分割线：贴 header 底边，通栏 ──
             headerSeparator.leadingAnchor.constraint(equalTo: header.leadingAnchor),
@@ -256,6 +261,8 @@ extension BalancePanelView {
         let titleSpacer = NSView()
         titleSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         apiTitle.addArrangedSubview(titleSpacer)
+        // 暂时隐藏 pin 按钮（2026-09-06 用户要求，代码保留；恢复 = 删除此行）
+        pinBtn.isHidden = true
         apiTitle.addArrangedSubview(pinBtn)
         apiTitle.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -6).isActive = true
         // 上下间距统一 6pt（离线横幅→标题、标题→卡片）
@@ -319,11 +326,38 @@ extension BalancePanelView {
         root.setCustomSpacing(10, after: apiGroupContainer)
 
         // ── Agent 分组标题（原「余额」板块改名；ZCode/Codex/TRAE/WB 等 Agent 平台）──
-        let balanceTitle = sectionTitleRow(name: "Agent")
+        // HoverCard 静默驻留（hoverDwellShowsProgress = false：hover 背景常规淡入、
+        // 无进度填充），驻留 Motion.hoverDwell 与平台卡同触发时长 → Token 板块切到
+        // .aggregate 三平台聚合视图；离开/快速掠过取消，确认后不回落（同平台卡口径）
+        let balanceTitle = HoverCard()
+        balanceTitle.wantsLayer = true
+        // 圆角与余额卡片统一（Palette.cardCornerRadius = 10pt）
+        balanceTitle.layer?.cornerRadius = Palette.cardCornerRadius
+        balanceTitle.layer?.cornerCurve = .continuous
+        balanceTitle.layer?.masksToBounds = true
+        // 边框色预设（HoverCard mouseEntered 只动画 borderWidth，色值由此处提供）
+        balanceTitle.layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: balanceTitle)
+        balanceTitle.layer?.borderWidth = 0
+        let balanceTitleLabel = NSTextField(labelWithString: "Agent")
+        balanceTitleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        balanceTitleLabel.textColor = .systemGray
+        balanceTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        balanceTitle.addSubview(balanceTitleLabel)
+        NSLayoutConstraint.activate([
+            balanceTitle.heightAnchor.constraint(equalToConstant: 24),
+            // 标题文字距左 8（与卡片内标题/API 标题对齐），垂直居中
+            balanceTitleLabel.leadingAnchor.constraint(equalTo: balanceTitle.leadingAnchor, constant: 8),
+            balanceTitleLabel.centerYAnchor.constraint(equalTo: balanceTitle.centerYAnchor),
+        ])
+        balanceTitle.hoverDwellDuration = Motion.hoverDwell
+        balanceTitle.hoverDwellShowsProgress = false
+        balanceTitle.hoverDebugLabel = "AgentTitle"
+        // hover 背景与平台卡同源：50% 黑 + 顶部椭圆光晕位图（默认 60° 淡渐变已废）
+        balanceTitle.hoverGradientOverride = Palette.cardHoverStrong
+        balanceTitle.onHoverConfirmed = { [weak self] in self?.confirmTokensHover(source: .aggregate) }
         balanceTitle.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(balanceTitle)
-        // 对齐到卡片内标题的左边界（root.leading + 8pt）
-        balanceTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8).isActive = true
+        pinFullWidth(balanceTitle, in: root)
         root.setCustomSpacing(0, after: balanceTitle)
 
         // ── Agent 卡片组容器：统一 kCardBackground 背景 + 圆角，子卡片透明 ──
@@ -469,6 +503,8 @@ extension BalancePanelView {
         valuePreviewSwitch.action = #selector(valueScrollPreviewToggled)
         statusDebugSwitch.target = self
         statusDebugSwitch.action = #selector(statusDebugPreviewToggled)
+        longProgressCardSwitch.target = self
+        longProgressCardSwitch.action = #selector(longProgressCardToggled)
         updateAutoSwitch.target = self
         updateAutoSwitch.action = #selector(updateAutoCheckToggled)
         // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 原生下拉菜单
@@ -510,6 +546,7 @@ extension BalancePanelView {
             switchRow(title: "面板渐变背景", sub: nil, sw: gradientSwitch),
             switchRow(title: "浅色主题", sub: nil, sw: lightThemeSwitch),
             switchRow(title: "Mono 风格", sub: nil, sw: monoSwitch),
+            switchRow(title: "长进度卡片", sub: nil, sw: longProgressCardSwitch),
             // 「滚动预览」暂时隐藏（2026-08-28）：恢复时把 switchRow 加回此处，
             // 并同步恢复下方 valuePreviewSub.isHidden = false
             // switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),
@@ -841,10 +878,15 @@ extension BalancePanelView {
     /// 故构建期按 rendition 导出 PNG 随 Resources 分发；保持原色非 template。
     /// 表里没有的条目（资产缺失，如旧 bundle）由调用方回退 SVG template。
     /// 键 = CardStyle.icon 图标名；ZCode 与 ZhiPu 共用 "zhipu" 品牌图标名，两卡同时生效。
-    private static let brandClearDarkImages: [String: NSImage] = {
+    /// 品牌卡 icon 资产（按生效外观选版）：深色 = `<平台>.png`（macOS27 ClearDark），
+    /// 浅色 = `<平台>-light.png`（macOS27 ClearLight，2026-09-06 用户导出）。
+    /// 键名与资源名不一致的仅两处：ZCode/ZhiPu 共用 "zhipu"、TRAE 卡 icon 名为 "trae-color"。
+    /// 命中即用、非 template 不着色；对应外观资产缺失时回退另一版，再无则回退原 SVG template
+    private static let brandDarkImages: [String: NSImage] = BalancePanelView.loadBrandImages(suffix: "")
+    private static let brandLightImages: [String: NSImage] = BalancePanelView.loadBrandImages(suffix: "-light")
+
+    private static func loadBrandImages(suffix: String) -> [String: NSImage] {
         var images: [String: NSImage] = [:]
-        // 资产统一按「平台名.png」命名（macOS27 ClearDark 256@1x 重导出）；
-        // 键名与资源名不一致的仅两处：ZCode/ZhiPu 共用 "zhipu"、TRAE 卡 icon 名为 "trae-color"。
         for (iconName, resource) in [
             "workbuddy": "workbuddy",
             "zhipu": "zcode",
@@ -853,27 +895,48 @@ extension BalancePanelView {
             "trae-color": "trae",
             "codex": "codex",
         ] {
-            guard let url = Bundle.main.url(forResource: resource, withExtension: "png"),
+            guard let url = Bundle.main.url(forResource: resource + suffix, withExtension: "png"),
                   let img = NSImage(contentsOf: url) else { continue }
             img.isTemplate = false
             images[iconName] = img
         }
         return images
-    }()
+    }
+
+    /// 按生效外观取品牌 icon（深/浅缺资产时回退另一版；都缺返回 nil → 调用方走 SVG
+    /// template）。internal：主题/系统外观切换时 BalancePanelView 就地换图标
+    ///（CardEntry.brandIconKey）
+    static func brandIconImage(_ iconName: String, dark: Bool) -> NSImage? {
+        let preferred = dark ? brandDarkImages : brandLightImages
+        let fallback = dark ? brandLightImages : brandDarkImages
+        return preferred[iconName] ?? fallback[iconName]
+    }
 
     /// 余额卡片内容行：左大 icon + 中间纵向（标题/签到信息）+ 右纵向（额度值/点阵）
-    /// 三列撑满整行：icon 24pt（2026-08-31 全平台统一） / middle ≥ 70% / right 40pt
+    /// 三列撑满整行：icon 与图标列宽同宽（27.75pt，2026-09-05 由 25pt +15%） / middle ≥ 70% / right 40pt
     /// 中间内容垂直居中；点阵进度放右侧额度值下方（DeepSeek 无点阵）
     /// failureBadge：外部创建的签到失败角标视图，叠加在 icon 右上角（显隐由调用方控制）
-    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 24, imageSize: CGFloat? = nil, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .medium, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, valuePrefixIcon: String? = nil, titleLabelRef: ((FadeableTextField) -> Void)? = nil, menuBarDotRef: ((NSView) -> Void)? = nil, statusRingRef: ((CardTaskStatusRingView) -> Void)? = nil) -> NSView {
+    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 24, imageSize: CGFloat? = nil, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .medium, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, valuePrefixIcon: String? = nil, longProgressCard: Bool = false, titleLabelRef: ((FadeableTextField) -> Void)? = nil, menuBarDotRef: ((NSView) -> Void)? = nil, statusRingRef: ((CardTaskStatusRingView) -> Void)? = nil) -> NSView {
         var imgSize = imageSize ?? iconSize
-        // 左：大 icon（统一图标列宽 = 25pt，2026-09-01 用户指定；
+        // 长进度卡片：icon 缩小 40% 与主标题同行（2026-09-06 用户指定）；
+        // 普通样式：icon 缩 2pt（2026-09-06 用户指定，列宽不变由图标列留白承接）
+        if longProgressCard { imgSize *= 0.6 } else { imgSize -= 2 }
+        // 左：大 icon（统一图标列宽 = 27.75pt，2026-09-05 由 25pt +15%，与 icon 等宽；
         // 约束写死不随 iconSize 变；image 在列内居中显示，imageSize 可独立缩小）；
         // premadeIconView 由外部传入（多号卡片预建 icon 视图，普通 NSImageView 即可）
         let iconView = premadeIconView ?? NSImageView()
-        // 品牌卡特例（WorkBuddy / ZCode+ZhiPu / DeepSeek）：macOS 26 ClearDark 品牌图（整图自带配色，保持原色非 template 不着色）
-        if let clearDark = Self.brandClearDarkImages[iconName] {
-            let scaled = clearDark.copy() as! NSImage
+        // 品牌卡特例（WorkBuddy / ZCode+ZhiPu / DeepSeek / Qwen / TRAE / Codex）：macOS27
+        // Clear 系列（深 ClearDark / 浅 ClearLight 按生效外观），整图自带配色非 template 不着色；
+        // identifier 标签供外观切换时就地换版（见 viewDidChangeEffectiveAppearance）
+        // ⚠️ 首建时本视图尚未挂窗，effectiveAppearance 回落系统外观：浅色主题开关
+        // （容器强制 aqua）下会误取深色版，且初次挂载不补发外观钩子、错版图标常驻。
+        // 与容器同源解算（panelAppearance 强制档），未强制时才回落系统外观
+        let brandAppearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                      gradientOn: panelGradientEnabled)
+            ?? NSApp.effectiveAppearance
+        if let brand = Self.brandIconImage(iconName, dark: brandAppearance.isDark) {
+            iconView.identifier = NSUserInterfaceItemIdentifier("brandIcon:" + iconName)
+            let scaled = brand.copy() as! NSImage
             scaled.size = NSSize(width: imgSize, height: imgSize)
             iconView.image = scaled
         } else {
@@ -888,6 +951,9 @@ extension BalancePanelView {
 
         // iconContainer：撑满 row 高度，iconView 在内 centerY 居中。
         // 拖拽由外层 HoverCard 接管，因此整张卡片而非仅 icon 可触发排序。
+        // 长进度卡片：图标列取消，iconContainer 缩为 icon 见方（左侧点位 lane 已随指示
+        // 改为 icon 辉光而取消）、直接进标题行前缘（行宽让给进度条 → 进度条贯穿整卡内容宽）
+        let iconColumnWidth: CGFloat = longProgressCard ? imgSize : 27.75
         let iconContainer = NSView()
         iconContainer.translatesAutoresizingMaskIntoConstraints = false
         if let ringRef = statusRingRef {
@@ -897,42 +963,67 @@ extension BalancePanelView {
             ring.translatesAutoresizingMaskIntoConstraints = false
             iconContainer.addSubview(ring)
             iconContainer.addSubview(iconView)
+            // 长进度卡片：host 含左侧点位 lane，光环钉 icon 本体（钉容器会整体偏左）
+            let ringBounds = longProgressCard ? iconView : iconContainer
             NSLayoutConstraint.activate([
-                ring.leadingAnchor.constraint(equalTo: iconContainer.leadingAnchor),
-                ring.trailingAnchor.constraint(equalTo: iconContainer.trailingAnchor),
-                ring.topAnchor.constraint(equalTo: iconContainer.topAnchor),
-                ring.bottomAnchor.constraint(equalTo: iconContainer.bottomAnchor),
-                iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
+                ring.leadingAnchor.constraint(equalTo: ringBounds.leadingAnchor),
+                ring.trailingAnchor.constraint(equalTo: ringBounds.trailingAnchor),
+                ring.topAnchor.constraint(equalTo: ringBounds.topAnchor),
+                ring.bottomAnchor.constraint(equalTo: ringBounds.bottomAnchor),
+                longProgressCard
+                    ? iconView.trailingAnchor.constraint(equalTo: iconContainer.trailingAnchor)
+                    : iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
                 iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
                 // 统一图标列宽（不再随各平台 iconSize 变化）：所有卡标题严格左对齐
-                iconContainer.widthAnchor.constraint(equalToConstant: 25),
+                iconContainer.widthAnchor.constraint(equalToConstant: iconColumnWidth),
             ])
             ringRef(ring)
         } else {
             iconContainer.addSubview(iconView)
             NSLayoutConstraint.activate([
-                iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
+                longProgressCard
+                    ? iconView.trailingAnchor.constraint(equalTo: iconContainer.trailingAnchor)
+                    : iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
                 // 统一图标列宽（不再随各平台 iconSize 变化）：所有卡标题严格左对齐；
                 // 各图标视觉尺寸差异（SVG 留白不同）由 CardStyle.iconSize 单独补偿
-                iconContainer.widthAnchor.constraint(equalToConstant: 25),
+                iconContainer.widthAnchor.constraint(equalToConstant: iconColumnWidth),
                 iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
             ])
         }
 
-        // 菜单栏显隐指示点：icon 底边下方 2pt，居中；显示在菜单栏时由调用方点亮（syncPanel）。
-        // 直径 3.6pt 圆点，cardForeground 跟随卡片前景色（2026-08-31 用户要求弃用白色）；
-        // 颜色由 CardMenuBarDotView 在 layout 时按生效外观解算（动态色直落 .cgColor 会定格外观）
-        let menuBarDot = CardMenuBarDotView()
-        menuBarDot.translatesAutoresizingMaskIntoConstraints = false
-        menuBarDot.isHidden = true
-        iconContainer.addSubview(menuBarDot)
-        NSLayoutConstraint.activate([
-            menuBarDot.widthAnchor.constraint(equalToConstant: 3.2),
-            menuBarDot.heightAnchor.constraint(equalToConstant: 3.2),
-            menuBarDot.centerXAnchor.constraint(equalTo: iconView.centerXAnchor),
-            menuBarDot.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 2),
-        ])
-        menuBarDotRef?(menuBarDot)
+        // 菜单栏显隐指示：列表态 = icon 下方 2pt 圆点（直径 3.2，cardForeground 跟随前景色）；
+        // 长进度卡片 = icon 四缘描边。显隐由调用方点亮（syncPanel 按 inMenuBar）；
+        // 颜色按生效外观解算（动态色直落 .cgColor 会定格外观）
+        let menuBarIndicator: NSView
+        if longProgressCard {
+            let glow = CardMenuBarGlowView()
+            glow.translatesAutoresizingMaskIntoConstraints = false
+            glow.isHidden = true
+            // 以 icon 为蒙版：辉光只透出在 icon 图案的不透明像素上，绝不溢出
+            //（2026-09-06 用户指定）。与 iconView 同大小、叠加其上（仍低于后建的签到失败角标）
+            glow.maskImage = iconView.image
+            iconContainer.addSubview(glow)
+            NSLayoutConstraint.activate([
+                glow.leadingAnchor.constraint(equalTo: iconView.leadingAnchor),
+                glow.trailingAnchor.constraint(equalTo: iconView.trailingAnchor),
+                glow.topAnchor.constraint(equalTo: iconView.topAnchor),
+                glow.bottomAnchor.constraint(equalTo: iconView.bottomAnchor),
+            ])
+            menuBarIndicator = glow
+        } else {
+            let dot = CardMenuBarDotView()
+            dot.translatesAutoresizingMaskIntoConstraints = false
+            dot.isHidden = true
+            iconContainer.addSubview(dot)
+            NSLayoutConstraint.activate([
+                dot.widthAnchor.constraint(equalToConstant: 3.2),
+                dot.heightAnchor.constraint(equalToConstant: 3.2),
+                dot.centerXAnchor.constraint(equalTo: iconView.centerXAnchor),
+                dot.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 2),
+            ])
+            menuBarIndicator = dot
+        }
+        menuBarDotRef?(menuBarIndicator)
 
         // 签到失败角标：贴 icon 右上角（跟随 iconView 偏移），默认隐藏由调用方按需显示
         if let badge = failureBadge {
@@ -1009,8 +1100,19 @@ extension BalancePanelView {
         row1.translatesAutoresizingMaskIntoConstraints = false
         row1.addSubview(titleRow)
         row1.addSubview(valueView)
+        // 长进度卡片：icon 与主标题同行（行前缘，图标列取消 → 进度条行贯穿整卡内容宽）
+        if longProgressCard {
+            row1.addSubview(iconContainer)
+            NSLayoutConstraint.activate([
+                iconContainer.leadingAnchor.constraint(equalTo: row1.leadingAnchor),
+                iconContainer.centerYAnchor.constraint(equalTo: row1.centerYAnchor),
+            ])
+        }
         NSLayoutConstraint.activate([
-            titleRow.leadingAnchor.constraint(equalTo: row1.leadingAnchor),
+            // 长进度卡片：标题起于 icon 右 4pt（2026-09-06 用户指定 -2pt，原 6）；列表态：标题起于行前缘
+            longProgressCard
+                ? titleRow.leadingAnchor.constraint(equalTo: iconContainer.trailingAnchor, constant: 4)
+                : titleRow.leadingAnchor.constraint(equalTo: row1.leadingAnchor),
             titleRow.firstBaselineAnchor.constraint(equalTo: valueView.baselineAnchor),
             // 昵称行允许向数值区多占 12pt（-4 → +8）：为昵称尾部签到徽章
             //（10pt 图标 + 薄空格）预留显示空间；数值右对齐（右锚 bounds-2.5），
@@ -1023,55 +1125,124 @@ extension BalancePanelView {
             row1.heightAnchor.constraint(equalToConstant: 16),
         ])
 
-        // 第二行：小项目（左）+ 点阵（右）同一行
-        // 用普通 NSView + 显式约束，避免 NSStackView gravity 分布歧义
-        // 点阵高度与小项目字号（9pt）等高，视觉对齐
-        let row2 = NSView()
-        row2.translatesAutoresizingMaskIntoConstraints = false
-        var row2HasContent = false
-        var subtitleFadeView: SubtitleFadeView?
-        if let info = info {
-            info.setContentHuggingPriority(.required, for: .horizontal)
-            info.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            info.translatesAutoresizingMaskIntoConstraints = false
-            let subtitle = hoverSubStrip == nil ? nil : SubtitleFadeView(contentView: info)
-            subtitleFadeView = subtitle
-            let subtitleView = subtitle ?? info
-            row2.addSubview(subtitleView)
-            NSLayoutConstraint.activate([
-                subtitleView.leadingAnchor.constraint(equalTo: row2.leadingAnchor),
-                subtitleView.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
-            ])
-            row2HasContent = true
-        }
-        if let dots = dots {
-            dots.translatesAutoresizingMaskIntoConstraints = false
-            dots.setContentHuggingPriority(.required, for: .horizontal)
-            dots.heightAnchor.constraint(equalToConstant: 7.0).isActive = true
-            row2.addSubview(dots)
-            NSLayoutConstraint.activate([
-                dots.trailingAnchor.constraint(equalTo: row2.trailingAnchor),
-                dots.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
-            ])
-            row2HasContent = true
-        }
-        // hover 其余账号条：与点阵同槽（trailing 叠放），hover 时由卡片 onHover 互换显隐
-        if let strip = hoverSubStrip {
-            strip.translatesAutoresizingMaskIntoConstraints = false
-            row2.addSubview(strip)
-            NSLayoutConstraint.activate([
-                strip.trailingAnchor.constraint(equalTo: row2.trailingAnchor),
-                strip.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
-            ])
-            if let subtitleFadeView {
-                // 副标题最多占到子账号条左缘；超出部分由 SubtitleFadeView 渐隐。
-                subtitleFadeView.trailingAnchor.constraint(equalTo: strip.leadingAnchor,
-                                                            constant: -3).isActive = true
+        // 第二行：列表态 = 副标题（左）+ 点阵/账号条（右）同行；
+        // 长进度卡片 = 进度条独占整行（左缘=主标题最左，槽高 14 容 12pt 子账号 chip 同槽互换）
+        // + 副标题下移一行（design/balance-card-mode.html 口径）
+        var extraRows: [NSView] = []
+        var barRowView: NSView?
+        if longProgressCard {
+            if dots != nil || hoverSubStrip != nil {
+                let barRow = NSView()
+                barRow.translatesAutoresizingMaskIntoConstraints = false
+                if let dots = dots {
+                    dots.translatesAutoresizingMaskIntoConstraints = false
+                    // 全宽进度条：两端钉死行宽（列表态为右锚定固有宽 50.09pt，2026-09-06 加长 10%）；
+                    // 高 4（2026-09-06 用户指定连续两轮 -1.5pt：7 → 5.5 → 4；行槽 14 容 chip 互换不变）
+                    dots.setContentHuggingPriority(.defaultLow, for: .horizontal)
+                    dots.heightAnchor.constraint(equalToConstant: 4.0).isActive = true
+                    barRow.addSubview(dots)
+                    NSLayoutConstraint.activate([
+                        dots.leadingAnchor.constraint(equalTo: barRow.leadingAnchor),
+                        dots.trailingAnchor.constraint(equalTo: barRow.trailingAnchor),
+                        dots.centerYAnchor.constraint(equalTo: barRow.centerYAnchor),
+                    ])
+                }
+                barRow.heightAnchor.constraint(equalToConstant: 14).isActive = true
+                extraRows.append(barRow)
+                barRowView = barRow
             }
-        }
-        // row2 高度由内容撑开（取 info 和 dots 中较高的）
-        if row2HasContent {
-            row2.heightAnchor.constraint(equalToConstant: 12).isActive = true
+            if let info = info {
+                // 副标题独占一行；hover 子账号条与其同行靠右（2026-09-06 用户指定：
+                // 不再与进度条同槽互换——进度条常驻 barRow 不消失），副标题经渐隐让位
+                //（同列表态口径；条隐藏期零宽由 stripZeroWidth 接管，副标题拿回全行）
+                info.translatesAutoresizingMaskIntoConstraints = false
+                let subRow = NSView()
+                subRow.translatesAutoresizingMaskIntoConstraints = false
+                let subtitle = hoverSubStrip == nil ? nil : SubtitleFadeView(contentView: info)
+                let subtitleView = subtitle ?? info
+                subRow.addSubview(subtitleView)
+                NSLayoutConstraint.activate([
+                    subtitleView.leadingAnchor.constraint(equalTo: subRow.leadingAnchor),
+                    subtitleView.centerYAnchor.constraint(equalTo: subRow.centerYAnchor),
+                ])
+                if let strip = hoverSubStrip {
+                    strip.translatesAutoresizingMaskIntoConstraints = false
+                    // 条宽阻力 999（同列表态口径）：宽度不足时亏空全由副标题渐隐让位
+                    strip.setContentCompressionResistancePriority(
+                        NSLayoutConstraint.Priority(999), for: .horizontal)
+                    subRow.addSubview(strip)
+                    var constraints = [
+                        strip.trailingAnchor.constraint(equalTo: subRow.trailingAnchor),
+                        strip.centerYAnchor.constraint(equalTo: subRow.centerYAnchor),
+                    ]
+                    if let subtitle {
+                        // 副标题最多占到子账号条左缘，超出部分渐隐
+                        constraints.append(subtitle.trailingAnchor.constraint(
+                            equalTo: strip.leadingAnchor, constant: -3))
+                    }
+                    NSLayoutConstraint.activate(constraints)
+                }
+                subRow.heightAnchor.constraint(equalToConstant: 12).isActive = true
+                extraRows.append(subRow)
+            }
+        } else {
+            // 列表态第二行：小项目（左）+ 点阵（右）同一行
+            // 用普通 NSView + 显式约束，避免 NSStackView gravity 分布歧义
+            // 点阵高度与小项目字号（9pt）等高，视觉对齐
+            let row2 = NSView()
+            row2.translatesAutoresizingMaskIntoConstraints = false
+            var row2HasContent = false
+            var subtitleFadeView: SubtitleFadeView?
+            if let info = info {
+                info.setContentHuggingPriority(.required, for: .horizontal)
+                info.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                info.translatesAutoresizingMaskIntoConstraints = false
+                let subtitle = hoverSubStrip == nil ? nil : SubtitleFadeView(contentView: info)
+                subtitleFadeView = subtitle
+                let subtitleView = subtitle ?? info
+                row2.addSubview(subtitleView)
+                NSLayoutConstraint.activate([
+                    subtitleView.leadingAnchor.constraint(equalTo: row2.leadingAnchor),
+                    subtitleView.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
+                ])
+                row2HasContent = true
+            }
+            if let dots = dots {
+                dots.translatesAutoresizingMaskIntoConstraints = false
+                dots.setContentHuggingPriority(.required, for: .horizontal)
+                dots.heightAnchor.constraint(equalToConstant: 7.0).isActive = true
+                row2.addSubview(dots)
+                NSLayoutConstraint.activate([
+                    dots.trailingAnchor.constraint(equalTo: row2.trailingAnchor),
+                    dots.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
+                ])
+                row2HasContent = true
+            }
+            // hover 其余账号条：与点阵同槽（trailing 叠放），hover 时由卡片 onHover 互换显隐
+            if let strip = hoverSubStrip {
+                strip.translatesAutoresizingMaskIntoConstraints = false
+                // 子账号条永不挤压（2026-09-06 codex 4 账号排查定案）：副标题渐隐尾随是
+                // 等式约束、条宽阻力默认 250 与副标题让位优先级打平，宽度不足时 AL 把
+                // 亏空摊给两边 → chip 被压 5pt。宽度阻力提到 999：亏空全由副标题渐隐
+                // 让位（可缩到 0）；行宽真不够时 999 < 行宽 required，条才是最后让位方。
+                strip.setContentCompressionResistancePriority(
+                    NSLayoutConstraint.Priority(999), for: .horizontal)
+                row2.addSubview(strip)
+                NSLayoutConstraint.activate([
+                    strip.trailingAnchor.constraint(equalTo: row2.trailingAnchor),
+                    strip.centerYAnchor.constraint(equalTo: row2.centerYAnchor),
+                ])
+                if let subtitleFadeView {
+                    // 副标题最多占到子账号条左缘；超出部分由 SubtitleFadeView 渐隐。
+                    subtitleFadeView.trailingAnchor.constraint(equalTo: strip.leadingAnchor,
+                                                                constant: -3).isActive = true
+                }
+            }
+            // row2 高度由内容撑开（取 info 和 dots 中较高的）
+            if row2HasContent {
+                row2.heightAnchor.constraint(equalToConstant: 12).isActive = true
+                extraRows.append(row2)
+            }
         }
 
         // 纵向 stack：row1（标题+数值）与第二行（副标题/点阵/账号条）成组垂直居中。
@@ -1081,15 +1252,17 @@ extension BalancePanelView {
         let contentContainer = NSView()
         contentContainer.translatesAutoresizingMaskIntoConstraints = false
         var contentViews: [NSView] = [row1]
-        if row2HasContent {
-            contentViews.append(row2)
-        }
+        contentViews.append(contentsOf: extraRows)
         let content = NSStackView(views: contentViews)
         content.orientation = .vertical
         content.alignment = .leading
         // 主副标题行间距 = 数值↔点阵间距（同一竖向 stack）：2 → 1（2026-08-31 用户要求 -1pt）
-        // → 0（2026-09-02 用户要求贴紧，保留 content.spacing 参数）
+        // → 0（2026-09-02 用户要求贴紧，保留 content.spacing 参数）；
+        // 长进度卡片标题行↔进度条行 1pt（HTML 口径 --gap-r1-bar）
         content.spacing = 0
+        if longProgressCard, barRowView != nil {
+            content.setCustomSpacing(1, after: row1)
+        }
         content.distribution = .fill
         content.setContentHuggingPriority(.defaultLow, for: .horizontal)
         content.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -1107,7 +1280,8 @@ extension BalancePanelView {
             content.bottomAnchor.constraint(lessThanOrEqualTo: contentContainer.bottomAnchor),
         ])
 
-        let row = NSStackView(views: [iconContainer, contentContainer])
+        // 长进度卡片：无图标列，内容区独占整行（进度条贯穿整卡内容宽）
+        let row = NSStackView(views: longProgressCard ? [contentContainer] : [iconContainer, contentContainer])
         row.orientation = .horizontal
         // icon 列↔标题区间距：8→5（2026-08-31 用户要求左侧整带统一 -3pt）→ 6.5（同日 +1.5pt 回调；
         // 不动卡片 horizontalPadding 以免右缘数值/点阵列同步位移）
@@ -1969,8 +2143,75 @@ extension BalancePanelView {
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
         override func layout() {
             super.layout()
-            layer?.cornerRadius = bounds.width / 2
+            // min 半高钳制：宽 > 高（胶囊形态预留）时呈两端半圆的胶囊
+            layer?.cornerRadius = min(bounds.width, bounds.height) / 2
             layer?.backgroundColor = Palette.borderCGColor(Palette.cardForeground, in: self)
+        }
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            needsLayout = true
+        }
+    }
+
+    /// 长进度卡片菜单栏显隐指示辉光：与 iconView 同大小、叠加其上的顶部椭圆高斯白光，
+    /// **icon α 烘焙进位图作蒙版**（白光只落在 icon 图案上，绝不溢出）——与卡片 hover
+    /// 背景同原理：一次性烘焙含蒙版的最终位图设给 layer.contents，无 CALayer mask。
+    /// 椭圆中心=icon 顶缘中点、向下衰减；逐像素 exp 衰减；alpha 按生效外观解算
+    ///（动态色直落 .cgColor 会定格外观）
+    final class CardMenuBarGlowView: NSView {
+        private var bakedKey: (w: Int, h: Int, dark: Bool) = (0, 0, false)
+        /// 蒙版源：icon 图像（烘焙时取每像素 α）
+        var maskImage: NSImage? { didSet { needsLayout = true } }
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+        override func layout() {
+            super.layout()
+            let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+            let w = max(2, Int(bounds.width * scale))
+            let h = max(2, Int(bounds.height * scale))
+            let dark = effectiveAppearance.isDark
+            guard (w, h, dark) != bakedKey else { return }
+            bakedKey = (w, h, dark)
+            let info = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+            guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: info),
+                  let data = ctx.data?.assumingMemoryBound(to: UInt8.self) else { return }
+            // 先把 icon 画进缓冲（α = 图案形状），随后逐像素合成：白光 α = icon α × 椭圆高斯。
+            // ⚠️ 画进的是 w×h 像素缓冲、CG 原点在左下——rect 必须用像素全幅，
+            // 用点单位的 bounds 会把 icon 缩进左下四分之一（实测）
+            if let cg = maskImage?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                ctx.interpolationQuality = .medium
+                ctx.draw(cg, in: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+            }
+            // 椭圆高斯：中心=icon 顶缘中点（cy=0），rx/ry 稍大于半高宽，向下衰减；
+            // 峰值按外观分档（暗 0.5 / 浅 0.4，可调）
+            let peak = dark ? 0.5 : 0.4
+            let spread = 1.2
+            let cx = Double(w) / 2
+            let rx = Double(w) * 0.55, ry = Double(h) * 0.55
+            for y in 0..<h {
+                let gy = (Double(y) + 0.5) / ry   // 顶缘最亮，向下衰减
+                let gy2 = gy * gy
+                for x in 0..<w {
+                    let gx = (Double(x) + 0.5 - cx) / rx
+                    let glow = peak * exp(-spread * spread * (gx * gx + gy2))
+                    let i = (y * w + x) * 4
+                    // icon α 取四通道最大值：premultiplied 缓冲 α 恒 ≥ 各颜色分量，
+                    // 无视实际字节序（RGBA/BGRA/ARGB）都精确等于 α；读错通道会出乱纹（实测）。
+                    // 白光 α = icon α × 高斯（白色 premultiplied：rgb = α，四通道等值写法亦字节序免疫）
+                    let iconA = Double(max(data[i], data[i + 1], data[i + 2], data[i + 3])) / 255.0
+                    let a = min(glow * iconA, 1)
+                    data[i] = UInt8(a * 255)
+                    data[i + 1] = UInt8(a * 255)
+                    data[i + 2] = UInt8(a * 255)
+                    data[i + 3] = UInt8(a * 255)
+                }
+            }
+            layer?.contents = ctx.makeImage()
         }
         override func viewDidChangeEffectiveAppearance() {
             super.viewDidChangeEffectiveAppearance()

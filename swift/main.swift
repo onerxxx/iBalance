@@ -418,9 +418,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         // Token 用量缓存预热：启动即触发后台构建（此后每 60s 自动重建），
-        // 用户 hover 卡片时直接命中缓存，弹面板零等待
+        // 用户 hover 卡片时直接命中缓存，弹面板零等待。
+        // 三仓齐预热（ZCode / WB / Codex）：Agent 标题 hover 聚合视图并发收集三仓，
+        // 缺一仓缓存则聚合挂起等该仓后台 build 完成才出数——Codex 原先漏预热，
+        // 首次 hover 聚合会延迟（甚至面板未开过时聚合卡住等 build）。
         ZcodeTokenStore.fetch { _ in }
         WBTokenStore.fetch { _ in }
+        CodexTokenStore.fetch { _ in }
 
         // WB / ZCode / Codex 任务状态轮询（本机 SQLite/JSONL 单行采样，5s 一轮）：
         // 可见状态变化（含 10 分钟过期归零）时主线程回调同步面板
@@ -630,13 +634,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onAddCodexAccount = { [weak self] in self?.onAddCodexAccount() }
         panel.onSetInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
         panel.onManualRefresh = { [weak self] in self?.onRefresh() }
-        panel.onQuickBuild = { [weak self] in self?.startQuickBuild() }
         panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
         panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
         panel.onToggleLightTheme = { [weak self] in self?.onToggleLightTheme() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
         panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
         panel.onToggleStatusDebugPreview = { [weak self] in self?.onToggleStatusDebugPreview() }
+        panel.onToggleLongProgressCard = { [weak self] in self?.onToggleLongProgressCard() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onCheckForUpdate = { [weak self] in self?.onCheckForUpdate() }
         panel.onToggleUpdateAutoCheck = { [weak self] in self?.onToggleUpdateAutoCheck() }
@@ -742,8 +746,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ConfigStore.save(self.config)
         }
         popover.contentViewController = panelVC
-        // 占位尺寸避免零尺寸 popover（宽 = 面板宽度唯一值）；正式尺寸由 showPanel
-        // 用 preferredContentSize（含箭头带高度）覆盖
+        // 占位尺寸避免零尺寸 popover（宽 = 面板宽度唯一值）；
+        // 正式尺寸由 showPanel 用 preferredContentSize（含箭头带高度）覆盖
         popover.contentSize = NSSize(width: BalancePanelViewController.panelWidth,
                                      height: panel.fittingSize.height)
         popoverController = popover
@@ -949,8 +953,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
         }
-        // 本周尚未消耗（usedRatio=0）或无数据时隐藏点阵（对齐 DS 口径）
-        qwSnap.hideDots = qwSnap.usedRatio <= 0
+        // Qwen 点阵恒显示：usedRatio=0 表示「本周一点没用」（满格全绿），有展示意义——
+        // 与 DS 的「0=没配置额度」语义不同，不套用 DS 的未消耗隐藏口径
         s.qwenAccounts = [qwSnap]
         let today = Self.todayString()
         // TRAE 多账号余额卡片：当前账号排最上
@@ -1237,6 +1241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.panelGradientEnabled = config.panelGradientEnabled
         s.lightThemeEnabled = config.lightThemeEnabled
         s.monoFontEnabled = config.monoFontEnabled
+        s.longProgressCard = config.longProgressCard
         return s
     }
 
@@ -1363,6 +1368,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 状态调试预览：切换开关（三态光环轮派前三张 Agent 卡演示动画；关闭恢复真实状态）。
     @objc private func onToggleStatusDebugPreview() {
         config.statusDebugPreview.toggle()
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
+    /// 长进度卡片：余额卡片进度条独占整行（左缘=主标题最左）+ 副标题下移一行
+    ///（design/balance-card-mode.html 口径），保存后经快照同步重建卡片
+    @objc private func onToggleLongProgressCard() {
+        config.longProgressCard.toggle()
         ConfigStore.save(config)
         syncPanel()
     }

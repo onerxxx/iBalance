@@ -247,48 +247,74 @@ enum AgentTaskStatusStore {
     /// 标记行 time_updated 超 zcodeMarkerStaleLimit 未推进视为崩溃残留不计数
     private static func zcodeHasActiveSession() -> Bool {
         guard FileManager.default.fileExists(atPath: zcodeCliDbPath) else { return false }
-        guard let db = openReadOnly(path: zcodeCliDbPath) else { return false }
+        if let active = zcodeActiveSessionMarker(immutable: false) { return active }
+        return zcodeActiveSessionMarker(immutable: true) ?? false
+    }
+
+    /// 单次「打开 + 查询」尝试；打开或 prepare 任一失败返回 nil（供外层回落 immutable）
+    private static func zcodeActiveSessionMarker(immutable: Bool) -> Bool? {
+        guard let db = openReadOnly(path: zcodeCliDbPath, immutable: immutable) else { return nil }
         defer { sqlite3_close(db) }
         var stmt: OpaquePointer?
         let minMs = Int64((Date().timeIntervalSince1970 - zcodeMarkerStaleLimit) * 1000)
+        // time_updated 过滤必须先于 json_extract、且 EXISTS 命中即止：message/part
+        // 上万行、data 是大 JSON，倒过来写会每轮全表 JSON 解析（实测 0.4s/次，常驻 CPU 大头）
         let sql = """
-            SELECT
-             (SELECT COUNT(*) FROM message m JOIN session s ON s.id = m.session_id
-               WHERE s.task_type = 'interactive'
+            SELECT EXISTS(
+              SELECT 1 FROM message m JOIN session s ON s.id = m.session_id
+               WHERE m.time_updated > \(minMs)
+                 AND s.task_type = 'interactive'
                  AND json_extract(m.data, '$.role') = 'assistant'
-                 AND json_extract(m.data, '$.time.completed') IS NULL
-                 AND m.time_updated > \(minMs))
-            +
-             (SELECT COUNT(*) FROM part p JOIN session s ON s.id = p.session_id
-               WHERE s.task_type = 'interactive'
-                 AND json_extract(p.data, '$.state.status') IN ('running','pending')
-                 AND p.time_updated > \(minMs))
+                 AND json_extract(m.data, '$.time.completed') IS NULL)
+            OR EXISTS(
+              SELECT 1 FROM part p JOIN session s ON s.id = p.session_id
+               WHERE p.time_updated > \(minMs)
+                 AND s.task_type = 'interactive'
+                 AND json_extract(p.data, '$.state.status') IN ('running','pending'))
             """
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return sqlite3_column_int64(stmt, 0) > 0
     }
 
     // MARK: - SQLite 单行查询
 
-    /// 只读打开 SQLite（WAL 库先直开拿 -wal 增量，失败再 immutable 直读主文件），失败返回 nil
-    private static func openReadOnly(path: String) -> OpaquePointer? {
+    /// 只读打开 SQLite；immutable=1 经 URI 直读主文件、绕过 -shm（失败返回 nil）。
+    /// ⚠️ open 是惰性的：WAL 库在对端未运行（无 -shm）时 ro open 也返回 OK，真正的
+    /// 失败（CANTOPEN）浮现在 prepare——所以打开+查询必须视为同一次尝试，
+    /// prepare 失败同样回落 immutable，调用方勿把「open 成功」当「可查」
+    private static func openReadOnly(path: String, immutable: Bool) -> OpaquePointer? {
         var db: OpaquePointer?
-        if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
-            sqlite3_close(db)
+        let rc: Int32
+        if immutable {
             let escaped = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
-            guard sqlite3_open_v2("file:\(escaped)?immutable=1", &db,
-                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else { return nil }
+            rc = sqlite3_open_v2("file:\(escaped)?immutable=1", &db,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
+        } else {
+            rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil)
+        }
+        guard rc == SQLITE_OK else {
+            sqlite3_close(db)
+            return nil
         }
         return db
     }
 
-    /// 打开库读首行（状态文本 + updated_at 毫秒）；库缺失/打开失败/无行返回 nil
+    /// 打开库读首行（状态文本 + updated_at 毫秒）；先 ro 后 immutable 各试一次
+    ///（库缺失/两次都失败/无行返回 nil）
     private static func queryLatest(path: String, sql: String,
                                      map: (String) -> AgentTaskState) -> AgentTaskStatus? {
         guard FileManager.default.fileExists(atPath: path) else { return nil }
-        guard let db = openReadOnly(path: path) else { return nil }
+        if let s = queryLatestOnce(path: path, sql: sql, map: map, immutable: false) { return s }
+        return queryLatestOnce(path: path, sql: sql, map: map, immutable: true)
+    }
+
+    /// 单次「打开 + 查询」尝试；任一失败返回 nil（供外层回落 immutable）
+    private static func queryLatestOnce(path: String, sql: String,
+                                         map: (String) -> AgentTaskState,
+                                         immutable: Bool) -> AgentTaskStatus? {
+        guard let db = openReadOnly(path: path, immutable: immutable) else { return nil }
         defer { sqlite3_close(db) }
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }

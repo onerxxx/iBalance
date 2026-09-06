@@ -524,8 +524,8 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     var onHoverChanged: ((Bool) -> Void)?
     /// hover 时是否对灰色文本/tint 做提亮（false = 仅背景变化，用于用量行等）
     var enablesTextBrightening: Bool = true
-    /// hover 时是否绘制发丝边框（与余额卡片 HoverCard 同一套 Palette：常态深白@20%/浅黑@12%、
-    /// hover 提亮到深白@35%/浅黑@80%，0.8pt borderWidth，0.22s 渐变）。仅用量行启用，
+    /// hover 时是否绘制发丝边框（与余额卡片 HoverCard 同一套 Palette：常态 hoverBorderNormal、
+    /// hover 提亮到 hoverBorderBright，0.8pt borderWidth，0.22s 渐变）。仅用量行启用，
     /// 设置卡片行保持纯平态。开启时预设 borderColor 避免首帧从黑边渐变。
     var enablesHoverBorder: Bool = false {
         didSet {
@@ -687,7 +687,7 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
             if layer?.borderColor == nil {
                 layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
             }
-            // 与余额卡片 HoverCard 同款：0.8pt + 白@35% 发丝边框
+            // 与余额卡片 HoverCard 同款：0.8pt + hoverBorderBright 描边
             animateLayerKey(layer, keyPath: "borderWidth", to: 0.8)
             animateLayerKey(layer, keyPath: "borderColor",
                             to: Palette.borderCGColor(Palette.hoverBorderBright, in: self))
@@ -1029,6 +1029,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
     private var suppressEnterUntilExit = false
     /// 点击回调：由外部设置，mouseUp 时触发
     var onClick: (() -> Void)?
+    /// 临时诊断（2026-09-06 假 hover 排查）：hover 事件日志的卡片标识，验完移除
+    var hoverDebugLabel = ""
     /// 右键点击回调：由外部设置，rightMouseDown 时触发（参数为事件，可用于弹出菜单定位）
     var onRightClick: ((NSEvent) -> Void)?
     /// 拖拽回调：设置后，整张卡片都可用于排序拖拽。
@@ -1044,6 +1046,10 @@ class HoverCard: NSView, PanelScrollHoverSync {
     /// 提前真实离开取消并复位。几何变化补发的 exit（事件位置仍在卡内）与补发 enter
     /// （isMouseInside 未清）均不重置进度，避免确认切换引发高度变化后进度条重跑。
     var hoverDwellDuration: CFTimeInterval?
+    /// 进度填充开关（默认 true = 原行为）：false = 静默驻留——hover 背景按常规淡入、
+    /// 不做左→右进度填充，驻留满时长仍触发 onHoverConfirmed（Agent 分组标题
+    /// 聚合 Token 板块用：要同一触发时长但不要进度条视觉）
+    var hoverDwellShowsProgress = true
     /// 进度撑满回调（主线程，时长到达时触发一次）
     var onHoverConfirmed: (() -> Void)?
     private var dwellWork: DispatchWorkItem?
@@ -1052,14 +1058,17 @@ class HoverCard: NSView, PanelScrollHoverSync {
     private let hoverEffectLayer = CALayer()
     /// hover 背景层：统一 hover 渐变（Palette.hoverGradient*）
     private let hoverGradientLayer = CAGradientLayer()
-    /// 平台卡 hover 背景：承载整张「外缘 → 中心」RGBA 位图。
-    /// CAGradientLayer 只有单方向线性渐变，四边等距渐隐须逐像素距离场绘制。
+    /// 平台卡 hover 背景：承载整张「实心填充 + 烘焙 1pt 上下渐变边框带」RGBA 位图。
+    /// CAGradientLayer 只有单方向线性渐变，圆角边框带须逐像素距离场绘制。
     private let hoverBitmapLayer = CALayer()
+    /// 平台卡 hover 光晕层：白@cardHoverGlowAlpha 椭圆高斯位图，独立成层以便
+    /// dwell 进度动画只平移此层（光晕从卡片上方下移落位）。浅色外观 contents 恒 nil。
+    private let hoverGlowLayer = CALayer()
     /// 位图缓存键：像素尺寸 + 外观（未变则跳过重绘）
     private var hoverBitmapKey: (w: Int, h: Int, dark: Bool)?
     /// 平台卡强背景开关（Agent/API 平台卡非 nil）；平台卡由位图独占背景，
     /// 其余卡片继续使用 Palette.hoverGradient。
-    /// 设置后按当前外观重解算（dwell 进度填充/mask 动画复用同一层，行为不变）。
+    /// 设置后按当前外观重解算；dwell 进度视觉 = 光晕层下移动画，复用同一层。
     var hoverGradientOverride: [NSColor]? = nil {
         didSet {
             guard hoverGradientOverride != oldValue else { return }
@@ -1082,6 +1091,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
                 // 切到平台卡：位图立即按当前尺寸+外观重画，dwell/first-hover 不落帧
                 // （否则 layout 中延迟重画会首帧空白，视觉上背景先消失再出现）
                 hoverBitmapLayer.frame = hoverEffectLayer.bounds
+                hoverGlowLayer.frame = hoverEffectLayer.bounds
                 hoverBitmapKey = nil
                 if hoverEffectLayer.bounds.width > 0, hoverEffectLayer.bounds.height > 0 {
                     updateHoverBitmapIfNeeded()
@@ -1095,7 +1105,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
         }
     }
 
-    /// 平台卡的边缘包含在 hover 位图内，表现为 CSS `inset` border；其余卡片沿用外层发丝描边。
+    /// 平台卡的边框已烘焙进位图（0.8pt 上下渐变带），不再用 CALayer 描边；
+    /// 其余卡片沿用外层描边。
     private func setHoverBorder(isVisible: Bool, animated: Bool) {
         let usesLayerBorder = isVisible && hoverGradientOverride == nil
         let width: CGFloat = usesLayerBorder ? 0.8 : 0
@@ -1152,6 +1163,9 @@ class HoverCard: NSView, PanelScrollHoverSync {
             let pts = Palette.gradientEndpoints(angleDeg: Palette.hoverGradientAngleDeg, in: bounds)
             hoverGradientLayer.startPoint = pts.start
             hoverGradientLayer.endPoint = pts.end
+        } else {
+            // 平台卡：光晕下移动画中途被截图时按终态落位（模型值恒终态，移除即无跳变）
+            hoverGlowLayer.removeAnimation(forKey: "glowDescend")
         }
         setHoverBorder(isVisible: true, animated: false)
         CATransaction.commit()
@@ -1193,6 +1207,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
     func syncHoverState(_ inside: Bool) {
         guard !isDragHoverLocked else { return }
         if inside == isMouseInside { return }
+        Logger.log(.layout, "[HoverDbg] sync \(hoverDebugLabel) -> \(inside) cursor=\(NSEvent.mouseLocation) cardOnScreen=\(window.map { $0.convertToScreen(convert(bounds, to: nil)) ?? .zero }) win=\(window?.frame ?? .zero)")
         if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
 
@@ -1222,6 +1237,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
         isMouseInside = showing
         hoverEffectLayer.isHidden = false
         layer?.backgroundColor = dragNormalBackgroundColor ?? kCardBackground.cgColor
+        // 光晕下移动画随拖拽交接移除（模型值恒终态）
+        hoverGlowLayer.removeAnimation(forKey: "glowDescend")
         if !animated {
             hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
             layer?.removeAnimation(forKey: "borderWidthTransition")
@@ -1257,14 +1274,17 @@ class HoverCard: NSView, PanelScrollHoverSync {
         }
         hoverEffectLayer.opacity = 0
         // 位图层在上、渐变层在下：平台卡隐藏渐变层，由整卡位图独占背景；
-        // 非平台卡位图 contents 恒 nil，不影响渐变层。
+        // 非平台卡位图/光晕 contents 恒 nil，不影响渐变层。
         hoverEffectLayer.addSublayer(hoverGradientLayer)
         hoverEffectLayer.addSublayer(hoverBitmapLayer)
+        hoverEffectLayer.addSublayer(hoverGlowLayer)
         layer?.addSublayer(hoverEffectLayer)
     }
 
-    /// 平台卡 hover 的整张 RGBA 位图：四边向内渐隐，中心保持 hover 强色。
-    /// 用单一圆角矩形距离场同时驱动直边和圆角，形成 CSS `inset` border，避免线性斜纹。
+    /// 平台卡 hover 底图：强背景纯色实心填充 + 烘焙 1pt 上下渐变边框带
+    /// （2026-09-06 起，上 = hoverBorderBright 原色、下 = RGB × BottomDim 压暗，
+    /// 取代 CALayer 均匀描边）。光晕另走 renderGlowBitmap（需独立平移动画）。
+    /// 圆角由同一距离场驱动，仅 1px 抗锯齿。
     private func renderHoverBitmap(wp: Int, hp: Int, scale: CGFloat, dark: Bool)
         -> CGImage? {
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
@@ -1274,29 +1294,44 @@ class HoverCard: NSView, PanelScrollHoverSync {
                                            bitmapInfo: bitmapInfo),
               let data = context.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        var edgeR: CGFloat = 0, edgeG: CGFloat = 0, edgeB: CGFloat = 0, edgeA: CGFloat = 0
+        var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
         effectiveAppearance.performAsCurrentDrawingAppearance {
             let c = (dark ? Palette.cardHoverStrongDark : Palette.cardHoverStrongBright)
                 .usingColorSpace(.deviceRGB)
             c?.getRed(&r, green: &g, blue: &b, alpha: &a)
-            // 暗色外缘：用 Palette.hoverBorderBright（白@35%/浅黑@80%）而非 systemGray，
-            // 与普通 HoverCard 外层发丝描边视觉一致，避免平台卡深色下边缘灰得突兀。
-            let edge = (dark ? Palette.hoverBorderBright : Palette.hoverBorderNormal)
-                .usingColorSpace(.deviceRGB)
-            edge?.getRed(&edgeR, green: &edgeG, blue: &edgeB, alpha: &edgeA)
+            // 边框带顶色：暗色 = hoverBorderBright 暗色分支（白@24%）；浅色 = 白系压暗
+            // 一档的灰白（亮度 cardHoverBorderLightBrightness，alpha 一致）——2026-09-06
+            // 用户指定浅色沿用暗色白系渐变边框、顶部压暗一些
+            if dark {
+                NSAppearance(named: .darkAqua)?.performAsCurrentDrawingAppearance {
+                    let c = Palette.hoverBorderBright.usingColorSpace(.deviceRGB)
+                    c?.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+                }
+            } else {
+                br = Palette.cardHoverBorderLightBrightness
+                bg = br
+                bb = br
+                ba = 0.24
+            }
         }
         // 以像素中心采样，并以实际位图尺寸作为边界；左右/上下渐变各占相同半个像素，
         // 避免 0 位置采样造成一侧多出半像素，圆角处看起来像斜切。
         let W = CGFloat(wp) / scale, H = CGFloat(hp) / scale
-        let f = min(Palette.cardHoverEdgeFade, W / 2, H / 2)
         let rad = min(Palette.cardCornerRadius, W / 2, H / 2)
         let cx = W / 2, cy = H / 2
+        let bw = Palette.cardHoverBorderWidth
+        let dim = Palette.cardHoverBorderBottomDim
+        let bandAlpha = min(ba * Palette.cardHoverBorderAlphaBoost, 1)
         for y in 0..<hp {
             let py = (CGFloat(y) + 0.5) / scale
+            // 上浅下深：按行线性插值，底部 = 顶部 RGB 压暗（alpha 不变）
+            let v = py / H
+            let rowBr = br * ((1 - v) + dim * v)
+            let rowBg = bg * ((1 - v) + dim * v)
+            let rowBb = bb * ((1 - v) + dim * v)
             for x in 0..<wp {
                 let px = (CGFloat(x) + 0.5) / scale
                 // 到圆角矩形边缘的 signed distance（内部为正）= iq sdRoundBox 取负：
-                // sdRoundBox = outside + inside - rad（内部为负）→ 取负得 rad - outside - inside。
                 // 同一距离值天然覆盖上/右/下/左四条直边及四个圆角，避免把横纵距离
                 // 再做 min 后在圆角过渡区出现可见的折线。
                 let qx = abs(px - cx) - (W / 2 - rad)
@@ -1304,35 +1339,71 @@ class HoverCard: NSView, PanelScrollHoverSync {
                 let ox = max(qx, 0), oy = max(qy, 0)
                 let roundedRectDistance = rad - sqrt(ox * ox + oy * oy)
                     - min(max(qx, qy), 0)
-                let d = max(roundedRectDistance, 0)
-                let t = min(max(d / f, 0), 1)
-                let s = t * t * (3 - 2 * t) // smoothstep：边缘柔和、中心稳定
+                // 1px 抗锯齿：边界处 0.5、向内饱和为 1、向外归零
+                let t = min(max((roundedRectDistance / scale) + 0.5, 0), 1)
+                let s = t * t * (3 - 2 * t)
+                // 边框带：d ∈ [0, 1pt]，内外两侧各 0.5px 抗锯齿过渡
+                let it = min(max(((roundedRectDistance - bw) / scale) + 0.5, 0), 1)
+                let inner = it * it * (3 - 2 * it)
+                let band = s * (1 - inner)
                 let i = (y * wp + x) * 4
-                if dark {
-                    // 暗色：外缘 border-bright 色与中心 hover 强色同图 premultiplied 插值。
-                    // 外缘 alpha 用完整的 edgeA（不再折半）——视觉上等同于 0.8pt 发丝边框。
-                    let edgeWeight = edgeA * (1 - s)
-                    let centerWeight = a * s
-                    data[i] = UInt8((edgeR * edgeWeight + r * centerWeight) * 255)
-                    data[i + 1] = UInt8((edgeG * edgeWeight + g * centerWeight) * 255)
-                    data[i + 2] = UInt8((edgeB * edgeWeight + b * centerWeight) * 255)
-                    data[i + 3] = UInt8((edgeWeight + centerWeight) * 255)
-                } else {
-                    // 浅色：外缘也做浅黑描边（与普通卡片 hoverBorderNormal 同量级），
-                    // 不再直接渐隐到全透明——否则白底卡片上边缘"消失"在留白里。
-                    let edgeWeight = edgeA * (1 - s)
-                    let centerWeight = a * s
-                    data[i] = UInt8((edgeR * edgeWeight + r * centerWeight) * 255)
-                    data[i + 1] = UInt8((edgeG * edgeWeight + g * centerWeight) * 255)
-                    data[i + 2] = UInt8((edgeB * edgeWeight + b * centerWeight) * 255)
-                    data[i + 3] = UInt8((edgeWeight + centerWeight) * 255)
-                }
+                // 填充（premultiplied）为底，边框带 source-over 叠加
+                let fillA = a * s
+                let bA = bandAlpha * band
+                let outA = bA + fillA * (1 - bA)
+                    data[i] = UInt8(min(rowBr * bA + r * a * s * (1 - bA), 1) * 255)
+                    data[i + 1] = UInt8(min(rowBg * bA + g * a * s * (1 - bA), 1) * 255)
+                    data[i + 2] = UInt8(min(rowBb * bA + b * a * s * (1 - bA), 1) * 255)
+                data[i + 3] = UInt8(min(outA, 1) * 255)
+            }
+        }
+        return context.makeImage()
+    }
+
+    /// 平台卡 hover 光晕层位图：白色椭圆高斯衰减（预模糊，alpha 按外观分档），
+    /// 中心在顶边中点、余处全透明。深/浅外观都绘制（浅色白底上白晕可见）。
+    private func renderGlowBitmap(wp: Int, hp: Int, scale: CGFloat, dark: Bool) -> CGImage? {
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+            | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let context = CGContext(data: nil, width: wp, height: hp, bitsPerComponent: 8,
+                                           bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                           bitmapInfo: bitmapInfo),
+              let data = context.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        let W = CGFloat(wp) / scale, H = CGFloat(hp) / scale
+        let rad = min(Palette.cardCornerRadius, W / 2, H / 2)
+        let cx = W / 2, cy = H / 2
+        for y in 0..<hp {
+            let py = (CGFloat(y) + 0.5) / scale
+            for x in 0..<wp {
+                let px = (CGFloat(x) + 0.5) / scale
+                let qx = abs(px - cx) - (W / 2 - rad)
+                let qy = abs(py - cy) - (H / 2 - rad)
+                let ox = max(qx, 0), oy = max(qy, 0)
+                let roundedRectDistance = rad - sqrt(ox * ox + oy * oy)
+                    - min(max(qx, qy), 0)
+                let t = min(max((roundedRectDistance / scale) + 0.5, 0), 1)
+                let s = t * t * (3 - 2 * t)
+                // 椭圆归一化距离 + 高斯衰减 exp(-(spread·t)²) 即预模糊椭圆；
+                // 乘 s 裁进圆角矩形（超出卡片部分由 card 层 masksToBounds 兜底）
+                let gx = (px - cx) / (W * Palette.cardHoverGlowRadiusX)
+                let gy = py / (H * Palette.cardHoverGlowRadiusY) // 椭圆中心=顶边中点(y=0)
+                let gt2 = gx * gx + gy * gy
+                let glowA = Palette.cardHoverGlowAlpha(dark: dark)
+                    * exp(-gt2 * Palette.cardHoverGlowSpread(dark: dark)
+                            * Palette.cardHoverGlowSpread(dark: dark)) * s
+                let i = (y * wp + x) * 4
+                // 白色 premultiplied：rgb = alpha
+                data[i] = UInt8(min(glowA, 1) * 255)
+                data[i + 1] = UInt8(min(glowA, 1) * 255)
+                data[i + 2] = UInt8(min(glowA, 1) * 255)
+                data[i + 3] = UInt8(min(glowA, 1) * 255)
             }
         }
         return context.makeImage()
     }
 
     /// 平台卡位图按需重绘：尺寸或外观变化才重画（菜单栏面板 Retina 恒定 2x）。
+    /// 底图（填充+边框带）与光晕层共用同一缓存键，光晕浅色外观置空。
     private func updateHoverBitmapIfNeeded() {
         guard hoverGradientOverride != nil else { return }
         let size = hoverEffectLayer.bounds.size
@@ -1349,6 +1420,12 @@ class HoverCard: NSView, PanelScrollHoverSync {
         } else {
             NSLog("[HoverCard] bitmap render FAILED")
         }
+        if let glow = renderGlowBitmap(wp: wp, hp: hp, scale: scale, dark: dark) {
+            hoverGlowLayer.contents = glow
+            hoverGlowLayer.contentsScale = scale
+        } else {
+            hoverGlowLayer.contents = nil
+        }
     }
 
     /// 子层 frame 不随 AutoLayout 同步，布局时手动贴满 bounds（圆角由父 layer masksToBounds 裁出）
@@ -1364,6 +1441,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
             hoverGradientLayer.frame = hoverEffectLayer.bounds
         }
         hoverBitmapLayer.frame = hoverEffectLayer.bounds
+        hoverGlowLayer.frame = hoverEffectLayer.bounds
         updateHoverBitmapIfNeeded()
         if hoverGradientOverride == nil {
             let pts = Palette.gradientEndpoints(angleDeg: Palette.hoverGradientAngleDeg, in: bounds)
@@ -1476,7 +1554,14 @@ class HoverCard: NSView, PanelScrollHoverSync {
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
         syncInteractiveHover(at: event)
-        guard HoverEnterValidation.isPlausible(event, in: self) else { return }
+        let plausible = HoverEnterValidation.isPlausible(event, in: self)
+        Logger.log(.layout, "[HoverDbg] enter \(hoverDebugLabel) plausible=\(plausible) real=\(isPointerInsideNow) loc=\(event.locationInWindow) cardOnScreen=\(window.map { $0.convertToScreen(convert(bounds, to: nil)) ?? .zero }) win=\(window?.frame ?? .zero)")
+        guard plausible else { return }
+        // dwell 卡确认切换会改 Token 板块高度 → 窗口原点平移，AppKit 补发**陈旧窗口
+        // 坐标**的 enter：光标停在全卡顶部附近时（看光晕下移时正是），错位量足以把
+        // 补发落进上方卡片点亮假 hover（0.15s 后才被 scheduleHoverSync 校准熄灭）。
+        // 事件坐标可陈旧、实时光标不会骗人：再按 mouseLocation 权威校验一次。
+        if hoverDwellDuration != nil, event.window != nil, !isPointerInsideNow { return }
         // dwell 卡：确认后几何变化补发的 enter（isMouseInside 未清）不重启进度
         if isMouseInside, hoverDwellDuration != nil { return }
         isMouseInside = true
@@ -1494,6 +1579,7 @@ class HoverCard: NSView, PanelScrollHoverSync {
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
+        Logger.log(.layout, "[HoverDbg] exit \(hoverDebugLabel) loc=\(event.locationInWindow) cardOnScreen=\(window.map { $0.convertToScreen(convert(bounds, to: nil)) ?? .zero }) win=\(window?.frame ?? .zero)")
         // dwell 卡：几何变化补发的 exit 其事件位置仍在卡内（陈旧坐标），忽略——
         // 否则确认切换引发高度变化后进度被打回重跑；自造事件（syncHoverState，
         // window=nil）是 hitTest 权威判定，照常退出。此路径仅按位置重算 hover 项，
@@ -1510,36 +1596,39 @@ class HoverCard: NSView, PanelScrollHoverSync {
         syncInteractiveHover(at: event)
     }
 
-    /// 启动 hover 确认进度：hover 效果层挂左锚 mask，bounds.width 0→满 线性填充；
-    /// 满时模型值落定 + 触发 onHoverConfirmed。mask 挂在 hoverEffectLayer（而非渐变层），
-    /// 平台卡位图层同在容器内，进度填充对整层生效。
-    /// 进度 mask 不带模糊（3pt 模糊只写在平台卡位图层，不进入合成容器）：
-    /// mask 只管显隐、前缘为硬边，取消冻结/满宽落定均沿用同一 mask，行为不变。
+    /// 启动 hover 确认：进度模式（默认）= 烘焙光晕位图整体从卡片上方位置下移落位
+    /// （2026-09-06 用户指定，替换原左→右 mask 填充），与驻留同时长、同时落点；
+    /// 动画只驱动 presentation、模型值恒终态，满时移除动画 + 触发 onHoverConfirmed。
+    /// 动画挂在光晕独立层（浅色外观光晕不绘制则无进度视觉，仅驻留计时）；
+    /// 取消/离开移除动画，随 hover 层整体淡出。
+    /// 静默模式（hoverDwellShowsProgress = false）：无下移动画，hover 背景按常规淡入，
+    /// 仅排驻留计时（满时长落点自检 + onHoverConfirmed 同进度模式）。
     private func startHoverDwell(duration: CFTimeInterval) {
         hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
-        let w = hoverEffectLayer.bounds.width
-        let h = hoverEffectLayer.bounds.height
-        guard w > 0, h > 0 else { return }
-        let mask = CALayer()
-        mask.anchorPoint = CGPoint(x: 0, y: 0.5)
-        mask.position = CGPoint(x: 0, y: h / 2)
-        mask.backgroundColor = NSColor.white.cgColor
-        // mask 只管显隐、前缘为硬边；平台卡边缘渐变已在位图内完成，
-        // 不对任一合成层施加模糊，以免破坏内嵌边缘。
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        hoverEffectLayer.opacity = 1
-        mask.bounds = CGRect(x: 0, y: 0, width: 0, height: h)
-        hoverEffectLayer.mask = mask
-        CATransaction.commit()
-        let anim = CABasicAnimation(keyPath: "bounds.size.width")
-        anim.fromValue = 0
-        anim.toValue = w
-        anim.duration = duration
-        anim.timingFunction = CAMediaTimingFunction(name: .linear)
-        anim.fillMode = .forwards
-        anim.isRemovedOnCompletion = false
-        mask.add(anim, forKey: "dwellFill")
+        // 两种模式背景都常规淡入（原进度模式的 mask 显隐已随填充一起退役）
+        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 1)
+        if hoverDwellShowsProgress {
+            // hover 进度视觉 = 烘焙光晕位图整体位置下移（2026-09-06 用户指定）：动画只驱动
+            // presentation、模型值恒为终态，确认/取消移除动画即无跳变。起始偏移取
+            // 光晕纵半轴（0.65×卡高），保证起始整团光晕都在卡片外被圆角裁剪、
+            // 全程可见地滑入落位。下移时长与 hover 触发（背景淡入）同节拍 =
+            // Motion.hover，不等确认时长——确认时光晕早已落位，收尾无跳变。
+            let h = hoverEffectLayer.bounds.height
+            let offset = h > 0 ? h * Palette.cardHoverGlowRadiusY : Motion.glowDescendOffset
+            // 终值从 bounds 现算（与 layout() 摆放的模型位置严格同源），不用层上
+            // position——面板刚重建就 hover 时层 position 可能尚未摆放，捕获即偏。
+            let final = CGPoint(x: hoverEffectLayer.bounds.midX, y: hoverEffectLayer.bounds.midY)
+            let anim = CABasicAnimation(keyPath: "position")
+            anim.fromValue = NSValue(point: CGPoint(x: final.x, y: final.y + offset))
+            anim.toValue = NSValue(point: final)
+            anim.duration = Motion.hover
+            anim.timingFunction = Motion.easeInOutStrong
+            // 结束自动移除：presentation 直接回落模型值（恒为终态）。勿改回
+            // forwards 常驻+事后移除——动画终值与模型值的任何毫秒级错位
+            // （GCD 确认计时 vs CA 时钟、中途 layout）都会在收尾瞬间跳一帧。
+            anim.isRemovedOnCompletion = true
+            hoverGlowLayer.add(anim, forKey: "glowDescend")
+        }
         dwellWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.dwellWork != nil else { return }
@@ -1551,32 +1640,23 @@ class HoverCard: NSView, PanelScrollHoverSync {
                 return
             }
             self.dwellConfirmed = true
-            // 模型值落满并移除动画：后续淡出/复用不回退
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            mask.bounds = CGRect(x: 0, y: 0, width: w, height: h)
-            mask.removeAnimation(forKey: "dwellFill")
-            CATransaction.commit()
+            if hoverDwellShowsProgress {
+                // 模型值恒为终态：移除动画即落位，无跳变
+                hoverGlowLayer.removeAnimation(forKey: "glowDescend")
+            }
             self.onHoverConfirmed?()
         }
         dwellWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
     }
 
-    /// 取消/复位确认进度（真实离开、点击清除、拖拽锁定）：mask 冻结在当前填充宽度
-    /// （不撤 mask，否则半截进度会闪成满背景再淡出），随 hover 层一起淡出；
-    /// 下次进入整体替换 mask，无需在此清理。
+    /// 取消/复位确认进度（真实离开、点击清除、拖拽锁定）：位置动画模型值恒为终态，
+    /// 移除动画即无跳变，随 hover 层一起淡出；下次进入重新播放下移动画。
     private func cancelHoverDwell() {
         dwellWork?.cancel()
         dwellWork = nil
         dwellConfirmed = false
-        guard let mask = hoverEffectLayer.mask else { return }
-        let current = (mask.presentation()?.bounds ?? mask.bounds).width
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        mask.removeAnimation(forKey: "dwellFill")
-        mask.bounds = CGRect(x: 0, y: 0, width: current, height: mask.bounds.height)
-        CATransaction.commit()
+        hoverGlowLayer.removeAnimation(forKey: "glowDescend")
     }
 
     /// 点击卡片：mouseDown 记录按下位置，mouseUp 在 bounds 内时触发回调（避免拖出后误触）
@@ -1699,7 +1779,7 @@ final class ActionTileButton: HoverCard {
         layer?.cornerRadius = 10
         layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
-        // 边框色与卡片统一（hover 时由 HoverCard 动画 borderWidth 到 0.8）
+        // 边框色与卡片统一（hover 时由 HoverCard 动画 borderWidth 到 0.8pt）
         layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
         layer?.borderWidth = 0
 

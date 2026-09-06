@@ -149,6 +149,7 @@ enum WBTokenStore {
             .sorted { $0.tokens > $1.tokens }
         let total = projectRows.reduce(Int64(0)) { $0 + $1.tokens }
         periodTotals[.all] = total   // All = 全量总计，无窗口
+        Logger.log(.refresh, "[WbTokDbg] 项目行=\(projectRows.count) 名=\(projectRows.prefix(3).map { $0.name }) 未知=\(projectRows.filter { $0.name == "(未知项目)" }.count)")
         let daily = dailyMap
             .map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
@@ -158,26 +159,51 @@ enum WBTokenStore {
 
     /// workbuddy.db sessions 表 sessionId → cwd（含已删除会话，保留历史用量归属）。
     /// WAL 库同 ZCode 打开链：先只读直开（WB 运行中含 -wal 增量），失败再 immutable 直读主文件。
+    /// workbuddy.db sessions 表 sessionId → cwd（含已删除会话，保留历史用量归属）。
+    /// WAL 库同 ZCode 打开链：先只读直开（WB 运行中含 -wal 增量），失败再 immutable 直读主文件。
+    /// ⚠️ open 是惰性的：WB 未启动（无 -shm）时只读 open 也返回 OK，失败（CANTOPEN）
+    /// 浮现在 prepare——所以打开与查询必须视为同一次尝试，prepare 失败同样回落 immutable
     private static func sessionProjects() -> [String: String] {
         let path = NSHomeDirectory() + "/.workbuddy/workbuddy.db"
-        guard FileManager.default.fileExists(atPath: path) else { return [:] }
+        guard FileManager.default.fileExists(atPath: path) else {
+            Logger.log(.refresh, "[WbTokDbg] workbuddy.db 不存在")
+            return [:]
+        }
+        if let out = querySessionMap(path: path, immutable: false) { return out }
+        return querySessionMap(path: path, immutable: true) ?? [:]
+    }
+
+    /// 单次「打开 + 查询」尝试；打开或 prepare 任一失败返回 nil（供外层回落 immutable）
+    private static func querySessionMap(path: String, immutable: Bool) -> [String: String]? {
         var db: OpaquePointer?
-        if sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) != SQLITE_OK {
-            sqlite3_close(db)
+        let rc: Int32
+        if immutable {
             let escaped = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
-            guard sqlite3_open_v2("file:\(escaped)?immutable=1", &db,
-                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else { return [:] }
+            rc = sqlite3_open_v2("file:\(escaped)?immutable=1", &db,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
+        } else {
+            rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil)
+        }
+        let mode = immutable ? "immutable" : "ro"
+        guard rc == SQLITE_OK else {
+            Logger.log(.refresh, "[WbTokDbg] \(mode) 打开失败 rc=\(rc)")
+            sqlite3_close(db)
+            return nil
         }
         defer { sqlite3_close(db) }
         var out: [String: String] = [:]
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT id, cwd FROM sessions", -1, &stmt, nil) == SQLITE_OK else { return out }
+        guard sqlite3_prepare_v2(db, "SELECT id, cwd FROM sessions", -1, &stmt, nil) == SQLITE_OK else {
+            Logger.log(.refresh, "[WbTokDbg] \(mode) prepare 失败 msg=\(sqlite3_errmsg(db).map { String(cString: $0) } ?? "")")
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
             let cwd = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
             if !id.isEmpty, !cwd.isEmpty { out[id] = cwd }
         }
-        sqlite3_finalize(stmt)
+        Logger.log(.refresh, "[WbTokDbg] \(mode) sessionMap=\(out.count)")
         return out
     }
 

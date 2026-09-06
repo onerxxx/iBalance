@@ -651,8 +651,8 @@ final class UsageHistoryPopoverAnchorView: NSView {
 /// pulsing=true 时填充层以 2s 周期透明度呼吸（0.55↔1.0），示意额度正在被消耗。
 /// 脉冲状态由外部（makePanelSnapshot）传入，不自行比较，避免被面板操作重置。
 /// 类名与 API（ratio / pulsing / intrinsicContentSize）沿用 UsageDots，调用点零改动；
-/// 尺寸适配原点阵槽位：固有宽 45.54pt（9×5.06）、槽高 7pt（外部 heightAnchor 固定），
-/// 条高 5.06pt（原方块边长）在槽内垂直居中，胶囊圆角 = 条高/2。
+/// 尺寸适配原点阵槽位：固有宽 50.09pt（9×5.06×1.1）、槽高 7pt（外部 heightAnchor 固定），
+/// 条高 4.06pt 在槽内垂直居中，胶囊圆角 = 条高/2。
 final class UsageDots: NSView {
     var ratio: CGFloat = 0 { didSet { updateProgress() } }
     var pulsing: Bool = false {
@@ -662,9 +662,10 @@ final class UsageDots: NSView {
         }
     }
 
-    // ── 尺寸：沿用原点阵口径（9 方块 × 5.06pt = 45.54pt 宽；7pt 槽高由外部约束固定）──
-    private static let barHeight: CGFloat = 5.06
-    private static let barWidth: CGFloat = 9 * 5.06   // 45.54
+    // ── 尺寸：原点阵口径加长 10%（9 方块 × 5.06 × 1.1 = 50.09pt 宽，2026-09-06 用户指定）；
+    //    条高 4.06（2026-09-06 用户「高度减少1pt」，原 5.06）；槽高 7pt 由外部约束固定 ──
+    private static let barHeight: CGFloat = 4.06
+    private static let barWidth: CGFloat = 9 * 5.06 * 1.1   // 50.09（原 45.54 加长 10%）
     /// 轨道透明度（dotsDim 再乘此系数：深 systemGray@0.75→0.34 / 浅 systemGray→0.45）
     private static let trackAlpha: CGFloat = 0.45
     /// 填充蓝（比 systemBlue 更亮的亮蓝 #409CFF，sRGB 所见即所得）
@@ -723,22 +724,29 @@ final class UsageDots: NSView {
         progressLayer.cornerRadius = barRect.height / 2
         CATransaction.commit()
     }
-    /// 条框：全宽（= 固有宽 45.54）、高 5.06 垂直居中于 7pt 槽
+    /// 条框：全宽（= 固有宽 50.09）、高 4.06 垂直居中于 7pt 槽
     private func barFrame() -> CGRect {
         let h = min(Self.barHeight, bounds.height)
         return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
     }
+    /// 三色渐变端标（2026-09-06 用户「改为 token 点阵颜色最亮三个颜色」定稿 =
+    /// Token 热力图 4 级绿阶 heatLevelsDark 的 level 2–4，左深右亮、填充右端最亮；
+    /// 2026-09-06 用户「浅色主题下三个颜色提亮一些 饱和一点点」拆双档：浅色 =
+    /// 各色 HSL 亮度 L +7~8、饱和 S +8，#1A9338 / #2CC348 / #69E277）
+    private static func progressStops(dark: Bool) -> [(r: CGFloat, g: CGFloat, b: CGFloat)] {
+        dark
+            ? [(0x19, 0x6C, 0x2E), (0x2E, 0xA0, 0x43), (0x56, 0xD3, 0x64)]
+            : [(0x1A, 0x93, 0x38), (0x2C, 0xC3, 0x48), (0x69, 0xE2, 0x77)]
+    }
     /// 轨道/渐变按「视图生效外观」解算落 layer（直接 .cgColor 会定格错主题分支）
     private func applyColors() {
         guard trackLayer.superlayer != nil else { return }
-        let blue = Self.brightBlue
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         trackLayer.backgroundColor = Palette.borderCGColor(Palette.dotsDim.withAlphaComponent(Self.trackAlpha), in: self)
-        progressLayer.colors = [
-            Palette.borderCGColor(blue.withAlphaComponent(0.30), in: self),
-            Palette.borderCGColor(blue.withAlphaComponent(0.95), in: self),
-        ]
+        progressLayer.colors = Self.progressStops(dark: effectiveAppearance.isDark)
+            .map { Palette.borderCGColor(NSColor(srgbRed: $0.0 / 255.0, green: $0.1 / 255.0,
+                                                 blue: $0.2 / 255.0, alpha: 1), in: self) }
         CATransaction.commit()
     }
     private func updateProgress() {
@@ -773,20 +781,13 @@ final class UsageDots: NSView {
     }
     private var lastHasFill = false
     private func updatePulse() {
+        // 脉冲呼吸（进行中 2s 透明度闪烁）已整体停用（2026-09-06 用户要求所有卡片
+        // 进度条不再闪烁）：仅清除在途动画并复位不透明度，pulsing 入参保留兼容调用方
         progressLayer.removeAnimation(forKey: "pulseGroup")
         progressLayer.opacity = 1.0
-        guard pulsing, ratio > 0 else { return }
-        // 填充层脉冲：2s 周期透明度呼吸（沿用点阵口径 0.55↔1.0）
-        let opacityAnim = CAKeyframeAnimation(keyPath: "opacity")
-        opacityAnim.values = [0.55, 1.0, 0.55]
-        opacityAnim.keyTimes = [0, 0.5, 1.0]
-        opacityAnim.duration = 2.0
-        opacityAnim.repeatCount = .infinity
-        opacityAnim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        progressLayer.add(opacityAnim, forKey: "pulseGroup")
     }
     override var intrinsicContentSize: NSSize {
-        // 宽度沿用点阵口径（9×5.06=45.54）；高度默认 7.0pt，实际由外部 heightAnchor 约束决定
+        // 宽度沿用点阵口径加长 10%（50.09）；高度默认 7.0pt，实际由外部 heightAnchor 约束决定
         return NSSize(width: Self.barWidth, height: 7.0)
     }
 }

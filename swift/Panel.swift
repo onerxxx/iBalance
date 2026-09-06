@@ -68,6 +68,8 @@ struct PanelSnapshot: Equatable {
     var valueScrollPreviewEnabled = false
     /// 状态调试预览开关（开启后三态光环轮派到前三张 Agent 卡，演示进行中/完成/中断动画）
     var statusDebugPreview = false
+    /// 长进度卡片开关（开启后余额卡片进度条独占整行 + 副标题下移一行）
+    var longProgressCard = false
     /// 自动检查更新开关（GitHub Releases 启动静默检查）
     var updateAutoCheckEnabled = true
 }
@@ -109,9 +111,13 @@ enum Motion {
     /// 余额数字滚动（Number Rolling）：数据变化反馈类动效，非 UI 状态切换，
     /// 用户指定加长时长，不适用 0.40 硬顶
     static let roll: CFTimeInterval = 3.0
-    /// Agent 卡 hover 确认时长：背景进度条从左到右撑满的时长，撑满才切换 Token 板块，
-    /// 子账号积分条换入同此节拍（用户指定 0.8s，滤掉光标快速掠过；确认交互非装饰动效，不适用 0.40 硬顶）
+    /// Agent 卡 hover 确认时长：光标驻留此时长才切换 Token 板块，
+    /// 子账号积分条换入同此节拍（用户指定 0.8s，滤掉光标快速掠过；确认交互非装饰动效，不适用 0.40 硬顶。
+    /// 光晕下移动效不等此时长，见 Controls.swift startHoverDwell）
     static let hoverDwell: CFTimeInterval = 0.8
+    /// 平台卡 hover 驻留进度视觉（2026-09-06 起 = 光晕下移，替换左→右填充）：
+    /// 光晕起始位置高出卡片顶边的距离
+    static let glowDescendOffset: CGFloat = 16
     /// 打开面板后滚动数字重滚入场的延迟（用户指定 0.5s）
     static let openRerollDelay: CFTimeInterval = 0.5
     /// 打开面板补发整段时长（用户指定 2s）：从开始到停下恒为此时长——行进最长的
@@ -198,27 +204,52 @@ enum Palette {
     }
     /// 渐变端点数组（CAGradientLayer.colors 直接可用）
     static let hoverGradient: [NSColor] = [hoverGradientBright, hoverGradientDark]
-    /// Agent/API 平台卡 hover 强背景（用户指定）：深色 = 黑 @50%，浅色 = 白 @80%。
-    /// 两端点同色 = 视觉纯色；平台卡 HoverCard 经 hoverGradientOverride 套用，
-    /// 余额卡/磁贴/折叠标题条/用量条仍走上面的淡渐变，互不影响。
+    /// Agent/API 平台卡 hover 强背景（用户指定）：深色 = 黑 @35%（2026-09-06 由 50% 提亮 10%，
+    /// 同日「渐变黑提亮一点点」再降 5 个点），浅色 = 白 @80%。两端点同色 = 视觉纯色；
+    /// 平台卡 HoverCard 与 Agent 标题胶囊经 hoverGradientOverride 套用，
+    /// 余额卡/磁贴/折叠标题条/用量条仍走淡渐变，互不影响。
     static let cardHoverStrongBright = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.black.withAlphaComponent(0.4)
-            : NSColor.white.withAlphaComponent(0.8)
+            ? NSColor.black.withAlphaComponent(0.35)
+        // 浅色外观 = 白 @52%（2026-09-06 用户「提亮大约30%」由 40% 上调，
+        // 白色叠加层亮度只由 alpha 决定，0.4×1.3≈0.52）
+            : NSColor.white.withAlphaComponent(0.52)
     }
     static let cardHoverStrongDark = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.black.withAlphaComponent(0.4)
+            ? NSColor.black.withAlphaComponent(0.35)
             : NSColor.white.withAlphaComponent(0.8)
     }
     static let cardHoverStrong: [NSColor] = [cardHoverStrongBright, cardHoverStrongDark]
-    /// 平台卡 hover 强背景边缘渐隐宽度（用户指定 5pt）：中心纯色、四边向内渐变到透明。
-    /// 位图渲染用，clamp 到 min(W,H)/2 防扁卡越界
-    static let cardHoverEdgeFade: CGFloat = 5
-    /// 暗色主题下平台卡 hover 渐隐带的外缘 alpha：系统灰 @50%，再向中心
-    /// 当前 hover 颜色/alpha 做 premultiplied 线性过渡。
-    /// 浅色主题不受影响，边缘仍渐隐到透明。
-    static let cardHoverEdgeAlpha: CGFloat = 0.50
+    /// 平台卡 hover 顶部椭圆光晕（2026-09-06 用户指定，参考图=顶部中央大椭圆模糊白光）：
+    /// 顶部椭圆光晕 alpha（按外观分档）：深色 20%（2026-09-06 用户「暗一些」由 25% 再降）；
+    /// 浅色 35%（2026-09-06 用户指定「浅色再加强」）
+    static let cardHoverGlowAlphaDark: CGFloat = 0.20
+    static let cardHoverGlowAlphaLight: CGFloat = 0.35
+    static func cardHoverGlowAlpha(dark: Bool) -> CGFloat {
+        dark ? cardHoverGlowAlphaDark : cardHoverGlowAlphaLight
+    }
+    static let cardHoverGlowRadiusX: CGFloat = 0.55  // 半轴 = 0.55 × 卡宽
+    static let cardHoverGlowRadiusY: CGFloat = 0.65  // 半轴 = 0.65 × 卡高
+    /// 高斯衰减松紧（按外观分档）：exp(-(spread·t)²)，越大光斑越收紧；2026-09-06
+    /// 用户「模糊放大」2.2 → 1.4，同日「暗色主题下光晕更宽」拆两档——暗色取更小值
+    /// 光晕更宽（1.4 → 1.15 → 1.0 用户「再宽一些」两连调）
+    static let cardHoverGlowSpreadDark: CGFloat = 1.0
+    static let cardHoverGlowSpreadLight: CGFloat = 1.4
+    static func cardHoverGlowSpread(dark: Bool) -> CGFloat {
+        dark ? cardHoverGlowSpreadDark : cardHoverGlowSpreadLight
+    }
+    /// 平台卡 hover 烘焙边框（2026-09-06 取代平台卡 CALayer 描边）：带宽 0.8pt
+    ///（2026-09-06 用户由 1pt 改细），
+    /// 顶 = hoverBorderBright 原色、底 = 同色 RGB × BottomDim（上浅下深压暗）。
+    /// AlphaBoost：位图边缘抗锯齿会把窄带的等效覆盖稀释，×2 恢复 CALayer 同宽描边的可见度
+    ///（2026-09-06 用户反馈「hover 没有边框」）
+    static let cardHoverBorderWidth: CGFloat = 0.8
+    static let cardHoverBorderBottomDim: CGFloat = 0.5
+    static let cardHoverBorderAlphaBoost: CGFloat = 2.0
+    /// 边框带顶色亮度（仅浅色）：2026-09-06 用户「改为灰色」由 0.7 降至 0.55
+    ///（0.8 白系压暗档已废）；alpha 与暗色一致
+    static let cardHoverBorderLightBrightness: CGFloat = 0.55
     /// 渐变视觉角度：水平向右为 0°，顺时针偏移
     static let hoverGradientAngleDeg: CGFloat = 60
 
@@ -247,10 +278,11 @@ enum Palette {
     /// 容器玻璃渐变底色（中灰半透明）：与 containerTint 组成纵向渐变，顶部近黑 → 底部中灰
     static let containerTintBottom = NSColor(calibratedWhite: 0.25, alpha: 0.55)
 
-    /// 浅色主题渐变遮罩两端：顶部亮白 → 底部全透明（统一增强浅色毛玻璃提亮，
+    /// 浅色主题渐变遮罩两端：顶部亮白 → 底部微白（2026-09-06 用户要求整体提亮：
+    /// 顶 0.55→0.75、底 0→0.2；同日晚「暗部更亮」底 0.2→0.35。
     /// 与深色遮罩方向互补——深色是顶部透明 → 底部近黑）
-    static let containerTintLightTop = NSColor.white.withAlphaComponent(0.55)
-    static let containerTintLightBottom = NSColor.white.withAlphaComponent(0)
+    static let containerTintLightTop = NSColor.white.withAlphaComponent(0.75)
+    static let containerTintLightBottom = NSColor.white.withAlphaComponent(0.35)
 
     /// 主面板容器背景配色（单一事实源）：applyGradient 与各子弹窗（Token/用量）兜底共用。
     /// 渐变开：深色遮罩（加深黑）= 顶部全透明 → 底部近黑（containerTint 系）；
@@ -283,6 +315,10 @@ enum Palette {
     static let panelHeaderContentColor = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor.systemGray : NSColor.black
     }
+    /// header 背景遮罩色（浅色外观）：#F4F4F4 @90%（2026-09-06 用户指定 #f4f4f4，
+    /// 原 #EBEBEB@90%）；深色外观沿用容器顶色
+    static let headerBackdropLightColor = NSColor(calibratedRed: 0xF4 / 255.0, green: 0xF4 / 255.0,
+                                                  blue: 0xF4 / 255.0, alpha: 0.9)
     /// header 下缘分割线色（深色白@10% / 浅色黑@8%），由 PanelSeparatorView 自绘使用。
     static let headerSeparatorColor = NSColor(name: nil) { appearance in
         appearance.isDark
@@ -297,11 +333,11 @@ enum Palette {
             ? NSColor.white.withAlphaComponent(0.10)
             : NSColor.black.withAlphaComponent(0.06)
     }
-    /// hover 边框提亮色（深色白@18% / 浅色黑@40%）：hover 时边框色随宽度一起动画到此色
+    /// hover 边框提亮色（深色白@24% / 浅色黑@46%）：hover 时边框色随宽度一起动画到此色
     static let hoverBorderBright = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.white.withAlphaComponent(0.18)
-            : NSColor.black.withAlphaComponent(0.40)
+            ? NSColor.white.withAlphaComponent(0.24)
+            : NSColor.black.withAlphaComponent(0.46)
     }
     /// 动态色落 CALayer 前按「视图生效外观」解算（hover 路径必须走这里）。
     /// 事件回调（mouseEntered/Exited）里 NSAppearance.current 是**系统**外观，
@@ -355,9 +391,10 @@ enum Palette {
     /// Token 热力图有量级配色（按生效外观选择，集中管理勿散落）：
     /// 深色主题 = GitHub 暗色绿阶 4 级离散色（用户定稿 2026-08-29）：
     /// #063A16 / #196C2E / #2EA043 / #56D364（level 1→4），见 heatLevelsDark；
-    /// 浅色主题沿用两端点线性插值 #b9eac5 → #2cc859（浅底由浅到深，4 级对比）。
+    /// 浅色主题两端点线性插值 #9BE9A8 → #216E39（2026-09-06 用户要求加深适配浅色主题，
+    /// 取 GitHub 浅色热力图两端点，原 #B9EAC5 → #2CC859 过浅已废）。
     static let heatLevelsLight: (from: (r: Int, g: Int, b: Int), to: (r: Int, g: Int, b: Int)) =
-        ((185, 234, 197), (44, 200, 89))
+        ((155, 233, 168), (33, 110, 57))
     /// 深色主题热力图 4 级离散色（level 1→4），levelColor 直取不做插值
     static let heatLevelsDark: [(r: Int, g: Int, b: Int)] = [
         (6, 58, 22), (25, 108, 46), (46, 160, 67), (86, 211, 100)
@@ -459,15 +496,15 @@ final class BalancePanelViewController: NSViewController {
     /// 面板宽度唯一值（用户口中的「面板宽度」即此值）：popover 总宽，含容器左右缩进。
     /// document 宽 = panelWidth − 容器缩进×2，内容按约束压缩/截断自适应承接，
     /// 不再由内容固有宽（fittingSize）反推宽度。用户改宽度只动这一个数。
-    /// ⚠️ 硬下限 270：操作磁贴行固定宽 4×56+3×2=230，要求 document ≥ 244
-    /// （230 + root 缩进 14），低于此值磁贴行被压、Auto Layout 破坏约束。
-    static let panelWidth: CGFloat = 276
+    /// 操作磁贴行固定宽 4×56+3×2=230：现行 document=242（264 − 11×2，2026-09-06 晚
+    /// 268→264、缩进 13→11 同轮调整，内容宽与 268/13 时代完全一致）实测可用。
+    static let panelWidth: CGFloat = 264
     /// 满尺寸内容（hasFullSizeContent）下容器铺满整个 popover 窗口，系统原有的
     /// 左右边距带不再存在：由容器层（scrollView 左右约束）统一补回的缩进。
-    /// root/footer 自身保留原 7pt 正文缩进，9+7=16pt（2026-09-03 四次调整：
-    /// 16 → 8 → 13 → 9）；header 按钮对齐、面板宽度下限、
+    /// root/footer 自身保留原 7pt 正文缩进，11+7=18pt（2026-09-03 四次调整：
+    /// 16 → 8 → 13 → 9；2026-09-06 晚用户 -2pt → 11）；header 按钮对齐、面板宽度下限、
     /// document 宽解算均引用此值。
-    static let contentHorizontalInset: CGFloat = 9
+    static let contentHorizontalInset: CGFloat = 11
     private let panel: BalancePanelView
     private let scrollView = NSScrollView()
     /// 底部「下方还有内容」提示层（磨砂 + 渐变 + 箭头），盖在 scrollView 之上
@@ -603,8 +640,10 @@ final class BalancePanelViewController: NSViewController {
             backdrop.state = .active
             backdrop.isEmphasized = false
             backdrop.appearance = container.appearance
-            backdrop.tintColor = initialColors.top
-            backdrop.tintBottomColor = initialColors.top
+            // 浅色外观 = #EBEBEB @90%（2026-09-06 用户指定），深色沿用容器顶色
+            backdrop.tintColor = container.effectiveAppearance.isDark
+                ? initialColors.top : Palette.headerBackdropLightColor
+            backdrop.tintBottomColor = backdrop.tintColor
             container.addSubview(backdrop)
             // 顶边贴窗口绝对顶部（= 伸进三角箭头区），header 的毛玻璃由此一直铺到
             // 三角里，箭头与 header 同色；底边落在 header 下缘（安全区顶 + header 高）。
@@ -1001,12 +1040,15 @@ final class BalancePanelViewController: NSViewController {
         container.tintColor = colors.top
         container.tintBottomColor = colors.bottom
         container.tintGradientStartY = 0
-        // header 背景层同步同一套外观与遮罩（渐变开关/浅色主题切换即时生效）
+        // header 背景层同步同一套外观与遮罩（渐变开关/浅色主题切换即时生效）；
+        // 浅色外观 = #EBEBEB @90%（2026-09-06 用户指定），深色沿用容器顶色
         if let backdrop = panel.headerBackdropView {
             backdrop.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
                                                           gradientOn: panel.panelGradientEnabled)
-            backdrop.tintColor = colors.top
-            backdrop.tintBottomColor = colors.top
+            let headerTint = container.effectiveAppearance.isDark
+                ? colors.top : Palette.headerBackdropLightColor
+            backdrop.tintColor = headerTint
+            backdrop.tintBottomColor = headerTint
         }
     }
 
@@ -1100,8 +1142,6 @@ final class BalancePanelView: NSView {
     var onSetInterval: ((Int) -> Void)?          // 秒数：60 / 180 / 300
     /// 手动刷新（刷新时间行内的刷新按钮触发）
     var onManualRefresh: (() -> Void)?
-    /// 快速编译（header 右侧按钮触发，后台静默执行 swift/build.sh）
-    var onQuickBuild: (() -> Void)?
     var onSetApiKey: (() -> Void)?
     /// 面板渐变背景开关（设置卡片开关触发）
     var onTogglePanelGradient: (() -> Void)?
@@ -1113,6 +1153,8 @@ final class BalancePanelView: NSView {
     var onToggleValueScrollPreview: (() -> Void)?
     /// 状态调试预览开关（设置卡片开关触发：三态光环轮派前三张 Agent 卡演示动画）
     var onToggleStatusDebugPreview: (() -> Void)?
+    /// 长进度卡片开关（设置卡片开关触发：整行进度条 + 副标题下移，随快照重建卡片）
+    var onToggleLongProgressCard: (() -> Void)?
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
     var onPanelGradientChanged: (() -> Void)?
     var onAbout: (() -> Void)?
@@ -1190,6 +1232,20 @@ final class BalancePanelView: NSView {
 
     /// 单个多号卡片的控件引用（update 时直接赋值，无需重建；WB / TRAE / ZCode 共用）。
     /// 非当前账号的 dots 为占位实例（未加入视图层级，更新时跳过）。
+    /// 副标题完整段落数据盒（引用类型）：apply 持续写入最新完整文案；账号条换入/离场
+    /// 闭包据此改写精简文案/恢复——跨闭包共享用引用，值类型数组做不到
+    final class ExpireSegBox {
+        var full: [String] = []
+    }
+
+    /// hover 账号条换入期间的副标题精简（2026-09-06 用户指定）：倒计时三段
+    /// ["剩余","26天","14:35"] → ["26天"]；无天段保留时间段；单段文案不精简
+    private func compactExpireSegments(_ segs: [String]) -> [String] {
+        guard segs.count > 1 else { return segs }
+        if let day = segs.first(where: { $0.contains("天") }) { return [day] }
+        return [segs.last!]
+    }
+
     private struct CardEntry {
         let uid: String
         let valueView: RollingNumberView   // 余额数值（逐位垂直滚动）
@@ -1207,6 +1263,8 @@ final class BalancePanelView: NSView {
         var subValueLabels: [NSTextField] = []   // 其余账号条内积分数值 label（apply 随刷新更新文本）
         var subItems: [SubAccountItemView] = []  // 其余账号条本体（apply 同步 tokenInvalid 等悬浮气泡数据）
         var chipTipBox: ChipTipBox? = nil        // 当前账号积分 chip 气泡数据盒（apply 随刷新更新昵称/签到徽章）
+        var segBox: ExpireSegBox? = nil          // 副标题完整段落数据盒（账号条换入期间改写精简文案/离场恢复）
+        var dotsAlwaysVisible = false            // 长进度卡片：进度条常驻，不随账号条换入隐藏
     }
 
     /// 各平台卡片差异配置（icon / 标题 / 签到行 / 到期行 / reward 兜底）
@@ -1220,18 +1278,19 @@ final class BalancePanelView: NSView {
         let expireIconSymbol: String?   // 第二行图标（nil = 纯文本行；重置倒计时按周期选 "clock-stop-w"=7天 / "clock-stop-m"=月，周期不确定的倒计时（ZCode 套餐到期）用 "clock-stop"，DS/ZhiPu 为 "external-link"，均 bundle SVG）
         let menuBarIdPrefix: String     // 菜单栏 item id 前缀："trae:" / "wb:" / "zcode:"
         // iconSize 已统一（2026-08-31 用户拍板）：所有 API / Agent 卡 icon 宽高一律 24pt
-        // （2026-09-02 用户要求 +1pt → 25pt，与图标列宽同宽）。
+        // （2026-09-02 用户要求 +1pt → 25pt，与图标列宽同宽；
+        // 2026-09-05 用户要求 +15% → 27.75pt，与图标列宽同宽）。
         // 非 Agent 平台（DS/ZhiPu/Qwen）恒单账号、Agent 平台非当前账号走 hover 账号条，
         // 不再存在「非当前账号小卡」，secondary 尺寸字段已随死代码清理移除
-        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 25, checkin: true, showsExpire: true, expireIconSymbol: "clock-stop-m", menuBarIdPrefix: "wb:")
-        static let trae  = CardStyle(icon: "trae-color", name: "Trae", platformID: "trae", iconSize: 25, checkin: true, showsExpire: true, expireIconSymbol: "xmark", menuBarIdPrefix: "trae:")
-        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 25, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "zcode:")
-        static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 25, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop-m", menuBarIdPrefix: "codex:")
-        static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 25, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
+        static let wb    = CardStyle(icon: "workbuddy", name: "WorkBuddy", platformID: "wb", iconSize: 27.75, checkin: true, showsExpire: true, expireIconSymbol: "clock-stop-m", menuBarIdPrefix: "wb:")
+        static let trae  = CardStyle(icon: "trae-color", name: "Trae", platformID: "trae", iconSize: 27.75, checkin: true, showsExpire: true, expireIconSymbol: "xmark", menuBarIdPrefix: "trae:")
+        static let zcode = CardStyle(icon: "zhipu", name: "ZCode", platformID: "zcode", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop", menuBarIdPrefix: "zcode:")
+        static let codex = CardStyle(icon: "codex", name: "Codex", platformID: "codex", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop-m", menuBarIdPrefix: "codex:")
+        static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
         // ZhiPu：与 ds 同构的单账号卡（uid 恒 "zhipu" 无前缀，右键菜单 id 恰为 MenuBarPrefix.zhipu）；副标题带 external-link 图标
-        static let zhipu = CardStyle(icon: "zhipu", name: "ZhiPu", platformID: "zhipu", iconSize: 25, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
+        static let zhipu = CardStyle(icon: "zhipu", name: "ZhiPu", platformID: "zhipu", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
         // Qwen（千问 Token Plan）：单账号卡，值为周剩余百分比；副标题为 7 天限额重置倒计时（clock-stop-w 图标）
-        static let qwen = CardStyle(icon: "qwen", name: "Qwen", platformID: "qwen", iconSize: 25, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop-w", menuBarIdPrefix: "")
+        static let qwen = CardStyle(icon: "qwen", name: "Qwen", platformID: "qwen", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop-w", menuBarIdPrefix: "")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -1246,9 +1305,9 @@ final class BalancePanelView: NSView {
     /// 平台容器 == 组宽：单列布局下容器撑满组宽，数值/点阵才能贴右对齐
     /// group 省略时锚定 Agent 组（API 组容器需显式传 apiGroupContainer）
     func pinPlatformWidth(_ container: NSStackView, in group: NSStackView? = nil) {
-        let c = container.widthAnchor.constraint(equalTo: (group ?? balanceGroupContainer).widthAnchor)
-        c.isActive = true
+        container.widthAnchor.constraint(equalTo: (group ?? balanceGroupContainer).widthAnchor).isActive = true
     }
+
     /// 余额卡片组视觉底边距面板顶部的距离（背景渐变从此处开始；panel 非 flipped，
     /// 视觉底部 = frame.minY，故 = bounds.height - minY；布局前为 0 = 渐变暂从顶部开始）
     var balanceSectionBottomY: CGFloat {
@@ -1318,18 +1377,31 @@ final class BalancePanelView: NSView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        // 预设边框色/hover 渐变经 .cgColor 落盘会定格当时外观：外观变化时重解算。
-        // hover 中（borderWidth > 0）的层跳过——其动画路径每次都取当前解算值。
+        // 外观切换就地换肤（不重建卡片）：① 品牌 Clear 系图标随生效外观换版
+        //（ClearDark ↔ ClearLight，2026-09-06 用户导出浅色资产，按 identifier 标签
+        // brandIcon:<键> 识别）；② 预设边框色/hover 渐变经 .cgColor 落盘会定格当时
+        // 外观：重解算（hover 中 borderWidth > 0 的层跳过——动画路径每次取当前值）。
         let appearance = effectiveAppearance
         var stack = subviews
         while let v = stack.popLast() {
+            if let iv = v as? NSImageView, let id = iv.identifier?.rawValue,
+               id.hasPrefix("brandIcon:") {
+                let key = String(id.dropFirst("brandIcon:".count))
+                if iv.bounds.width > 0,
+                   let brand = BalancePanelView.brandIconImage(key, dark: appearance.isDark) {
+                    let scaled = brand.copy() as! NSImage
+                    scaled.size = iv.bounds.size
+                    iv.image = scaled
+                }
+            }
             if let layer = v.layer, layer.borderWidth == 0 {
                 appearance.performAsCurrentDrawingAppearance {
                     layer.borderColor = Palette.hoverBorderNormal.cgColor
                 }
             }
             stack.append(contentsOf: v.subviews)
-        }        // 渐变开时遮罩明暗随生效外观：系统深浅切换重刷遮罩，并同步用量趋势子面板配色
+        }
+        // 渐变开时遮罩明暗随生效外观：系统深浅切换重刷遮罩，并同步用量趋势子面板配色
         onPanelGradientChanged?()
         syncUsageHistoryPanelBackground()
 
@@ -1438,6 +1510,9 @@ final class BalancePanelView: NSView {
     private(set) var valueScrollPreviewEnabled = false
     /// 状态调试预览开关（设置卡片开关：三态光环轮派前三张 Agent 卡，演示进行中/完成/中断动画）
     let statusDebugSwitch = MiniSwitch()
+    /// 长进度卡片开关（余额卡片整行进度条 + 副标题下移；update 时随快照同步状态）
+    let longProgressCardSwitch = MiniSwitch()
+    private(set) var longProgressCardEnabled = false
     /// 状态调试副标题（开发调试行）：2026-09-01 加 90pt 宽度上限——原文案 ≈138pt 把
     /// 设置卡 fittingSize 撑到 256（popover 撑宽元凶之一）；上限约束参与 fittingSize，
     /// 防止开发调试行影响面板宽度
@@ -1585,6 +1660,21 @@ final class BalancePanelView: NSView {
         statusDebugPreviewEnabled = s.statusDebugPreview
         statusDebugSwitch.state = s.statusDebugPreview ? .on : .off
         if statusDebugChanged {
+            wbCardUids = []
+            zcodeCardUids = []
+            traeCardUids = []
+            codexCardUids = []
+            contentSizeChanged = true
+        }
+        // 长进度卡片开关同步：卡片第二行结构（整行进度条+副标题下移）随卡片重建切换，
+        // 清全部平台 uid 缓存强制重建
+        let longProgressCardChanged = s.longProgressCard != longProgressCardEnabled
+        longProgressCardEnabled = s.longProgressCard
+        longProgressCardSwitch.state = s.longProgressCard ? .on : .off
+        if longProgressCardChanged {
+            dsCardUids = []
+            zhipuCardUids = []
+            qwenCardUids = []
             wbCardUids = []
             zcodeCardUids = []
             traeCardUids = []
@@ -1904,12 +1994,20 @@ final class BalancePanelView: NSView {
             /// 期间重复 exit 事件（滚动补偿/几何校准会补发）若不加拦会重复启动 crossfade，
             /// 动画反复重启 = 观感不连贯的根因之一
             var stripExitInFlight = false
+            /// 账号条隐藏期零宽约束（2026-09-06 默认态副标题重叠排查）：条隐藏时若仍占
+            /// 自然宽，副标题渐隐视图（尾随钉条前缘）会被无谓压窄。零宽=隐藏不占位，
+            /// 换入解除、落藏恢复
+            var stripZeroWidth: NSLayoutConstraint?
             if isAgentCard, accounts.contains(where: { !$0.isCurrent }) {
                 let strip = NSStackView()
                 strip.orientation = .horizontal
                 strip.alignment = .centerY
                 strip.spacing = 2.5
                 strip.heightAnchor.constraint(equalToConstant: 12).isActive = true
+                // 隐藏期零宽（见 stripZeroWidth 注释）：初始隐藏即激活
+                let zeroWidth = strip.widthAnchor.constraint(equalToConstant: 0)
+                zeroWidth.isActive = true
+                stripZeroWidth = zeroWidth
                 strip.isHidden = true
                 for sub in accounts where !sub.isCurrent {
                     let item = SubAccountItemView()
@@ -1983,6 +2081,7 @@ final class BalancePanelView: NSView {
             // TRAE 原签到信息行是恒空的占位容器（文字条目已移除）——已废弃：
             // info=nil 时点阵/账号条仍作第二行入组（标题+积分贴顶，与其他卡对齐）；非当前账号无第二行
             var segLabels: [NSTextField] = []
+            let segBox = ExpireSegBox()
             var expireIcon: NSImageView? = nil
             let info: NSStackView?
             if isCurrent && style.showsExpire {
@@ -2057,6 +2156,7 @@ final class BalancePanelView: NSView {
                                   premadeIconView: fadeIcon,
                                   hoverSubStrip: subStrip,
                                   valuePrefixIcon: isAgentCard ? "coin" : nil,
+                                  longProgressCard: longProgressCardEnabled,
                                   titleLabelRef: { capturedTitle = $0 },
                                   menuBarDotRef: { capturedMenuBarDot = $0 },
                                   statusRingRef: needsStatusRing
@@ -2074,14 +2174,21 @@ final class BalancePanelView: NSView {
                 self?.updatePlatformDrag(style.platformID, locationInWindow: point)
             }, onDragEnded: { [weak self] in
                 self?.endPlatformDrag()
-            }, topPadding: cardPadTop, bottomPadding: cardPadBottom, horizontalPadding: 8, trailingPadding: 10,
+            }, topPadding: cardPadTop, bottomPadding: cardPadBottom,
+               // 长进度卡片左缩进与普通卡一致 8pt（2026-09-06 用户「+1pt」由 7 改）；
+               // 右缩进独立档恒 10
+               horizontalPadding: 8, trailingPadding: 10,
                cardBackground: nil, hoverGradientOverride: Palette.cardHoverStrong)
             cardRef = card
             // 当前账号积分 chip 气泡数据盒（hc 块内挂接闭包捕获，append 后存入 entry 供 apply 更新）
             var newChipTipBox: ChipTipBox? = nil
             if let hc = card as? HoverCard {
+                hc.hoverDebugLabel = style.menuBarIdPrefix + uid
                 // 其余账号切换项注册到卡片：点在项内由卡片 mouseDown 路由转交，
                 // 不触发整卡点击/拖拽（整卡 hitTest 接管，项自身收不到事件）
+                // 长进度卡片：进度条常驻不参与互换（2026-09-06 用户指定），点阵淡出/
+                // 恢复仅列表态执行；子账号条落点在副标题行右侧（布局见 balanceContentRow）
+                let dotsIndependent = longProgressCardEnabled
                 if let strip = subStrip {
                     hc.interactiveSubviews = strip.arrangedSubviews
                 }
@@ -2111,7 +2218,15 @@ final class BalancePanelView: NSView {
                                 let showEp = subStripSwapEpoch
                                 strip.isHidden = false
                                 strip.alphaValue = 1
+                                stripZeroWidth?.isActive = false   // 换入：零宽解除，条按自然宽接管
                                 stripExitInFlight = false   // 新一轮换入：离场在途标记复位
+                                // 副标题精简让位账号条（2026-09-06 用户指定）：
+                                // ["剩余","26天","14:35"] → ["26天"]；离场由落藏回调恢复
+                                let shown = compactExpireSegments(segBox.full)
+                                for (i, lbl) in segLabels.enumerated() {
+                                    if i < shown.count { lbl.stringValue = shown[i]; lbl.isHidden = false }
+                                    else { lbl.isHidden = true }
+                                }
                                 // 当前账号积分同步 chip 化（cardForeground 背景 + 反向前景，2026-09-02 用户定稿）
                                 valueView?.setChipActive(true)
                                 // chip 换入落点主动探测：光标可能恰停在积分按钮上静止，
@@ -2124,38 +2239,41 @@ final class BalancePanelView: NSView {
                                 }
                                 self.staggerRiseIn(strip.arrangedSubviews,
                                                    isCancelled: { showEp != subStripSwapEpoch })
-                                if self.shouldReduceMotion {
-                                    dotsView.isHidden = true
-                                    dotsView.alphaValue = 1
-                                } else {
-                                    // 显式 CABasicAnimation（fromValue 钉表现层当前值）：
-                                    // animator 路径 fromValue=nil，CA 会取提交时 presentation，
-                                    // 与 restore 的 model 钉值互踩
-                                    if let layer = dotsView.layer {
-                                        layer.removeAnimation(forKey: "dotsRestore")
-                                        layer.removeAnimation(forKey: "opacity")   // 清隐式残留
-                                        let anim = CABasicAnimation(keyPath: "opacity")
-                                        anim.fromValue = layer.presentation()?.opacity ?? layer.opacity
-                                        anim.toValue = Float(0)
-                                        anim.duration = Motion.stripSwap.dotsFade
-                                        anim.timingFunction = Motion.easeOutCubic
-                                        layer.add(anim, forKey: "dotsFadeSwap")
-                                        CATransaction.begin()
-                                        CATransaction.setDisableActions(true)
-                                        layer.opacity = 0
-                                        CATransaction.commit()
-                                    } else {
-                                        dotsView.alphaValue = 0
-                                    }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + Motion.stripSwap.dotsFade) { [weak dotsView] in
-                                        // 点阵落藏：期间该换入若已被离场换出作废（换出会推进代际并
-                                        // 把点阵回升），过期回调不得藏掉
-                                        guard showEp == subStripSwapEpoch, let dotsView else { return }
-                                        CATransaction.begin()
-                                        CATransaction.setDisableActions(true)
+                                // 长进度卡片：进度条常驻（dotsIndependent），跳过点阵淡出与落藏
+                                if !dotsIndependent {
+                                    if self.shouldReduceMotion {
                                         dotsView.isHidden = true
-                                        dotsView.alphaValue = 1   // 落藏位 model 回写（禁隐式，防污染 restore 起播）
-                                        CATransaction.commit()
+                                        dotsView.alphaValue = 1
+                                    } else {
+                                        // 显式 CABasicAnimation（fromValue 钉表现层当前值）：
+                                        // animator 路径 fromValue=nil，CA 会取提交时 presentation，
+                                        // 与 restore 的 model 钉值互踩
+                                        if let layer = dotsView.layer {
+                                            layer.removeAnimation(forKey: "dotsRestore")
+                                            layer.removeAnimation(forKey: "opacity")   // 清隐式残留
+                                            let anim = CABasicAnimation(keyPath: "opacity")
+                                            anim.fromValue = layer.presentation()?.opacity ?? layer.opacity
+                                            anim.toValue = Float(0)
+                                            anim.duration = Motion.stripSwap.dotsFade
+                                            anim.timingFunction = Motion.easeOutCubic
+                                            layer.add(anim, forKey: "dotsFadeSwap")
+                                            CATransaction.begin()
+                                            CATransaction.setDisableActions(true)
+                                            layer.opacity = 0
+                                            CATransaction.commit()
+                                        } else {
+                                            dotsView.alphaValue = 0
+                                        }
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + Motion.stripSwap.dotsFade) { [weak dotsView] in
+                                            // 点阵落藏：期间该换入若已被离场换出作废（换出会推进代际并
+                                            // 把点阵回升），过期回调不得藏掉
+                                            guard showEp == subStripSwapEpoch, let dotsView else { return }
+                                            CATransaction.begin()
+                                            CATransaction.setDisableActions(true)
+                                            dotsView.isHidden = true
+                                            dotsView.alphaValue = 1   // 落藏位 model 回写（禁隐式，防污染 restore 起播）
+                                            CATransaction.commit()
+                                        }
                                     }
                                 }
                             }
@@ -2164,6 +2282,13 @@ final class BalancePanelView: NSView {
                         } else {
                             stripRevealWork?.cancel()
                             stripRevealWork = nil
+                            // 离开卡片：子账号 hover 态与悬浮气泡一律清掉（2026-09-06）。
+                            // 滚动/hitTest 校准走合成事件（window=nil），syncInteractiveHover
+                            // 会跳过 → chip 的 hideTip 不执行，已弹气泡残留；此处兜底必清
+                            self?.dismissSubAccountTip()
+                            for case let item as SubAccountItemView in strip.arrangedSubviews {
+                                item.setHovered(false)
+                            }
                             // 账号条尚未显示（驻留未满）：无换出对象，点阵保持原样。
                             // 离场 = chip 交错下沉淡出（staggerRiseIn 镜像）+ 点阵透明度恢复
                             if !strip.isHidden, !stripExitInFlight {
@@ -2185,6 +2310,12 @@ final class BalancePanelView: NSView {
                                     // 落藏 + chip 状态复位（alpha/transform/背景归位，供下一轮换入）
                                     guard exitEp == subStripSwapEpoch else { return }
                                     strip.isHidden = true
+                                    stripZeroWidth?.isActive = true   // 落藏：恢复零宽，副标题拿回全行宽
+                                    // 副标题恢复完整文案（账号条已落藏不可见）
+                                    for (i, lbl) in segLabels.enumerated() {
+                                        if i < segBox.full.count { lbl.stringValue = segBox.full[i]; lbl.isHidden = false }
+                                        else { lbl.isHidden = true }
+                                    }
                                     for v in chips {
                                         v.alphaValue = 1
                                         if let l = v.layer {
@@ -2201,6 +2332,8 @@ final class BalancePanelView: NSView {
                                     }
                                     stripExitInFlight = false
                                 })
+                                // 长进度卡片：进度条常驻（dotsIndependent），跳过点阵恢复动画
+                                if !dotsIndependent {
                                 // 点阵恢复放慢（dotsRestore，先慢后快、末段缓收，与 chip
                                 // 快速下沉形成节奏差）。必须显式 CABasicAnimation：
                                 // 落藏回写过 alpha=1，animator 的 fromValue=nil 会取 presentation(=1)
@@ -2230,6 +2363,7 @@ final class BalancePanelView: NSView {
                                     CATransaction.commit()
                                 } else {
                                     dotsView.alphaValue = 1
+                                }
                                 }
                             }
                         }
@@ -2294,9 +2428,11 @@ final class BalancePanelView: NSView {
                                      statusRing: capturedStatusRing,
                                      menuBarDot: capturedMenuBarDot ?? NSView()))
             entries[entries.count - 1].subAccountsStrip = subStrip
+            entries[entries.count - 1].dotsAlwaysVisible = longProgressCardEnabled
             entries[entries.count - 1].subValueLabels = subValueLabels
             entries[entries.count - 1].subItems = subItems
             entries[entries.count - 1].chipTipBox = newChipTipBox
+            entries[entries.count - 1].segBox = segBox
         }
         // ⚠️ 必须与 update() 的检测口径一致（uid + isCurrent ✓ 后缀）：
         // 旧实现只存裸 uid，导致每轮刷新都误判「uid 变化」→ 全量重建卡片，
@@ -2409,9 +2545,13 @@ final class BalancePanelView: NSView {
             // （2026-08-27：「套餐已到期」取消红色警告，与其他到期文本一致用 systemGray）
             // TRAE 已停止维护：固定显示 xmark +「此平台不再维护」，不再显示套餐重置时间。
             let segs = style.platformID == "trae" ? ["此平台不再维护"] : (ac.expireSegments ?? [])
+            e.segBox?.full = segs
+            // 账号条换入期间保持精简文案（单一事实源 = 账号条可见性）：hover 中途刷新
+            // 不把完整文案顶回来，破坏副标题给账号条让位的约定
+            let shownSegs = (e.subAccountsStrip?.isHidden ?? true) ? segs : compactExpireSegments(segs)
             for (i, lbl) in e.segmentLabels.enumerated() {
-                if i < segs.count {
-                    lbl.stringValue = segs[i]
+                if i < shownSegs.count {
+                    lbl.stringValue = shownSegs[i]
                     lbl.isHidden = false
                 } else {
                     lbl.isHidden = true
@@ -2440,7 +2580,7 @@ final class BalancePanelView: NSView {
             // Agent 卡 hover 期间其余账号条可见（strip 未隐藏）→ 点阵强制保持隐藏：
             // 否则本行每次刷新都按 hideDots 重显点阵，叠在按钮上（点阵「无故冒出」根因
             // =显隐有两个写入方，此处合成两态为单一事实）
-            e.dots.isHidden = ac.hideDots || !(e.subAccountsStrip?.isHidden ?? true)
+            e.dots.isHidden = ac.hideDots || (!e.dotsAlwaysVisible && !(e.subAccountsStrip?.isHidden ?? true))
         }
     }
 
@@ -2886,6 +3026,7 @@ final class BalancePanelView: NSView {
     @objc func monoFontToggled() { onToggleMonoFont?() }
     @objc func valueScrollPreviewToggled() { onToggleValueScrollPreview?() }
     @objc func statusDebugPreviewToggled() { onToggleStatusDebugPreview?() }
+    @objc func longProgressCardToggled() { onToggleLongProgressCard?() }
     @objc func checkUpdateTapped() { onCheckForUpdate?() }
     @objc func updateAutoCheckToggled() { onToggleUpdateAutoCheck?() }
 
@@ -3013,5 +3154,9 @@ final class BalancePanelView: NSView {
         onSetInterval?(intervalPopup.selectedItem?.tag ?? 300)
     }
     @objc func manualRefreshTapped() { onManualRefresh?() }
-    @objc func quickBuildTapped() { onQuickBuild?() }
+    /// header 右上角浅色主题按钮：翻转设置行开关后走同一回调，状态由 update(s:) 回写
+    @objc func headerLightThemeTapped() {
+        lightThemeSwitch.state = lightThemeSwitch.state == .on ? .off : .on
+        lightThemeToggled()
+    }
 }

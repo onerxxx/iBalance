@@ -4,12 +4,14 @@
 // 对话历史（可续聊）与记忆。
 // (2026-09-01, 由「聚合查看」方案改写为「同步共享」方案)
 //
-// ─── 数据事实（2026-09-01 实测）────────────────────────────────────────────────
+// ─── 数据事实（2026-09-01 实测 / 2026-09-03 补充）─────────────────────────────
 // - workbuddy.db sessions.user_id 是会话归属的唯一键；jsonl 正文路径
 //   projects/{cwd编码}/{sessionId}.jsonl 与 artifact-index 均不含 uid
 //   → 只转移 user_id，目标账号即可在会话列表看到并直接续聊
 // - 记忆按 memory/{uid}_memory.md 分账号，三份为同构文档（~90% 重复）
 //   → 合并拼接无意义，以 mtime 最新为基准广播到各账号文件
+// - 根目录 SOUL.md / IDENTITY.md / USER.md / MEMORY.md 是全局单份（所有账号共用
+//   同一路径，db 无按账号副本）→ 无需广播，但客户端云端同步可能覆盖 → 备份留档可回滚
 // - workspaces 表无 user_id（全局共享，无需处理）；automations 有 user_id 但 v1 不动
 //
 // ⚠️ 风险与约束
@@ -18,7 +20,9 @@
 // - 转移不可从 db 反推：执行前把 (id, 旧 user_id) 明细导出到
 //   ~/Library/Application Support/com.local.ibalance/wb_share_backup.json 留回滚依据
 // - 记忆广播前把各账号原文件备份为 {uid}_memory.md.pre-share（保留首次，不覆盖）
-// - 只写 sessions.user_id 一列 + memory 文件，不碰其他表/目录（WorkBuddy 升级零耦合）
+// - 广播目标补齐：目标账号还没有 {uid}_memory.md 时也纳入（新账号切过去同样看到共享记忆）
+// - 只写 sessions.user_id 一列 + memory 文件 + 根目录 MD 备份，不碰其他表/目录
+//   （WorkBuddy 升级零耦合）
 
 import Cocoa
 import SQLite3
@@ -37,9 +41,13 @@ enum WbShareSync {
         let memoryBaseNickname: String?  // mtime 最新的记忆归属账号（nil = 无记忆文件）
     }
 
+    /// 根目录个性化 MD（全局单份，切号/云端同步覆盖前留档用）
+    static let personaFiles = ["SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"]
+
     struct Report {
         var movedSessions = 0
         var memorySynced = 0
+        var personaBackedUp = 0
         var memoryBaseNickname: String?
         var backupPath: String?
         var error: String?
@@ -150,14 +158,20 @@ enum WbShareSync {
         Logger.log(.switchAccount, "[wb-share] sessions moved: \(report.movedSessions) → uid=\(targetUid)")
 
         // 3. 记忆广播：mtime 最新为基准，写入其余账号文件（原文件备份 .pre-share，保留首次）
-        let memFiles = accountMemoryFiles()
+        var memFiles = accountMemoryFiles()
+        // 目标账号还没有记忆文件（新登录账号）时也纳入广播，切过去同样能看到共享记忆
+        if !memFiles.isEmpty, memFiles[targetUid] == nil {
+            let url = URL(fileURLWithPath: home + "/memory/\(targetUid)_memory.md")
+            memFiles[targetUid] = (url, "", .distantPast)
+            Logger.log(.switchAccount, "[wb-share] target uid has no memory file, will create: \(targetUid)")
+        }
         if let base = memFiles.max(by: { $0.value.mtime < $1.value.mtime }) {
             let baseContent = base.value.content
             report.memoryBaseNickname = nicknameByUid[base.key] ?? String(base.key.prefix(6))
             for (uid, info) in memFiles where uid != base.key {
                 let path = info.url.path
                 let bak = path + ".pre-share"
-                if !FileManager.default.fileExists(atPath: bak) {
+                if FileManager.default.fileExists(atPath: path), !FileManager.default.fileExists(atPath: bak) {
                     try? FileManager.default.copyItem(atPath: path, toPath: bak)
                 }
                 if (try? baseContent.write(toFile: path, atomically: true, encoding: .utf8)) != nil {
@@ -167,6 +181,21 @@ enum WbShareSync {
                 }
             }
             Logger.log(.switchAccount, "[wb-share] memory base=\(base.key) synced=\(report.memorySynced) files")
+        }
+
+        // 4. 根目录个性化 MD 备份保护：SOUL/IDENTITY/USER/MEMORY 全局单份，
+        //    客户端云端同步或账号切换可能覆盖 → 留档 .pre-share（保留首次，不覆盖）
+        let fm = FileManager.default
+        for name in personaFiles {
+            let p = home + "/" + name
+            let bak = p + ".pre-share"
+            guard fm.fileExists(atPath: p), !fm.fileExists(atPath: bak) else { continue }
+            if (try? fm.copyItem(atPath: p, toPath: bak)) != nil {
+                report.personaBackedUp += 1
+            }
+        }
+        if report.personaBackedUp > 0 {
+            Logger.log(.switchAccount, "[wb-share] persona files backed up: \(report.personaBackedUp)")
         }
         return report
     }
@@ -228,6 +257,20 @@ enum WbShareSync {
                 } else {
                     report.error = report.error ?? "记忆恢复失败：\(target.lastPathComponent)"
                 }
+            }
+        }
+        // 3. 根目录个性化 MD 从 .pre-share 拷回（同上：备份保留，回滚幂等）
+        for name in personaFiles {
+            let f = URL(fileURLWithPath: home + "/" + name + ".pre-share")
+            guard fm.fileExists(atPath: f.path) else { continue }
+            let target = URL(fileURLWithPath: home + "/" + name)
+            if fm.fileExists(atPath: target.path) {
+                try? fm.removeItem(at: target)
+            }
+            if (try? fm.copyItem(at: f, to: target)) != nil {
+                report.restoredMemories += 1
+            } else {
+                report.error = report.error ?? "个性化文件恢复失败：\(name)"
             }
         }
         Logger.log(.switchAccount, "[wb-share] rollback memories restored: \(report.restoredMemories)")
@@ -325,7 +368,7 @@ extension AppDelegate {
                     done.addInfo("回滚失败：\(err)")
                 } else {
                     var msg = "已按最近一次同步前的备份还原：\(rb.restoredSessions) 条会话回到原账号归属，"
-                    msg += "\(rb.restoredMemories) 份记忆文件恢复原内容。\n"
+                    msg += "\(rb.restoredMemories) 份记忆/个性化文件恢复原内容。\n"
                     msg += wasRunning ? "WorkBuddy 正在重启。" : "WorkBuddy 未在运行，下次启动即生效。"
                     msg += "\n注意：之后用 iBalance 切号时仍会自动执行同步。"
                     done.addInfo(msg)
@@ -350,6 +393,10 @@ extension AppDelegate {
                 var msg = "已将 \(report.movedSessions) 条会话归属到「\(auth.nickname)」。\n"
                 if let base = report.memoryBaseNickname, report.memorySynced > 0 {
                     msg += "记忆已按「\(base)」（最近更新）同步到 \(report.memorySynced) 个账号文件。"
+                }
+                if report.personaBackedUp > 0 {
+                    if report.memorySynced > 0 { msg += "\n" }
+                    msg += "个性化文件（SOUL/IDENTITY/USER/MEMORY）已留档可回滚。"
                 }
                 if wasRunning { msg += "\nWorkBuddy 正在重启。" } else { msg += "\nWorkBuddy 未在运行，下次启动即生效。" }
                 done.addInfo(msg)

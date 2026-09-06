@@ -168,6 +168,10 @@ struct AppConfig: Codable {
     /// 状态调试预览开关：true = 三态光环演示——按 Agent 平台序轮派
     /// 进行中/完成/中断到前三张 Agent 卡（WB/ZCode/TRAE/Codex 中实际存在者），预览动画效果
     var statusDebugPreview: Bool = false
+    /// 长进度卡片（原「新卡片模式」，2026-09-06 改名）：true = 余额卡片进度条独占整行
+    ///（左缘=主标题最左）+ 副标题下移一行（design/balance-card-mode.html 口径）；
+    /// false = 现行副标题+窄进度条同行
+    var longProgressCard: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
     var fadeHintBandHeight: Double = 54
     var fadeHintHighlightAlpha: Double = -0.6
@@ -219,6 +223,7 @@ struct AppConfig: Codable {
         case monoFontEnabled = "mono_font_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case statusDebugPreview = "status_debug_preview"
+        case longProgressCard = "long_progress_card"
         case updateAutoCheck = "update_auto_check"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
@@ -238,8 +243,9 @@ struct AppConfig: Codable {
         case floatingPanelHeight = "floating_panel_height"
     }
 
-    // 仅解码用的 legacy 字段（旧版统一 "decimals"，新版按服务拆分；读取兼容两者）
-    private enum LegacyKeys: String, CodingKey { case decimals }
+    // 仅解码用的 legacy 字段（旧版统一 "decimals"，新版按服务拆分；读取兼容两者；
+    // balanceCardNewMode = 长进度卡片改名前的旧键）
+    private enum LegacyKeys: String, CodingKey { case decimals, balanceCardNewMode = "balance_card_new_mode" }
 
     init() {}
 
@@ -272,6 +278,11 @@ struct AppConfig: Codable {
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
         updateAutoCheck = try c.decodeIfPresent(Bool.self, forKey: .updateAutoCheck) ?? true
         statusDebugPreview = try c.decodeIfPresent(Bool.self, forKey: .statusDebugPreview) ?? false
+        // 新键 long_progress_card；旧键 balance_card_new_mode 兼容读取（改名不丢已存开关值）
+        longProgressCard = try c.decodeIfPresent(Bool.self, forKey: .longProgressCard)
+            ?? decoder.container(keyedBy: LegacyKeys.self)
+                .decodeIfPresent(Bool.self, forKey: .balanceCardNewMode)
+            ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
         fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55

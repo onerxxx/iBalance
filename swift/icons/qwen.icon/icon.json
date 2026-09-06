@@ -2,13 +2,22 @@
   "features" : [
     "refractivity"
   ],
-  "fill" : "system-dark",
+  "fill" : "system-light",
   "groups" : [
     {
+      "blend-mode" : "normal",
       "hidden" : false,
       "layers" : [
         {
-          "fill" : "system-light",
+          "fill-specializations" : [
+            {
+              "value" : "system-dark"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "system-light"
+            }
+          ],
           "glass" : true,
           "image-name" : "qwen.png",
           "name" : "qwen",

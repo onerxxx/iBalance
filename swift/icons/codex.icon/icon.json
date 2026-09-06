@@ -1,13 +1,25 @@
 {
-  "fill" : "system-dark",
+  "fill" : "system-light",
   "groups" : [
     {
       "blur-material" : null,
       "layers" : [
         {
-          "fill" : {
-            "solid" : "extended-gray:1.00000,1.00000"
-          },
+          "blend-mode-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : "normal"
+            }
+          ],
+          "fill-specializations" : [
+            {
+              "value" : "system-dark"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "system-light"
+            }
+          ],
           "image-name" : "codex.svg",
           "name" : "codex",
           "position" : {

@@ -32,7 +32,8 @@ enum HTTP {
         }
     }
 
-    /// 带重试的请求：仅在「网络错误」（status == 0）时重试，HTTP 响应（含 4xx/5xx）不重试。
+    /// 带重试的请求：网络错误（status == 0）与 429 限流时重试，其余 HTTP 响应（终态 4xx/5xx）不重试。
+    /// 429 = 服务端「稍后再试」语义、非终态结果（实测 CodeBuddy 多账号连续查询会偶发 429）。
     /// 退避按 attempt 线性递增，避免短时内风暴。
     static func requestWithRetry(url: URL,
                                  method: String = "GET",
@@ -45,7 +46,8 @@ enum HTTP {
         var attempt = 0
         while true {
             let r = await request(url: url, method: method, headers: headers, body: body, timeout: timeout)
-            if r.1 != 0 || attempt >= retries {
+            let retryable = r.1 == 0 || r.1 == 429
+            if !retryable || attempt >= retries {
                 if r.1 == 0 {
                     Logger.log(.network, "RETRY EXHAUSTED: \(tag) — giving up after \(attempt + 1) attempt(s)")
                 }
@@ -53,7 +55,7 @@ enum HTTP {
             }
             attempt += 1
             let delayNs = UInt64(backoff * Double(attempt) * 1_000_000_000)
-            Logger.log(.network, "RETRY \(attempt)/\(retries): \(tag) — waiting \(backoff * Double(attempt))s")
+            Logger.log(.network, "RETRY \(attempt)/\(retries): \(tag) — HTTP \(r.1), waiting \(backoff * Double(attempt))s")
             try? await Task.sleep(nanoseconds: delayNs)
         }
     }

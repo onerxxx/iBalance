@@ -1,13 +1,19 @@
 {
-  "fill" : "system-dark",
+  "fill" : "system-light",
   "groups" : [
     {
       "blend-mode" : "normal",
       "layers" : [
         {
-          "fill" : {
-            "solid" : "extended-gray:1.00000,1.00000"
-          },
+          "fill-specializations" : [
+            {
+              "value" : "system-dark"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "system-light"
+            }
+          ],
           "image-name" : "zhipu.svg",
           "name" : "zhipu",
           "position" : {

@@ -7,7 +7,8 @@
 // 缓存壳         TokenStoreCache（60s 后台重建；fetch 只回缓存，首次无缓存挂起回调主线程补发）
 // 查询 / 聚合     ZcodeTokenStore（SQLite 读取）；数据模型 TokenSummary / TokenDayUsage
 // 周期            TokenPeriod（日/周）+ TokenPeriodWindows
-// 数据源来源       TokensPanelSource（.zcode / .workbuddy / .codex：卡片 hover 子面板与主面板内嵌板块共用）
+// 数据源来源       TokensPanelSource（.zcode / .workbuddy / .codex：卡片 hover 子面板与主面板内嵌板块共用；
+//                  .aggregate = Agent 分组标题 hover 驻留触发的三平台聚合视图）
 // 面板视图         TokensPanelView（数值 + 热力图 + hover 气泡）
 // 主面板内嵌挂载    extension BalancePanelView（「Token」板块复用同一个 TokensPanelView）
 //
@@ -30,8 +31,10 @@ final class TokenStoreCache {
     private var timer: DispatchSourceTimer?
     private let interval: TimeInterval = 60
 
+    /// .utility：60s 后台预热重建非交互路径，userInitiated 会与面板动画抢调度
+    ///（2026-08-31 效率审查遗留项；面板弹出时取数走缓存，QoS 不影响体感）
     init(label: String, build: @escaping () -> TokenSummary?) {
-        queue = DispatchQueue(label: label, qos: .userInitiated)
+        queue = DispatchQueue(label: label, qos: .utility)
         self.build = build
     }
 
@@ -68,6 +71,8 @@ enum TokensPanelSource {
     case zcode
     case workbuddy
     case codex
+    /// 三平台聚合（Agent 分组标题 hover 驻留触发）：ZCode + WorkBuddy + Codex 加总
+    case aggregate
 
     /// 面板首行标题 = 平台名
     var platformName: String {
@@ -75,6 +80,7 @@ enum TokensPanelSource {
         case .zcode: return "ZCode"
         case .workbuddy: return "WorkBuddy"
         case .codex: return "Codex"
+        case .aggregate: return "Agent"   // 首行会再拼「总计」，标题带「总计」会重复（2026-09-06）
         }
     }
     /// 异步取汇总（各数据仓后台每 60s 重建缓存，fetch 只回缓存，主线程回调）
@@ -83,6 +89,19 @@ enum TokensPanelSource {
         case .zcode: ZcodeTokenStore.fetch(completion: completion)
         case .workbuddy: WBTokenStore.fetch(completion: completion)
         case .codex: CodexTokenStore.fetch(completion: completion)
+        case .aggregate:
+            // 三仓缓存并行收集（各仓回调均在主线程：缓存命中同步返回 / 未命中构建后补发），
+            // 全部到齐后合并；三仓皆无数据 → nil（聚合视图与单仓口径一致地保持隐藏）
+            let sources: [TokensPanelSource] = [.zcode, .workbuddy, .codex]
+            var results: [TokenSummary?] = Array(repeating: nil, count: sources.count)
+            var remaining = sources.count
+            for (i, s) in sources.enumerated() {
+                s.fetch { sum in
+                    results[i] = sum
+                    remaining -= 1
+                    if remaining == 0 { completion(TokenSummary.merge(results)) }
+                }
+            }
         }
     }
 }
@@ -134,6 +153,67 @@ struct TokenSummary {
     /// 各周期总计词元（5H/1D/1W/1M 首行切换；窗口起点 = TokenPeriodWindows，
     /// 数据仓构建时按当前时刻聚合，60s 重建自然滚动窗口）
     var periodTotals: [TokenPeriod: Int64] = [:]
+
+    /// Agent 聚合视图合并（.aggregate 取数收口）：总计/请求数逐项加总，
+    /// 每日与周期窗口按键求和，项目按「完整目录 ?? 名称」跨仓归并（同目录合并一行），
+    /// 模型按小写名归并（展示名口径同 ZCode 单仓：大写优先、同档取大），列表重排降序。
+    /// 三仓全部为 nil → nil（板块隐藏）。
+    static func merge(_ parts: [TokenSummary?]) -> TokenSummary? {
+        let valid = parts.compactMap { $0 }
+        guard !valid.isEmpty else { return nil }
+
+        let total = valid.reduce(Int64(0)) { $0 + $1.totalTokens }
+        let requests = valid.reduce(Int64(0)) { $0 + $1.requestCount }
+
+        var dayAgg: [TimeInterval: Int64] = [:]
+        for s in valid { for d in s.daily { dayAgg[d.dayStart, default: 0] += d.tokens } }
+        let daily = dayAgg.map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
+            .sorted { $0.dayStart < $1.dayStart }
+
+        var periodTotals: [TokenPeriod: Int64] = [:]
+        for s in valid { for (p, v) in s.periodTotals { periodTotals[p, default: 0] += v } }
+
+        // 项目归并：键 = 完整目录（缺失用名称前缀区分，避免与真目录同名误合）
+        struct ProjAgg { var tokens: Int64 = 0; var path: String?; var name: String }
+        var projAgg: [String: ProjAgg] = [:]
+        for s in valid {
+            for p in s.projects {
+                let key = p.path ?? "name:\(p.name)"
+                var a = projAgg[key] ?? ProjAgg(tokens: 0, path: nil, name: "")
+                a.tokens += p.tokens
+                a.path = a.path ?? p.path
+                a.name = p.path == nil ? p.name : (p.path! as NSString).lastPathComponent
+                projAgg[key] = a
+            }
+        }
+        let projects = projAgg
+            .map { TokenSummary.ProjectUsage(name: $0.value.name, tokens: $0.value.tokens,
+                                             path: $0.value.path) }
+            .sorted { $0.tokens > $1.tokens }
+
+        // 模型归并：小写名同键；展示名大写写法优先，同档取单仓名下用量大的写法
+        var modelAgg: [String: (tokens: Int64, name: String, nameTokens: Int64)] = [:]
+        for s in valid {
+            for m in s.models {
+                let key = m.name.lowercased()
+                var a = modelAgg[key] ?? (0, m.name, -1)
+                a.tokens += m.tokens
+                let curUpper = m.name != key
+                let dispUpper = a.name != a.name.lowercased()
+                let replace: Bool
+                if curUpper != dispUpper { replace = curUpper }
+                else { replace = m.tokens > a.nameTokens }
+                if replace { a.name = m.name; a.nameTokens = m.tokens }
+                modelAgg[key] = a
+            }
+        }
+        let models = modelAgg.values
+            .map { TokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
+            .sorted { $0.tokens > $1.tokens }
+
+        return TokenSummary(totalTokens: total, projects: projects, models: models,
+                            requestCount: requests, daily: daily, periodTotals: periodTotals)
+    }
 }
 
 enum ZcodeTokenStore {
@@ -720,13 +800,10 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     override var intrinsicContentSize: NSSize {
-        // 行数取当前列表视图（模型视图空数据时回落项目，与 draw 的 showModels 逻辑一致）
-        let active = summary.flatMap { s -> [TokenSummary.ProjectUsage] in
-            (listMode == .models && !s.models.isEmpty) ? s.models : s.projects
-        } ?? []
-        let rows = min(active.count, Self.maxListRows)
-        // 高度 = 锚点链一路推到热力图网格顶（与 draw 同一表达式，无重复字面量）
-        let height: CGFloat = activityGridTop(rows: rows)
+        // 列表区恒保留 maxListRows 行高度（行数少则留白）：平台切换列表行数不同，
+        // 若高度随之伸缩，文档高度变化会让滚动位置重锚定、整块内容在静止光标下
+        // 滑动点亮相邻卡的假 hover（2026-09-06 诊断闭环，见 [HoverDbg] 日志结论）
+        let height: CGFloat = activityGridTop(rows: Self.maxListRows)
             + activityGridHeight + activityAxisHeight + insets.bottom
         return NSSize(width: Self.contentWidth, height: height)
     }
@@ -924,7 +1001,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
         // 词元活动顶 = 末行墨迹底 + 20（行框居中留白不计入间距）
         drawActivitySection(topY: activityTitleTop(rows: projects.count),
-                            gridTop: activityGridTop(rows: projects.count),
+                            gridTop: activityGridTop(rows: Self.maxListRows),
                             labelFont: labelFont, labelColor: labelColor, titleColor: titleColor)
         // 行命中框/可点击路径已随本次绘制更新：光标矩形仅在命中内容实际变化时才
         // 通知窗口重算（切换动效 42 帧零窗口级重算；原实现每帧无条件 invalidate）
@@ -1617,6 +1694,7 @@ extension BalancePanelView {
     /// 快速掠过不进入此回调（dwell 已取消）。同平台重复确认经 refreshInlineTokens
     /// 去重（view.source 未变则无高度变化，无几何反馈振荡）。
     func confirmTokensHover(source: TokensPanelSource) {
+        Logger.log(.layout, "[HoverDbg] confirm source=\(source)")
         hoverTokensSource = source
         refreshInlineTokens()
     }
