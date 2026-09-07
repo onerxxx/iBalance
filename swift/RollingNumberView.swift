@@ -379,7 +379,7 @@ final class RollingNumberView: NSView {
     }
     /// 常规态前缀图标边长（chip 态切 ChipStyle.iconSize 与子账号按钮统一；面板按此
     /// 尺寸烘焙 2× 图像，chip 态只缩小绘制——放大糊、缩小清晰；离开 hover 复原此值）
-    static let baseIconSize: CGFloat = 10
+    static let baseIconSize: CGFloat = 8.5   // 2026-09-06 用户「缩小15%」（原 10）
     private var prefixIconSize: CGFloat = RollingNumberView.baseIconSize
     private let prefixIconGap: CGFloat = ChipStyle.iconTextGap
     private let prefixIconView = NSImageView()
@@ -832,7 +832,9 @@ final class RollingNumberView: NSView {
         // 滑移中间态不会被任何一次重排打回终点（闪动根因）
         let p = slideProgress()
         // chip 态垂直居中：字体缩小后行高 < 视图高（intrinsic 恒取基础档），槽位整体
-        // 下移半个差值；常规态 lineH == bounds.height，yShift = 0 行为不变
+        // 下移半个差值；常规态 lineH == bounds.height，yShift = 0 行为不变。
+        // （曾按 2026-09-06 需求 hover 点亮时整组上移 3pt，同日用户撤销「不再位移」，
+        // 并已实测上移会与账号条/标题行产生叠影，勿加回）
         let yShift = max(0, (bounds.height - lineH) / 2)
         // 左对齐：左缘锚 0（原 drawText 的 pen 位置），正向逐槽排布；
         // 右对齐：右缘锚 bounds−右留白，逆向排布（超宽左溢裁掉）。

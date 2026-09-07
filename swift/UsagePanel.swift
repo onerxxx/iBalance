@@ -655,6 +655,40 @@ final class UsageHistoryPopoverAnchorView: NSView {
 /// 条高 4.06pt 在槽内垂直居中，胶囊圆角 = 条高/2。
 final class UsageDots: NSView {
     var ratio: CGFloat = 0 { didSet { updateProgress() } }
+    /// 竖向模式（默认卡片进度条贴容器最右）：2026-09-07 用户改版 = 4 个圆角正方形点
+    /// 竖向排列的点阵——边长 = 视图宽（verticalThickness），间隔 = (高 − 4×边长) ÷ 3
+    /// 随容器高度伸缩；填充自下而上按整点亮灭（ratio=剩余比例，四舍五入到档位），
+    /// 点亮色 = 词元活动热力图三档最亮色（剩余越多越亮，2026-09-07 定稿；曾用绿黄橙红已废），
+    /// 未点亮 = 热力图底点色 heatDotEmpty；无背景无边框（draw 直绘，隐藏轨道/填充层）。
+    /// 历史口径：09-06 为连续竖条（1pt 边框+内缩填充），已被本点阵替换。须在进视图层级前置位
+    var isVertical = false { didSet { needsLayout = true } }
+    /// 竖线模式（2026-09-07 用户指定，仅长进度卡片整行条替换形态）：50 条 1.5pt 竖线横向排列，
+    /// 间隔自适应容器宽；已填充=轨道同款绿渐变按横向位置采样、未填充=浅灰线；
+    /// 无轨道背景无边框（隐藏 track/progress 层，draw 直绘）。与 isVertical 互斥，勿同开
+    var lineBarMode = false {
+        didSet {
+            guard oldValue != lineBarMode else { return }
+            trackLayer.isHidden = lineBarMode
+            progressLayer.isHidden = lineBarMode
+            needsLayout = true
+            needsDisplay = true
+        }
+    }
+    /// 竖线条数与线宽（间隔 = (容器宽 − 条数×线宽) ÷ (条数−1)，自适应；
+    /// 2026-09-07 用户多轮调参：30×1 → 60×1 → 50×1.5）
+    private static let lineCount = 50
+    private static let lineWidth: CGFloat = 1.5
+    /// 未填充线透明度（dotsDim 再乘此系数；比轨道 0.45 更浅，避免整排灰线读作背景）
+    private static let emptyLineAlpha: CGFloat = 0.35
+    /// 竖排点阵：点数与圆角比例（圆角 = 边长 × 0.2，2026-09-07 用户「减小圆角」，原 0.3 同热力图口径）
+    private static let verticalDotCount = 4
+    private static let dotCornerRadiusFactor: CGFloat = 0.2
+    /// 点亮泛光：外扩宽度（2026-09-07 用户指定 0.3pt）与透明度（微弱档自定，可调）；
+    /// 颜色与点亮本体同色，仅点亮档绘制
+    private static let dotGlowWidth: CGFloat = 0.3
+    private static let dotGlowAlpha: CGFloat = 0.45
+    /// ⚠️ ratio = 剩余比例（消费端 `dots.ratio = 1 − usedRatio`）：点亮档数 = 剩余档位，
+    /// 状态色走 Palette.heatLevelColor(filled)（与词元活动热力图同档同色，深浅主题自动分档）
     var pulsing: Bool = false {
         didSet {
             guard oldValue != pulsing else { return }
@@ -663,8 +697,12 @@ final class UsageDots: NSView {
     }
 
     // ── 尺寸：原点阵口径加长 10%（9 方块 × 5.06 × 1.1 = 50.09pt 宽，2026-09-06 用户指定）；
-    //    条高 4.06（2026-09-06 用户「高度减少1pt」，原 5.06）；槽高 7pt 由外部约束固定 ──
-    private static let barHeight: CGFloat = 4.06
+    //    条高 4.06（2026-09-06 用户「高度减少1pt」，原 5.06）；槽高 7pt 由外部 heightAnchor 固定 ──
+    /// 条的粗细（横态 = 条高；PanelLayout 引用常量防漂移）
+    static let barHeight: CGFloat = 4.06
+    /// 竖向点阵点边长（默认卡片竖向模式 = 4 圆角正方点，2026-09-07 改版；容器宽由此
+    /// 常量推导同值，历史：09-06 竖条粗 4.06；同日点阵 +0.5pt → 4.56）
+    static let verticalThickness: CGFloat = 4.56
     private static let barWidth: CGFloat = 9 * 5.06 * 1.1   // 50.09（原 45.54 加长 10%）
     /// 轨道透明度（dotsDim 再乘此系数：深 systemGray@0.75→0.34 / 浅 systemGray→0.45）
     private static let trackAlpha: CGFloat = 0.45
@@ -706,38 +744,139 @@ final class UsageDots: NSView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyColors()
+        // 竖线/点阵形态的配色在 draw 里按生效外观直解，主题切换须重绘
+        if lineBarMode || isVertical { needsDisplay = true }
     }
     override func layout() {
         super.layout()
+        if lineBarMode || isVertical {
+            // 线位/点位随 bounds 重排：标脏走 draw 直绘（track/progress 层隐藏）
+            trackLayer.isHidden = true
+            progressLayer.isHidden = true
+            needsDisplay = true
+            return
+        }
+        trackLayer.isHidden = false
+        progressLayer.isHidden = false
         layoutBar()
     }
-    /// 首次布局前 bounds 为零：跳过（intrinsicContentSize 驱动 Auto Layout 随后到位）
+    override func draw(_ dirtyRect: NSRect) {
+        guard bounds.width > 0, bounds.height > 0 else {
+            super.draw(dirtyRect)
+            return
+        }
+        if lineBarMode { drawLineBar(); return }
+        if isVertical { drawVerticalDots(); return }
+        super.draw(dirtyRect)
+    }
+    /// 竖排点阵直绘（isVertical 现形态）：4 个圆角正方形点竖排，边长 = 视图宽、
+    /// 间隔 = (高 − 4×边长) ÷ 3 随容器高伸缩；填充自下而上整点亮灭（ratio 四舍五入
+    /// 到 4 档）。2026-09-07 用户改版：档位状态色 = 词元活动热力图**三个最亮档**
+    ///（Palette.heatLevelColor L2/L3/L4，filled+1 起步跳过最暗档、顶两档共用峰值色；
+    /// 曾用绿黄橙红已废），未点亮 = 热力图无用量底点色 heatDotEmpty；圆角 = 边长 ×
+    /// dotCornerRadiusFactor（现 0.2）；位置按 backing 像素取整防亚像素发糊；无背景无边框，
+    /// 点亮档外罩 0.3pt 同色微弱泛光（dotGlowWidth/dotGlowAlpha）
+    private func drawVerticalDots() {
+        let count = Self.verticalDotCount
+        let side = min(bounds.width, bounds.height / CGFloat(count))
+        let gap = max(0, (bounds.height - side * CGFloat(count)) / CGFloat(count - 1))
+        let filled = min(count, max(0, Int((ratio * CGFloat(count)).rounded())))
+        let scale = window?.backingScaleFactor ?? 2
+        let snap = { (v: CGFloat) in (v * scale).rounded() / scale }
+        let x0 = snap((bounds.width - side) / 2)
+        let radius = side * Self.dotCornerRadiusFactor
+        let dark = effectiveAppearance.isDark
+        // 只取热力图三个最亮档（2026-09-07 用户指定）：档位 = filled+1 起步（跳过最暗的
+        // L1 深橄榄）、钳到 L4——顶部两档共用峰值黄绿；深色 L2/L3/L4，浅色镜像反向
+        //（浅色色阶 1=峰值亮端）→ 3/2/1
+        let heatLevel = min(filled + 1, count)
+        for i in 0..<count {   // i=0 = 底部点
+            let y = snap(CGFloat(i) * (side + gap))
+            let rect = NSRect(x: x0, y: y, width: side, height: side)
+            // 未点亮底色 = 词元活动无用量底点色（heatDotEmpty：深 #262626 / 浅 210 灰，
+            // 2026-09-07 用户指定与热力图底点同色）；动态色在 draw 内按生效外观解算
+            let color = i < filled ? Palette.heatLevelColor(dark ? heatLevel : count + 1 - heatLevel,
+                                                            dark: dark)
+                                   : Palette.heatDotEmpty
+            // 点亮泛光：同色低透明度外扩 0.3pt 晕圈先铺底，本体满色盖回 → 可见仅外圈；
+            // 圆角同步外扩保持同心（2026-09-07 用户指定）
+            if i < filled {
+                let glowRect = rect.insetBy(dx: -Self.dotGlowWidth, dy: -Self.dotGlowWidth)
+                let glowRadius = radius + Self.dotGlowWidth
+                color.withAlphaComponent(Self.dotGlowAlpha).setFill()
+                NSBezierPath(roundedRect: glowRect, xRadius: glowRadius, yRadius: glowRadius).fill()
+            }
+            color.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+        }
+    }
+    /// 竖线模式直绘：50 条 1.5pt 竖线，间隔 = (宽 − 条数×线宽) ÷ (条数−1) 自适应；线位按
+    /// backing 像素取整防亚像素发糊（coin 图标同款教训）；无轨道背景无边框
+    private func drawLineBar() {
+        let count = Self.lineCount
+        let gap = max(0, (bounds.width - CGFloat(count) * Self.lineWidth) / CGFloat(count - 1))
+        let filled = min(count, max(0, Int((ratio * CGFloat(count)).rounded())))
+        let scale = window?.backingScaleFactor ?? 2
+        let stops = Self.progressStops(dark: effectiveAppearance.isDark)
+        for i in 0..<count {
+            let x = (CGFloat(i) * (Self.lineWidth + gap) * scale).rounded() / scale
+            let color: NSColor
+            if i < filled {
+                // 热力渐变按整条横向位置采样（左深右亮，与横态轨道渐变同构）
+                let t = CGFloat(i) / CGFloat(count - 1)
+                let mix = { (a: CGFloat, b: CGFloat) in a + (b - a) * t }
+                color = NSColor(srgbRed: mix(stops[0].r, stops[1].r) / 255.0,
+                                green: mix(stops[0].g, stops[1].g) / 255.0,
+                                blue: mix(stops[0].b, stops[1].b) / 255.0, alpha: 1)
+            } else {
+                color = Palette.dotsDim.withAlphaComponent(Self.emptyLineAlpha)
+            }
+            color.setFill()
+            NSBezierPath(rect: NSRect(x: x, y: 0, width: Self.lineWidth, height: bounds.height)).fill()
+        }
+    }
+    /// 首次布局前 bounds 为零：跳过（intrinsicContentSize 驱动 Auto Layout 随后到位）。
+    /// 仅横态（长进度卡片胶囊轨道）走层路径；竖态点阵与竖线模式在 layout 早退走 draw 直绘
     private func layoutBar() {
         guard bounds.width > 0, bounds.height > 0 else { return }
         let barRect = barFrame()
+        let cornerRadius = min(barRect.width, barRect.height) / 2
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         trackLayer.frame = barRect
-        trackLayer.cornerRadius = barRect.height / 2
-        progressLayer.frame = CGRect(x: 0, y: barRect.minY,
-                                     width: barRect.width * ratio, height: barRect.height)
-        progressLayer.cornerRadius = barRect.height / 2
+        trackLayer.cornerRadius = cornerRadius
+        progressLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        progressLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        progressLayer.frame = progressFrame(in: barRect)
+        progressLayer.cornerRadius = cornerRadius
         CATransaction.commit()
     }
-    /// 条框：全宽（= 固有宽 50.09）、高 4.06 垂直居中于 7pt 槽
+    /// 条框（横态）：全宽、高 4.06 垂直居中于容器
     private func barFrame() -> CGRect {
         let h = min(Self.barHeight, bounds.height)
         return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
     }
-    /// 三色渐变端标（2026-09-06 用户「改为 token 点阵颜色最亮三个颜色」定稿 =
-    /// Token 热力图 4 级绿阶 heatLevelsDark 的 level 2–4，左深右亮、填充右端最亮；
-    /// 2026-09-06 用户「浅色主题下三个颜色提亮一些 饱和一点点」拆双档：浅色 =
-    /// 各色 HSL 亮度 L +7~8、饱和 S +8，#1A9338 / #2CC348 / #69E277）
-    private static func progressStops(dark: Bool) -> [(r: CGFloat, g: CGFloat, b: CGFloat)] {
-        dark
-            ? [(0x19, 0x6C, 0x2E), (0x2E, 0xA0, 0x43), (0x56, 0xD3, 0x64)]
-            : [(0x1A, 0x93, 0x38), (0x2C, 0xC3, 0x48), (0x69, 0xE2, 0x77)]
+    /// 填充框（横态）：自左向右，宽 = 轨道宽 × ratio
+    private func progressFrame(in barRect: CGRect) -> CGRect {
+        CGRect(x: 0, y: barRect.minY, width: barRect.width * ratio, height: barRect.height)
     }
+    /// 渐变端点 = 点阵热力色阶（2026-09-07 用户「进度颜色的改变需要泛化到长进度卡片」：
+    /// 原硬编码绿档废弃，改由 heatLevelColor 推导，header 调色气泡调色相/饱和度即时跟随）。
+    /// 深色 = L1→L4（45% 压暗端→峰值），浅色 = L4→L1（浅色阶 33% 暗端→峰值亮端），
+    /// 两端均保持左深右亮观感。返回 sRGB 0–255 元组：横态层渐变与竖线逐条采样共用。
+    private static func progressStops(dark: Bool) -> [(r: CGFloat, g: CGFloat, b: CGFloat)] {
+        (dark ? [1, 4] : [4, 1]).map { level in
+            let c = Palette.heatLevelColor(level, dark: dark).usingColorSpace(.sRGB) ?? .black
+            return (c.redComponent * 255, c.greenComponent * 255, c.blueComponent * 255)
+        }
+    }
+    /// 调色气泡改了色相/饱和度后的整体重取色：横态走层 applyColors，
+    /// 竖线/竖点阵 draw 直绘现算，needsDisplay 兜住两种形态
+    func refreshHeatColors() {
+        applyColors()
+        needsDisplay = true
+    }
+
     /// 轨道/渐变按「视图生效外观」解算落 layer（直接 .cgColor 会定格错主题分支）
     private func applyColors() {
         guard trackLayer.superlayer != nil else { return }
@@ -757,9 +896,10 @@ final class UsageDots: NSView {
             updatePulse()
         }
         guard bounds.width > 0, bounds.height > 0 else { return }
+        // 竖线/点阵形态无在途层动画：整列重绘即可
+        if lineBarMode || isVertical { needsDisplay = true; return }
         let barRect = barFrame()
-        let newWidth = barRect.width * ratio
-        let newFrame = CGRect(x: 0, y: barRect.minY, width: newWidth, height: barRect.height)
+        let newFrame = progressFrame(in: barRect)
 
         // 模型值无动画直落（含首次设置），动画单独挂 presentation 补间
         CATransaction.begin()
@@ -769,12 +909,14 @@ final class UsageDots: NSView {
 
         // 首帧（无 presentation）从模型值出发无可见跳变，直接返回
         guard progressLayer.presentation() != nil else { return }
-        // 当前显示中的宽度
-        let currentWidth = progressLayer.presentation()?.frame.width ?? newWidth
-        guard abs(currentWidth - newWidth) > 0.5 else { return }
+        // 当前显示中的宽度（横态；竖态点阵/竖线在上方早退，无层动画）
+        let current = progressLayer.presentation()?.frame ?? newFrame
+        let currentLength = current.width
+        let targetLength = newFrame.width
+        guard abs(currentLength - targetLength) > 0.5 else { return }
         let animation = CABasicAnimation(keyPath: "bounds.size.width")
-        animation.fromValue = currentWidth
-        animation.toValue = newWidth
+        animation.fromValue = currentLength
+        animation.toValue = targetLength
         animation.duration = 0.25
         animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         progressLayer.add(animation, forKey: "progress")
@@ -787,8 +929,9 @@ final class UsageDots: NSView {
         progressLayer.opacity = 1.0
     }
     override var intrinsicContentSize: NSSize {
-        // 宽度沿用点阵口径加长 10%（50.09）；高度默认 7.0pt，实际由外部 heightAnchor 约束决定
-        return NSSize(width: Self.barWidth, height: 7.0)
+        // 横态宽 = 点阵口径加长 10%（50.09）；竖态宽 = 点边长 4.06、高纵贯（由外部
+        // top/bottom 约束决定，点间隔随高伸缩）。另一维默认 7.0pt，实际由外部约束决定
+        return NSSize(width: isVertical ? Self.verticalThickness : Self.barWidth, height: 7.0)
     }
 }
 

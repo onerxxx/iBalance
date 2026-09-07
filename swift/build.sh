@@ -132,6 +132,16 @@ if [[ -f "$SCRIPT_DIR/AppIcon.icns" ]]; then
     cp "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 fi
 
+# 拷贝 Assets.car 到 Resources（Liquid Glass 分层图标，macOS 26+ 经 CFBundleIconName=App
+# 优先使用；由 swift/icons/App.icon 经 Xcode 的 actool 编译，产物为静态文件：
+# DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun actool App.icon \
+#   --compile <out> --app-icon App --include-all-app-icons --enable-on-demand-resources NO \
+#   --target-device mac --platform macosx --minimum-deployment-target 26.0 \
+#   --output-partial-info-plist <out>/gen.plist ｜ .icon 改动后重跑一次即可，无需常驻 Xcode
+if [[ -f "$SCRIPT_DIR/Assets.car" ]]; then
+    cp "$SCRIPT_DIR/Assets.car" "$RESOURCES_DIR/Assets.car"
+fi
+
 # 拷贝 config.json 到 Resources（作为内置 fallback）
 cp "$CONFIG" "$RESOURCES_DIR/config.json"
 
@@ -153,6 +163,9 @@ fi
 EXPECTED_RESOURCES="config.json"$'\n'
 if [[ -f "$SCRIPT_DIR/AppIcon.icns" ]]; then
     EXPECTED_RESOURCES+="AppIcon.icns"$'\n'
+fi
+if [[ -f "$SCRIPT_DIR/Assets.car" ]]; then
+    EXPECTED_RESOURCES+="Assets.car"$'\n'
 fi
 for src in "$SCRIPT_DIR/icons/"*.svg "$SCRIPT_DIR/icons/"*.png "$SCRIPT_DIR/icons/"*.pdf \
            "$SCRIPT_DIR/fonts/"*.otf "$SCRIPT_DIR/fonts/"*.ttf; do

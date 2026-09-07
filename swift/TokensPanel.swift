@@ -569,7 +569,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 「每日/每周」切换文案命中区（draw 时更新）
     private var dailyToggleRect = NSRect.zero
     private var weeklyToggleRect = NSRect.zero
-    /// 正圆点阵印章缓存（5 级亮度，懒建；NSImage 绘制块按需执行，避免每次 draw 重建路径）
+    /// 圆角方块点阵印章缓存（5 级亮度，懒建；NSImage 绘制块按需执行，避免每次 draw 重建路径）
     private var dotStamps: [NSImage?] = []
 
     /// 列表行数上限（超出按用量截断，头部项目已覆盖绝大多数占比）
@@ -789,12 +789,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     private var activityPitch: CGFloat {
         max(6, activityAvail / CGFloat(activityWindow().cols))
     }
-    /// 点阵间隙比例（间隙 ÷ 版心可用宽）：锚定 2026-09-03 调定观感
-    /// （面板 280 / 可用宽 202pt 时间隙 2.1pt，即 2026-09-02「格内四周各缩 1.05」的比例）。
+    /// 点阵间隙比例（间隙 ÷ 版心可用宽）：锚定 2026-09-03 调定观感，
+    /// 2026-09-06 圆角方块化时间隙缩小一档（2.1 → 1.7，方块观感比圆点更密才协调）。
     /// 间隙随可用宽等比缩放（点径 = 点距 − 间隙），任意宽度（面板定宽/浮窗 resize）下
     /// 点:隙:格比例恒定不漂移
-    private static let dotGapPerAvail: CGFloat = 2.1 / 202
-    /// 当前宽度下的点阵间隙（相邻圆之间的空隙 = 格内两侧各半隙）
+    private static let dotGapPerAvail: CGFloat = 1.7 / 202
+    /// 当前宽度下的点阵间隙（相邻点之间的空隙 = 格内两侧各半隙）
     private var activityDotGap: CGFloat {
         activityAvail * Self.dotGapPerAvail
     }
@@ -1220,7 +1220,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     // MARK: 词元活动热力图
 
-    /// 词元活动：标题 + 每日/每周切换 + 正圆点阵（用量越多越亮）。
+    /// 词元活动：标题 + 每日/每周切换 + 圆角方块点阵（用量越多越亮）。
     /// 每日 = 7 行（周一→周日）× 26 周列；每周 = 单行 26 点（每周合计）。
     /// topY/gridTop 由锚点链传入（activityTitleTop/activityGridTop），与 intrinsic 同源
     private func drawActivitySection(topY: CGFloat, gridTop gridTopAnchor: CGFloat, labelFont: NSFont,
@@ -1330,10 +1330,11 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         // hover 圆点：外圈高亮环 + 悬浮提示（日期 + 用量，中文量级）
         if let hi = hoveredDot, dotCells.indices.contains(hi) {
             let cell = dotCells[hi]
-            // 描边居中于路径：外扩半个线宽（0.5pt）→ 环内缘紧贴圆点边缘
+            // 描边居中于路径：外扩半个线宽（0.5pt）→ 环内缘紧贴点边缘；
+            // 圆角半径随环尺寸等比（与点印章同 0.3 比例，环与点形状同心一致）
             let ring = cell.rect.insetBy(dx: -0.5, dy: -0.5)
             Palette.heatDotRing.setStroke()
-            let path = NSBezierPath(ovalIn: ring)
+            let path = NSBezierPath(roundedRect: ring, xRadius: ring.width * 0.3, yRadius: ring.width * 0.3)
             path.lineWidth = 1
             path.stroke()
             drawTooltip(for: cell, anchor: cell.rect)
@@ -1598,7 +1599,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         incomingLitImage = nil
     }
 
-    /// 亮度第 level 级的正圆印章（懒建缓存）：0 = 无用量底色（动态色，浅色外观=浅灰），
+    /// 亮度第 level 级的圆角方块印章（懒建缓存，圆角 = 边长 × 0.3）：
+    /// 0 = 无用量底色（动态色，浅色外观=浅灰），
     /// 1-4 = 深色 GitHub 暗色绿阶离散色 / 浅色两端点插值。动态色按本视图 effectiveAppearance 解算成实色
     /// 后烘焙（NSImage 位图缓存会定格颜色，主题/浅色开关切换经 viewDidChangeEffectiveAppearance
     /// 清缓存重建）
@@ -1607,37 +1609,20 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             dotStamps.append(contentsOf: Array(repeating: nil, count: level + 1 - dotStamps.count))
         }
         if let cached = dotStamps[level] { return cached }
-        var color = Self.levelColor(level, dark: effectiveAppearance.isDark)
+        var color = Palette.heatLevelColor(level, dark: effectiveAppearance.isDark)
         effectiveAppearance.performAsCurrentDrawingAppearance {
             color = color.usingColorSpace(.deviceRGB) ?? color
         }
         let size = activityPitch - activityDotGap
+        let radius = size * 0.3
         let img = NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
             color.setFill()
-            NSBezierPath(ovalIn: NSRect(x: 0, y: 0, width: size, height: size)).fill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: size, height: size),
+                         xRadius: radius, yRadius: radius).fill()
             return true
         }
         dotStamps[level] = img
         return img
-    }
-
-    private static func levelColor(_ level: Int, dark: Bool) -> NSColor {
-        if level <= 0 { return Palette.heatDotEmpty }
-        // 深色主题：GitHub 暗色绿阶离散色直取；浅色主题：两端点线性插值
-        if dark {
-            let c = Palette.heatLevelsDark[min(level, 4) - 1]
-            return NSColor(calibratedRed: CGFloat(c.r) / 255,
-                           green: CGFloat(c.g) / 255,
-                           blue: CGFloat(c.b) / 255, alpha: 1)
-        }
-        let t = Double(min(level, 4) - 1) / 3
-        let levels = Palette.heatLevelsLight
-        func lerp(_ a: Int, _ b: Int) -> CGFloat {
-            CGFloat(a) + (CGFloat(b) - CGFloat(a)) * CGFloat(t)
-        }
-        return NSColor(calibratedRed: lerp(levels.from.r, levels.to.r) / 255,
-                       green: lerp(levels.from.g, levels.to.g) / 255,
-                       blue: lerp(levels.from.b, levels.to.b) / 255, alpha: 1)
     }
 
     /// 面板 icon 统一入口：来源（品牌 SVG / SF Symbol）一律 sourceAtop 单色化后按键缓存
@@ -1659,6 +1644,15 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 9, weight: .medium))
         }
+    }
+
+    /// header 色相按钮改了峰值色：点阵印章/淡变位图都烘了旧色，清缓存重绘
+    ///（与外观切换钩子同一失效口径）
+    func refreshHeatPalette() {
+        dotsImagesDirty = true
+        releaseDotsImages()
+        dotStamps.removeAll()
+        needsDisplay = true
     }
 
     /// 品牌图标染色经 sourceAtop 烘进缓存图，会定格当时外观：主题切换时清缓存重染；

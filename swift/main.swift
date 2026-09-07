@@ -112,7 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// alert 结束后由 presentCheckResultAlert 自行归还焦点）
     var isPresentingSystemAlert = false
     private var settingsMenu: NSMenu!
-    /// 菜单栏按钮原生右键菜单：仅保留编译、刷新、退出
+    /// 菜单栏按钮原生右键菜单：仅保留刷新、退出（编译入口 2026-09-06 移除）
     private var statusContextMenu: NSMenu!
     /// 面板最近一次释放拖拽后的平台顺序；面板未拖拽前回退到 UserDefaults。
     private var menuBarPlatformOrder: [String]?
@@ -122,8 +122,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 进行中的刷新任务：onRefresh 触发时先取消旧任务，保证同一时刻只有一个刷新在跑
     private var refreshTask: Task<Void, Never>?
-    /// header 快速编译桥接进程：负责把命令交给 Terminal
-    private var quickBuildProcess: Process?
     /// 刷新序号（递增）：日志中关联 onRefresh / performRefresh / refreshOne*
     var refreshSeq: Int64 = 0
     /// updateTitle 去抖：180ms 窗口内多次调用合并为一次，避免刷新过程中每账号回调
@@ -358,7 +356,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         func contextMenuItem(_ title: String, action: Selector) -> NSMenuItem {
             NSMenuItem(title: title, action: action, keyEquivalent: "")
         }
-        contextMenu.addItem(contextMenuItem("🔨  编译", action: #selector(onQuickBuildFromMenu)))
         contextMenu.addItem(contextMenuItem("🔄  刷新", action: #selector(onRefresh)))
         contextMenu.addItem(contextMenuItem("🚪  退出", action: #selector(onQuit)))
         for item in contextMenu.items { item.target = self }
@@ -641,6 +638,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
         panel.onToggleStatusDebugPreview = { [weak self] in self?.onToggleStatusDebugPreview() }
         panel.onToggleLongProgressCard = { [weak self] in self?.onToggleLongProgressCard() }
+        panel.onToggleIconThemeSwap = { [weak self] in self?.onToggleIconThemeSwap() }
+        panel.onToggleVerticalLineProgress = { [weak self] in self?.onToggleVerticalLineProgress() }
         panel.onAbout = { [weak self] in self?.onAbout() }
         panel.onCheckForUpdate = { [weak self] in self?.onCheckForUpdate() }
         panel.onToggleUpdateAutoCheck = { [weak self] in self?.onToggleUpdateAutoCheck() }
@@ -655,6 +654,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 右上角 pin：置顶常驻——内容转移至无边框 NSPanel 浮动窗口（无箭头、
         // 浮层层级、背景原生拖动）；取消置顶时浮窗直接关闭
         panel.onTogglePin = { [weak self] in self?.togglePanelPin() }
+        // header 调色气泡存续期间挂起主面板 transient（点自绘气泡窗会被误判「面板外
+        // 点击」先关主面板）；气泡关闭按 pin 态恢复——与 keepPanelAliveDuring 同一口径
+        panel.onHeatWindowActive = { [weak self] active in
+            guard let self, let popover = self.popoverController, popover.isShown else { return }
+            if active {
+                popover.behavior = .applicationDefined
+            } else {
+                popover.behavior = popover.contentViewController?.view.window?.level == .floating
+                    ? .applicationDefined : .transient
+            }
+        }
         // 余额卡片点击：DeepSeek 打开浏览器，TRAE / WorkBuddy / ZCode 启动应用
         panel.onClickDeepSeek = {
             NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!)
@@ -859,6 +869,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// popover 关闭后归还焦点（隐藏 App），让之前活跃的应用恢复前台，
     /// 避免菜单栏小工具霸占焦点。
     func popoverDidClose(_ notification: Notification) {
+        // 主面板收起（点外/pin 转移等）联动收起 header 调色气泡，防孤儿浮层
+        panelView?.dismissHeatWindow()
         // 移除面板位置锁定：停用 KVO + 清空顶边锚点
         panelFrameObserver?.invalidate()
         panelFrameObserver = nil
@@ -915,6 +927,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 复用 expireSegments 作为第二行副标题（external-link 图标 + 文本）；
         // 日常额度不再显示，恒为引导文案
         dsSnap.expireSegments = ["打开Harness"]
+        if let ds = cacheDs {
+            dsSnap.weekDailyText = weekDailyText(platform: "ds", accounts: [(uid: "main", current: ds.total)],
+                                                 increasing: false, percent: false, decimals: 2, prefix: ds.symbol)
+        }
         s.dsAccounts = [dsSnap]
         // ZhiPu 卡片：智谱 BigModel 可用余额（同多号管线单元素，uid 恒 "zhipu"，
         // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.zhipu）
@@ -930,6 +946,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             zpSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.zhipu, isCurrent: true)
         }
         zpSnap.expireSegments = ["打开财务中心"]
+        if let bal = cacheBigModelBalance {
+            zpSnap.weekDailyText = weekDailyText(platform: "zhipu", accounts: [(uid: "zhipu", current: bal)],
+                                                 increasing: false, percent: false, decimals: 2, prefix: "¥")
+        }
         s.zhipuAccounts = [zpSnap]
         // Qwen 卡片：千问 Token Plan 周剩余百分比（同多号管线单元素，uid 恒 "qwen"，
         // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.qwen）；副标题为 7 天限额重置倒计时
@@ -955,6 +975,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // Qwen 点阵恒显示：usedRatio=0 表示「本周一点没用」（满格全绿），有展示意义——
         // 与 DS 的「0=没配置额度」语义不同，不套用 DS 的未消耗隐藏口径
+        if let q = cacheQwen, q.weekLimit > 0 {
+            qwSnap.weekDailyText = weekDailyText(platform: "qwen",
+                                                 accounts: [(uid: "qwen", current: q.weekRem / q.weekLimit * 100)],
+                                                 increasing: false, percent: true, decimals: 1)
+        }
         s.qwenAccounts = [qwSnap]
         let today = Self.todayString()
         // TRAE 多账号余额卡片：当前账号排最上
@@ -964,6 +989,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == traeMainUid { return false }
             return false
         }
+        let traeWeekDaily = weekDailyText(platform: "trae",
+                                          accounts: cacheTraeAccounts.map { (uid: $0.key, current: $0.value.used) },
+                                          increasing: true, percent: false, decimals: config.traeDecimals)
         for ac in traeAccountsList {
             let isCurrent = ac.uid == traeMainUid
             let cached = cacheTraeAccounts[ac.uid]
@@ -990,6 +1018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
             snap.pulsing = traePulsingTracker.isPulsing(ac.uid)
+            snap.weekDailyText = traeWeekDaily
             s.traeAccounts.append(snap)
         }
         // WorkBuddy 多账号余额卡片：当前账号排最上
@@ -999,6 +1028,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == mainUid { return false }
             return false
         }
+        let wbWeekDaily = weekDailyText(platform: "wb",
+                                        accounts: cacheWbAccounts.map { (uid: $0.key, current: $0.value.remain) },
+                                        increasing: false, percent: false, decimals: config.workbuddyDecimals)
         for ac in accounts {
             let isCurrent = ac.uid == mainUid
             let cached = cacheWbAccounts[ac.uid]
@@ -1017,6 +1049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
             snap.pulsing = wbPulsingTracker.isPulsing(ac.uid)
+            snap.weekDailyText = wbWeekDaily
             // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 5 分钟）
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.workbuddyVisible
@@ -1034,6 +1067,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == zcodeMainUid { return false }
             return false
         }
+        let zcodeWeekDaily = weekDailyText(platform: "zcode",
+                                           accounts: cacheZcodeAccounts.compactMap {
+                                               $0.value.total > 0 ? (uid: $0.key, current: $0.value.remain / $0.value.total * 100) : nil
+                                           },
+                                           increasing: false, percent: true, decimals: 1)
         for ac in zcodeAccountsList {
             let isCurrent = ac.uid == zcodeMainUid
             let cached = cacheZcodeAccounts[ac.uid]
@@ -1059,6 +1097,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 snap.taskState = AgentTaskStatusStore.zcodeVisible
             }
             snap.tokenInvalid = zcodeInvalidUids.contains(ac.uid)
+            snap.weekDailyText = zcodeWeekDaily
             s.zcodeAccounts.append(snap)
         }
         // Codex 多账号 usage 卡片：当前 auth.json 对应账号排首位，昵称固定显示邮箱。
@@ -1068,6 +1107,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == codexMainUid { return false }
             return false
         }
+        let codexWeekDaily = weekDailyText(platform: "codex",
+                                           accounts: cacheCodexAccounts.map { (uid: $0.key, current: $0.value.usedPercent) },
+                                           increasing: true, percent: true, decimals: 1)
         for ac in codexAccountsList {
             let isCurrent = ac.uid == codexMainUid
             let cached = cacheCodexAccounts[ac.uid]
@@ -1082,6 +1124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.pulsing = codexPulsingTracker.isPulsing(ac.uid)
+            snap.weekDailyText = codexWeekDaily
             // Codex Desktop/CLI 的 rollout 事件流：仅当前账号挂接 Agent 三态光环。
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.codexVisible
@@ -1161,6 +1204,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                     todayText: prefix + fmtUsage(u.today, percent: percent, decimals: decimals),
                                     weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals),
                                     historyWeeks: weeks)
+        }
+        // 卡片副标题右侧 meta（2026-09-06 用户指定）：过去 7 天总消耗 ÷ 7 的日均数值。
+        // 2026-09-07 用户定案窗口口径 = 真·过去 7 日（今日实时差值 + 前 6 自然日快照，
+        // UsageStore.last7Days），不再用自然周 ÷7（旧实现）；全账号加总同用量行；
+        // 无观测记录 = nil 不显示。「/ 日 (7日)」后缀与 2pt 固定间隔由 Panel 侧 stack 布局提供
+        func weekDailyText(platform: String, accounts: [(uid: String, current: Double)],
+                           increasing: Bool, percent: Bool, decimals: Int, prefix: String = "") -> String? {
+            guard let sum7 = UsageStore.last7Days(platform: platform, accounts: accounts, increasing: increasing) else { return nil }
+            return prefix + fmtUsage(sum7 / 7, percent: percent, decimals: decimals)
         }
         if let ds = cacheDs,
            let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds",
@@ -1242,6 +1294,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.lightThemeEnabled = config.lightThemeEnabled
         s.monoFontEnabled = config.monoFontEnabled
         s.longProgressCard = config.longProgressCard
+        s.iconThemeSwap = config.iconThemeSwap
+        s.verticalLineProgress = config.verticalLineProgress
         return s
     }
 
@@ -1294,11 +1348,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             Logger.log(.refresh, "[\(seq)] refreshTask scope END (elapsed=\(ms)ms, cancelled=\(Task.isCancelled))")
         }
-    }
-
-    /// 菜单栏原生右键菜单的“编译”入口。
-    @objc private func onQuickBuildFromMenu(_ sender: Any?) {
-        startQuickBuild()
     }
 
     /// 子菜单单选切换刷新间隔（tag = 秒数：60 / 180 / 300）
@@ -1380,6 +1429,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
+    /// 图标深浅互换：切换开关（余额卡片品牌 icon ClearDark ↔ ClearLight 版本互换，仅影响 icon）
+    @objc private func onToggleIconThemeSwap() {
+        config.iconThemeSwap.toggle()
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
+    /// 竖线进度条：切换开关（长进度卡片整行条替换为 50 条 1.5pt 竖线，间隔自适应、无背景无边框）
+    @objc private func onToggleVerticalLineProgress() {
+        config.verticalLineProgress.toggle()
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
     /// 打开平台开关弹窗：保存后同步右键菜单、自动签到定时器和面板状态。
     @objc private func onManagePlatformToggles() {
         let oldConfig = config
@@ -1406,62 +1469,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func onQuit() {
         NSApp.terminate(nil)
-    }
-
-    /// 从项目 swift/ 目录打开 Terminal 执行快速编译脚本。
-    /// build.sh 自身负责编译、打包、签名、停止旧实例并重启新 App；
-    /// 编译成功后由 Terminal 自己关闭窗口，失败时保留窗口方便查看错误输出。
-    private func startQuickBuild() {
-        guard quickBuildProcess?.isRunning != true else {
-            Logger.log(.refresh, "[quick-build] already running, ignored")
-            return
-        }
-        let buildDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        let script = buildDirectory.appendingPathComponent("build.sh")
-        guard FileManager.default.isExecutableFile(atPath: script.path) else {
-            Logger.log(.refresh, "[quick-build] build.sh not executable: \(script.path)")
-            return
-        }
-
-        let command = """
-        cd \"\(buildDirectory.path)\" && ./build.sh
-        build_status=$?
-        if [ \"$build_status\" -eq 0 ]; then
-            osascript -e 'tell application \"Terminal\" to close front window'
-        fi
-        exit \"$build_status\"
-        """
-        let escapedCommand = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let appleScript = """
-        tell application "Terminal"
-            activate
-            do script "\(escapedCommand)"
-        end tell
-        """
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", appleScript]
-        let nullOutput = FileHandle(forWritingAtPath: "/dev/null")
-        process.standardOutput = nullOutput
-        process.standardError = nullOutput
-        process.terminationHandler = { [weak self] process in
-            DispatchQueue.main.async {
-                guard let self, self.quickBuildProcess === process else { return }
-                self.quickBuildProcess = nil
-                Logger.log(.refresh, "[quick-build] finished status=\(process.terminationStatus)")
-            }
-        }
-
-        do {
-            try process.run()
-            quickBuildProcess = process
-            Logger.log(.refresh, "[quick-build] opened Terminal for: \(script.path); closes on success")
-        } catch {
-            Logger.log(.refresh, "[quick-build] open Terminal failed: \(error.localizedDescription)")
-        }
     }
 
     // MARK: - 滚动提示层参数

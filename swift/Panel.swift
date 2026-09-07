@@ -70,6 +70,10 @@ struct PanelSnapshot: Equatable {
     var statusDebugPreview = false
     /// 长进度卡片开关（开启后余额卡片进度条独占整行 + 副标题下移一行）
     var longProgressCard = false
+    /// 图标深浅互换开关（开启后卡片品牌 icon ClearDark/ClearLight 版本互换）
+    var iconThemeSwap = false
+    /// 竖线进度条开关（长进度卡片整行条替换为 50 条 1.5pt 竖线，间隔自适应、无背景无边框）
+    var verticalLineProgress = false
     /// 自动检查更新开关（GitHub Releases 启动静默检查）
     var updateAutoCheckEnabled = true
 }
@@ -92,6 +96,7 @@ struct AccountCardSnapshot: Equatable {
     var hideDots: Bool = false      // 隐藏点阵（DeepSeek 未配置日常额度时；多号平台恒 false）
     var tokenInvalid: Bool = false  // 令牌失效/账号无套餐（账号级问题）：悬浮气泡 ID 后黄色徽章，不进平台刷新失败
     var taskState: AgentTaskState? = nil  // Agent 任务状态（仅当前账号）：icon 光环（nil = 无）
+    var weekDailyText: String? = nil  // 副标题右侧 meta：过去 7 天总消耗 ÷ 7 的日均文案（无用量记录 = nil 不显示）
 }
 
 /// 动效统一取值表（UIUX-OPTIMIZATION.md §1）：时长与曲线只允许从这里取，
@@ -143,10 +148,10 @@ enum Motion {
         static let riseDuration: CFTimeInterval = 0.40
         /// 入场行间错峰
         static let riseGap: CFTimeInterval = 0.10
-        /// 离场下沉量（调用处取负：-y = 视觉向下）
-        static let sinkOffset: CGFloat = 14
-        /// 离场单块时长（easeIn 重力感，用户指定）
-        static let sinkDuration: CFTimeInterval = 0.35
+        /// 离场下沉量（调用处取负：-y = 视觉向下；2026-09-06 用户指定 14 → 10 → 6）
+        static let sinkOffset: CGFloat = 6
+        /// 离场单块时长（easeIn 重力感，用户指定 0.35 → 2026-09-06 用户「透明度更快的降低」0.2）
+        static let sinkDuration: CFTimeInterval = 0.2
         /// 离场行间错峰
         static let sinkGap: CFTimeInterval = 0.06
     }
@@ -168,6 +173,152 @@ extension NSAppearance {
     var isDark: Bool {
         bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
+}
+
+/// header 调色气泡的内容视图：两行「行首 SF Symbol + 原生 NSSlider」（0..1 连续上报，
+/// 上行色相、下行饱和度，拖动实时改点阵配色；icon 不着色=默认前景色）+ 尾部主题/样式
+/// 开关行组（setSwitchRows 挂入，行视图本体归面板 switchRows 注册表管）。
+/// 目标/动作都挂在自身，不经面板浮窗拆除路径。载体是自绘气泡窗（showHeatWindow，
+/// 与子账号悬浮气泡同机制），frame 直铺纵向流式排布。
+final class HeatAdjustView: NSView {
+    let hueSlider = NSSlider()
+    let satSlider = NSSlider()
+    var onHue: ((CGFloat) -> Void)?
+    var onSaturation: ((CGFloat) -> Void)?
+
+    /// 本体（不含箭头）宽 166 = 内边距 10 + icon 16 + 距 6 + 轨道 124 + 内边距 10
+    ///（2026-09-07 用户「增加容器宽度 60pt」：106→166，容纳开关行、轨道加长）
+    static let bodyWidth: CGFloat = 166
+    private static let sideInset: CGFloat = 10
+    private static let iconSize: CGFloat = 16
+    private static let iconGap: CGFloat = 6
+    /// 纵向：上下内边距 10（与四边同值）、滑杆行带 19 + 行间 6、滑杆组↔开关组 10、
+    /// 开关行 18 + 行间 6
+    private static let vPad: CGFloat = 10
+    static let sliderRowH: CGFloat = 19
+    private static let rowGap: CGFloat = 6
+    private static let sectionGap: CGFloat = 10
+    static let switchRowH: CGFloat = 18
+
+    /// 按开关行数求本体高（展示方建窗同一算式，保证行带/内边距严格落位）
+    static func bodyHeight(switchRows: Int) -> CGFloat {
+        vPad * 2 + sliderRowH * 2 + rowGap + sectionGap
+            + CGFloat(switchRows) * switchRowH + CGFloat(max(0, switchRows - 1)) * rowGap
+    }
+
+    /// 本体在窗口内的左右边界偏移：箭头侧让出箭头长，由展示方按 edge 注入
+    var bodyOriginX: CGFloat = 0 {
+        didSet { if oldValue != bodyOriginX { needsLayout = true } }
+    }
+    var bodyRightTrim: CGFloat = 0 {
+        didSet { if oldValue != bodyRightTrim { needsLayout = true } }
+    }
+
+    /// 行首图标（模板图默认前景色染色，勿再设 contentTintColor）
+    private static func symbolImageView(_ name: String) -> NSImageView {
+        let iv = NSImageView()
+        iv.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 16, weight: .medium))
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        return iv
+    }
+    private let hueIcon = symbolImageView("paintpalette")
+    private let satIcon = symbolImageView("drop.fill")
+
+    private var switchRows: [NSView] = []
+    /// 开关行承载宿主：行用 Auto Layout 撑满宿主宽（trailing 钉死 → 开关贴右缘）；
+    /// 宿主自身 frame 直铺，与滑杆行共用左右边界
+    private let rowsHost = NSView()
+    private var rowConstraints: [NSLayoutConstraint] = []
+
+    /// 挂入/换入开关行（行视图由面板侧 switchRow() 构建并注册，这里只做承载与排布）
+    func setSwitchRows(_ rows: [NSView]) {
+        NSLayoutConstraint.deactivate(rowConstraints)
+        rowConstraints = []
+        for r in switchRows { r.removeFromSuperview() }
+        switchRows = rows
+        var previous: NSView?
+        for row in rows {
+            row.translatesAutoresizingMaskIntoConstraints = false
+            rowsHost.addSubview(row)
+            rowConstraints.append(contentsOf: [
+                row.leadingAnchor.constraint(equalTo: rowsHost.leadingAnchor),
+                row.trailingAnchor.constraint(equalTo: rowsHost.trailingAnchor),
+                row.heightAnchor.constraint(equalToConstant: Self.switchRowH),
+                previous.map { row.topAnchor.constraint(equalTo: $0.bottomAnchor,
+                                                        constant: Self.rowGap) }
+                    ?? row.topAnchor.constraint(equalTo: rowsHost.topAnchor),
+            ])
+            previous = row
+        }
+        NSLayoutConstraint.activate(rowConstraints)
+        needsLayout = true
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        for slider in [hueSlider, satSlider] {
+            slider.minValue = 0
+            slider.maxValue = 1
+            slider.isContinuous = true
+            slider.controlSize = .small
+            slider.target = self
+            addSubview(slider)
+        }
+        hueSlider.action = #selector(hueChanged(_:))
+        satSlider.action = #selector(satChanged(_:))
+        addSubview(hueIcon)
+        addSubview(satIcon)
+        addSubview(rowsHost)
+        syncFromPalette()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 展示前同步滑杆位置到 Palette 当前值
+    func syncFromPalette() {
+        hueSlider.doubleValue = Double(Palette.heatPeakHue)
+        satSlider.doubleValue = Double(Palette.heatPeakSaturation)
+    }
+
+    override func layout() {
+        super.layout()
+        // 非翻转坐标 y 向上，自顶向下流式：色相行 → 饱和度行 → 开关行组
+        let x = bodyOriginX + Self.sideInset
+        let contentW = max(40, bounds.width - bodyOriginX - bodyRightTrim
+                                - Self.sideInset * 2)
+        let trackW = max(20, contentW - Self.iconSize - Self.iconGap)
+        var top = bounds.height - Self.vPad
+        for (slider, icon) in [(hueSlider, hueIcon), (satSlider, satIcon)] {
+            let centerY = top - Self.sliderRowH / 2
+            icon.frame = NSRect(x: x, y: centerY - Self.iconSize / 2,
+                                width: Self.iconSize, height: Self.iconSize)
+            slider.frame = NSRect(x: x + Self.iconSize + Self.iconGap,
+                                  y: centerY - slider.fittingSize.height / 2,
+                                  width: trackW, height: slider.fittingSize.height)
+            top -= Self.sliderRowH + Self.rowGap
+        }
+        top -= Self.sectionGap - Self.rowGap
+        // 开关组宿主：frame 定位置与大小，行在宿主内 AL 撑满宽（右缘对齐由约束保证）
+        let n = switchRows.count
+        let blockH = n == 0 ? 0 : Self.switchRowH * CGFloat(n) + Self.rowGap * CGFloat(n - 1)
+        rowsHost.frame = NSRect(x: x, y: top - blockH, width: contentW, height: blockH)
+    }
+
+    @objc private func hueChanged(_ sender: NSSlider) {
+        onHue?(CGFloat(sender.doubleValue))
+    }
+    @objc private func satChanged(_ sender: NSSlider) {
+        onSaturation?(CGFloat(sender.doubleValue))
+    }
+}
+
+/// 调色气泡窗：borderless NSWindow 默认不可成 key，而 AppKit 对「非 key 窗口」里的
+/// 控件一律按 inactive 态绘制——NSSwitch 的开态轨道（controlAccentColor）失焦自动
+/// 渲染成灰（用户所见「原生颜色被接管」真因，非代码染色）。放行 key 获取即可恢复
+/// 原生强调色；不覆写 canBecomeMain，避免抢主窗口语义。
+final class HeatBubbleWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
 }
 
 /// 配色 token：集中管理所有自定义颜色，避免硬编码散落各处
@@ -204,27 +355,28 @@ enum Palette {
     }
     /// 渐变端点数组（CAGradientLayer.colors 直接可用）
     static let hoverGradient: [NSColor] = [hoverGradientBright, hoverGradientDark]
-    /// Agent/API 平台卡 hover 强背景（用户指定）：深色 = 黑 @35%（2026-09-06 由 50% 提亮 10%，
-    /// 同日「渐变黑提亮一点点」再降 5 个点），浅色 = 白 @80%。两端点同色 = 视觉纯色；
+    /// Agent/API 平台卡 hover 强背景（用户指定）：深色 = 黑 @45%（2026-09-06 用户
+    /// 「更暗」由 35% 加深；当日更早演化 50% → 35% 后回调），浅色 = 白 @80%。
+    /// 两端点同色 = 视觉纯色；
     /// 平台卡 HoverCard 与 Agent 标题胶囊经 hoverGradientOverride 套用，
     /// 余额卡/磁贴/折叠标题条/用量条仍走淡渐变，互不影响。
     static let cardHoverStrongBright = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.black.withAlphaComponent(0.35)
+            ? NSColor.black.withAlphaComponent(0.45)
         // 浅色外观 = 白 @52%（2026-09-06 用户「提亮大约30%」由 40% 上调，
         // 白色叠加层亮度只由 alpha 决定，0.4×1.3≈0.52）
             : NSColor.white.withAlphaComponent(0.52)
     }
     static let cardHoverStrongDark = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.black.withAlphaComponent(0.35)
+            ? NSColor.black.withAlphaComponent(0.45)
             : NSColor.white.withAlphaComponent(0.8)
     }
     static let cardHoverStrong: [NSColor] = [cardHoverStrongBright, cardHoverStrongDark]
     /// 平台卡 hover 顶部椭圆光晕（2026-09-06 用户指定，参考图=顶部中央大椭圆模糊白光）：
-    /// 顶部椭圆光晕 alpha（按外观分档）：深色 20%（2026-09-06 用户「暗一些」由 25% 再降）；
+    /// 顶部椭圆光晕 alpha（按外观分档）：深色 10%（2026-09-06 用户「透明度降低 10%」由 20% 再降）；
     /// 浅色 35%（2026-09-06 用户指定「浅色再加强」）
-    static let cardHoverGlowAlphaDark: CGFloat = 0.20
+    static let cardHoverGlowAlphaDark: CGFloat = 0.10
     static let cardHoverGlowAlphaLight: CGFloat = 0.35
     static func cardHoverGlowAlpha(dark: Bool) -> CGFloat {
         dark ? cardHoverGlowAlphaDark : cardHoverGlowAlphaLight
@@ -279,14 +431,17 @@ enum Palette {
     static let containerTintBottom = NSColor(calibratedWhite: 0.25, alpha: 0.55)
 
     /// 浅色主题渐变遮罩两端：顶部亮白 → 底部微白（2026-09-06 用户要求整体提亮：
-    /// 顶 0.55→0.75、底 0→0.2；同日晚「暗部更亮」底 0.2→0.35。
-    /// 与深色遮罩方向互补——深色是顶部透明 → 底部近黑）
+    /// 顶 0.55→0.75、底 0→0.2；同日晚「暗部更亮」底 0.2→0.35；
+    /// 2026-09-07 「高对比背景下浅色相反=底部提亮」底 0.35→0.55。
+    /// 与深色遮罩方向互补——深色是顶部近黑 → 底部深灰）
     static let containerTintLightTop = NSColor.white.withAlphaComponent(0.75)
-    static let containerTintLightBottom = NSColor.white.withAlphaComponent(0.35)
+    static let containerTintLightBottom = NSColor.white.withAlphaComponent(0.55)
+    /// 深色遮罩底端：压黑面板底部亮玻璃用（2026-09-07 用户要求，原全透明露出毛玻璃亮色）
+    static let containerTintDarkBottom = NSColor(calibratedWhite: 0.02, alpha: 0.28)
 
     /// 主面板容器背景配色（单一事实源）：applyGradient 与各子弹窗（Token/用量）兜底共用。
-    /// 渐变开：深色遮罩（加深黑）= 顶部全透明 → 底部近黑（containerTint 系）；
-    /// 浅色遮罩（提亮白）= 顶部亮白 → 底部全透明（containerTintLight 两端）。
+    /// 渐变开：深色遮罩（加深黑）= 顶部近黑 → 底部深灰（containerTint / containerTintDarkBottom）；
+    /// 浅色遮罩（提亮白）= 顶部亮白 → 底部微白（containerTintLight 两端）。
     /// lightTint 由调用方按「浅色主题开关开或生效外观为浅色」传入——遮罩明暗跟随系统深浅色。
     /// 关 = 无任何遮罩（top/bottom 均 nil，露出原生 Liquid Glass 毛玻璃）。
     /// top/bottom 分别对应 TintedVisualEffectView 的 tintColor / tintBottomColor
@@ -295,7 +450,7 @@ enum Palette {
         guard gradientOn else { return (nil, nil) }
         return lightTint
             ? (containerTintLightTop, containerTintLightBottom)
-            : (containerTint, containerTint.withAlphaComponent(0))
+            : (containerTint, containerTintDarkBottom)
     }
     /// 面板外观统一解析（唯一事实源，所有容器/popover/子面板必须走这里，禁止散落三元式）：
     /// 浅色主题开 = 强制浅色 aqua（即使系统是深色主题）；其余（含渐变开）= nil 跟随系统
@@ -376,29 +531,83 @@ enum Palette {
             ? NSColor(calibratedRed: 0xEB/255.0, green: 0xEB/255.0, blue: 0xEB/255.0, alpha: 1)
             : NSColor(calibratedWhite: 0x26 / 255.0, alpha: 1)
     }
-    /// Token 热力图无用量底点（深 中性灰 #262626（去饱和定稿，亮度取自 #1E262E 中值）/ 浅 sRGB 210,210,210 中性浅灰）。
+    /// Token 热力图无用量底点（深 中性灰 #292929（2026-09-07 用户由 #262626 提亮）/
+    /// 浅 sRGB 210,210,210 中性浅灰）。
     /// 浅色值必须用 sRGB 定义：calibratedWhite 是 gamma1.8 校准空间，合成到 sRGB 屏幕时
     /// 做 gamma 补偿会把 215 渲染成 223（取色实测），sRGB 定义则所见即所得。
     static let heatDotEmpty = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor(calibratedRed: 0x26/255.0, green: 0x26/255.0, blue: 0x26/255.0, alpha: 1)
+            ? NSColor(calibratedRed: 0x29/255.0, green: 0x29/255.0, blue: 0x29/255.0, alpha: 1)
             : NSColor(srgbRed: 210/255.0, green: 210/255.0, blue: 210/255.0, alpha: 1)
     }
     /// Token 热力图 hover 高亮环（深 白@90% / 浅 黑@70%）
     static let heatDotRing = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor.white.withAlphaComponent(0.9) : NSColor.black.withAlphaComponent(0.7)
     }
-    /// Token 热力图有量级配色（按生效外观选择，集中管理勿散落）：
-    /// 深色主题 = GitHub 暗色绿阶 4 级离散色（用户定稿 2026-08-29）：
-    /// #063A16 / #196C2E / #2EA043 / #56D364（level 1→4），见 heatLevelsDark；
-    /// 浅色主题两端点线性插值 #9BE9A8 → #216E39（2026-09-06 用户要求加深适配浅色主题，
-    /// 取 GitHub 浅色热力图两端点，原 #B9EAC5 → #2CC859 过浅已废）。
-    static let heatLevelsLight: (from: (r: Int, g: Int, b: Int), to: (r: Int, g: Int, b: Int)) =
-        ((155, 233, 168), (33, 110, 57))
-    /// 深色主题热力图 4 级离散色（level 1→4），levelColor 直取不做插值
-    static let heatLevelsDark: [(r: Int, g: Int, b: Int)] = [
-        (6, 58, 22), (25, 108, 46), (46, 160, 67), (86, 211, 100)
-    ]
+    /// Token 热力图有量级配色（按生效外观选择，集中管理勿散落）。
+    /// 2026-09-07 用户定稿峰值色 = sRGB (225, 254, 119)（亮黄绿），其余档位 = 同色相
+    /// 亮度阶梯（对峰值色等比压暗，色相/饱和走向不变）：
+    /// 深色主题 = 4 级离散档（level 1→4）压暗系数 45% / 65% / 82% / 100%
+    ///（「前三档过暗提亮」定稿；首版 28/50/73/100 作废）；
+    /// 浅色主题 = 两端点线性插值，低用量端 = 峰值色原样、高用量端 = 33% 压暗
+    ///（替换 2026-08-29 GitHub 绿阶 #063A16…#56D364 与浅色 #9BE9A8→#216E39 旧档）。
+    /// 峰值基准色 HSB 分解：饱和/色相可调（header 调色弹层两行滑杆）、明度恒 = 254/255
+    ///（弹层圆点取色同用，故 internal）。
+    static let heatPeakBrightness: CGFloat = 254.0 / 255.0
+    /// 基准黄绿的色相/饱和（0..1）：峰值 (225,254,119) → hue=(2+(B−R)/Δ)/6、sat=Δ/max。
+    static let heatPeakDefaultHue: CGFloat = (2 + (119 - 225) / 135) / 6
+    static let heatPeakDefaultSaturation: CGFloat = 135.0 / 254.0
+    /// 点阵色相（0..1）：header 调色弹层滑杆写入；UserDefaults 持久化跨重启。
+    static var heatPeakHue: CGFloat {
+        get {
+            ((UserDefaults.standard.object(forKey: UDKey.heatDotHue) as? Double).map { CGFloat($0) })
+                ?? heatPeakDefaultHue
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: UDKey.heatDotHue) }
+    }
+    /// 点阵饱和度（0..1）：同上，弹层第二行滑杆。
+    static var heatPeakSaturation: CGFloat {
+        get {
+            ((UserDefaults.standard.object(forKey: UDKey.heatDotSaturation) as? Double)
+                .map { CGFloat($0) }) ?? heatPeakDefaultSaturation
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: UDKey.heatDotSaturation) }
+    }
+    /// 当前最终峰值色（level 4 / 弹层圆点实时显色）。
+    static var heatPeakColor: NSColor {
+        let c = heatPeakRGB()
+        return NSColor(calibratedRed: c.r, green: c.g, blue: c.b, alpha: 1)
+    }
+    /// HSB → RGB（0..1）：色相/饱和度调整后推导峰值色的唯一实现。
+    private static func heatPeakRGB() -> (r: CGFloat, g: CGFloat, b: CGFloat) {
+        let h = heatPeakHue * 6, s = heatPeakSaturation, v = heatPeakBrightness
+        let i = Int(floor(h)), f = h - floor(h)
+        let p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f))
+        switch ((i % 6) + 6) % 6 {
+        case 0: return (v, t, p)
+        case 1: return (q, v, p)
+        case 2: return (p, v, t)
+        case 3: return (p, q, v)
+        case 4: return (t, p, v)
+        default: return (v, p, q)
+        }
+    }
+    /// 热力档位 → 实色（0 = 无用量底点；= 峰值色 × 压暗系数：深色离散档、
+    /// 浅色 1.0→0.33 线性）。2026-09-07 从 TokensPanel 上收到此集中管理：词元活动
+    /// 热力图与默认卡片竖排点阵四档状态色共用同一口径，勿再散落
+    static func heatLevelColor(_ level: Int, dark: Bool) -> NSColor {
+        if level <= 0 { return heatDotEmpty }
+        let peak = heatPeakRGB()
+        let factor: CGFloat
+        if dark {
+            factor = [0.45, 0.65, 0.82, 1.0][min(level, 4) - 1]
+        } else {
+            let t = CGFloat(min(level, 4) - 1) / 3
+            factor = 1 + (0.33 - 1) * t
+        }
+        return NSColor(calibratedRed: peak.r * factor, green: peak.g * factor,
+                       blue: peak.b * factor, alpha: 1)
+    }
     /// 悬浮提示气泡（深 近黑@94% + 白@16% 边 / 浅 近白@95% + 黑@15% 边）
     static let tooltipBackground = NSColor(name: nil) { appearance in
         appearance.isDark
@@ -1050,6 +1259,8 @@ final class BalancePanelViewController: NSViewController {
             backdrop.tintColor = headerTint
             backdrop.tintBottomColor = headerTint
         }
+        // 调色气泡开着时翻渐变/浅色开关：玻璃遮罩/appearance 同步重染（即时生效）
+        panel.refreshHeatWindowChromeIfVisible()
     }
 
     override func viewWillAppear() {
@@ -1130,6 +1341,19 @@ final class BalancePanelView: NSView {
     static let headerHeight: CGFloat = 30
     /// 由布局构建，随后由 BalancePanelViewController 提升到滚动容器上层固定显示。
     var headerView: NSView?
+    /// header 点阵调色按钮（弹悬浮气泡：色相/饱和度滑杆 + 主题/样式开关组）
+    var heatHueBtn: HoverIconButton?
+    /// 主题/样式开关行（面板渐变/浅色主题/Mono/长进度/图标互换/竖线进度，
+    /// 2026-09-07 用户指定移出设置卡；行照常注册进 switchRows，气泡展示时挂入）
+    var themeSwitchRows: [NSView] = []
+    /// 调色气泡窗（自绘，子账号悬浮气泡同机制）；存续期间须经 onHeatWindowActive
+    /// 挂起主面板 transient（否则点自绘气泡窗会被误判「面板外点击」先关主面板）
+    private var heatWindow: NSWindow?
+    /// 气泡玻璃层弱引用（气泡内翻渐变/浅色开关时即时重染，遮罩色创建时定格）
+    private weak var heatGlass: TintedVisualEffectView?
+    private var heatLocalMonitor: Any?
+    private var heatGlobalMonitor: Any?
+    var onHeatWindowActive: ((Bool) -> Void)?
     /// header 独立背景层：固定在滚动内容上方，不承载文字/按钮，只负责
     /// 复刻面板容器的毛玻璃（遮住滚到 header 下方的内容）+ 承载下缘分割线。
     var headerBackdropView: TintedVisualEffectView?
@@ -1155,6 +1379,10 @@ final class BalancePanelView: NSView {
     var onToggleStatusDebugPreview: (() -> Void)?
     /// 长进度卡片开关（设置卡片开关触发：整行进度条 + 副标题下移，随快照重建卡片）
     var onToggleLongProgressCard: (() -> Void)?
+    /// 图标深浅互换开关（设置卡片开关触发：品牌 icon ClearDark ↔ ClearLight 互换）
+    var onToggleIconThemeSwap: (() -> Void)?
+    /// 竖线进度条开关（设置卡片开关触发：长进度卡片整行条替换为 50 条竖线）
+    var onToggleVerticalLineProgress: (() -> Void)?
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
     var onPanelGradientChanged: (() -> Void)?
     var onAbout: (() -> Void)?
@@ -1265,6 +1493,7 @@ final class BalancePanelView: NSView {
         var chipTipBox: ChipTipBox? = nil        // 当前账号积分 chip 气泡数据盒（apply 随刷新更新昵称/签到徽章）
         var segBox: ExpireSegBox? = nil          // 副标题完整段落数据盒（账号条换入期间改写精简文案/离场恢复）
         var dotsAlwaysVisible = false            // 长进度卡片：进度条常驻，不随账号条换入隐藏
+        var metaWeekLabel: NSTextField? = nil    // 副标题右侧 meta：7日消耗的数值段（apply 随刷新更新；标题段静态）
     }
 
     /// 各平台卡片差异配置（icon / 标题 / 签到行 / 到期行 / reward 兜底）
@@ -1328,10 +1557,13 @@ final class BalancePanelView: NSView {
     /// 当前实际被拖动的账号卡片；用于占位内容，组幽灵的源视图单独记录。
     weak var draggingCard: NSView?
     weak var draggingGhostSourceView: NSView?
-    weak var draggingGhostView: NSImageView?
+    weak var draggingGhostView: NSView?
     var draggingGhostOffset = NSPoint.zero
     /// 当前拖动平台内的其他账号小卡片及其原始内容透明度。
     var draggingSiblingCardOpacities: [(card: HoverCard, opacity: Float)] = []
+    /// 拖动期间被隐藏的 icon 状态光环（CardTaskStatusRingView，2026-09-06 用户指定
+    /// 「拖动卡片时 icon 的状态层不显示」）：截图前隐藏（幽灵/原卡同步生效），拖拽结束恢复
+    var draggingHiddenStatusRings: [CardTaskStatusRingView] = []
     let updatedLabel = NSTextField(labelWithString: "")
     /// 刷新动效状态：true 时 header 的「更新于」区域脉冲显示「刷新中…」
     /// setter 私有，仅 setRefreshing(_:) 可写；getter internal，供 AppDelegate 调试日志用。
@@ -1386,13 +1618,8 @@ final class BalancePanelView: NSView {
         while let v = stack.popLast() {
             if let iv = v as? NSImageView, let id = iv.identifier?.rawValue,
                id.hasPrefix("brandIcon:") {
-                let key = String(id.dropFirst("brandIcon:".count))
-                if iv.bounds.width > 0,
-                   let brand = BalancePanelView.brandIconImage(key, dark: appearance.isDark) {
-                    let scaled = brand.copy() as! NSImage
-                    scaled.size = iv.bounds.size
-                    iv.image = scaled
-                }
+                applyBrandIcon(iv, key: String(id.dropFirst("brandIcon:".count)),
+                               dark: brandIconDark(for: appearance))
             }
             if let layer = v.layer, layer.borderWidth == 0 {
                 appearance.performAsCurrentDrawingAppearance {
@@ -1405,6 +1632,49 @@ final class BalancePanelView: NSView {
         onPanelGradientChanged?()
         syncUsageHistoryPanelBackground()
 
+    }
+
+    /// 品牌 icon 取版深浅判定：生效外观 ⊕ 图标深浅互换开关（开启即在生效外观上反向取版）
+    func brandIconDark(for appearance: NSAppearance) -> Bool {
+        appearance.isDark != iconThemeSwapEnabled
+    }
+
+    /// 单个品牌 icon 视图换到指定深浅版（brandIconImage 内部含缺资产回退另一版）；
+    /// 长进度卡片的菜单栏辉光以 icon 为蒙版，随换版同步 maskImage
+    private func applyBrandIcon(_ iv: NSImageView, key: String, dark: Bool) {
+        guard iv.bounds.width > 0,
+              let brand = Self.brandIconImage(key, dark: dark) else { return }
+        let scaled = brand.copy() as! NSImage
+        scaled.size = iv.bounds.size
+        iv.image = scaled
+        iv.superview?.subviews.compactMap { $0 as? CardMenuBarGlowView }.forEach {
+            $0.maskImage = scaled
+        }
+    }
+
+    /// 竖线进度条开关变化：遍历视图树，把横态 UsageDots（= 长进度卡片整行条）翻成
+    /// lineBarMode；列表态竖向条 isVertical 跳过，不受本开关影响
+    func applyLineBarModeInPlace() {
+        var stack = subviews
+        while let v = stack.popLast() {
+            if let d = v as? UsageDots, !d.isVertical {
+                d.lineBarMode = verticalLineProgressEnabled
+            }
+            stack.append(contentsOf: v.subviews)
+        }
+    }
+
+    /// 图标深浅互换开关变化：遍历视图树就地换品牌 icon 版（与外观切换钩子同一换版逻辑）
+    func swapBrandIconsInPlace() {
+        var stack = subviews
+        while let v = stack.popLast() {
+            if let iv = v as? NSImageView, let id = iv.identifier?.rawValue,
+               id.hasPrefix("brandIcon:") {
+                applyBrandIcon(iv, key: String(id.dropFirst("brandIcon:".count)),
+                               dark: brandIconDark(for: effectiveAppearance))
+            }
+            stack.append(contentsOf: v.subviews)
+        }
     }
     /// 用量行实际宽度（列宽自动分配的预算基准）：用量卡片 horizontalPadding 0、行撑满
     /// 卡片，卡片又撑满 root，故 = document 宽 − root 左右正文缩进 7×2。
@@ -1513,6 +1783,12 @@ final class BalancePanelView: NSView {
     /// 长进度卡片开关（余额卡片整行进度条 + 副标题下移；update 时随快照同步状态）
     let longProgressCardSwitch = MiniSwitch()
     private(set) var longProgressCardEnabled = false
+    /// 图标深浅互换开关（设置卡片开关：品牌 icon 深浅版互换；update 时随快照同步状态）
+    let iconThemeSwapSwitch = MiniSwitch()
+    private(set) var iconThemeSwapEnabled = false
+    /// 竖线进度条开关（设置卡片开关：长进度卡片整行条改竖线形态；update 时随快照同步）
+    let verticalLineProgressSwitch = MiniSwitch()
+    private(set) var verticalLineProgressEnabled = false
     /// 状态调试副标题（开发调试行）：2026-09-01 加 90pt 宽度上限——原文案 ≈138pt 把
     /// 设置卡 fittingSize 撑到 256（popover 撑宽元凶之一）；上限约束参与 fittingSize，
     /// 防止开发调试行影响面板宽度
@@ -1679,8 +1955,21 @@ final class BalancePanelView: NSView {
             zcodeCardUids = []
             traeCardUids = []
             codexCardUids = []
+            applyPlatformCardGaps()   // 组内平台卡间距随模式切换（列表态 4 / 长进度 2.5）
             contentSizeChanged = true
         }
+        // 图标深浅互换开关同步：变化时按当前生效外观就地换版（不重建卡片；
+        // 设置段先于卡片构建执行，后续新建卡直接读 iconThemeSwapEnabled 取对版）
+        let iconSwapChanged = s.iconThemeSwap != iconThemeSwapEnabled
+        iconThemeSwapEnabled = s.iconThemeSwap
+        iconThemeSwapSwitch.state = s.iconThemeSwap ? .on : .off
+        if iconSwapChanged { swapBrandIconsInPlace() }
+        // 竖线进度条开关同步：变化时就地翻长进度卡片整行条的形态（不重建卡片；
+        // 设置段先于卡片构建执行，后续新建卡在 barRow 组装处直接读开关取形态）
+        let lineBarChanged = s.verticalLineProgress != verticalLineProgressEnabled
+        verticalLineProgressEnabled = s.verticalLineProgress
+        verticalLineProgressSwitch.state = s.verticalLineProgress ? .on : .off
+        if lineBarChanged { applyLineBarModeInPlace() }
         offlineBanner.isHidden = !s.offline
 
         // 行序跟随面板卡片视觉序：API 板块在前、Agent 板块在后，
@@ -2123,6 +2412,28 @@ final class BalancePanelView: NSView {
             } else {
                 info = nil
             }
+            // 副标题右侧 meta 标签（2026-09-06 用户指定）：「x / 日 (7日)」两段——
+            // 日均数值 + 后缀（快照有用量记录时）。数值↔后缀间隔 = stack 2pt 固定间隔
+            //（不用空格字符）；有 info 行的卡片才挂（非当前小卡无副标题）。hover 账号条
+            // 换入时隐藏（同一区域被条占用）、离场恢复（见换入/离场闭包）
+            var metaStack: NSStackView? = nil
+            var metaWeekLabel: NSTextField? = nil
+            if info != nil, let value = accounts.first(where: { $0.isCurrent })?.weekDailyText {
+                let stack = NSStackView()
+                stack.orientation = .horizontal
+                stack.alignment = .centerY
+                stack.spacing = 2
+                let lbl = NSTextField(labelWithString: value)
+                registerFont(lbl, size: Palette.cardSubFontSize)
+                lbl.textColor = .systemGray
+                let suffix = NSTextField(labelWithString: "/ 日\u{2087}")
+                registerFont(suffix, size: Palette.cardSubFontSize)
+                suffix.textColor = .systemGray
+                metaWeekLabel = lbl
+                stack.addArrangedSubview(lbl)
+                stack.addArrangedSubview(suffix)
+                metaStack = stack
+            }
             // 昵称 label：2026-09-02 移除卡片 hover 昵称展示——昵称/徽章改由积分按钮
             // 悬浮气泡承载（showSubAccountTip）。label 仅作透明占位参与标题行布局
             //（保持既有行几何不变），恒不显示
@@ -2155,6 +2466,7 @@ final class BalancePanelView: NSView {
                                   failureBadge: badge,
                                   premadeIconView: fadeIcon,
                                   hoverSubStrip: subStrip,
+                                  subtitleMeta: metaStack,
                                   valuePrefixIcon: isAgentCard ? "coin" : nil,
                                   longProgressCard: longProgressCardEnabled,
                                   titleLabelRef: { capturedTitle = $0 },
@@ -2176,8 +2488,8 @@ final class BalancePanelView: NSView {
                 self?.endPlatformDrag()
             }, topPadding: cardPadTop, bottomPadding: cardPadBottom,
                // 长进度卡片左缩进与普通卡一致 8pt（2026-09-06 用户「+1pt」由 7 改）；
-               // 右缩进独立档恒 10
-               horizontalPadding: 8, trailingPadding: 10,
+               // 右缩进独立档 9（2026-09-06 用户「减少1pt」，原 10）
+               horizontalPadding: 8, trailingPadding: 9,
                cardBackground: nil, hoverGradientOverride: Palette.cardHoverStrong)
             cardRef = card
             // 当前账号积分 chip 气泡数据盒（hc 块内挂接闭包捕获，append 后存入 entry 供 apply 更新）
@@ -2186,9 +2498,10 @@ final class BalancePanelView: NSView {
                 hc.hoverDebugLabel = style.menuBarIdPrefix + uid
                 // 其余账号切换项注册到卡片：点在项内由卡片 mouseDown 路由转交，
                 // 不触发整卡点击/拖拽（整卡 hitTest 接管，项自身收不到事件）
-                // 长进度卡片：进度条常驻不参与互换（2026-09-06 用户指定），点阵淡出/
-                // 恢复仅列表态执行；子账号条落点在副标题行右侧（布局见 balanceContentRow）
-                let dotsIndependent = longProgressCardEnabled
+                // 进度条恒常驻不参与互换（2026-09-06 用户指定「卡片 hover 时不再隐藏
+                // 进度条」；竖条贴右缘与账号条分居两行无碰撞）：点阵淡出/恢复两条路径
+                // 全平台跳过，子账号条落点在副标题行右侧（布局见 balanceContentRow）
+                let dotsIndependent = true
                 if let strip = subStrip {
                     hc.interactiveSubviews = strip.arrangedSubviews
                 }
@@ -2206,7 +2519,7 @@ final class BalancePanelView: NSView {
                         // 之后每次离场 crossfade 把 alpha 复位拉回 1 = 积分按钮无 hover 误亮）。
                         if showing {
                             stripRevealWork?.cancel()
-                            let work = DispatchWorkItem { [weak self, weak strip, weak dotsView, weak hc, weak valueView] in
+                            let work = DispatchWorkItem { [weak self, weak strip, weak dotsView, weak hc, weak valueView, weak metaView = metaStack] in
                                 guard let self, let strip, let dotsView else { return }
                                 stripRevealWork = nil
                                 // 落点权威校验：快速掠过时真实离开的 exit 可能丢失/被吞
@@ -2227,8 +2540,11 @@ final class BalancePanelView: NSView {
                                     if i < shown.count { lbl.stringValue = shown[i]; lbl.isHidden = false }
                                     else { lbl.isHidden = true }
                                 }
-                                // 当前账号积分同步 chip 化（cardForeground 背景 + 反向前景，2026-09-02 用户定稿）
-                                valueView?.setChipActive(true)
+                                // 副标题右侧 meta（子账号/7日消耗）同区让位：换入隐藏，离场恢复
+                                metaView?.isHidden = true
+                                // 当前账号积分不再 chip 化（2026-09-06 用户指定「hover 时不改变
+                                // 样式」）：值显示恒定，setChipActive 调用已摘除（chip 背景气泡
+                                // 入口随之下线，setChipActive 机制保留在 RollingNumberView）
                                 // chip 换入落点主动探测：光标可能恰停在积分按钮上静止，
                                 // 无 mouseMoved 补发，主动重算否则气泡永不弹出
                                 hc?.syncInteractiveHoverFromCursor()
@@ -2295,8 +2611,7 @@ final class BalancePanelView: NSView {
                                 subStripSwapEpoch += 1   // 作废在途换入的点阵落藏 guard + 在途 stagger 淡入块
                                 stripExitInFlight = true
                                 let exitEp = subStripSwapEpoch
-                                // 积分 chip 同步熄灭（与 chip 交错下沉同拍淡出）
-                                valueView.setChipActive(false)
+                                // 积分不再 chip 化：离场无需熄灭（2026-09-06，见换入处注释）
                                 let chips = strip.arrangedSubviews
                                 // 冻结 chip 背景写入（mouseExited 已改为先离场块、后熄 hover，
                                 // 此刻 setHovered(false) 尚未执行，model 仍是离场前颜色），
@@ -2316,6 +2631,8 @@ final class BalancePanelView: NSView {
                                         if i < segBox.full.count { lbl.stringValue = segBox.full[i]; lbl.isHidden = false }
                                         else { lbl.isHidden = true }
                                     }
+                                    // 副标题右侧 meta（子账号/7日消耗）恢复显示
+                                    metaStack?.isHidden = false
                                     for v in chips {
                                         v.alphaValue = 1
                                         if let l = v.layer {
@@ -2428,11 +2745,12 @@ final class BalancePanelView: NSView {
                                      statusRing: capturedStatusRing,
                                      menuBarDot: capturedMenuBarDot ?? NSView()))
             entries[entries.count - 1].subAccountsStrip = subStrip
-            entries[entries.count - 1].dotsAlwaysVisible = longProgressCardEnabled
+            entries[entries.count - 1].dotsAlwaysVisible = true   // 进度条恒常驻（2026-09-06，hover 换入账号条不再隐藏）
             entries[entries.count - 1].subValueLabels = subValueLabels
             entries[entries.count - 1].subItems = subItems
             entries[entries.count - 1].chipTipBox = newChipTipBox
             entries[entries.count - 1].segBox = segBox
+            entries[entries.count - 1].metaWeekLabel = metaWeekLabel
         }
         // ⚠️ 必须与 update() 的检测口径一致（uid + isCurrent ✓ 后缀）：
         // 旧实现只存裸 uid，导致每轮刷新都误判「uid 变化」→ 全量重建卡片，
@@ -2559,6 +2877,16 @@ final class BalancePanelView: NSView {
                 lbl.textColor = .systemGray
             }
             e.expireIcon?.contentTintColor = .systemGray
+            // 副标题右侧 meta：7日消耗随刷新更新（快照无用量记录时隐藏）；
+            // 子账号数随重建走（账号增减触发 uid 变化重建），apply 不更新
+            if let lbl = e.metaWeekLabel {
+                if let text = ac.weekDailyText {
+                    lbl.stringValue = text
+                    lbl.isHidden = false
+                } else {
+                    lbl.isHidden = true
+                }
+            }
             // 菜单栏显隐指示：显示在菜单栏 → icon 下方小白点点亮；原渐变遮罩已移除
             e.menuBarDot.isHidden = !ac.inMenuBar
             // 任务状态光环：Agent 卡 = 快照 taskState（WB/ZCode/Codex 实际任务态/调试轮派）；
@@ -2657,7 +2985,15 @@ final class BalancePanelView: NSView {
             // icon 用 SF Symbol 附件（黄色，随昵称字号等比行内居中）——
             // ⚠︎ 文本字形在 10pt 下渲染不完整且与文字间空隙偏宽，故弃用；
             // icon 紧贴「令牌失效」文本（零字间距），胶囊底色黄@18%
-            let tint = NSColor(calibratedRed: 1, green: 0.78, blue: 0, alpha: 1)
+            // 颜色按生效外观分档（2026-09-06 用户指定「浅色主题下加深确保对比度」）：
+            // 深色 = 原 #FFC700；浅色 = 加深琥珀 #B87800（原黄在亮玻璃底上对比不足）。
+            // 解算口径与品牌图标同源（panelAppearance 强制档优先，浅色主题开关下不漂）
+            let tipAppearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                        gradientOn: panelGradientEnabled)
+                ?? NSApp.effectiveAppearance
+            let tint = tipAppearance.isDark
+                ? NSColor(calibratedRed: 1, green: 0.78, blue: 0, alpha: 1)
+                : NSColor(calibratedRed: 0.72, green: 0.47, blue: 0, alpha: 1)
             let badgeBg = NSColor(calibratedRed: 1, green: 0.78, blue: 0, alpha: 0.18)
             line.append(NSAttributedString(string: "\u{2009}"))
             // 胶囊内边距（thin space ≈ 0.8pt @10pt）：首尾 thin space + icon 附件均带背景色，
@@ -2699,7 +3035,7 @@ final class BalancePanelView: NSView {
         nick.usesSingleLineMode = true
         nick.lineBreakMode = .byClipping
         nick.attributedStringValue = line
-        let val = NSTextField(labelWithString: "积分:\(value)")
+        let val = NSTextField(labelWithString: "积分: \(value)")
         registerFont(val, size: Palette.cardSubFontSize, weight: .medium)
         val.textColor = Palette.cardForeground
         val.usesSingleLineMode = true
@@ -2707,7 +3043,7 @@ final class BalancePanelView: NSView {
         // 度量：直接量属性串（附件按 attachment.bounds 计入），不信 intrinsicContentSize——
         // 含附件/部分字体组合下 cellSize 低估宽度，正是徽章被裁的根因
         let valLine = NSAttributedString(
-            string: "积分:\(value)",
+            string: "积分: \(value)",
             attributes: [.font: val.font ?? .systemFont(ofSize: Palette.cardSubFontSize),
                          .foregroundColor: Palette.cardForeground])
         val.attributedStringValue = valLine
@@ -2808,12 +3144,15 @@ final class BalancePanelView: NSView {
     private final class SubAccountTipBubbleView: NSView {
         /// 箭头方向：.maxX=箭头在本体左侧指向左（气泡在锚点右侧）;.minX 反向
         var arrowEdge: NSRectEdge = .maxX
+        /// 箭头顶点纵坐标（窗口局部）：nil=垂直居中（账号气泡口径）；
+        /// 高气泡（调色弹层）窗口被屏幕顶钳位后，由展示方注入锚点中点相对值
+        var tipY: CGFloat?
         static let arrowLength: CGFloat = 8
         static let arrowHalfWidth: CGFloat = 6
 
         /// 单轮廓路径（bounds 局部坐标）：逆时针 上缘→右上弧→右缘（.minX 嵌箭头）
         /// →右下弧→下缘→左下弧→左缘（.maxX 嵌箭头）→左上弧→闭合
-        static func tipShapePath(bounds: NSRect, edge: NSRectEdge) -> NSBezierPath {
+        static func tipShapePath(bounds: NSRect, edge: NSRectEdge, tipY: CGFloat? = nil) -> NSBezierPath {
             let r = Palette.cardCornerRadius
             let inset: CGFloat = 0.25   // 描边半宽,防轮廓被裁
             let body: NSRect
@@ -2829,7 +3168,7 @@ final class BalancePanelView: NSView {
                               height: bounds.height - inset * 2)
                 tipX = bounds.maxX - inset
             }
-            let midY = bounds.midY
+            let midY = tipY ?? bounds.midY
             let path = NSBezierPath()
             path.move(to: NSPoint(x: body.minX + r, y: body.maxY))
             path.line(to: NSPoint(x: body.maxX - r, y: body.maxY))
@@ -2860,7 +3199,7 @@ final class BalancePanelView: NSView {
 
         override func draw(_ dirtyRect: NSRect) {
             // 只描边（玻璃填充由 mask 后的 TintedVisualEffectView 承担）
-            let path = Self.tipShapePath(bounds: bounds, edge: arrowEdge)
+            let path = Self.tipShapePath(bounds: bounds, edge: arrowEdge, tipY: tipY)
             Palette.tooltipBorder.setStroke()
             path.lineWidth = 0.5
             path.stroke()
@@ -3027,6 +3366,8 @@ final class BalancePanelView: NSView {
     @objc func valueScrollPreviewToggled() { onToggleValueScrollPreview?() }
     @objc func statusDebugPreviewToggled() { onToggleStatusDebugPreview?() }
     @objc func longProgressCardToggled() { onToggleLongProgressCard?() }
+    @objc func iconThemeSwapToggled() { onToggleIconThemeSwap?() }
+    @objc func verticalLineProgressToggled() { onToggleVerticalLineProgress?() }
     @objc func checkUpdateTapped() { onCheckForUpdate?() }
     @objc func updateAutoCheckToggled() { onToggleUpdateAutoCheck?() }
 
@@ -3154,9 +3495,181 @@ final class BalancePanelView: NSView {
         onSetInterval?(intervalPopup.selectedItem?.tag ?? 300)
     }
     @objc func manualRefreshTapped() { onManualRefresh?() }
-    /// header 右上角浅色主题按钮：翻转设置行开关后走同一回调，状态由 update(s:) 回写
-    @objc func headerLightThemeTapped() {
-        lightThemeSwitch.state = lightThemeSwitch.state == .on ? .off : .on
-        lightThemeToggled()
+    /// header 点阵调色按钮：切换悬浮气泡（子账号气泡同款载体），内含色相/饱和度两行滑杆；
+    /// 存续期间经 onHeatWindowActive 挂起主面板 transient
+    @objc func headerHeatHueTapped() {
+        if heatWindow != nil {
+            dismissHeatWindow()
+        } else {
+            showHeatWindow()
+        }
+    }
+
+    /// 弹出调色气泡：与 showSubAccountTip 同一套自绘 borderless 窗——TintedVisualEffectView
+    /// 玻璃（.menu/behindWindow、继承面板容器遮罩）+「圆角矩形+侧箭头」layer mask
+    ///（圆角 = cardCornerRadius 与卡片统一）+ 描边覆盖层；箭头顶点对准按钮侧缘中点贴 2pt，
+    /// 默认弹按钮右侧、屏幕空间不足翻左（tip 同款翻转）。与 tip 不同：要接收滑杆拖动，
+    /// 不设 ignoresMouseEvents；「点气泡外收起」用本地/全局事件监视器自管。
+    private func showHeatWindow() {
+        guard let button = heatHueBtn, let anchorWindow = button.window else { return }
+        let arrowLen = SubAccountTipBubbleView.arrowLength
+        let totalW = HeatAdjustView.bodyWidth + arrowLen
+        let h = HeatAdjustView.bodyHeight(switchRows: themeSwitchRows.count)
+        let screenVisible = anchorWindow.screen?.visibleFrame
+        var edge: NSRectEdge = .maxX
+        if let visible = screenVisible,
+           visible.maxX - anchorWindow.frame.maxX < totalW + 16 {
+            edge = .minX
+        }
+        // 先定窗位再画轮廓：header 按钮贴近屏幕顶、气泡高，居中放会顶出屏幕——
+        // 整体钳进可见区，箭头顶点纵坐标（窗口局部）保持瞄准按钮中线
+        let btnRect = anchorWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        let originX = edge == .maxX ? btnRect.maxX - 2 : btnRect.minX + 2 - totalW
+        var originY = btnRect.midY - h / 2
+        if let visible = screenVisible {
+            originY = min(originY, visible.maxY - h - 6)
+            originY = max(originY, visible.minY + 6)
+        }
+        let tipMargin = Palette.cardCornerRadius + SubAccountTipBubbleView.arrowHalfWidth + 2
+        let tipY = min(max(btnRect.midY - originY, tipMargin), h - tipMargin)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: totalW, height: h))
+        // 玻璃本体（与账号气泡逐参一致）
+        let glass = TintedVisualEffectView(frame: container.bounds)
+        glass.autoresizingMask = [.width, .height]
+        glass.material = .menu
+        glass.blendingMode = .behindWindow
+        glass.state = .active
+        glass.isEmphasized = false
+        if let pc = Self.findPanelContainer(from: self) {
+            glass.tintColor = pc.tintColor
+            glass.tintBottomColor = pc.tintBottomColor
+        } else {
+            let colors = Palette.containerColors(
+                lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
+                gradientOn: panelGradientEnabled)
+            glass.tintColor = colors.top
+            glass.tintBottomColor = colors.bottom
+        }
+        let shape = SubAccountTipBubbleView.tipShapePath(bounds: container.bounds,
+                                                         edge: edge, tipY: tipY)
+        let maskImage = NSImage(size: container.frame.size)
+        maskImage.lockFocus()
+        NSColor.white.setFill()
+        shape.fill()
+        maskImage.unlockFocus()
+        let maskLayer = CALayer()
+        maskLayer.frame = CGRect(origin: .zero, size: container.frame.size)
+        maskLayer.contents = maskImage
+        glass.wantsLayer = true
+        glass.layer?.masksToBounds = true
+        glass.layer?.mask = maskLayer
+        container.addSubview(glass)
+        // 轮廓描边（独立覆盖层，不受 mask 裁切）
+        let outline = SubAccountTipBubbleView(frame: container.bounds)
+        outline.autoresizingMask = [.width, .height]
+        outline.arrowEdge = edge
+        outline.tipY = tipY
+        container.addSubview(outline)
+        // 内容：滑杆两行 + 主题/样式开关行（行本体归面板注册表，这里只做承载）；
+        // 本体区左右边界随箭头侧偏移
+        let adjust = HeatAdjustView(frame: container.bounds)
+        adjust.autoresizingMask = [.width, .height]
+        adjust.bodyOriginX = edge == .maxX ? arrowLen : 0
+        adjust.bodyRightTrim = edge == .minX ? arrowLen : 0
+        adjust.onHue = { [weak self] hue in self?.applyHeatHue(hue) }
+        adjust.onSaturation = { [weak self] sat in self?.applyHeatSaturation(sat) }
+        adjust.syncFromPalette()
+        adjust.setSwitchRows(themeSwitchRows)
+        container.addSubview(adjust)
+        heatGlass = glass
+        let win = HeatBubbleWindow(contentRect: container.frame, styleMask: .borderless,
+                                   backing: .buffered, defer: false)
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.level = NSWindow.Level(rawValue: anchorWindow.level.rawValue + 1)
+        win.collectionBehavior = [.transient, .ignoresCycle]
+        win.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                 gradientOn: panelGradientEnabled)
+        win.contentView = container
+        win.setFrameOrigin(NSPoint(x: originX, y: originY))
+        heatWindow = win
+        win.orderFrontRegardless()
+        // 气泡窗置 key：否则窗内 NSSwitch 恒按「窗口失焦」渲染（开态轨道灰不是强调色）
+        win.makeKey()
+        onHeatWindowActive?(true)
+        // 点气泡外收起：本地监视器管本 App 其余窗口（点主面板只收气泡、面板留在屏上；
+        // 恢复 transient 放到下一轮 runloop，防本次点击串扰成面板关闭），全局管其它 App
+        heatLocalMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            if event.window !== win, let self, self.heatWindow === win {
+                self.teardownHeatWindow()
+                // transient 恢复推迟到下一轮 runloop：本次点击若落在主面板，
+                // 同轮恢复会把面板连坐关掉（应只收气泡、面板留下）
+                DispatchQueue.main.async { self.onHeatWindowActive?(false) }
+            }
+            return event
+        }
+        heatGlobalMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            self?.dismissHeatWindow()
+        }
+    }
+
+    /// 气泡窗与事件监视器的公共拆台（行为恢复由调用方决定时机）
+    private func teardownHeatWindow() {
+        if let m = heatLocalMonitor { NSEvent.removeMonitor(m); heatLocalMonitor = nil }
+        if let m = heatGlobalMonitor { NSEvent.removeMonitor(m); heatGlobalMonitor = nil }
+        heatWindow?.orderOut(nil)
+        heatWindow = nil
+        // key 还给主面板：气泡收掉后设置卡里的开关要恢复强调色（同「失焦灰」机制）
+        self.window?.makeKey()
+    }
+
+    /// 收起调色气泡（幂等）+ 即时恢复主面板行为。
+    /// 主面板关闭/转移（popoverDidClose）、点其它 App 都走这里。
+    func dismissHeatWindow() {
+        guard heatWindow != nil else { return }
+        teardownHeatWindow()
+        onHeatWindowActive?(false)
+    }
+    /// 气泡开着时主题/渐变开关翻转 → 玻璃遮罩色与窗口 appearance 即时重染
+    ///（账号气泡每次展示重建无此课题；调色气泡可在开着时被自身开关改变主题）
+    func refreshHeatWindowChromeIfVisible() {
+        guard let win = heatWindow, let glass = heatGlass else { return }
+        if let pc = Self.findPanelContainer(from: self) {
+            glass.tintColor = pc.tintColor
+            glass.tintBottomColor = pc.tintBottomColor
+        } else {
+            let colors = Palette.containerColors(
+                lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
+                gradientOn: panelGradientEnabled)
+            glass.tintColor = colors.top
+            glass.tintBottomColor = colors.bottom
+        }
+        win.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
+                                                 gradientOn: panelGradientEnabled)
+    }
+    /// 滑杆取色落值：持久化 + 视图树重绘（按钮图标不着色，2026-09-07 用户定稿）
+    private func applyHeatHue(_ hue: CGFloat) {
+        Palette.heatPeakHue = hue
+        applyHeatHueInPlace()
+    }
+    /// 饱和度滑杆落值：与色相同一持久化/重绘链路
+    private func applyHeatSaturation(_ sat: CGFloat) {
+        Palette.heatPeakSaturation = sat
+        applyHeatHueInPlace()
+    }
+    /// 点阵色相/饱和度变化就地重绘：热力图印章/淡变位图与卡片点阵均烘色，须清缓存重绘
+    ///（同外观切换钩子口径）；UsageDots 三形态（横条层/竖线/竖点阵）统一走
+    /// refreshHeatColors（2026-09-07 长进度卡片进度色泛化后含层路径）
+    func applyHeatHueInPlace() {
+        var stack = subviews
+        while let v = stack.popLast() {
+            if let d = v as? UsageDots { d.refreshHeatColors() }
+            if let t = v as? TokensPanelView { t.refreshHeatPalette() }
+            stack.append(contentsOf: v.subviews)
+        }
     }
 }

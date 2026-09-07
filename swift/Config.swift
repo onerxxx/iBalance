@@ -172,6 +172,13 @@ struct AppConfig: Codable {
     ///（左缘=主标题最左）+ 副标题下移一行（design/balance-card-mode.html 口径）；
     /// false = 现行副标题+窄进度条同行
     var longProgressCard: Bool = false
+    /// 图标深浅互换开关：true = 余额卡片品牌 icon 的 ClearDark/ClearLight 版本互换
+    ///（深色外观取浅色版、浅色外观取深色版；仅影响卡片 icon，面板外观不动）。
+    /// 2026-09-07 用户定稿默认开启（旧配置无此键时解码兜底同为 true）
+    var iconThemeSwap: Bool = true
+    /// 竖线进度条开关：true = 长进度卡片的整行进度条替换为 50 条 1.5pt 竖线横向排列
+    ///（间隔自适应容器宽，无轨道背景无边框）；仅影响长进度卡片模式，默认关
+    var verticalLineProgress: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
     var fadeHintBandHeight: Double = 54
     var fadeHintHighlightAlpha: Double = -0.6
@@ -224,6 +231,8 @@ struct AppConfig: Codable {
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case statusDebugPreview = "status_debug_preview"
         case longProgressCard = "long_progress_card"
+        case iconThemeSwap = "icon_theme_swap"
+        case verticalLineProgress = "vertical_line_progress"
         case updateAutoCheck = "update_auto_check"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
@@ -283,6 +292,8 @@ struct AppConfig: Codable {
             ?? decoder.container(keyedBy: LegacyKeys.self)
                 .decodeIfPresent(Bool.self, forKey: .balanceCardNewMode)
             ?? false
+        iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? true
+        verticalLineProgress = try c.decodeIfPresent(Bool.self, forKey: .verticalLineProgress) ?? false
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
         fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55
@@ -481,6 +492,9 @@ enum UDKey {
     static var tokenSectionCollapsed: String { "panel_token_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
+    /// 热力点阵峰值色相/饱和（Double 0..1，header 调色弹层滑杆写入，Palette 读写）
+    static var heatDotHue: String { "heat_dot_hue" }
+    static var heatDotSaturation: String { "heat_dot_saturation" }
 
     // App 自更新（GitHub Releases）：静默检查节流与「暂不」提醒抑制
     static var updateLastCheckDate: String { "update_last_check_date" }
@@ -776,6 +790,40 @@ enum UsageStore {
             week += u.week
         }
         return any ? (today, week) : nil
+    }
+
+    /// 过去 7 日（含今天）用量：今日取实时差值（进行中含在内），前 6 个自然日读
+    /// 每日快照 dailyUsage（缺天 = 0）；与「当今天」重叠的 key 跳过防双计。
+    /// 账号从未观测返回 nil（同日/周口径）
+    static func last7DaysUsage(platform: String, uid: String, current: Double, increasing: Bool) -> Double? {
+        guard let e = memory.entries["\(platform):\(uid)"],
+              let u = usage(platform: platform, uid: uid, current: current, increasing: increasing) else { return nil }
+        let cal = Calendar.current
+        let now = Date()
+        let todayKey = dayFormatter.string(from: now)
+        var sum = u.today
+        for back in 1...6 {
+            guard let date = cal.date(byAdding: .day, value: -back, to: now) else { continue }
+            let key = dayFormatter.string(from: date)
+            guard key != todayKey else { continue }
+            sum += e.dailyUsage[key] ?? 0
+        }
+        return sum
+    }
+
+    /// 平台级过去 7 日加总：逐账号计算后求和（同 usage(platform:accounts:) 日/周加总口径）；
+    /// 任一账号有观测记录即返回，全部无记录 nil
+    static func last7Days(platform: String, accounts: [(uid: String, current: Double)],
+                          increasing: Bool) -> Double? {
+        var sum: Double = 0
+        var any = false
+        for a in accounts where !a.uid.isEmpty {
+            guard let v = last7DaysUsage(platform: platform, uid: a.uid,
+                                         current: a.current, increasing: increasing) else { continue }
+            any = true
+            sum += v
+        }
+        return any ? sum : nil
     }
 
     /// 近 1 小时用量：取 ≤1 小时前最新的观测点做锚点（窗口内无更早点时用最早的点），

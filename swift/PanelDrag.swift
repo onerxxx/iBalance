@@ -33,6 +33,19 @@ extension BalancePanelView {
         }
     }
 
+    /// 视图整棵子树（含自身层级展开），供拖拽起手收集 icon 状态光环
+    private func allDescendants(of view: NSView) -> [NSView] {
+        view.subviews.flatMap { [$0] + allDescendants(of: $0) }
+    }
+
+    /// 内容快照模式：递归隐藏/恢复路径上所有 HoverCard 的背景层（含清空边框），
+    /// 使缓存截图只含内容像素（透明底），供两段式幽灵合成
+    private func setGhostContentSnapshotMode(_ view: NSView, _ hidden: Bool) {
+        if let hc = view as? HoverCard { hc.setContentOnlySnapshotAppearance(hidden) }
+        for sub in view.subviews { setGhostContentSnapshotMode(sub, hidden) }
+    }
+
+    /// 生成原卡静态截图（拖动幽灵源）
     private func makeDragSnapshot(of card: NSView) -> NSImage? {
         guard !card.bounds.isEmpty,
               let representation = card.bitmapImageRepForCachingDisplay(in: card.bounds) else { return nil }
@@ -105,19 +118,41 @@ extension BalancePanelView {
         // 快速按下拖动时 mouseEntered 的 hover 动画可能尚未完成，先同步补齐
         // hover 背景，确保拖动中的卡片始终有明确的提亮反馈。
         hoverCard?.prepareDragSnapshotAppearance()
+        // 拖动中 icon 状态层不显示（2026-09-06 用户指定）：截图前隐藏，幽灵与原卡同步生效；
+        // 恢复在 endPlatformDrag 的归位交接点
+        draggingHiddenStatusRings = allDescendants(of: card).compactMap { $0 as? CardTaskStatusRingView }
+        for ring in draggingHiddenStatusRings { ring.isHidden = true }
         var ghostReady = false
-        if let image = makeDragSnapshot(of: ghostSourceView) {
-            let ghost = NSImageView(frame: ghostFrame)
-            ghost.image = image
-            ghost.imageScaling = .scaleAxesIndependently
-            ghost.imageAlignment = .alignCenter
+        // 两段式幽灵（2026-09-06 用户指定「只背景加模糊，边框和卡片内容不加」）：
+        // ① 背景段 = 幽灵容器 layer 开 backgroundFilters 高斯模糊——只模糊身后的面板
+        //    内容（GPU 合成、区域限于幽灵 frame），叠 hover 强背景色定调，边框清晰；
+        // ② 内容段 = 递归隐藏卡片背景层后重截的清晰内容位图（透明底）。
+        // 滤镜实例只在拖起时创建一次（勿移入 movePlatformGhost 逐帧重建）
+        setGhostContentSnapshotMode(ghostSourceView, true)
+        let contentImage = makeDragSnapshot(of: ghostSourceView)
+        setGhostContentSnapshotMode(ghostSourceView, false)
+        if let contentImage {
+            let ghost = NSView(frame: ghostFrame)
             ghost.wantsLayer = true
-            ghost.layer?.cornerRadius = Palette.cardCornerRadius
-            ghost.layer?.cornerCurve = .continuous
-            ghost.layer?.shadowColor = NSColor.black.cgColor
-            ghost.layer?.shadowOffset = CGSize(width: 0, height: -3)
-            ghost.layer?.shadowRadius = 10
-            ghost.layer?.shadowOpacity = shouldReduceMotion ? 0.35 : 0.48
+            if let l = ghost.layer {
+                l.cornerRadius = Palette.cardCornerRadius
+                l.cornerCurve = .continuous
+                if let blur = CIFilter(name: "CIGaussianBlur") {
+                    blur.setValue(6, forKey: kCIInputRadiusKey)
+                    l.backgroundFilters = [blur]
+                }
+                l.backgroundColor = Palette.borderCGColor(Palette.cardHoverStrongBright, in: self)
+                l.borderColor = Palette.borderCGColor(Palette.hoverBorderBright, in: self)
+                l.borderWidth = 0.8
+                l.shadowColor = NSColor.black.cgColor
+                l.shadowOffset = CGSize(width: 0, height: -3)
+                l.shadowRadius = 10
+                l.shadowOpacity = shouldReduceMotion ? 0.35 : 0.48
+            }
+            let contentView = NSImageView(frame: NSRect(origin: .zero, size: ghostFrame.size))
+            contentView.image = contentImage
+            contentView.autoresizingMask = [.width, .height]
+            ghost.addSubview(contentView)
             // 拖拽开始时直接显示到最终透明度，避免幽灵卡片从 0 淡入造成起手闪烁。
             ghost.alphaValue = 0.96
             addSubview(ghost, positioned: .above, relativeTo: nil)
@@ -228,6 +263,7 @@ extension BalancePanelView {
             draggingCard = nil
             draggingGhostSourceView = nil
             restoreDraggingSiblingCards()
+            restoreDragHiddenStatusRings()
             draggingGhostView?.removeFromSuperview()
             draggingGhostView = nil
             return
@@ -266,6 +302,8 @@ extension BalancePanelView {
                 // 幽灵与占位在同一个交接事务内恢复最终 hover 状态，
                 // 光标若已在卡片内则直接显示，避免多余的 hover 淡入闪烁。
                 hoverCard?.setDragHoverLocked(false, animated: false)
+                // 状态光环随占位内容一起恢复显示
+                self?.restoreDragHiddenStatusRings()
                 CATransaction.commit()
                 self?.restoreDraggingSiblingCards()
                 self?.draggingGhostOffset = .zero
@@ -277,12 +315,19 @@ extension BalancePanelView {
             } else {
                 card.layer?.opacity = 1
             }
+            restoreDragHiddenStatusRings()
             restoreDraggingSiblingCards()
             hoverCard?.setDragHoverLocked(false, animated: false)
             draggingGhostOffset = .zero
         }
         UserDefaults.standard.set(platformOrder, forKey: UDKey.balancePlatformOrder)
         onPlatformOrderChanged?(platformOrder)
+    }
+
+    /// 拖拽结束恢复被隐藏的 icon 状态光环（beginPlatformDrag 截图前隐藏）
+    private func restoreDragHiddenStatusRings() {
+        for ring in draggingHiddenStatusRings { ring.isHidden = false }
+        draggingHiddenStatusRings = []
     }
 
     /// 调整 arrangedSubview 顺序，并仅用 Y 轴位移动画让相邻平台卡片平滑让位。

@@ -32,15 +32,25 @@ final class MiniSwitch: NSSwitch {
         super.init(frame: frameRect)
         controlSize = .mini
         wantsLayer = true
-        appearance = NSAppearance(named: .darkAqua)
+        appearance = Self.themedAppearance(light: false)
     }
+
+    // 完全原生外观（2026-09-07 定稿「能还原原生开关吗 只做尺寸上的修改」）：
+    // 曾尝试「开」轨道=系统灰的自绘路线（draw 覆写 + canDrawSubviewsIntoLayer，
+    // 详见记忆 project-zcode-tokens-panel），观感反复被打回后整体回退——
+    // 本类只保留 0.81 缩放做尺寸修改，勿再加自绘。
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    /// 主题跟随：控件自带 appearance（不继承容器），浅色主题时需显式切换为浅色，
-    /// 否则浅色面板里开关仍渲染深色样式
+    /// 控件自带 appearance（不继承容器）：浅色主题需显式切浅色，否则浅色面板里
+    /// 开关仍渲染深色样式
+    private static func themedAppearance(light: Bool) -> NSAppearance? {
+        NSAppearance(named: light ? .aqua : .darkAqua)
+    }
+
+    /// 主题跟随（开关行与气泡同管线）
     func applyThemeAppearance(light: Bool) {
-        appearance = light ? NSAppearance(named: .aqua) : NSAppearance(named: .darkAqua)
+        appearance = Self.themedAppearance(light: light)
     }
 
     override func viewDidMoveToWindow() {
@@ -1168,6 +1178,27 @@ class HoverCard: NSView, PanelScrollHoverSync {
             hoverGlowLayer.removeAnimation(forKey: "glowDescend")
         }
         setHoverBorder(isVisible: true, animated: false)
+        CATransaction.commit()
+    }
+
+    /// 内容快照模式的边框色暂存（setContentOnlySnapshotAppearance 配对恢复）
+    private var snapshotSavedBorderColor: CGColor?
+
+    /// 内容快照模式（拖拽幽灵两段式合成用）：临时隐藏背景层（渐变/强背景 + 光晕）并
+    /// 清空 layer 边框，使缓存截图只含内容像素（透明底）；用后必须配对恢复。
+    /// 任务状态光环由拖拽侧独立隐藏（draggingHiddenStatusRings），此处不涉及
+    func setContentOnlySnapshotAppearance(_ hidden: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        hoverEffectLayer.isHidden = hidden
+        hoverGlowLayer.isHidden = hidden
+        if hidden {
+            snapshotSavedBorderColor = layer?.borderColor
+            layer?.borderColor = NSColor.clear.cgColor
+        } else if let saved = snapshotSavedBorderColor {
+            layer?.borderColor = saved
+            snapshotSavedBorderColor = nil
+        }
         CATransaction.commit()
     }
 

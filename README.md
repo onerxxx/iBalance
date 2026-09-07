@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/app-icon.png" width="128" alt="iBalance App 图标">
+
 # iBalance
 
 **一款纯原生 AppKit 打造的 macOS 菜单栏应用，实时聚合多个 AI 服务的余额与额度**
