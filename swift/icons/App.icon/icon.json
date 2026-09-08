@@ -8,30 +8,29 @@
       "blur-material" : null,
       "layers" : [
         {
-          "fill" : "system-light",
-          "image-name" : "¥0.01.svg",
-          "name" : "¥0.01",
+          "image-name" : "main 6.svg",
+          "name" : "main 6",
           "position" : {
-            "scale" : 1,
+            "scale" : 1.16,
             "translation-in-points" : [
-              -10,
-              0.1209999999999809
+              0,
+              0
             ]
           }
         }
       ],
       "refractivity" : {
-        "depth" : 0.2711328125,
+        "depth" : 0.25203125,
         "enabled" : true,
-        "strength" : 0.361875
+        "strength" : 0.21921875
       },
       "shadow" : {
         "kind" : "neutral",
-        "opacity" : 0.5
+        "opacity" : 0
       },
       "translucency" : {
         "enabled" : true,
-        "value" : 0.35
+        "value" : 0.3
       }
     }
   ],

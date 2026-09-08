@@ -58,6 +58,9 @@ enum CodexTokenStore {
         var modelNames: [String: String] = [:]
         var dailyMap: [TimeInterval: Int64] = [:]
         var periodTotals: [TokenPeriod: Int64] = [:]
+        // 各窗口项目/模型小计（5h/1d/7d/30d 滚动窗口，口径同 periodTotals）
+        var periodProjectTokens: [TokenPeriod: [String: Int64]] = [:]
+        var periodModelTokens: [TokenPeriod: [String: Int64]] = [:]
         var requestCount: Int64 = 0
         let periodStarts = TokenPeriodWindows.starts()
         let calendar = Calendar.current
@@ -89,6 +92,8 @@ enum CodexTokenStore {
                 for period in TokenPeriod.windowed
                 where value.t >= (periodStarts[period] ?? .infinity) {
                     periodTotals[period, default: 0] += value.tokens
+                    periodProjectTokens[period, default: [:]][projectName, default: 0] += value.tokens
+                    periodModelTokens[period, default: [:]][modelKey, default: 0] += value.tokens
                 }
             }
         }
@@ -108,11 +113,27 @@ enum CodexTokenStore {
             .sorted { $0.tokens > $1.tokens }
         let total = projectRows.reduce(Int64(0)) { $0 + $1.tokens }
         periodTotals[.all] = total
+        // 各窗口列表：项目 path 回查全量映射；模型展示名取全量聚合结果
+        // （窗口 ⊆ 全量，键必已存在）
+        var periodProjects: [TokenPeriod: [TokenSummary.ProjectUsage]] = [:]
+        for (p, dict) in periodProjectTokens {
+            periodProjects[p] = dict
+                .map { TokenSummary.ProjectUsage(name: $0.key, tokens: $0.value,
+                                                 path: projectPaths[$0.key]) }
+                .sorted { $0.tokens > $1.tokens }
+        }
+        var periodModels: [TokenPeriod: [TokenSummary.ProjectUsage]] = [:]
+        for (p, dict) in periodModelTokens {
+            periodModels[p] = dict
+                .map { TokenSummary.ProjectUsage(name: modelNames[$0.key]!, tokens: $0.value) }
+                .sorted { $0.tokens > $1.tokens }
+        }
         let daily = dailyMap
             .map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
         return TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
-                            requestCount: requestCount, daily: daily, periodTotals: periodTotals)
+                            requestCount: requestCount, daily: daily, periodTotals: periodTotals,
+                            periodProjects: periodProjects, periodModels: periodModels)
     }
 
     /// 单文件解析结果（增量缓存的值）；整体持久化到 App Support，

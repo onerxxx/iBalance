@@ -1,11 +1,11 @@
-// Config.swift — 配置结构（Codable）+ 加载/保存
+// Config.swift — 配置结构（Codable）+ 加载/保存（凭据走钥匙串，见 KeychainStore.swift）
 import Foundation
 
 // MARK: - WorkBuddy 多号签到账号
 
 /// OAuth 采集得到的 token/refreshToken/uid/domain/nickname。
 /// refreshToken 用于在 access_token 过期前自动刷新，token 永不过期。
-/// 同一时刻 WorkBuddy Desktop 只能登录一个账号，多号签到需在 config.json 预存各账号凭据。
+/// 同一时刻 WorkBuddy Desktop 只能登录一个账号，多号签到需预存各账号凭据（钥匙串）。
 struct WBAccount: Codable, Equatable {
     var token: String
     var uid: String
@@ -322,6 +322,61 @@ struct AppConfig: Codable {
         floatingPanelWidth = try c.decodeIfPresent(Double.self, forKey: .floatingPanelWidth) ?? 0
         floatingPanelHeight = try c.decodeIfPresent(Double.self, forKey: .floatingPanelHeight) ?? 0
     }
+
+    /// Keychain 写失败时的兜底开关（ConfigStore.save 独家使用，仅主线程）：
+    /// true = 本次编码把 7 个凭据字段一并写进 JSON，防止凭据仅存内存；
+    /// 正常路径恒 false——凭据只进钥匙串（CredentialVault），config.json 不落明文。
+    static var emergencyPlaintextFallback = false
+
+    /// 自定义编码：凭据字段（deepseekApiKey / bigmodelTokenOverride / qwenTicketOverride /
+    /// 四平台 accounts）默认不写入 JSON，由 CredentialVault 走钥匙串；
+    /// init(from:) 仍照常解码这些键（legacy 明文配置升级兼容）。
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(deepseekCommonQuota, forKey: .deepseekCommonQuota)
+        try c.encode(refreshInterval, forKey: .refreshInterval)
+        try c.encode(workbuddyDecimals, forKey: .workbuddyDecimals)
+        try c.encode(traeStoragePath, forKey: .traeStoragePath)
+        try c.encode(traeDecimals, forKey: .traeDecimals)
+        try c.encode(deepseekRefreshEnabled, forKey: .deepseekRefreshEnabled)
+        try c.encode(bigmodelRefreshEnabled, forKey: .bigmodelRefreshEnabled)
+        try c.encode(qwenRefreshEnabled, forKey: .qwenRefreshEnabled)
+        try c.encode(traeRefreshEnabled, forKey: .traeRefreshEnabled)
+        try c.encode(zcodeRefreshEnabled, forKey: .zcodeRefreshEnabled)
+        try c.encode(codexRefreshEnabled, forKey: .codexRefreshEnabled)
+        try c.encode(workbuddyEnabled, forKey: .workbuddyEnabled)
+        try c.encode(traeAutoCheckin, forKey: .traeAutoCheckin)
+        try c.encode(hideWbNickname, forKey: .hideWbNickname)
+        try c.encode(panelGradientEnabled, forKey: .panelGradientEnabled)
+        try c.encode(lightThemeEnabled, forKey: .lightThemeEnabled)
+        try c.encode(monoFontEnabled, forKey: .monoFontEnabled)
+        try c.encode(valueScrollPreviewEnabled, forKey: .valueScrollPreviewEnabled)
+        try c.encode(updateAutoCheck, forKey: .updateAutoCheck)
+        try c.encode(statusDebugPreview, forKey: .statusDebugPreview)
+        try c.encode(longProgressCard, forKey: .longProgressCard)
+        try c.encode(iconThemeSwap, forKey: .iconThemeSwap)
+        try c.encode(verticalLineProgress, forKey: .verticalLineProgress)
+        try c.encode(fadeHintBandHeight, forKey: .fadeHintBandHeight)
+        try c.encode(fadeHintHighlightAlpha, forKey: .fadeHintHighlightAlpha)
+        try c.encode(fadeHintMaskMidAlpha, forKey: .fadeHintMaskMidAlpha)
+        try c.encode(fadeHintArrowAlpha, forKey: .fadeHintArrowAlpha)
+        try c.encode(fadeHintBobAmplitude, forKey: .fadeHintBobAmplitude)
+        try c.encode(cockpitAppId, forKey: .cockpitAppId)
+        try c.encode(workbuddyAutoCheckin, forKey: .workbuddyAutoCheckin)
+        try c.encode(menuBarVisible, forKey: .menuBarVisible)
+        try c.encode(panelCardVisible, forKey: .panelCardVisible)
+        try c.encode(panelUsageVisible, forKey: .panelUsageVisible)
+        try c.encode(floatingPanelWidth, forKey: .floatingPanelWidth)
+        try c.encode(floatingPanelHeight, forKey: .floatingPanelHeight)
+        guard AppConfig.emergencyPlaintextFallback else { return }
+        try c.encode(deepseekApiKey, forKey: .deepseekApiKey)
+        try c.encode(bigmodelTokenOverride, forKey: .bigmodelTokenOverride)
+        try c.encode(qwenTicketOverride, forKey: .qwenTicketOverride)
+        try c.encode(workbuddyAccounts, forKey: .workbuddyAccounts)
+        try c.encode(traeAccounts, forKey: .traeAccounts)
+        try c.encode(zcodeAccounts, forKey: .zcodeAccounts)
+        try c.encode(codexAccounts, forKey: .codexAccounts)
+    }
 }
 
 // MARK: - 加载 / 保存
@@ -399,6 +454,7 @@ enum AppDataStore {
 
 enum ConfigStore {
     /// 优先 Application Support 中的用户配置，其次迁移旧版同目录配置，最后使用 Resources 默认值。
+    /// 凭据（7 个敏感字段）从钥匙串合并（命中优先），config.json 里的 legacy 明文自动迁入并清洗。
     static func load() -> AppConfig {
         AppDataStore.prepareDirectory()
         AppDataStore.migrateIfNeeded(filename: "config.json")
@@ -416,12 +472,20 @@ enum ConfigStore {
             shouldPersist = url != AppDataStore.configURL
         }
         if cfg.traeStoragePath.isEmpty { cfg.traeStoragePath = detectTraeStoragePath() }
-        if shouldPersist { save(cfg) }
+        // 凭据合并：keychain 命中优先；发现 legacy 明文 → 迁入钥匙串并立即 save 清洗 JSON
+        let migrated = CredentialVault.merge(into: &cfg)
+        if shouldPersist || migrated { save(cfg) }
         return cfg
     }
 
-    /// 写回 Application Support 中的 config.json。Codable 序列化，弃用字段不再落盘。
+    /// 写回 Application Support 中的 config.json。
+    /// 凭据先写钥匙串（CredentialVault.persist，空值=删项）；
+    /// 钥匙串写失败或本会话读挂起 → 本次 JSON 保留明文兜底（emergencyPlaintextFallback），
+    /// 错误日志可见，下次加载自动重试迁移——不静默丢数据。
     static func save(_ config: AppConfig) {
+        let keychainOK = !CredentialVault.writeSuspended && CredentialVault.persist(config)
+        AppConfig.emergencyPlaintextFallback = !keychainOK
+        defer { AppConfig.emergencyPlaintextFallback = false }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let out = try? encoder.encode(config) else { return }

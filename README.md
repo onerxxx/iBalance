@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/app-icon.png" width="128" alt="iBalance App 图标">
+<img src="swift/icons/App-Icon-Default-1024@1x.png" width="128" alt="iBalance App 图标">
 
 # iBalance
 

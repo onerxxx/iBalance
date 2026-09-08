@@ -367,6 +367,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem.menu = nil
 
+        // 菜单栏平台图标任务状态光晕（MenuBarGlow.swift）：挂到 button 上，
+        // 后续由 updateTitleImpl（图标 frame）与任务态轮询（状态变化）驱动同步
+        if let btn = statusItem.button {
+            menuBarGlow.attach(button: btn)
+        }
+
         // 菜单栏前景色随屏幕聚焦状态变化；macOS 27 不总会主动重绘，手动监听刷新
         observeFocusChanges()
 
@@ -427,6 +433,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 可见状态变化（含 10 分钟过期归零）时主线程回调同步面板
         AgentTaskStatusStore.startPolling { [weak self] in
             self?.syncPanel()
+            // 仅换色无需重烘焙，直接刷新光晕层；圆点出现/消失由 sync 检测并
+            // 经 onDotPresenceChanged 触发标题重烘焙（预留间距随存亡）
+            self?.menuBarGlow.sync()
         }
 
         // 自动签到：启动时检查 + 每小时轮询（本地日期守卫，每天最多一次网络请求）
@@ -450,6 +459,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 图标形状缓存（iconName → 黑形位图）
     private var menuBarIconShapes: [String: NSImage] = [:]
+
+    /// 菜单栏平台图标任务状态光晕（MenuBarGlow.swift）：WB/ZCode/Codex 有可见任务态时
+    /// 对应菜单栏图标前状态圆点（常亮）+ 圆点呼吸光晕；状态映射用 MenuBarPrefix 前缀
+    /// 平台条目当前的任务状态（nil = 无状态点）。标题烘焙与光晕层共用同一映射。
+    private func menuBarGlowState(for id: String) -> AgentTaskState? {
+        if id.hasPrefix(MenuBarPrefix.wb) { return AgentTaskStatusStore.workbuddyVisible }
+        if id.hasPrefix(MenuBarPrefix.zcode) { return AgentTaskStatusStore.zcodeVisible }
+        if id.hasPrefix(MenuBarPrefix.codex) { return AgentTaskStatusStore.codexVisible }
+        return nil
+    }
+
+    /// 上次标题烘焙的条目 id 序列与各条目整段区间——排序变化检测 & 滑动动画旧位快照
+    private var lastMenuBarIDs: [String] = []
+    private var lastMenuBarSpans: [String: NSRect] = [:]
+
+    /// 各条目整段横向区间（图标左缘-2pt → 下一条目内容左缘+2pt，末条目到行尾），
+    /// 位图点空间。滑动动画按此区间从旧位图裁出「图标+数值」整段快照。
+    private func entrySpans(attr: NSAttributedString,
+                            iconInfos: [(rect: NSRect, leftFreeSpace: CGFloat?)],
+                            entries: [(id: String, icon: String)]) -> [String: NSRect] {
+        let totalW = attr.boundingRect(with: NSSize(width: 10000, height: 100),
+                                       options: [.usesLineFragmentOrigin, .usesFontLeading]).width
+        var result: [String: NSRect] = [:]
+        for (i, e) in entries.enumerated() {
+            guard i < iconInfos.count else { continue }
+            let icon = iconInfos[i].rect
+            let start = max(0, icon.minX - 2)
+            let end: CGFloat
+            if i + 1 < iconInfos.count {
+                end = iconInfos[i + 1].rect.minX - (iconInfos[i + 1].leftFreeSpace ?? 0) + 2
+            } else {
+                end = totalW + 2
+            }
+            guard end > start + 1 else { continue }
+            result[e.id] = NSRect(x: start, y: 0, width: end - start, height: 0)
+        }
+        return result
+    }
+
+    private lazy var menuBarGlow: MenuBarStatusGlowController = {
+        let c = MenuBarStatusGlowController(stateProvider: { [weak self] in self?.menuBarGlowState(for: $0) })
+        // 圆点出现/消失改变标题排版 → 重烘焙标题位图（状态点预留间距随存亡增删）
+        c.onDotPresenceChanged = { [weak self] in self?.updateTitle(tag: "dotPresence") }
+        return c
+    }()
 
     /// 获取菜单栏图标形状（惰性加载并缓存）：
     /// PDF/SVG 栅格化为黑形位图（矢量直接设 isTemplate 不生效，会渲染成黑色）；PNG 品牌色原样（烘焙进 template 后只取其 alpha 形状）
@@ -524,6 +578,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         img.addRepresentation(rep)
         img.isTemplate = true
         return img
+    }
+
+    /// 标题位图内附件（NSTextAttachment 平台图标）的精确 frame（容器坐标，top-down）。
+    /// NSLayoutManager 与 NSString.draw(.usesLineFragmentOrigin) 同一套排版引擎，
+    /// 比逐段测量累加 x 更准（kern/字形间距差异全被吸收）；仅在标题重烘焙时调用一次
+    /// 解出标题位图内每个附件（平台图标）的 frame 与左侧可用空隙。
+    /// leftFreeSpace = 图标前连续空白字形的总宽（即与前一内容的间隔）；nil = 位图最左、左侧无内容。
+    private func attachmentRects(in attr: NSAttributedString) -> [(rect: NSRect, leftFreeSpace: CGFloat?)] {
+        let ts = NSTextStorage(attributedString: attr)
+        let lm = NSLayoutManager()
+        ts.addLayoutManager(lm)
+        let tc = NSTextContainer(size: NSSize(width: 10_000, height: 100))
+        tc.lineFragmentPadding = 0
+        lm.addTextContainer(tc)
+        lm.ensureLayout(forCharacterRange: NSRange(location: 0, length: attr.length))
+        let nsStr = attr.string as NSString
+        var rects: [(rect: NSRect, leftFreeSpace: CGFloat?)] = []
+        attr.enumerateAttribute(.attachment, in: NSRange(location: 0, length: attr.length)) {
+            value, chrRange, _ in
+            guard value is NSTextAttachment else { return }
+            let glyphRange = lm.glyphRange(forCharacterRange: chrRange, actualCharacterRange: nil)
+            let rect = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
+            // 向前扫连续空白（半角空格 / 细空格），其宽度即图标与左侧内容的间隔
+            var wsCount = 0
+            while chrRange.location - wsCount - 1 >= 0 {
+                let ch = nsStr.character(at: chrRange.location - wsCount - 1)
+                if ch == 32 || ch == 0x2009 { wsCount += 1 } else { break }
+            }
+            let gLoc = glyphRange.location
+            let leftFree: CGFloat?
+            if chrRange.location == 0 {
+                leftFree = nil
+            } else if wsCount > 0 {
+                let wsCharLoc = chrRange.location - wsCount
+                let wsGlyphLoc = lm.glyphRange(forCharacterRange: NSRange(location: wsCharLoc, length: wsCount),
+                                               actualCharacterRange: nil).location
+                leftFree = lm.location(forGlyphAt: gLoc).x - lm.location(forGlyphAt: wsGlyphLoc).x
+            } else {
+                leftFree = 0
+            }
+            rects.append((rect: rect, leftFreeSpace: leftFree))
+        }
+        return rects
     }
 
     // MARK: - 菜单栏前景色适配（屏幕聚焦状态）
@@ -727,8 +824,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onRightClickCard = { [weak self] itemId, event in
             self?.toggleMenuBarVisibility(itemId: itemId, event: event)
         }
-        panel.onPlatformOrderChanged = { [weak self] order in
+        panel.onPlatformOrderChanged = { [weak self, weak panel] order in
             self?.menuBarPlatformOrder = order
+            // 拖拽中即时跟手：每次跨行都重烘焙菜单栏并播放缩短版排序动画
+            // （quickReorder 0.12s）。链式重入时上一场动画可能未结束，beginReorder
+            // 内部会取其目标位图当旧图（按钮 image 是透明占位，不能用）。
+            // 松手 endPlatformDrag 再回调一次，序已一致自动跳过。
+            if let panel { self?.menuBarGlow.quickReorder = (panel.draggingPlatform != nil) }
             self?.updateTitle()
         }
         let popover = NSPopover()
@@ -1486,12 +1588,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func onAbout() {
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         let shell = DialogShell()
-        shell.addIcon(NSApp.applicationIconImage)
+        // 操作磁贴类弹窗统一用 App 图标快照（见 Dialogs.makeAppIconSnapshot 注释）
+        shell.addIcon(makeAppIconSnapshot())
         shell.addTitle("关于 iBalance")
         // 长文阅读类弹窗：内容宽 +8 抵消 sidePadding 增量，再 +20 加宽正文行宽
         shell.contentWidth = DialogMetrics.width + 8 + 20
-        shell.addInfo("菜单栏常驻小工具，实时聚合多平台账户余额与积分。\n\n"
-            + "• DeepSeek 余额（API Key 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• Qwen Token Plan 周额度（浏览器登录态自动采集）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（JSON 导入，多号切换）\n• 刷新间隔 1 / 3 / 5 分钟\n\n"
+        shell.addInfo("菜单栏常驻小工具，实时聚合多个 AI 服务的余额与额度。\n\n"
+            + "• DeepSeek 余额（官方 API 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• Qwen Token Plan 周额度（浏览器登录态自动采集）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（本机 JWT + JSON 导入，一键切号）\n• Codex 额度（auth.json 导入，一键切号）\n\n"
+            + "多账号管理 · 自动签到 · 日/周用量统计 · 应用内自更新\n\n"
             + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }
@@ -1605,6 +1709,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         floatingPanel?.orderOut(nil)
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
+        // 检查更新终态提示也走 App 图标快照（与其他操作磁贴弹窗同口径）
+        alert.icon = makeAppIconSnapshot()
         alert.alertStyle = warning ? .warning : .informational
         alert.messageText = title
         alert.informativeText = message
@@ -1906,7 +2012,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updateTitleRenderCount &+= 1
         let fingerprint = (isOffline ? "offline" : orderedMenuBarEntries()
             .filter { isMenuBarVisible(id: $0.id, isCurrent: $0.isCurrent) }
-            .map { "\($0.id):\($0.value)" }
+            .map { "\($0.id):\($0.value):dot=\(menuBarGlowState(for: $0.id) != nil)" }
             .joined(separator: "|"))
             + "|size:\(NSFont.menuBarFont(ofSize: 0).pointSize)"
         if fingerprint == lastTitleFingerprint, statusItem.button?.image != nil {
@@ -1950,6 +2056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             append("⚠︎ 离线")
             statusItem.button?.attributedTitle = NSAttributedString(string: "")
             statusItem.button?.image = renderTemplateTitleImage(attr)
+            menuBarGlow.clear()
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): offline, \(ms)ms")
             // 面板打开时同步重绘
@@ -1962,9 +2069,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         var hasContent = false
         var renderedIds: [String] = []
+        // 光晕层用：本次实际渲染的条目（id/icon，顺序与标题位图内附件一致）
+        var renderedEntries: [(id: String, icon: String)] = []
         for entry in orderedMenuBarEntries() {
             guard isMenuBarVisible(id: entry.id, isCurrent: entry.isCurrent) else { continue }
             renderedIds.append(entry.id)
+            renderedEntries.append((entry.id, entry.icon))
             if hasContent { append("  \u{2009}") }
 
             // 平台品牌图标（黑形，随整条标题烘焙进 template 位图）；TRAE 缩小 6%，ZCode 缩小 13%
@@ -1977,6 +2087,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             default: iconScale = 1.0
             }
             // DeepSeek 图标后用细空格（后面紧跟 ¥ 符号），其余平台保持普通空格
+            // 状态点平台：图标前插入预留空隙（圆点左侧间距），点消失时重烘焙自动回收
+            if menuBarGlowState(for: entry.id) != nil {
+                append(MenuBarStatusGlowController.dotReserve)
+            }
             attachIcon(named: entry.icon, size: iconSize * iconScale, spacing: entry.symbol.isEmpty ? " " : "\u{2009}")
 
             // 货币符号（仅 DeepSeek 有）：小字号 + 底对齐
@@ -1992,7 +2106,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
-        statusItem.button?.image = renderTemplateTitleImage(attr)
+
+        // 光晕层同步：附件（平台图标）在标题位图内的精确 frame 用 NSLayoutManager 解出，
+        // 与 NSString.draw 同一套排版引擎，坐标可直接对位
+        let titleH = attr.boundingRect(with: NSSize(width: 10000, height: 100),
+                                       options: [.usesLineFragmentOrigin, .usesFontLeading]).height
+        let iconInfos = attachmentRects(in: attr)
+        let glowEntries = zip(renderedEntries, iconInfos).map {
+            MenuBarStatusGlowController.EntryIcon(id: $0.id, rect: $1.rect, leftFreeSpace: $1.leftFreeSpace)
+        }
+        // 各条目整段横向区间（图标起 → 下一条目内容起），供排序滑动动画裁快照
+        let spansByID = entrySpans(attr: attr, iconInfos: iconInfos, entries: renderedEntries)
+        let newImage = renderTemplateTitleImage(attr) ?? NSImage()  // 烘焙失败 = 空图（原 nil 赋值同样清空）
+        let newIDs = renderedEntries.map(\.id)
+        var animated = false
+        if !isOffline, !lastMenuBarIDs.isEmpty, newIDs != lastMenuBarIDs,
+           !Set(newIDs).intersection(lastMenuBarIDs).isEmpty,
+           let oldImage = statusItem.button?.image {
+            animated = menuBarGlow.beginReorder(oldImage: oldImage,
+                                                oldSpansByID: lastMenuBarSpans,
+                                                newImage: newImage,
+                                                newEntries: glowEntries,
+                                                newSpansByID: spansByID)
+        }
+        if !animated {
+            statusItem.button?.image = newImage
+        }
+        lastMenuBarIDs = newIDs
+        lastMenuBarSpans = spansByID
+        menuBarGlow.setEntries(glowEntries, imageHeight: ceil(titleH))
 
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
         let slow = ms >= 10 ? " SLOW!" : ""

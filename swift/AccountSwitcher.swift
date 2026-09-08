@@ -228,10 +228,18 @@ extension AppDelegate {
         syncPanel()
 
         let shell = DialogShell()
-        if let url = Bundle.main.url(forResource: "codex", withExtension: "svg"),
+        // 弹窗图标随主题切 Codex 品牌图：深色 = codex.png（ClearDark）、浅色 = codex-light.png
+        //（ClearLight，与余额卡同一套资产）；缺对应版时回退另一版
+        let darkIcon = NSApp.effectiveAppearance.isDark
+        let codexResource = darkIcon ? "codex" : "codex-light"
+        if let url = Bundle.main.url(forResource: codexResource, withExtension: "png"),
            let icon = NSImage(contentsOf: url) {
             icon.isTemplate = false
-            icon.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
+            shell.addIcon(icon)
+        } else if let url = Bundle.main.url(forResource: darkIcon ? "codex-light" : "codex",
+                                            withExtension: "png"),
+                  let icon = NSImage(contentsOf: url) {
+            icon.isTemplate = false
             shell.addIcon(icon)
         }
         let title: String

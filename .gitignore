@@ -54,3 +54,8 @@ Inter-4.1/
 
 # codegraph 本机符号索引（守护进程自动重建，勿入库）
 .codegraph/
+
+# 本地设计稿 / 专题文档 / 会话计划（本地资料，不入库；README 引用的 docs 资源需另定去留）
+/design/
+/docs/
+/plans/

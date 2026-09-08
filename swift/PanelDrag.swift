@@ -143,7 +143,7 @@ extension BalancePanelView {
                 }
                 l.backgroundColor = Palette.borderCGColor(Palette.cardHoverStrongBright, in: self)
                 l.borderColor = Palette.borderCGColor(Palette.hoverBorderBright, in: self)
-                l.borderWidth = 0.8
+                l.borderWidth = Palette.cardBorderWidth
                 l.shadowColor = NSColor.black.cgColor
                 l.shadowOffset = CGSize(width: 0, height: -3)
                 l.shadowRadius = 10

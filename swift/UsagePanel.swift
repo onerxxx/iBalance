@@ -786,17 +786,15 @@ final class UsageDots: NSView {
         let x0 = snap((bounds.width - side) / 2)
         let radius = side * Self.dotCornerRadiusFactor
         let dark = effectiveAppearance.isDark
-        // 只取热力图三个最亮档（2026-09-07 用户指定）：档位 = filled+1 起步（跳过最暗的
-        // L1 深橄榄）、钳到 L4——顶部两档共用峰值黄绿；深色 L2/L3/L4，浅色镜像反向
-        //（浅色色阶 1=峰值亮端）→ 3/2/1
+        // 深色：三个最亮档 L2/L3/L4（2026-09-07 用户指定，filled+1 起步跳过最暗档、
+        // 钳到 L4）；浅色：只用峰值色（2026-09-08 用户「卡片进度条只用最亮的颜色」）
         let heatLevel = min(filled + 1, count)
         for i in 0..<count {   // i=0 = 底部点
             let y = snap(CGFloat(i) * (side + gap))
             let rect = NSRect(x: x0, y: y, width: side, height: side)
             // 未点亮底色 = 词元活动无用量底点色（heatDotEmpty：深 #262626 / 浅 210 灰，
             // 2026-09-07 用户指定与热力图底点同色）；动态色在 draw 内按生效外观解算
-            let color = i < filled ? Palette.heatLevelColor(dark ? heatLevel : count + 1 - heatLevel,
-                                                            dark: dark)
+            let color = i < filled ? Palette.heatLevelColor(dark ? heatLevel : 4, dark: dark)
                                    : Palette.heatDotEmpty
             // 点亮泛光：同色低透明度外扩 0.3pt 晕圈先铺底，本体满色盖回 → 可见仅外圈；
             // 圆角同步外扩保持同心（2026-09-07 用户指定）
@@ -862,10 +860,11 @@ final class UsageDots: NSView {
     }
     /// 渐变端点 = 点阵热力色阶（2026-09-07 用户「进度颜色的改变需要泛化到长进度卡片」：
     /// 原硬编码绿档废弃，改由 heatLevelColor 推导，header 调色气泡调色相/饱和度即时跟随）。
-    /// 深色 = L1→L4（45% 压暗端→峰值），浅色 = L4→L1（浅色阶 33% 暗端→峰值亮端），
-    /// 两端均保持左深右亮观感。返回 sRGB 0–255 元组：横态层渐变与竖线逐条采样共用。
+    /// 深色 = L1→L4（45% 压暗端→峰值）；浅色 = 两端均峰值色（2026-09-08 用户
+    /// 「卡片进度条只用最亮的颜色」，单色条）。返回 sRGB 0–255 元组：
+    /// 横态层渐变与竖线逐条采样共用。
     private static func progressStops(dark: Bool) -> [(r: CGFloat, g: CGFloat, b: CGFloat)] {
-        (dark ? [1, 4] : [4, 1]).map { level in
+        (dark ? [1, 4] : [4, 4]).map { level in
             let c = Palette.heatLevelColor(level, dark: dark).usingColorSpace(.sRGB) ?? .black
             return (c.redComponent * 255, c.greenComponent * 255, c.blueComponent * 255)
         }
@@ -1018,7 +1017,7 @@ extension BalancePanelView {
                                     topInset: usageRowTopInset,
                                     bottomInset: usageRowBottomInset)
         hoverRow.hoverGradientColors = Palette.hoverGradient
-        // 发丝边框：与余额卡片 HoverCard 同款（白@20%→白@35%，0.8pt，0.22s）
+        // 发丝边框：与余额卡片 HoverCard 同款（hoverBorderNormal 18% ↔ Bright，1.2pt，0.22s）
         hoverRow.enablesHoverBorder = true
         hoverRow.wantsLayer = true
         hoverRow.onHoverChanged = { [weak self, weak hoverRow] inside in

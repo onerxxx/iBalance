@@ -104,9 +104,12 @@ enum WBTokenStore {
         var projectPaths: [String: String] = [:]
         var dailyMap: [TimeInterval: Int64] = [:]
         var requests: Int64 = 0
-        // 周期总计（5h/1d/7d/30d 滚动窗口）：startedAt 落在各窗口起点之后即计入（All 补全量）
+        // 周期总计 + 各窗口项目/模型小计（5h/1d/7d/30d 滚动窗口）：startedAt 落在
+        // 各窗口起点之后即计入（All 补全量；startedAt 缺失的贡献不计入任何窗口）
         let periodStarts = TokenPeriodWindows.starts()
         var periodTotals: [TokenPeriod: Int64] = [:]
+        var periodProjectTokens: [TokenPeriod: [String: Int64]] = [:]
+        var periodModelTokens: [TokenPeriod: [String: Int64]] = [:]
         for c in fresh.values {
             let key = c.model.lowercased()
             var agg = models[key] ?? ModelAgg()
@@ -133,6 +136,8 @@ enum WBTokenStore {
             if let s = c.startedAt {
                 for p in TokenPeriod.windowed where s >= (periodStarts[p] ?? .infinity) {
                     periodTotals[p, default: 0] += c.tokens
+                    periodProjectTokens[p, default: [:]][proj, default: 0] += c.tokens
+                    periodModelTokens[p, default: [:]][key, default: 0] += c.tokens
                 }
             }
         }
@@ -149,12 +154,28 @@ enum WBTokenStore {
             .sorted { $0.tokens > $1.tokens }
         let total = projectRows.reduce(Int64(0)) { $0 + $1.tokens }
         periodTotals[.all] = total   // All = 全量总计，无窗口
+        // 各窗口列表：项目键沿用 basename（path 回查全量映射）；模型展示名取全量
+        // 聚合结果（窗口 ⊆ 全量，键必已存在）
+        var periodProjects: [TokenPeriod: [TokenSummary.ProjectUsage]] = [:]
+        for (p, dict) in periodProjectTokens {
+            periodProjects[p] = dict
+                .map { TokenSummary.ProjectUsage(name: $0.key, tokens: $0.value,
+                                                 path: projectPaths[$0.key]) }
+                .sorted { $0.tokens > $1.tokens }
+        }
+        var periodModels: [TokenPeriod: [TokenSummary.ProjectUsage]] = [:]
+        for (p, dict) in periodModelTokens {
+            periodModels[p] = dict
+                .map { TokenSummary.ProjectUsage(name: models[$0.key]!.name, tokens: $0.value) }
+                .sorted { $0.tokens > $1.tokens }
+        }
         Logger.log(.refresh, "[WbTokDbg] 项目行=\(projectRows.count) 名=\(projectRows.prefix(3).map { $0.name }) 未知=\(projectRows.filter { $0.name == "(未知项目)" }.count)")
         let daily = dailyMap
             .map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
         return TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
-                                 requestCount: requests, daily: daily, periodTotals: periodTotals)
+                                 requestCount: requests, daily: daily, periodTotals: periodTotals,
+                                 periodProjects: periodProjects, periodModels: periodModels)
     }
 
     /// workbuddy.db sessions 表 sessionId → cwd（含已删除会话，保留历史用量归属）。

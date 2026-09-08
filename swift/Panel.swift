@@ -117,12 +117,8 @@ enum Motion {
     /// 用户指定加长时长，不适用 0.40 硬顶
     static let roll: CFTimeInterval = 3.0
     /// Agent 卡 hover 确认时长：光标驻留此时长才切换 Token 板块，
-    /// 子账号积分条换入同此节拍（用户指定 0.8s，滤掉光标快速掠过；确认交互非装饰动效，不适用 0.40 硬顶。
-    /// 光晕下移动效不等此时长，见 Controls.swift startHoverDwell）
+    /// 子账号积分条换入同此节拍（用户指定 0.8s，滤掉光标快速掠过）
     static let hoverDwell: CFTimeInterval = 0.8
-    /// 平台卡 hover 驻留进度视觉（2026-09-06 起 = 光晕下移，替换左→右填充）：
-    /// 光晕起始位置高出卡片顶边的距离
-    static let glowDescendOffset: CGFloat = 16
     /// 打开面板后滚动数字重滚入场的延迟（用户指定 0.5s）
     static let openRerollDelay: CFTimeInterval = 0.5
     /// 打开面板补发整段时长（用户指定 2s）：从开始到停下恒为此时长——行进最长的
@@ -179,31 +175,46 @@ extension NSAppearance {
 /// 上行色相、下行饱和度，拖动实时改点阵配色；icon 不着色=默认前景色）+ 尾部主题/样式
 /// 开关行组（setSwitchRows 挂入，行视图本体归面板 switchRows 注册表管）。
 /// 目标/动作都挂在自身，不经面板浮窗拆除路径。载体是自绘气泡窗（showHeatWindow，
-/// 与子账号悬浮气泡同机制），frame 直铺纵向流式排布。
+/// 与子账号悬浮气泡同机制），frame 直铺纵向流式排布；分「Panel / Card」两个区块，
+/// 标题样式与面板 sectionTitleRow 同款（13pt semibold / systemGray / 24pt 行带）。
 final class HeatAdjustView: NSView {
     let hueSlider = NSSlider()
     let satSlider = NSSlider()
     var onHue: ((CGFloat) -> Void)?
     var onSaturation: ((CGFloat) -> Void)?
 
-    /// 本体（不含箭头）宽 166 = 内边距 10 + icon 16 + 距 6 + 轨道 124 + 内边距 10
-    ///（2026-09-07 用户「增加容器宽度 60pt」：106→166，容纳开关行、轨道加长）
-    static let bodyWidth: CGFloat = 166
-    private static let sideInset: CGFloat = 10
+    /// 本体（不含箭头）宽 174 = 内边距 14 + icon 16 + 距 6 + 轨道 124 + 内边距 14
+    ///（2026-09-07 用户「增加容器宽度 60pt」：106→166，容纳开关行、轨道加长；
+    /// 2026-09-09 用户「左右缩进下缩进增加 4pt」：sideInset 10→14、底部 vPad 10→14，
+    /// 宽随边距 +8 保轨道 124 不变）
+    static let bodyWidth: CGFloat = 174
+    private static let sideInset: CGFloat = 14
     private static let iconSize: CGFloat = 16
     private static let iconGap: CGFloat = 6
-    /// 纵向：上下内边距 10（与四边同值）、滑杆行带 19 + 行间 6、滑杆组↔开关组 10、
-    /// 开关行 18 + 行间 6
-    private static let vPad: CGFloat = 10
+    /// 纵向：顶部内边距 10、底部内边距 14（2026-09-09 用户「下缩进 +4pt」）、
+    /// 标题带 24（文字垂直居中——与面板 sectionTitleRow 同款）+ 带下 7（面板标题下
+    /// 贴卡片，卡片 topPadding=7，浮层无卡片壳须自己补上同值）、滑杆行带 19 + 行间 6、
+    /// 区块间 10、开关行 18 + 行间 6
+    private static let vPadTop: CGFloat = 10
+    private static let vPadBottom: CGFloat = 14
     static let sliderRowH: CGFloat = 19
     private static let rowGap: CGFloat = 6
     private static let sectionGap: CGFloat = 10
     static let switchRowH: CGFloat = 18
+    private static let titleH: CGFloat = 24
+    private static let titleGap: CGFloat = 7
 
-    /// 按开关行数求本体高（展示方建窗同一算式，保证行带/内边距严格落位）
-    static func bodyHeight(switchRows: Int) -> CGFloat {
-        vPad * 2 + sliderRowH * 2 + rowGap + sectionGap
-            + CGFloat(switchRows) * switchRowH + CGFloat(max(0, switchRows - 1)) * rowGap
+    /// 按两区块开关行数求本体高（展示方建窗同一算式，保证行带/内边距严格落位）。
+    /// 纵向流：Panel 标题 → 滑杆两行 → 面板开关组 → Card 标题 → 卡片开关组。
+    /// ⚠️ 滑杆行距要算两处（两杆之间 + 第二杆与开关组之间，layout 每行都减
+    /// sliderRowH+rowGap）——曾漏计后者致高度少 6pt，底部留白恒 = 名义值 − 6
+    /// （2026-09-09 「下缩进 +4 看起来没变」由此起）
+    static func bodyHeight(panelRows: Int, cardRows: Int) -> CGFloat {
+        vPadTop + vPadBottom + (titleH + titleGap) * 2
+            + sliderRowH * 2 + rowGap * 2
+            + CGFloat(panelRows) * switchRowH + CGFloat(max(0, panelRows - 1)) * rowGap
+            + sectionGap
+            + CGFloat(cardRows) * switchRowH + CGFloat(max(0, cardRows - 1)) * rowGap
     }
 
     /// 本体在窗口内的左右边界偏移：箭头侧让出箭头长，由展示方按 edge 注入
@@ -213,6 +224,16 @@ final class HeatAdjustView: NSView {
     var bodyRightTrim: CGFloat = 0 {
         didSet { if oldValue != bodyRightTrim { needsLayout = true } }
     }
+
+    /// 区块标题：面板 sectionTitleRow 同款（13pt semibold / systemGray）
+    private static func makeTitle(_ name: String) -> NSTextField {
+        let l = NSTextField(labelWithString: name)
+        l.font = .systemFont(ofSize: 13, weight: .semibold)
+        l.textColor = .systemGray
+        return l
+    }
+    private let panelTitle = makeTitle("Panel")
+    private let cardTitle = makeTitle("Card")
 
     /// 行首图标（模板图默认前景色染色，勿再设 contentTintColor）
     private static func symbolImageView(_ name: String) -> NSImageView {
@@ -225,20 +246,23 @@ final class HeatAdjustView: NSView {
     private let hueIcon = symbolImageView("paintpalette")
     private let satIcon = symbolImageView("drop.fill")
 
-    private var switchRows: [NSView] = []
+    private var panelSwitchRows: [NSView] = []
+    private var cardSwitchRows: [NSView] = []
     /// 开关行承载宿主：行用 Auto Layout 撑满宿主宽（trailing 钉死 → 开关贴右缘）；
     /// 宿主自身 frame 直铺，与滑杆行共用左右边界
     private let rowsHost = NSView()
+    private let cardRowsHost = NSView()
     private var rowConstraints: [NSLayoutConstraint] = []
+    private var cardRowConstraints: [NSLayoutConstraint] = []
 
-    /// 挂入/换入开关行（行视图由面板侧 switchRow() 构建并注册，这里只做承载与排布）
-    func setSwitchRows(_ rows: [NSView]) {
+    /// 挂入两区块开关行（行视图由面板侧 switchRow() 构建并注册，这里只做承载与排布）
+    func setSwitchRows(panelRows: [NSView], cardRows: [NSView]) {
         NSLayoutConstraint.deactivate(rowConstraints)
         rowConstraints = []
-        for r in switchRows { r.removeFromSuperview() }
-        switchRows = rows
+        for r in panelSwitchRows { r.removeFromSuperview() }
+        panelSwitchRows = panelRows
         var previous: NSView?
-        for row in rows {
+        for row in panelRows {
             row.translatesAutoresizingMaskIntoConstraints = false
             rowsHost.addSubview(row)
             rowConstraints.append(contentsOf: [
@@ -252,6 +276,26 @@ final class HeatAdjustView: NSView {
             previous = row
         }
         NSLayoutConstraint.activate(rowConstraints)
+
+        NSLayoutConstraint.deactivate(cardRowConstraints)
+        cardRowConstraints = []
+        for r in cardSwitchRows { r.removeFromSuperview() }
+        cardSwitchRows = cardRows
+        previous = nil
+        for row in cardRows {
+            row.translatesAutoresizingMaskIntoConstraints = false
+            cardRowsHost.addSubview(row)
+            cardRowConstraints.append(contentsOf: [
+                row.leadingAnchor.constraint(equalTo: cardRowsHost.leadingAnchor),
+                row.trailingAnchor.constraint(equalTo: cardRowsHost.trailingAnchor),
+                row.heightAnchor.constraint(equalToConstant: Self.switchRowH),
+                previous.map { row.topAnchor.constraint(equalTo: $0.bottomAnchor,
+                                                        constant: Self.rowGap) }
+                    ?? row.topAnchor.constraint(equalTo: cardRowsHost.topAnchor),
+            ])
+            previous = row
+        }
+        NSLayoutConstraint.activate(cardRowConstraints)
         needsLayout = true
     }
 
@@ -269,7 +313,10 @@ final class HeatAdjustView: NSView {
         satSlider.action = #selector(satChanged(_:))
         addSubview(hueIcon)
         addSubview(satIcon)
+        addSubview(panelTitle)
+        addSubview(cardTitle)
         addSubview(rowsHost)
+        addSubview(cardRowsHost)
         syncFromPalette()
     }
 
@@ -283,12 +330,25 @@ final class HeatAdjustView: NSView {
 
     override func layout() {
         super.layout()
-        // 非翻转坐标 y 向上，自顶向下流式：色相行 → 饱和度行 → 开关行组
+        // 非翻转坐标 y 向上，自顶向下流式：Panel 标题 → 滑杆两行 → 面板开关组 →
+        // Card 标题 → 卡片开关组
         let x = bodyOriginX + Self.sideInset
         let contentW = max(40, bounds.width - bodyOriginX - bodyRightTrim
                                 - Self.sideInset * 2)
         let trackW = max(20, contentW - Self.iconSize - Self.iconGap)
-        var top = bounds.height - Self.vPad
+        var top = bounds.height - Self.vPadTop
+
+        // 标题：文字在 24pt 带内垂直居中（与面板 sectionTitleRow 的 stack centerY 同款；
+        // 直放 24pt frame 文字会偏上），带下 titleGap=7（面板标题下贴卡片、卡片
+        // topPadding=7，浮层行无卡片壳，由这个间距补齐面板的视觉留白）
+        func placeTitle(_ l: NSTextField) {
+            let th = l.fittingSize.height
+            l.frame = NSRect(x: x, y: top - Self.titleH + (Self.titleH - th) / 2,
+                             width: contentW, height: th)
+            top -= Self.titleH + Self.titleGap
+        }
+        placeTitle(panelTitle)
+
         for (slider, icon) in [(hueSlider, hueIcon), (satSlider, satIcon)] {
             let centerY = top - Self.sliderRowH / 2
             icon.frame = NSRect(x: x, y: centerY - Self.iconSize / 2,
@@ -298,11 +358,19 @@ final class HeatAdjustView: NSView {
                                   width: trackW, height: slider.fittingSize.height)
             top -= Self.sliderRowH + Self.rowGap
         }
-        top -= Self.sectionGap - Self.rowGap
-        // 开关组宿主：frame 定位置与大小，行在宿主内 AL 撑满宽（右缘对齐由约束保证）
-        let n = switchRows.count
-        let blockH = n == 0 ? 0 : Self.switchRowH * CGFloat(n) + Self.rowGap * CGFloat(n - 1)
-        rowsHost.frame = NSRect(x: x, y: top - blockH, width: contentW, height: blockH)
+
+        func placeBlock(rows: Int, host: NSView) {
+            let blockH = rows == 0 ? 0 : Self.switchRowH * CGFloat(rows)
+                + Self.rowGap * CGFloat(rows - 1)
+            host.frame = NSRect(x: x, y: top - blockH, width: contentW, height: blockH)
+            top -= blockH
+        }
+        placeBlock(rows: panelSwitchRows.count, host: rowsHost)
+        top -= Self.sectionGap
+
+        placeTitle(cardTitle)
+
+        placeBlock(rows: cardSwitchRows.count, host: cardRowsHost)
     }
 
     @objc private func hueChanged(_ sender: NSSlider) {
@@ -342,66 +410,32 @@ enum Palette {
     /// 卡片 hover 提亮色 #333333 @ 30%
     static let cardBackgroundHover = NSColor(calibratedWhite: 51.0 / 255.0, alpha: 0.3)
     /// 统一 hover 渐变背景（余额卡片/操作磁贴/折叠标题条/用量条目共用）：
-    /// 深/浅色外观动态解析——深色 = 白色提亮 8%→5%，浅色 = 黑色压暗 5%→3%。改色只动这四个分支。
+    /// 深/浅色外观动态解析——深色 = 白色提亮 8%→5%，浅色 = 黑色压暗 5%→3%。
+    /// （2026-09-08 曾短暂改为深色黑@45% 纯色，用户澄清「统一成原来 token 标题
+    /// 那个 hover」后撤销恢复。）改色只动这四个分支。
+    /// 统一 hover 渐变背景（全部卡片共用）：深色 = 白色提亮 8%→5% 斜向渐变；
+    /// 浅色 = 黑@6% 两端同色（2026-09-08 用户「改成黑@6%」，10%→33% 实测过重回调）。
+    /// 改色只动这四个分支。
     static let hoverGradientBright = NSColor(name: nil) { appearance in
         appearance.isDark
             ? NSColor.white.withAlphaComponent(0.08)
-            : NSColor.black.withAlphaComponent(0.05)
+            : NSColor.black.withAlphaComponent(0.06)
     }
     static let hoverGradientDark = NSColor(name: nil) { appearance in
         appearance.isDark
             ? NSColor.white.withAlphaComponent(0.05)
-            : NSColor.black.withAlphaComponent(0.03)
+            : NSColor.black.withAlphaComponent(0.06)
     }
     /// 渐变端点数组（CAGradientLayer.colors 直接可用）
     static let hoverGradient: [NSColor] = [hoverGradientBright, hoverGradientDark]
-    /// Agent/API 平台卡 hover 强背景（用户指定）：深色 = 黑 @45%（2026-09-06 用户
-    /// 「更暗」由 35% 加深；当日更早演化 50% → 35% 后回调），浅色 = 白 @80%。
-    /// 两端点同色 = 视觉纯色；
-    /// 平台卡 HoverCard 与 Agent 标题胶囊经 hoverGradientOverride 套用，
-    /// 余额卡/磁贴/折叠标题条/用量条仍走淡渐变，互不影响。
+    /// 拖拽幽灵背景定调色（2026-09-06 两段式幽灵：只背景加模糊、叠 hover 强背景色）：
+    /// 深色 = 黑@45%，浅色 = 点阵峰值色 heatPeakColor（跟随调色气泡色相/饱和）。
+    /// （原平台卡 hover 强背景/烘焙位图管线已于 2026-09-08 删除，仅幽灵仍用此色）
     static let cardHoverStrongBright = NSColor(name: nil) { appearance in
         appearance.isDark
             ? NSColor.black.withAlphaComponent(0.45)
-        // 浅色外观 = 白 @52%（2026-09-06 用户「提亮大约30%」由 40% 上调，
-        // 白色叠加层亮度只由 alpha 决定，0.4×1.3≈0.52）
-            : NSColor.white.withAlphaComponent(0.52)
+            : heatPeakColor.withAlphaComponent(0.7)
     }
-    static let cardHoverStrongDark = NSColor(name: nil) { appearance in
-        appearance.isDark
-            ? NSColor.black.withAlphaComponent(0.45)
-            : NSColor.white.withAlphaComponent(0.8)
-    }
-    static let cardHoverStrong: [NSColor] = [cardHoverStrongBright, cardHoverStrongDark]
-    /// 平台卡 hover 顶部椭圆光晕（2026-09-06 用户指定，参考图=顶部中央大椭圆模糊白光）：
-    /// 顶部椭圆光晕 alpha（按外观分档）：深色 10%（2026-09-06 用户「透明度降低 10%」由 20% 再降）；
-    /// 浅色 35%（2026-09-06 用户指定「浅色再加强」）
-    static let cardHoverGlowAlphaDark: CGFloat = 0.10
-    static let cardHoverGlowAlphaLight: CGFloat = 0.35
-    static func cardHoverGlowAlpha(dark: Bool) -> CGFloat {
-        dark ? cardHoverGlowAlphaDark : cardHoverGlowAlphaLight
-    }
-    static let cardHoverGlowRadiusX: CGFloat = 0.55  // 半轴 = 0.55 × 卡宽
-    static let cardHoverGlowRadiusY: CGFloat = 0.65  // 半轴 = 0.65 × 卡高
-    /// 高斯衰减松紧（按外观分档）：exp(-(spread·t)²)，越大光斑越收紧；2026-09-06
-    /// 用户「模糊放大」2.2 → 1.4，同日「暗色主题下光晕更宽」拆两档——暗色取更小值
-    /// 光晕更宽（1.4 → 1.15 → 1.0 用户「再宽一些」两连调）
-    static let cardHoverGlowSpreadDark: CGFloat = 1.0
-    static let cardHoverGlowSpreadLight: CGFloat = 1.4
-    static func cardHoverGlowSpread(dark: Bool) -> CGFloat {
-        dark ? cardHoverGlowSpreadDark : cardHoverGlowSpreadLight
-    }
-    /// 平台卡 hover 烘焙边框（2026-09-06 取代平台卡 CALayer 描边）：带宽 0.8pt
-    ///（2026-09-06 用户由 1pt 改细），
-    /// 顶 = hoverBorderBright 原色、底 = 同色 RGB × BottomDim（上浅下深压暗）。
-    /// AlphaBoost：位图边缘抗锯齿会把窄带的等效覆盖稀释，×2 恢复 CALayer 同宽描边的可见度
-    ///（2026-09-06 用户反馈「hover 没有边框」）
-    static let cardHoverBorderWidth: CGFloat = 0.8
-    static let cardHoverBorderBottomDim: CGFloat = 0.5
-    static let cardHoverBorderAlphaBoost: CGFloat = 2.0
-    /// 边框带顶色亮度（仅浅色）：2026-09-06 用户「改为灰色」由 0.7 降至 0.55
-    ///（0.8 白系压暗档已废）；alpha 与暗色一致
-    static let cardHoverBorderLightBrightness: CGFloat = 0.55
     /// 渐变视觉角度：水平向右为 0°，顺时针偏移
     static let hoverGradientAngleDeg: CGFloat = 60
 
@@ -430,12 +464,15 @@ enum Palette {
     /// 容器玻璃渐变底色（中灰半透明）：与 containerTint 组成纵向渐变，顶部近黑 → 底部中灰
     static let containerTintBottom = NSColor(calibratedWhite: 0.25, alpha: 0.55)
 
-    /// 浅色主题渐变遮罩两端：顶部亮白 → 底部微白（2026-09-06 用户要求整体提亮：
-    /// 顶 0.55→0.75、底 0→0.2；同日晚「暗部更亮」底 0.2→0.35；
-    /// 2026-09-07 「高对比背景下浅色相反=底部提亮」底 0.35→0.55。
+    /// 浅色主题渐变遮罩两端（2026-09-08 用户指定色值 #F2F2F2）：顶 @0.95 → 底 @0.8
+    /// （2026-09-06 整体提亮：顶 0.55→0.75、底 0→0.2；同日「暗部更亮」底 0.2→0.35；
+    /// 2026-09-07 「高对比背景下浅色相反=底部提亮」底 0.35→0.55；
+    /// 2026-09-08 alpha 档位 0.75/0.55 → 0.95/0.8。
     /// 与深色遮罩方向互补——深色是顶部近黑 → 底部深灰）
-    static let containerTintLightTop = NSColor.white.withAlphaComponent(0.75)
-    static let containerTintLightBottom = NSColor.white.withAlphaComponent(0.55)
+    static let containerTintLightTop = NSColor(calibratedRed: 0xF2 / 255.0, green: 0xF2 / 255.0,
+                                               blue: 0xF2 / 255.0, alpha: 0.95)
+    static let containerTintLightBottom = NSColor(calibratedRed: 0xF2 / 255.0, green: 0xF2 / 255.0,
+                                                  blue: 0xF2 / 255.0, alpha: 0.8)
     /// 深色遮罩底端：压黑面板底部亮玻璃用（2026-09-07 用户要求，原全透明露出毛玻璃亮色）
     static let containerTintDarkBottom = NSColor(calibratedWhite: 0.02, alpha: 0.28)
 
@@ -482,17 +519,20 @@ enum Palette {
     }
     /// 卡片边框色/分割线色（暗主题：浅灰半透明，1px 描边，统一白@10%）
     static let cardBorderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10)
-    /// hover 边框常态色（深色白@10% / 浅色黑@6%）：卡片预设边框色，非 hover 时使用
+    /// 卡片常态边框（2026-09-08 用户「粗 1.2pt alpha 18% 全部统一」）：恒显描边，
+    /// 深色白@18% / 浅色黑@18%（alpha 统一档，色相随外观取相对明暗）
     static let hoverBorderNormal = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.white.withAlphaComponent(0.10)
-            : NSColor.black.withAlphaComponent(0.06)
+            ? NSColor.white.withAlphaComponent(0.18)
+            : NSColor.black.withAlphaComponent(0.18)
     }
-    /// hover 边框提亮色（深色白@24% / 浅色黑@46%）：hover 时边框色随宽度一起动画到此色
+    /// hover 边框提亮色（2026-09-08 用户「hover 时边框 1.2pt alpha 18% 全部统一」）：
+    /// 深色白@18% / 浅色黑@18%，与 hoverBorderNormal 同 alpha——hover 只动宽度，
+    /// 色动画链路保留（Normal→Bright 同值），日后单独调 hover 色只改此处
     static let hoverBorderBright = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.white.withAlphaComponent(0.24)
-            : NSColor.black.withAlphaComponent(0.46)
+            ? NSColor.white.withAlphaComponent(0.18)
+            : NSColor.black.withAlphaComponent(0.18)
     }
     /// 动态色落 CALayer 前按「视图生效外观」解算（hover 路径必须走这里）。
     /// 事件回调（mouseEntered/Exited）里 NSAppearance.current 是**系统**外观，
@@ -532,13 +572,13 @@ enum Palette {
             : NSColor(calibratedWhite: 0x26 / 255.0, alpha: 1)
     }
     /// Token 热力图无用量底点（深 中性灰 #292929（2026-09-07 用户由 #262626 提亮）/
-    /// 浅 sRGB 210,210,210 中性浅灰）。
+    /// 浅 #dddddd（2026-09-08 用户指定，原 210,210,210））。
     /// 浅色值必须用 sRGB 定义：calibratedWhite 是 gamma1.8 校准空间，合成到 sRGB 屏幕时
     /// 做 gamma 补偿会把 215 渲染成 223（取色实测），sRGB 定义则所见即所得。
     static let heatDotEmpty = NSColor(name: nil) { appearance in
         appearance.isDark
             ? NSColor(calibratedRed: 0x29/255.0, green: 0x29/255.0, blue: 0x29/255.0, alpha: 1)
-            : NSColor(srgbRed: 210/255.0, green: 210/255.0, blue: 210/255.0, alpha: 1)
+            : NSColor(srgbRed: 0xdd/255.0, green: 0xdd/255.0, blue: 0xdd/255.0, alpha: 1)
     }
     /// Token 热力图 hover 高亮环（深 白@90% / 浅 黑@70%）
     static let heatDotRing = NSColor(name: nil) { appearance in
@@ -632,8 +672,9 @@ enum Palette {
             ? NSColor.systemGray.withAlphaComponent(0.75)
             : NSColor.systemGray
     }
-    /// 卡片边框宽度 1pt
-    static let cardBorderWidth: CGFloat = 1
+    /// 卡片边框宽度 1.2pt（2026-09-08 用户「粗 1.2pt 全部统一」，原 1pt 死常量改由
+    /// HoverCard 常态描边 / 拖拽 ghost / 各预设点统一引用）
+    static let cardBorderWidth: CGFloat = 1.2
     /// 卡片主标题（平台名）/ 数值字号：13pt。气泡 ID 行与之同号（2026-08-31 用户要求）
     static let cardTitleFontSize: CGFloat = 13
     /// 卡片副标题（到期/剩余分段）、其余账号积分 chip、气泡积分行：9pt（2026-08-31 统一，原 8pt）
@@ -1269,8 +1310,6 @@ final class BalancePanelViewController: NSViewController {
         updateContentSize()
         // App 启动后首次弹出：内容归位到最上方（默认会显示底部）
         scrollToTopIfNeeded()
-        // 首次展示前预置阶梯入场（必须在可见前执行，避免先整屏闪现再重置）
-        panel.staggerRevealBalanceGroupsIfNeeded()
     }
 
     override func viewDidAppear() {
@@ -1342,7 +1381,7 @@ final class BalancePanelView: NSView {
     /// 由布局构建，随后由 BalancePanelViewController 提升到滚动容器上层固定显示。
     var headerView: NSView?
     /// header 点阵调色按钮（弹悬浮气泡：色相/饱和度滑杆 + 主题/样式开关组）
-    var heatHueBtn: HoverIconButton?
+    var themeTuneBtn: HoverIconButton?
     /// 主题/样式开关行（面板渐变/浅色主题/Mono/长进度/图标互换/竖线进度，
     /// 2026-09-07 用户指定移出设置卡；行照常注册进 switchRows，气泡展示时挂入）
     var themeSwitchRows: [NSView] = []
@@ -2134,55 +2173,6 @@ final class BalancePanelView: NSView {
         if contentSizeChanged { onContentChanged?() }
     }
 
-    // MARK: - 首开阶梯入场（UIUX-OPTIMIZATION.md §5）
-
-    /// 进程级一次性：只有本进程第一次面板展示编排入场，之后所有开面板零动画
-    ///（菜单栏面板是高频动作，首帧低频时刻才值得编排）
-    private static var didStaggerReveal = false
-
-    func staggerRevealBalanceGroupsIfNeeded() {
-        guard !Self.didStaggerReveal else { return }
-        Self.didStaggerReveal = true
-        let groups = (apiGroupContainer.arrangedSubviews + balanceGroupContainer.arrangedSubviews)
-            .filter { !$0.isHidden }
-        guard groups.count > 1 else { return }
-        // 平台组自上而下 40ms 阶梯（30–80ms 区间），每组 240ms「上浮 6pt + 淡入」。
-        // 编排总时长 ≤ 240 + 40×组数；纯视觉层动画，不阻塞任何交互。
-        // reduced-motion：去位移只留淡入。NSStackView 非 flipped（y 向上），
-        // 终位上方 dy = +y 平移。
-        let dy: CGFloat = shouldReduceMotion ? 0 : 6
-        for (i, g) in groups.enumerated() {
-            g.wantsLayer = true
-            g.alphaValue = 0
-            if dy > 0, let layer = g.layer {
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                layer.transform = CATransform3DMakeTranslation(0, dy, 0)
-                CATransaction.commit()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.04) { [weak g] in
-                guard let g else { return }
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = Motion.reveal
-                    ctx.timingFunction = Motion.easeOutStrong
-                    g.animator().alphaValue = 1
-                }
-                guard dy > 0, let layer = g.layer else { return }
-                let anim = CABasicAnimation(keyPath: "transform.translation.y")
-                anim.fromValue = dy
-                anim.toValue = 0
-                anim.duration = Motion.reveal
-                anim.timingFunction = Motion.easeOutStrong
-                layer.add(anim, forKey: "staggerReveal")
-                // model 立即归位（播放期间 presentation 覆盖 model，结束即无缝停在终位）
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                layer.transform = CATransform3DIdentity
-                CATransaction.commit()
-            }
-        }
-    }
-
     // MARK: - 打开重滚入场
 
     /// 打开面板延迟重滚的挂起任务（关闭面板即取消，0.5s 内关面板不触发）
@@ -2490,7 +2480,7 @@ final class BalancePanelView: NSView {
                // 长进度卡片左缩进与普通卡一致 8pt（2026-09-06 用户「+1pt」由 7 改）；
                // 右缩进独立档 9（2026-09-06 用户「减少1pt」，原 10）
                horizontalPadding: 8, trailingPadding: 9,
-               cardBackground: nil, hoverGradientOverride: Palette.cardHoverStrong)
+               cardBackground: nil)
             cardRef = card
             // 当前账号积分 chip 气泡数据盒（hc 块内挂接闭包捕获，append 后存入 entry 供 apply 更新）
             var newChipTipBox: ChipTipBox? = nil
@@ -3497,7 +3487,7 @@ final class BalancePanelView: NSView {
     @objc func manualRefreshTapped() { onManualRefresh?() }
     /// header 点阵调色按钮：切换悬浮气泡（子账号气泡同款载体），内含色相/饱和度两行滑杆；
     /// 存续期间经 onHeatWindowActive 挂起主面板 transient
-    @objc func headerHeatHueTapped() {
+    @objc func headerThemeTuneTapped() {
         if heatWindow != nil {
             dismissHeatWindow()
         } else {
@@ -3511,10 +3501,14 @@ final class BalancePanelView: NSView {
     /// 默认弹按钮右侧、屏幕空间不足翻左（tip 同款翻转）。与 tip 不同：要接收滑杆拖动，
     /// 不设 ignoresMouseEvents；「点气泡外收起」用本地/全局事件监视器自管。
     private func showHeatWindow() {
-        guard let button = heatHueBtn, let anchorWindow = button.window else { return }
+        guard let button = themeTuneBtn, let anchorWindow = button.window else { return }
         let arrowLen = SubAccountTipBubbleView.arrowLength
         let totalW = HeatAdjustView.bodyWidth + arrowLen
-        let h = HeatAdjustView.bodyHeight(switchRows: themeSwitchRows.count)
+        // 区块分组：Panel = 点阵色相滑杆 + 前 2 开关，Card = 下面 4 个开关
+        let panelRows = Array(themeSwitchRows.prefix(2))
+        let cardRows = Array(themeSwitchRows.suffix(4))
+        let h = HeatAdjustView.bodyHeight(panelRows: panelRows.count,
+                                          cardRows: cardRows.count)
         let screenVisible = anchorWindow.screen?.visibleFrame
         var edge: NSRectEdge = .maxX
         if let visible = screenVisible,
@@ -3579,7 +3573,7 @@ final class BalancePanelView: NSView {
         adjust.onHue = { [weak self] hue in self?.applyHeatHue(hue) }
         adjust.onSaturation = { [weak self] sat in self?.applyHeatSaturation(sat) }
         adjust.syncFromPalette()
-        adjust.setSwitchRows(themeSwitchRows)
+        adjust.setSwitchRows(panelRows: panelRows, cardRows: cardRows)
         container.addSubview(adjust)
         heatGlass = glass
         let win = HeatBubbleWindow(contentRect: container.frame, styleMask: .borderless,

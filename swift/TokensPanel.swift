@@ -114,14 +114,13 @@ enum TokenPeriod: Int, CaseIterable {
     static var windowed: [TokenPeriod] { [.h5, .d1, .d7, .d30] }
 }
 
-/// 各滚动窗口起点（秒）：5 小时前 / 今日零点 / 7 天前 / 30 天前（.all 无窗口）。
-/// 周一回退算法与热力图 activityWindow 同口径 (weekday+5)%7 仅 1d 用。
+/// 各滚动窗口起点（秒）：均为滚动窗口 = now − 窗口时长（.all 无窗口）。
+/// 2026-09-08 用户指定：1d 由「今日零点」改为过去 24h，与其余周期统一为纯时间差。
 enum TokenPeriodWindows {
-    static func starts(now: Date = Date(), cal: Calendar = .current) -> [TokenPeriod: TimeInterval] {
+    static func starts(now: Date = Date()) -> [TokenPeriod: TimeInterval] {
         let t = now.timeIntervalSince1970
-        let day = cal.startOfDay(for: now)
         return [.h5: t - 5 * 3600,
-                .d1: day.timeIntervalSince1970,
+                .d1: t - 86400,
                 .d7: t - 7 * 86400,
                 .d30: t - 30 * 86400,
                 .all: 0]
@@ -153,6 +152,59 @@ struct TokenSummary {
     /// 各周期总计词元（5H/1D/1W/1M 首行切换；窗口起点 = TokenPeriodWindows，
     /// 数据仓构建时按当前时刻聚合，60s 重建自然滚动窗口）
     var periodTotals: [TokenPeriod: Int64] = [:]
+    /// 各滚动窗口下的项目/模型聚合（窗口口径同 periodTotals，窗口内无用量 = 无键/空列表；
+    /// .all 不存 = 全量即 projects/models，列表随总计周期切换换数据）
+    var periodProjects: [TokenPeriod: [ProjectUsage]] = [:]
+    var periodModels: [TokenPeriod: [ProjectUsage]] = [:]
+
+    /// 列表行（周期口径）：All = 全量列表；窗口周期取各窗口聚合，窗口内无用量 = 空列表
+    ///（不做全量回落——列表与首行大数字保持同一周期口径）
+    func listRows(period: TokenPeriod, isModels: Bool) -> [ProjectUsage] {
+        if period == .all { return isModels ? models : projects }
+        return (isModels ? periodModels[period] : periodProjects[period]) ?? []
+    }
+
+    /// 项目行跨仓归并：键 = 完整目录（缺失用名称前缀区分，避免与真目录同名误合），
+    /// 同键 tokens 相加，降序
+    private static func mergedProjectRows(_ lists: [[ProjectUsage]]) -> [ProjectUsage] {
+        struct Agg { var tokens: Int64 = 0; var path: String?; var name: String }
+        var aggs: [String: Agg] = [:]
+        for rows in lists {
+            for p in rows {
+                let key = p.path ?? "name:\(p.name)"
+                var a = aggs[key] ?? Agg(tokens: 0, path: nil, name: "")
+                a.tokens += p.tokens
+                a.path = a.path ?? p.path
+                a.name = p.path == nil ? p.name : (p.path! as NSString).lastPathComponent
+                aggs[key] = a
+            }
+        }
+        return aggs.values
+            .map { ProjectUsage(name: $0.name, tokens: $0.tokens, path: $0.path) }
+            .sorted { $0.tokens > $1.tokens }
+    }
+
+    /// 模型行跨仓归并：小写名同键；展示名大写写法优先，同档取单仓名下用量大的写法，降序
+    private static func mergedModelRows(_ lists: [[ProjectUsage]]) -> [ProjectUsage] {
+        var aggs: [String: (tokens: Int64, name: String, nameTokens: Int64)] = [:]
+        for rows in lists {
+            for m in rows {
+                let key = m.name.lowercased()
+                var a = aggs[key] ?? (0, m.name, -1)
+                a.tokens += m.tokens
+                let curUpper = m.name != key
+                let dispUpper = a.name != a.name.lowercased()
+                let replace: Bool
+                if curUpper != dispUpper { replace = curUpper }
+                else { replace = m.tokens > a.nameTokens }
+                if replace { a.name = m.name; a.nameTokens = m.tokens }
+                aggs[key] = a
+            }
+        }
+        return aggs.values
+            .map { ProjectUsage(name: $0.name, tokens: $0.tokens) }
+            .sorted { $0.tokens > $1.tokens }
+    }
 
     /// Agent 聚合视图合并（.aggregate 取数收口）：总计/请求数逐项加总，
     /// 每日与周期窗口按键求和，项目按「完整目录 ?? 名称」跨仓归并（同目录合并一行），
@@ -173,46 +225,20 @@ struct TokenSummary {
         var periodTotals: [TokenPeriod: Int64] = [:]
         for s in valid { for (p, v) in s.periodTotals { periodTotals[p, default: 0] += v } }
 
-        // 项目归并：键 = 完整目录（缺失用名称前缀区分，避免与真目录同名误合）
-        struct ProjAgg { var tokens: Int64 = 0; var path: String?; var name: String }
-        var projAgg: [String: ProjAgg] = [:]
-        for s in valid {
-            for p in s.projects {
-                let key = p.path ?? "name:\(p.name)"
-                var a = projAgg[key] ?? ProjAgg(tokens: 0, path: nil, name: "")
-                a.tokens += p.tokens
-                a.path = a.path ?? p.path
-                a.name = p.path == nil ? p.name : (p.path! as NSString).lastPathComponent
-                projAgg[key] = a
-            }
-        }
-        let projects = projAgg
-            .map { TokenSummary.ProjectUsage(name: $0.value.name, tokens: $0.value.tokens,
-                                             path: $0.value.path) }
-            .sorted { $0.tokens > $1.tokens }
+        let projects = mergedProjectRows(valid.map { $0.projects })
+        let models = mergedModelRows(valid.map { $0.models })
 
-        // 模型归并：小写名同键；展示名大写写法优先，同档取单仓名下用量大的写法
-        var modelAgg: [String: (tokens: Int64, name: String, nameTokens: Int64)] = [:]
-        for s in valid {
-            for m in s.models {
-                let key = m.name.lowercased()
-                var a = modelAgg[key] ?? (0, m.name, -1)
-                a.tokens += m.tokens
-                let curUpper = m.name != key
-                let dispUpper = a.name != a.name.lowercased()
-                let replace: Bool
-                if curUpper != dispUpper { replace = curUpper }
-                else { replace = m.tokens > a.nameTokens }
-                if replace { a.name = m.name; a.nameTokens = m.tokens }
-                modelAgg[key] = a
-            }
+        // 各周期窗口列表逐仓归并（键口径与全量一致），窗口内无用量的周期为空列表
+        var periodProjects: [TokenPeriod: [ProjectUsage]] = [:]
+        var periodModels: [TokenPeriod: [ProjectUsage]] = [:]
+        for p in TokenPeriod.windowed {
+            periodProjects[p] = mergedProjectRows(valid.map { $0.periodProjects[p] ?? [] })
+            periodModels[p] = mergedModelRows(valid.map { $0.periodModels[p] ?? [] })
         }
-        let models = modelAgg.values
-            .map { TokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
-            .sorted { $0.tokens > $1.tokens }
 
         return TokenSummary(totalTokens: total, projects: projects, models: models,
-                            requestCount: requests, daily: daily, periodTotals: periodTotals)
+                            requestCount: requests, daily: daily, periodTotals: periodTotals,
+                            periodProjects: periodProjects, periodModels: periodModels)
     }
 }
 
@@ -281,21 +307,35 @@ enum ZcodeTokenStore {
         var daily: [TokenDayUsage] = []
         var periodTotals: [TokenPeriod: Int64] = [:]
 
+        // 窗口起点（毫秒）与各窗口 CASE 列：列表（项目/模型）与总计共用同一窗口口径
+        let starts = TokenPeriodWindows.starts()
+        func ms(_ p: TokenPeriod) -> Int64 { Int64((starts[p] ?? 0) * 1000) }
+        let periodCase = TokenPeriod.windowed
+            .map { "SUM(CASE WHEN started_at >= \(ms($0)) THEN input_tokens + output_tokens ELSE 0 END)" }
+            .joined(separator: ",\n                   ")
+
         var stmt: OpaquePointer?
-        // 按会话目录（项目）聚合；目录缺失的会话归入「(未知项目)」
+        // 按会话目录（项目）聚合；目录缺失的会话归入「(未知项目)」；
+        // 第 3~6 列 = 各窗口（5h/1d/7d/30d）项目小计，供列表随周期切换
         let projectSQL = """
             SELECT COALESCE(NULLIF(s.directory, ''), '(未知项目)') AS proj,
-                   SUM(m.input_tokens) + SUM(m.output_tokens), COUNT(*)
+                   SUM(m.input_tokens) + SUM(m.output_tokens), COUNT(*),
+                   \(periodCase)
             FROM model_usage m JOIN session s ON s.id = m.session_id
             GROUP BY s.directory
             HAVING SUM(m.input_tokens) + SUM(m.output_tokens) > 0
             ORDER BY 2 DESC
             """
+        var periodProjTokens: [TokenPeriod: [(path: String, tokens: Int64)]] = [:]
         if sqlite3_prepare_v2(db, projectSQL, -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let dir = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "(未知项目)"
                 let tokens = sqlite3_column_int64(stmt, 1)
                 requests += sqlite3_column_int64(stmt, 2)
+                for (i, p) in TokenPeriod.windowed.enumerated() {
+                    let t = sqlite3_column_int64(stmt, Int32(3 + i))
+                    if t > 0 { periodProjTokens[p, default: []].append((dir, t)) }
+                }
                 // 项目名 = 目录末段（(未知项目) 原样保留）；完整目录随行携带供点击打开
                 let name = dir == "(未知项目)" ? dir : (dir as NSString).lastPathComponent
                 projects.append(TokenSummary.ProjectUsage(name: name, tokens: tokens,
@@ -303,24 +343,38 @@ enum ZcodeTokenStore {
             }
         }
         sqlite3_finalize(stmt)
+        let periodProjects: [TokenPeriod: [TokenSummary.ProjectUsage]] = periodProjTokens.mapValues { rows in
+            rows.map { dir, tokens in
+                TokenSummary.ProjectUsage(
+                    name: dir == "(未知项目)" ? dir : (dir as NSString).lastPathComponent,
+                    tokens: tokens, path: dir == "(未知项目)" ? nil : dir)
+            }.sorted { $0.tokens > $1.tokens }
+        }
 
         // 按模型聚合（口径与 WB 数据源一致：input + output 降序），供「项目/模型」切换；
         // 大小写变体归并为一行（GLM-5.3-Flash / glm-5.3-flash），展示名优先带大写的写法，
         // 同档取用量大的写法，全小写时回落小写
         let modelSQL = """
             SELECT model_id,
-                   SUM(input_tokens) + SUM(output_tokens)
+                   SUM(input_tokens) + SUM(output_tokens),
+                   \(periodCase)
             FROM model_usage
             GROUP BY model_id
             HAVING SUM(input_tokens) + SUM(output_tokens) > 0
             """
         // key = 小写模型名；value = (累计词元, 展示名, 展示名写法的词元)
         var modelAggs: [String: (tokens: Int64, name: String, nameTokens: Int64)] = [:]
+        // 各窗口模型小计（key = 小写名，展示名取全量聚合结果——窗口 ⊆ 全量，键必已存在）
+        var modelPeriodTokens: [String: [TokenPeriod: Int64]] = [:]
         if sqlite3_prepare_v2(db, modelSQL, -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let name = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "(未知模型)"
                 let tokens = sqlite3_column_int64(stmt, 1)
                 let key = name.lowercased()
+                for (i, p) in TokenPeriod.windowed.enumerated() {
+                    let t = sqlite3_column_int64(stmt, Int32(2 + i))
+                    if t > 0 { modelPeriodTokens[key, default: [:]][p, default: 0] += t }
+                }
                 var agg = modelAggs[key] ?? (0, "", -1)
                 agg.tokens += tokens
                 let curUpper = name != key
@@ -340,6 +394,15 @@ enum ZcodeTokenStore {
         models = modelAggs.values
             .map { TokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
             .sorted { $0.tokens > $1.tokens }
+        var periodModels: [TokenPeriod: [TokenSummary.ProjectUsage]] = [:]
+        for (key, periods) in modelPeriodTokens {
+            for (p, t) in periods {
+                // 展示名取全量聚合结果：窗口 ⊆ 全量，此键必已存在
+                periodModels[p, default: []].append(
+                    TokenSummary.ProjectUsage(name: modelAggs[key]!.name, tokens: t))
+            }
+        }
+        periodModels = periodModels.mapValues { $0.sorted { $0.tokens > $1.tokens } }
 
         // 按天聚合（本地时区日界），供「词元活动」热力图
         let daySQL = """
@@ -364,8 +427,6 @@ enum ZcodeTokenStore {
 
         // 周期总计（5h/1d/7d/30d 滚动窗口）：started_at 为毫秒，四窗口起点转毫秒后
         // 单条 CASE 求和（All = 全量总计在下方补入）；缓存每 60s 重建 → 窗口自然前移
-        let starts = TokenPeriodWindows.starts()
-        func ms(_ p: TokenPeriod) -> Int64 { Int64((starts[p] ?? 0) * 1000) }
         let periodSQL = """
             SELECT
               SUM(CASE WHEN started_at >= \(ms(.h5)) THEN input_tokens + output_tokens ELSE 0 END),
@@ -389,7 +450,9 @@ enum ZcodeTokenStore {
         return projects.isEmpty ? nil : TokenSummary(totalTokens: total, projects: projects,
                                                           models: models,
                                                           requestCount: requests, daily: daily.sorted { $0.dayStart < $1.dayStart },
-                                                          periodTotals: periodTotals)
+                                                          periodTotals: periodTotals,
+                                                          periodProjects: periodProjects,
+                                                          periodModels: periodModels)
     }
 
     /// 异步取汇总：后台每 60s 重建缓存，fetch 只回缓存不触发读取
@@ -455,6 +518,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 总计词元大数字（逐位垂直滚动；左对齐贴版心，位次与原 drawText 排版一致）
     private let totalRollView = RollingNumberView()
+    /// 总计占位 loading：数据未到时替代「—」横杆（2026-09-09 用户指定）
+    private let totalSpinner = NSProgressIndicator()
     /// 大数字当前字号（超宽逐级缩 26→15；字号变化才重新 configure）
     private var totalNumberSize: CGFloat = 26
     var onHoverChanged: ((Bool) -> Void)?
@@ -487,6 +552,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     var period: TokenPeriod = .d7 {
         didSet {
             guard oldValue != period else { return }
+            hoveredListRow = nil   // 行内容随周期换数据，旧 hover 索引指向的行已非原项目/模型
+            metricsDirty = true    // 行数值/百分比随周期变化 → 行度量缓存作废
             needsDisplay = true
             // 用户主动换周期：结构变化（位数增减）走整组滑移
             syncTotalRoll(slideOnRebuild: true)
@@ -554,6 +621,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 原实现每次 draw 全量重算 182 格并逐格生成日期文案
     private var activityCellsCache: (daily: [TokenDayUsage], mode: ActivityMode,
                                      windowStart: Date, cells: [ActivityCell])?
+    /// 占位态（summary 未到）全底色点阵缓存：输入 = activityMode + 窗口起点
+    private var activityPlaceholderCache: (mode: ActivityMode, windowStart: Date,
+                                           cells: [ActivityCell])?
     /// 热力图格子（缓存单元）：几何随 pitch/bounds 在 draw 现算，这里只留数据。
     /// tokens = 亮度源（每日 = 当天用量；每周 = 周合计，列内未点亮行记 0）；
     /// day = 提示锚点日（每日 = 当天；每周 = 该列周一）；tipTokens = 提示用量
@@ -583,8 +653,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 行间墨迹空隙恒 5pt，与用量表格（usageRowTop/BottomInset）同源同口径；
     /// Mono 墨迹更高时行距自动放宽
     private var rowHeight: CGFloat { rowInkHeight + 2 * SmallTable.rowInset }
-    /// 区块间距（总计词元 / 列表 / 词元活动 统一 20pt）
-    private static let sectionGap: CGFloat = 20
+    /// 区块间距（总计词元 / 列表 / 词元活动 统一）：20 → 16（2026-09-08 用户
+    /// 「项目列表和词元活动上面间隔都减少 4pt」）
+    private static let sectionGap: CGFloat = 16
     /// 左右内容缩进：hover 子面板保持 16（原版视觉）；主面板内嵌设 8，与用量行 /
     /// 设置卡片的内容边界（usageHorizontalInset / 卡片 horizontalPadding）对齐
     var horizontalInset: CGFloat = 16
@@ -610,6 +681,13 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
                 ?? .monospacedDigitSystemFont(ofSize: s, weight: w)
         })
         addSubview(totalRollView)
+        // 总计占位 loading（2026-09-09 用户指定：替代原「—」横杆）：系统原生小转圈，
+        // 停转自动隐藏（isDisplayedWhenStopped），起停在 syncTotalRoll 按 summary 有无切换
+        totalSpinner.isIndeterminate = true
+        totalSpinner.controlSize = .small
+        totalSpinner.style = .spinning
+        totalSpinner.isDisplayedWhenStopped = false
+        addSubview(totalSpinner)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -621,6 +699,13 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     private func makeLabelFont() -> NSFont {
         monoFontEnabled ? MonoFontProvider.font(size: 9)
             : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+    }
+    /// 选中周期字体：字重加一档（regular → medium，2026-09-08 用户指定；未选中仍 regular）。
+    /// mono 模式 JetBrains 仅打包 SemiBold 单 face，无更高档可选，维持原字体。
+    /// 宽度度量（cachedPeriodWidths）按此字体测——槽位取较宽态，选中切换不跳动。
+    private func makePeriodSelectedFont() -> NSFont {
+        monoFontEnabled ? MonoFontProvider.font(size: 9)
+            : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
     }
     /// 标签墨迹高度（9pt 小注释）
     private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
@@ -675,6 +760,10 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         totalRollView.frame = NSRect(x: insets.left, y: numberRowY,
                                      width: max(0, bounds.width - insets.left - insets.right),
                                      height: 32)
+        // spinner 与大数字同带垂直居中、左对齐（小号系统转圈 ~16pt 见方）
+        let spinSize = totalSpinner.intrinsicContentSize
+        totalSpinner.frame = NSRect(x: insets.left + 1, y: numberRowY + (32 - spinSize.height) / 2,
+                                    width: spinSize.width, height: spinSize.height)
         // 布局就绪后复算缩字号（打开瞬间 summary 落位时 view 可能尚未布局，宽度不可判）
         if let text = totalDisplayText {
             applyTotalNumberSize(for: text)
@@ -686,6 +775,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 大数字显示文本 = 当前周期窗口的总计（无数据回落 —）
     private var totalDisplayText: String? {
         summary.map { ZcodeTokenStore.grouped($0.periodTotals[period] ?? 0) }
+    }
+
+    /// 列表行百分比/hover 占比条的分母（与大数字同周期口径：All = 全量总计，窗口 = periodTotals）
+    private var listBaseTotal: Int64 {
+        guard let summary else { return 0 }
+        return period == .all ? summary.totalTokens : (summary.periodTotals[period] ?? 0)
     }
 
     /// 总计数字落位：nil → 占位 —；有值 → 滚动落值（结构相同=逐位滚动，
@@ -703,11 +798,16 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     var openRerollDeadline: Date?
 
     func syncTotalRoll(slideOnRebuild: Bool = false, totalDuration: CFTimeInterval? = nil) {
-        guard totalRollView.window != nil || totalRollView.currentText == "—" else { return }
         guard let text = totalDisplayText else {
-            totalRollView.setText("—", animated: false)
+            // 占位：原生 loading 转圈（替代「—」横杆，2026-09-09 用户指定）；
+            // 占位阶段不受下方挂起闸限制（启动预读即起转，数据到达直接落位）
+            totalRollView.isHidden = true
+            totalSpinner.startAnimation(self)
             return
         }
+        guard totalRollView.window != nil || totalRollView.currentText == "—" else { return }
+        totalSpinner.stopAnimation(self)
+        totalRollView.isHidden = false
         applyTotalNumberSize(for: text)
         var effectiveTotal = totalDuration
         if effectiveTotal == nil, let deadline = openRerollDeadline {
@@ -930,13 +1030,16 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         drawText("总计", at: NSPoint(x: insets.left + ceil(cachedNameWidth) + 4, y: totalLabelTop),
                  font: titleFont, color: titleColor)
 
-        // ── 首行右侧：周期切换（5H/1D/1W/1M；样式同项目/模型切换：选中主前景/未选次级灰）──
+        // ── 首行右侧：周期切换（5H/1D/1W/1M；选中 = 主前景 + 字重加一档 medium，
+        // 未选 = 次级灰 regular；槽位宽按选中态字体测量，切换不跳）──
         periodToggleRects = []
         let pWidths = cachedPeriodWidths
+        let periodSelectedFont = makePeriodSelectedFont()
         var px = bounds.width - insets.right - cachedPeriodTotal
         let pY = totalLabelTop + (titleInkHeight - labelFont.boundingRectForFont.height) / 2
         for (i, p) in TokenPeriod.allCases.enumerated() {
-            drawText(p.label, at: NSPoint(x: px, y: pY), font: labelFont,
+            drawText(p.label, at: NSPoint(x: px, y: pY),
+                     font: period == p ? periodSelectedFont : labelFont,
                      color: period == p ? Palette.cardForeground : labelColor)
             periodToggleRects.append(NSRect(x: px, y: totalLabelTop,
                                             width: pWidths[i], height: titleInkHeight))
@@ -946,10 +1049,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         // ── 总计大数字：RollingNumberView 子视图渲染（layout() 定位，summary didSet 驱动滚动）──
 
         // ── 列表区块头 ──（WB 双数据齐备时右上角「项目/模型」切换，样式同词元活动的每日/每周）
-        let allProjects = summary?.projects ?? []
         let allModels = summary?.models ?? []
         let showModels = listMode == .models && !allModels.isEmpty
-        let projects = Array((showModels ? allModels : allProjects).prefix(Self.maxListRows))
+        // 列表随总计周期换数据：All = 全量列表，窗口周期取各窗口聚合（窗口内无用量 = 空列表）
+        let projects = summary.map {
+            Array($0.listRows(period: period, isModels: showModels).prefix(Self.maxListRows))
+        } ?? []
         let sectionY = sectionLabelTop
         drawText(showModels ? "模型" : "项目", at: NSPoint(x: insets.left, y: sectionY),
                  font: titleFont, color: titleColor)
@@ -974,12 +1079,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         var listEndY = listStartTop
         listRowRects = []
         listRowPaths = []
-        if projects.isEmpty {
-            if summary == nil {
-                drawText("读取中…", at: NSPoint(x: insets.left, y: listEndY),
-                         font: SmallTable.rowFont(mono: monoFontEnabled), color: labelColor)
-            }
-        } else if let summary {
+        // 占位态（summary 未到）：列表区画 4 行灰条骨架（2026-09-09 用户指定），
+        // 词元活动标题按满行数排——骨架行填补后与点阵之间不再有空白带
+        if summary == nil {
+            drawSkeletonRows(count: Self.maxListRows, topY: listStartTop)
+        }
+        if !projects.isEmpty && summary != nil {
             // 行字体 = 用量行同款（小表格口径）：名称/百分比 medium，数值等宽数字；
             // 切换过渡期按逐行交错进度绘制(行遮罩显影:行带内自下缘上滑入位),常态直绘零开销
             let nameFont = SmallTable.rowFont(mono: monoFontEnabled)
@@ -987,20 +1092,22 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             let pctFont = SmallTable.rowFont(mono: monoFontEnabled)
             if let start = switchTransitionStart {
                 let elapsed = CACurrentMediaTime() - start
-                listEndY = drawProjectRows(projects, summary: summary, topY: listStartTop,
+                listEndY = drawProjectRows(projects, baseTotal: listBaseTotal, topY: listStartTop,
                                            nameFont: nameFont, valueFont: valueFont, pctFont: pctFont,
                                            rowReveals: (0..<projects.count).map { i in
                                                let t = (elapsed - Double(i) * Self.staggerDelay) / Self.rowDuration
                                                return CGFloat(easeOutCubic(min(1, max(0, t))))
                                            })
             } else {
-                listEndY = drawProjectRows(projects, summary: summary, topY: listStartTop,
+                listEndY = drawProjectRows(projects, baseTotal: listBaseTotal, topY: listStartTop,
                                            nameFont: nameFont, valueFont: valueFont, pctFont: pctFont)
             }
         }
 
-        // 词元活动顶 = 末行墨迹底 + 20（行框居中留白不计入间距）
-        drawActivitySection(topY: activityTitleTop(rows: projects.count),
+        // 词元活动顶 = 末行墨迹底 + 20（行框居中留白不计入间距）。标题与点阵恒按满行数
+        // （maxListRows）排——intrinsic 高度与点阵都钉死满行数（行数少留白留在列表区），
+        // 标题若跟实际行数走会与点阵错开一条空带（2026-09-09 两行项目实测）
+        drawActivitySection(topY: activityTitleTop(rows: Self.maxListRows),
                             gridTop: activityGridTop(rows: Self.maxListRows),
                             labelFont: labelFont, labelColor: labelColor, titleColor: titleColor)
         // 行命中框/可点击路径已随本次绘制更新：光标矩形仅在命中内容实际变化时才
@@ -1013,15 +1120,43 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     /// 项目行：文件夹 icon + 项目名（限宽截断）+ token 值 + 百分比；返回行块底部 Y。
+    /// baseTotal = 百分比/hover 占比条的分母（周期口径：All = 全量总计，窗口 = periodTotals[period]）。
     /// 内容（icon/名/值/百分比）统一系统灰（语义色随主题适配）；
-    /// hover 行（hoveredListRow）背景只显百分比条 + 0.8pt 发丝边框（2026-08-31 用户要求
+    /// hover 行（hoveredListRow）背景只显百分比条 + 1.2pt 发丝边框（2026-08-31 用户要求
     /// 去掉用量行同款渐变底、边框保留），文字/icon 仍提亮到 Palette.cardForeground，
     /// 命中框回填 listRowRects 供 mouseMoved 判定。
     /// rowReveals = 平台切换动效的逐行交错进度（nil = 常态直绘）：每行裁切到行带、
     /// 内容自「起始全遮最小行程」(行高+墨迹高)/2 上滑显影，淡入全程同步（alpha=rv），
     /// CG 变换实现、绘制坐标不变、命中框仍按最终几何记录
     @discardableResult
-    private func drawProjectRows(_ projects: [TokenSummary.ProjectUsage], summary: TokenSummary,
+    /// 占位骨架行（summary 未到时列表区）：与真实行同构的四列——icon 圆点 + 名称灰条 +
+    /// 数值灰条 + 百分比灰条，列位/列宽与 drawProjectRows 一致，色与点阵底点同源
+    ///（heatDotEmpty），名称/数值宽度逐行错开避免呆板
+    private func drawSkeletonRows(count: Int, topY: CGFloat) {
+        let pctColWidth: CGFloat = 45
+        let valueRight = bounds.width - insets.right - pctColWidth
+        let valueColWidth: CGFloat = 40
+        let nameX = insets.left + 14
+        let barH: CGFloat = 8
+        let nameWidths: [CGFloat] = [92, 66, 80, 58]
+        Palette.heatDotEmpty.setFill()
+        for i in 0..<count {
+            let y = topY + CGFloat(i) * rowHeight + (rowHeight - barH) / 2
+            // icon：10×10 圆点（与真实行 iconRect 同位同径）
+            let iconRect = NSRect(x: insets.left, y: topY + CGFloat(i) * rowHeight + (rowHeight - 10) / 2,
+                                  width: 10, height: 10)
+            NSBezierPath(ovalIn: iconRect).fill()
+            // 名称条 / 数值条（右对齐至数值列右缘）/ 百分比条（右对齐内容缘）
+            let nameRect = NSRect(x: nameX, y: y, width: nameWidths[i % nameWidths.count], height: barH)
+            let valueRect = NSRect(x: valueRight - valueColWidth, y: y, width: valueColWidth, height: barH)
+            let pctRect = NSRect(x: bounds.width - insets.right - 38, y: y, width: 38, height: barH)
+            for r in [nameRect, valueRect, pctRect] {
+                NSBezierPath(roundedRect: r, xRadius: barH / 2, yRadius: barH / 2).fill()
+            }
+        }
+    }
+
+    private func drawProjectRows(_ projects: [TokenSummary.ProjectUsage], baseTotal: Int64,
                                  topY: CGFloat, nameFont: NSFont, valueFont: NSFont,
                                  pctFont: NSFont, rowReveals: [CGFloat]? = nil) -> CGFloat {
         let pctColWidth: CGFloat = 45
@@ -1061,8 +1196,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             // 百分比背景条（仅 hover 行显示）：按行占比从左到右填充行底
             // （复用热力图无用量底点色，深 #262626/浅 210 灰）；常态行无背景
             if hovered {
-                let pctBarRatio = summary.totalTokens > 0
-                    ? CGFloat(p.tokens) / CGFloat(summary.totalTokens) : 0
+                let pctBarRatio = baseTotal > 0
+                    ? CGFloat(p.tokens) / CGFloat(baseTotal) : 0
                 let barRect = NSRect(x: 0, y: rowY,
                                      width: bounds.width * pctBarRatio, height: rowH)
                 let barPath = NSBezierPath(roundedRect: barRect, xRadius: 6, yRadius: 6)
@@ -1074,7 +1209,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
                 let rect = NSRect(x: 0, y: rowY, width: bounds.width, height: rowH)
                 let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
                 Palette.hoverBorderBright.setStroke()
-                path.lineWidth = 0.8
+                path.lineWidth = Palette.cardBorderWidth
                 path.stroke()
             }
             let iconRect = NSRect(x: insets.left, y: rowY + (rowH - 10) / 2, width: 10, height: 10)
@@ -1105,8 +1240,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             if let m = i < cachedRowMetrics.count ? cachedRowMetrics[i] : nil {
                 (pctText, pctW) = (m.pct, m.pctW)
             } else {
-                let pctValue = summary.totalTokens > 0
-                    ? Double(p.tokens) / Double(summary.totalTokens) * 100 : 0
+                let pctValue = baseTotal > 0
+                    ? Double(p.tokens) / Double(baseTotal) * 100 : 0
                 pctText = String(format: "%.1f%%", pctValue)
                 pctW = pctText.size(withAttributes: [.font: pctFont]).width
             }
@@ -1345,8 +1480,24 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 每日 = 窗口周列 × 7 行逐日；每周 = 窗口周列周合计单行点亮列内。
     /// 结果按 (daily, activityMode, 窗口起点) 缓存，draw 重复进入零重算
     private func activityCells() -> [ActivityCell] {
-        guard let summary else { return [] }
         let window = activityWindow()
+        // 占位态（数据未到）：全底色点阵（tokens 恒 0）——2026-09-08 用户要求
+        // 「词元活动的占位显示只有背景色的点阵」，网格形态/月份轴与加载后一致
+        guard let summary else {
+            if let c = activityPlaceholderCache,
+               c.mode == activityMode, c.windowStart == window.start {
+                return c.cells
+            }
+            var cells: [ActivityCell] = []
+            for col in 0..<window.cols {
+                for row in 0..<7 {
+                    let day = window.start.addingTimeInterval(TimeInterval((col * 7 + row) * 86400))
+                    cells.append(ActivityCell(col: col, row: row, tokens: 0, day: day, tipTokens: 0))
+                }
+            }
+            activityPlaceholderCache = (activityMode, window.start, cells)
+            return cells
+        }
         if let c = activityCellsCache,
            c.mode == activityMode, c.windowStart == window.start, c.daily == summary.daily {
             return c.cells
@@ -1454,7 +1605,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     // MARK: 绘制度量缓存（性能：动画帧零 size() 实测 / 零 Calendar 运算）
 
-    /// 度量缓存失效标记：summary/source/listMode/monoFont didSet 与 layout() 宽度变化置位，
+    /// 度量缓存失效标记：summary/source/listMode/period/monoFont didSet 与 layout() 宽度变化置位，
     /// draw 头部统一重建。覆盖文本度量全部输入（内容、字体、几何），不随 hover/动效进度变化
     private var metricsDirty = true
     private var cachedNameWidth: CGFloat = 0
@@ -1478,8 +1629,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         let titleFont = makeHeaderTitleFont()
         cachedNameWidth = (source.platformName as NSString)
             .size(withAttributes: [.font: titleFont]).width
+        // 周期槽宽按选中态字体（medium）测：选中切换时槽位/整块宽度不跳
         cachedPeriodWidths = TokenPeriod.allCases.map {
-            ($0.label as NSString).size(withAttributes: [.font: labelFont]).width
+            ($0.label as NSString).size(withAttributes: [.font: makePeriodSelectedFont()]).width
         }
         let pGap: CGFloat = 6
         cachedPeriodTotal = cachedPeriodWidths.reduce(0, +)
@@ -1508,12 +1660,14 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         let pctFont = SmallTable.rowFont(mono: monoFontEnabled)
         if let summary {
             let showModels = listMode == .models && !summary.models.isEmpty
-            let rows = Array((showModels ? summary.models : summary.projects)
+            // 行随总计周期换数据：All = 全量列表，窗口周期取各窗口聚合，分母同大数字口径
+            let rows = Array(summary.listRows(period: period, isModels: showModels)
                 .prefix(Self.maxListRows))
+            let base = listBaseTotal
             cachedRowMetrics = rows.map { p in
                 let value = ZcodeTokenStore.cnCompact(p.tokens)
-                let pct = String(format: "%.1f%%", summary.totalTokens > 0
-                    ? Double(p.tokens) / Double(summary.totalTokens) * 100 : 0)
+                let pct = String(format: "%.1f%%", base > 0
+                    ? Double(p.tokens) / Double(base) * 100 : 0)
                 return (value,
                         (value as NSString).size(withAttributes: [.font: valueFont]).width,
                         pct,
@@ -1749,7 +1903,8 @@ extension BalancePanelView {
     }
 
     /// 取数并套用到内嵌视图。缓存命中同步返回（零读取），未命中挂起待后台构建补发；
-    /// 无数据时块保持隐藏（主面板内不放「读取中」常驻占位）。
+    /// 数据未到时保留空占位（表头骨架，2026-09-08 用户要求：打开面板时信息显示前
+    /// 先占位，避免板块内容突现）；顶部平台解析不出（无源）才整块隐藏。
     /// hover/回落引起平台切换时做淡入动效（旧平台内容先清，新内容落定后整体揭示）。
     func refreshInlineTokens() {
         guard let view = inlineTokenView, view.superview != nil else { return }
@@ -1759,6 +1914,13 @@ extension BalancePanelView {
                 applyInlineTokensVisibility()
             }
             return
+        }
+        // 占位同步落地：缓存未命中时 fetch 只挂起回调、构建完成才补发（最长达一个
+        // 重建周期），占位必须在 fetch 前就显示——打开面板即见表头骨架 + 空点阵，
+        // 数据落定原位填充（intrinsic 高度恒定，不跳版）
+        if view.isHidden {
+            view.isHidden = false
+            applyInlineTokensVisibility()
         }
         source.fetch { [weak self, weak view] summary in
             guard let self, let view, view.superview != nil else { return }
@@ -1773,21 +1935,12 @@ extension BalancePanelView {
                 // 先清会落 "—" 使滚动起点丢失。无数据的收尾清理由下方 guard else 分支接管
             }
             guard let summary = summary else {
-                // 单次后台构建失败：已有数据则保留展示（本机库/trace 仍在，下一轮重试即恢复），
-                // 避免偶发失败导致整块闪隐 60s；从未拿到过数据才保持隐藏。
-                // 平台切换到无数据源：才清旧平台展示并隐藏
+                // 单次后台构建失败：已有数据则保留展示（本机库/trace 仍在，下一轮重试即恢复）；
+                // 无数据（含切换清空后）→ 维持表头骨架空占位
                 if switched { view.summary = nil }
-                if view.summary == nil, !view.isHidden {
-                    view.isHidden = true
-                    applyInlineTokensVisibility()
-                }
                 return
             }
             view.summary = summary
-            if view.isHidden {
-                view.isHidden = false
-                applyInlineTokensVisibility()
-            }
             if switched {
                 // 动效已由 beginSwitchTransition 启动的 60fps timer 驱动，这里只按新内容高度重算面板尺寸
                 self.onContentChanged?()
@@ -1795,9 +1948,9 @@ extension BalancePanelView {
         }
     }
 
-    /// Token 板块显隐总闸：顶部平台有数据 → 标题+卡片按折叠态显隐（与用量区块同款）；
-    /// 无数据 → 标题+卡片一并隐藏，标题隐藏期间折叠态不变（点击入口已消失），
-    /// 数据恢复时按持久化的折叠态重新落地。
+    /// Token 板块显隐总闸：顶部平台有源 → 标题+卡片按折叠态显隐（数据未到时为
+    /// 表头骨架空占位，2026-09-08 用户要求）；无源 → 标题+卡片一并隐藏，
+    /// 标题隐藏期间折叠态不变（点击入口已消失），数据恢复时按持久化的折叠态重新落地。
     private func applyInlineTokensVisibility() {
         guard let view = inlineTokenView else { return }
         let hasData = !view.isHidden

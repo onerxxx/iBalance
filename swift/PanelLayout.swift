@@ -174,15 +174,15 @@ extension BalancePanelView {
         // 右上角按钮：点阵调色（2026-09-07 用户指定：先加在右侧，同日浅色主题按钮移除后
         // 接管右缘位）。点击弹悬浮气泡=色相/饱和度两行滑杆 + 主题/样式开关组
         //（子账号气泡同款载体）；图标不着色，与 header 其它按钮同内容色
-        let hueBtn = HoverIconButton()
-        hueBtn.image = symbolImage("paintbrush", size: 11)
-        hueBtn.normalTintColor = Palette.panelHeaderContentColor
-        hueBtn.target = self
-        hueBtn.action = #selector(headerHeatHueTapped)
-        hueBtn.toolTip = "调整点阵颜色色相/饱和度"
-        hueBtn.translatesAutoresizingMaskIntoConstraints = false
-        heatHueBtn = hueBtn
-        header.addSubview(hueBtn)
+        let themeTuneBtn = HoverIconButton()
+        themeTuneBtn.image = symbolImage("paintbrush", size: 11)
+        themeTuneBtn.normalTintColor = Palette.panelHeaderContentColor
+        themeTuneBtn.target = self
+        themeTuneBtn.action = #selector(headerThemeTuneTapped)
+        themeTuneBtn.toolTip = "主题调校"
+        themeTuneBtn.translatesAutoresizingMaskIntoConstraints = false
+        self.themeTuneBtn = themeTuneBtn
+        header.addSubview(themeTuneBtn)
         let quitBtn = HoverIconButton()
         quitBtn.image = symbolImage("power", size: 11)
         quitBtn.normalTintColor = Palette.panelHeaderContentColor
@@ -203,14 +203,14 @@ extension BalancePanelView {
             updatedLabel.centerYAnchor.constraint(equalTo: header.topAnchor,
                                                   constant: panelTopPadding + panelBarHeight / 2),
             updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: panelBarHeight),
-            hueBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
-            hueBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            themeTuneBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            themeTuneBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             // 距容器缘 = 容器缩进 + 正文缩进 7 + 2.6（2026-09-06 用户「header 左右缩进增加2pt」
             // 后再「再增加0.6pt」，原 +7 与 root 内容左右缘对齐）——原 themeBtn 右缘位由调色按钮接管
-            hueBtn.trailingAnchor.constraint(
+            themeTuneBtn.trailingAnchor.constraint(
                 equalTo: header.trailingAnchor,
                 constant: -(BalancePanelViewController.contentHorizontalInset + 9.6)),
-            hueBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
+            themeTuneBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
             quitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             quitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             quitBtn.leadingAnchor.constraint(
@@ -328,16 +328,16 @@ extension BalancePanelView {
         root.setCustomSpacing(10, after: apiGroupContainer)
 
         // ── Agent 分组标题（原「余额」板块改名；ZCode/Codex/TRAE/WB 等 Agent 平台）──
-        // HoverCard 静默驻留（hoverDwellShowsProgress = false：hover 背景常规淡入、
-        // 无进度填充），驻留 Motion.hoverDwell 与平台卡同触发时长 → Token 板块切到
-        // .aggregate 三平台聚合视图；离开/快速掠过取消，确认后不回落（同平台卡口径）
+        // HoverCard 驻留：hover 背景常规淡入，驻留 Motion.hoverDwell 与平台卡同触发
+        // 时长 → Token 板块切到 .aggregate 三平台聚合视图；离开/快速掠过取消，
+        // 确认后不回落（同平台卡口径）
         let balanceTitle = HoverCard()
         balanceTitle.wantsLayer = true
         // 圆角与余额卡片统一（Palette.cardCornerRadius = 10pt）
         balanceTitle.layer?.cornerRadius = Palette.cardCornerRadius
         balanceTitle.layer?.cornerCurve = .continuous
         balanceTitle.layer?.masksToBounds = true
-        // 边框色预设（HoverCard mouseEntered 只动画 borderWidth，色值由此处提供）
+        // 边框色预设：卡片默认无边框（width=0），hover 时由 HoverCard 动画出 1.2pt
         balanceTitle.layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: balanceTitle)
         balanceTitle.layer?.borderWidth = 0
         let balanceTitleLabel = NSTextField(labelWithString: "Agent")
@@ -352,10 +352,7 @@ extension BalancePanelView {
             balanceTitleLabel.centerYAnchor.constraint(equalTo: balanceTitle.centerYAnchor),
         ])
         balanceTitle.hoverDwellDuration = Motion.hoverDwell
-        balanceTitle.hoverDwellShowsProgress = false
         balanceTitle.hoverDebugLabel = "AgentTitle"
-        // hover 背景与平台卡同源：50% 黑 + 顶部椭圆光晕位图（默认 60° 淡渐变已废）
-        balanceTitle.hoverGradientOverride = Palette.cardHoverStrong
         balanceTitle.onHoverConfirmed = { [weak self] in self?.confirmTokensHover(source: .aggregate) }
         balanceTitle.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(balanceTitle)
@@ -755,7 +752,7 @@ extension BalancePanelView {
     /// 有点击、右键或拖拽回调时卡片使用 HoverCard；设置/操作卡片用普通 NSView。
     /// bottomPadding: 卡片底部内边距（默认 7，操作卡片可减小以消除与 footer 间的空白）
     @discardableResult
-    func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, onDragStarted: ((NSPoint) -> Void)? = nil, onDragChanged: ((NSPoint) -> Void)? = nil, onDragEnded: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, trailingPadding: CGFloat? = nil, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true, centerRows: Bool = false, hoverGradientOverride: [NSColor]? = nil) -> NSView {
+    func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, onDragStarted: ((NSPoint) -> Void)? = nil, onDragChanged: ((NSPoint) -> Void)? = nil, onDragEnded: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, trailingPadding: CGFloat? = nil, titleColor: NSColor = .systemGray, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true, centerRows: Bool = false) -> NSView {
         var all = rows
         if let t = title {
             all.insert(sectionTitleRow(name: t, color: titleColor), at: 0)
@@ -778,9 +775,6 @@ extension BalancePanelView {
         let card: NSView
         if onClick != nil || onRightClick != nil || onDragStarted != nil {
             let hc = HoverCard()
-            // 强背景必须在卡片加入面板层级前配置，避免初始化阶段的默认 60° 渐变
-            // 被首次 layout / display / 拖拽截图捕获。
-            hc.hoverGradientOverride = hoverGradientOverride
             hc.onClick = onClick
             hc.onRightClick = onRightClick
             hc.onDragStarted = onDragStarted
@@ -794,7 +788,7 @@ extension BalancePanelView {
         card.layer?.cornerRadius = Palette.cardCornerRadius
         card.layer?.cornerCurve = .continuous
         card.layer?.masksToBounds = true
-        // 预设边框色（hover 时由 HoverCard/ActionTileButton 动画 borderWidth 显示）
+        // 预设边框色：卡片默认无边框（width=0），hover 时由 HoverCard 动画出 1.2pt
         card.layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: card)
         card.layer?.borderWidth = 0
         // 卡片底色：cardBackground=nil 表示子卡片透明（由外层容器统一提供背景）
@@ -834,7 +828,7 @@ extension BalancePanelView {
         return row
     }
 
-    /// 可折叠区块标题条：hover 复用余额卡片样式（HoverCard hover 背景色+0.8pt 发丝边框），
+    /// 可折叠区块标题条：hover 复用余额卡片样式（HoverCard hover 背景色+统一 1.2pt 发丝边框），
     /// 点击切换折叠并持久化（UserDefaults，key 走 UDKey）。整条撑满 root 宽：
     /// 标题文字左对齐余额标题（内边距 8），箭头（▸ 折叠 / ▾ 展开）靠右贴卡片内边界。
     /// targets 闭包返回随折叠一起隐藏的视图（build 在区块内容创建后才会填充，闭包按引用取最新值）；
@@ -870,7 +864,7 @@ extension BalancePanelView {
         hc.layer?.cornerRadius = Palette.cardCornerRadius
         hc.layer?.cornerCurve = .continuous
         hc.layer?.masksToBounds = true
-        // 边框色预设（HoverCard mouseEntered 只动画 borderWidth，色值由此处提供）
+        // 边框色预设：卡片默认无边框（width=0），hover 时由 HoverCard 动画出 1.2pt
         hc.layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: hc)
         hc.layer?.borderWidth = 0
         // label 与箭头直接锚到标题条两端——不经 NSStackView（默认 .gravityAreas
@@ -2222,11 +2216,13 @@ extension BalancePanelView {
         private static func color(for state: AgentTaskState, in view: NSView) -> CGColor {
             let ns: NSColor
             switch state {
-            // 进行中蓝（2026-09-01 提亮一档：115/199/255 → 140/214/255）
-            case .running: ns = NSColor(calibratedRed: 0.55, green: 0.84, blue: 1.0, alpha: 1)
-            case .completed: ns = NSColor(calibratedRed: 0.45, green: 0.95, blue: 0.55, alpha: 1)
+            // 进行中蓝（2026-09-01 提亮一档：115/199/255 → 140/214/255；
+            // 2026-09-08 饱和度统一 +10%：S 0.45 → 0.495 → 129/210/255）
+            case .running: ns = NSColor(calibratedRed: 0.505, green: 0.824, blue: 1.0, alpha: 1)
+            // 完成绿（2026-09-08 饱和度统一 +10%：S 0.526 → 0.579 → 130/242/102）
+            case .completed: ns = NSColor(calibratedRed: 0.51, green: 0.95, blue: 0.40, alpha: 1)
             // 中断橙红（2026-09-02 用户要求故障态换橙红 #FF7333 → #FF4514 → 更亮更红 #FF3300）：
-            // 与进行中蓝 140/214/255、完成绿 115/242/140 形成色相对比
+            // 与进行中蓝、完成绿形成色相对比；2026-09-08 饱和 +10% 时 S 已封顶 1.0，值不变
             case .interrupted: ns = NSColor(calibratedRed: 1, green: 0.20, blue: 0, alpha: 1)
             }
             return Palette.borderCGColor(ns, in: view)

@@ -355,7 +355,7 @@ extension AppDelegate {
     /// 文字规格与输入类弹窗一致（12pt、与容器等宽）
     private func presentCheckinResult(okCount: Int, failCount: Int, rows: [CheckinResultRow]) {
         let shell = DialogShell()
-        shell.addIcon(NSApp.applicationIconImage)
+        shell.addIcon(makeAppIconSnapshot())
         shell.addTitle("手动签到完成")
         // 手动签到结果较长，info 容器在输入类弹窗基准上加宽 25pt，减少账号名称换行。
         shell.contentWidth = DialogMetrics.inputWidth
@@ -456,7 +456,7 @@ extension AppDelegate {
             .sorted { $0.date == $1.date ? $0.time > $1.time : $0.date > $1.date }
 
         let shell = DialogShell()
-        shell.addIcon(NSApp.applicationIconImage)
+        shell.addIcon(makeAppIconSnapshot())
         shell.addTitle("签到历史")
         shell.contentWidth = DialogMetrics.inputWidth + 38
         let para = NSMutableParagraphStyle()

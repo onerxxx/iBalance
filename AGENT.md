@@ -69,6 +69,7 @@
 │   ├── Network.swift        # async HTTP + 重试 + 离线感知（NWPathMonitor）+ JSON 工具
 │   ├── UpdateService.swift  # App 自更新（2026-08-27）：GitHub Releases 检查 / 流式下载 / SHA256+codesign 校验 / 同卷暂存 / spawn sh 互换重启
 │   ├── Crypto.swift         # SHA-512 / AES-CBC / PBKDF2
+│   ├── KeychainStore.swift  # 凭据保险库（CredentialVault）：7 个敏感字段钥匙串读写迁移
 │   ├── Logger.swift         # 统一日志（取代各 Service 私有 appendLog）
 │   ├── ProcessUtil.swift    # Electron 应用切号共用进程工具（找主进程/温和杀/强杀/等待退出）
 │   ├── RollingNumberView.swift # 余额数值「里程表」逐位滚动视图（数字轮独立 tween 自驱动）
@@ -223,6 +224,8 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 
 ## 配置字段（config.json）
 
+> 2026-09-08 起，下表中的**凭据类字段**（`deepseek_api_key`、`bigmodel_token_override`、`qwen_ticket_override`、`workbuddy_accounts`、`trae_accounts`、`zcode_accounts`、`codex_accounts`）实际存钥匙串，不落 config.json；旧版明文配置首次启动自动迁移。运行时仍以 `config.xxx` 内存字段访问（`ConfigStore.load` 已合并）。
+
 | 字段                                                        | 说明                                                                        |
 | --------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `deepseek_api_key`                                        | DeepSeek API Key（sk-...），为空则菜单/面板引导输入                                  |
@@ -264,6 +267,7 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | `Config.swift`                     | `AppConfig` / `WBAccount` / `TraeAccount` / `ZCodeAccount` / `CodexAccount`（Codable）+ `AppDataStore`（Application Support 路径 / 0700-0600 权限 / 旧版迁移）+ `ConfigStore` / `BalanceCacheStore` / `UsageStore`（日/周用量本地差值基线，usage.json）+ `UDKey` |
 | `Network.swift`                    | `HTTP.request/requestWithRetry`（async）、`NetworkMonitor`（NWPathMonitor 离线感知）、JSON 工具 |
 | `Crypto.swift`                     | SHA-512 / AES-128-CBC / PBKDF2-HMAC-SHA1                              |
+| `KeychainStore.swift`              | `CredentialVault`：凭据钥匙串存取（7 键位 kSecClassGenericPassword）；`ConfigStore.load` 合并（keychain 命中优先 + legacy 明文迁移），`save` 先写钥匙串、JSON 不落明文（写失败显式兜底） |
 | `Logger.swift`                     | 统一带时间戳日志（分场景 category，后台线程安全）                                        |
 | `ProcessUtil.swift`                | 切号共用进程工具：按 Bundle ID 找主进程、SIGTERM 温和杀、超时 SIGKILL、等待退出、耗时统计（WorkBuddy / TRAE / ZCode / Codex 复用） |
 | `Services/DeepSeek.swift`          | DeepSeek 余额查询（Codable 响应）                        |
@@ -300,6 +304,7 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 
 ## 安全注意
 
+- **凭据已迁钥匙串（2026-09-08，`swift/KeychainStore.swift`）**：7 个敏感字段（`deepseek_api_key` / `bigmodel_token_override` / `qwen_ticket_override` / 四平台 `*_accounts`）打包成**单条** generic password（service `com.local.ibalance.credentials`，account `credentials_bundle`，JSON dict，ThisDeviceOnly），`config.json` 不再落明文。单条目是刻意的：逐键多条目在钥匙串锁定时每条 SecItem 操作各弹一次解锁密码（首版实测连弹 6-7 次），单条目迁移/保存各 1 次操作、至多弹 1 次，创建后日常 update 静默。规则：**Service 层照旧读 `config.xxx` 内存字段，凭据读写只发生在 `ConfigStore.load/save`**（load 时 bundle 命中优先 + legacy 一次性打包迁移并清洗 JSON；save 先写钥匙串，写失败删 bundle + JSON 保留明文兜底并打 `[Keychain]` 错误日志——显式降级，不静默丢数据）。钥匙串排查：`security find-generic-password -s com.local.ibalance.credentials -a credentials_bundle`；迁移/失败日志在 `/tmp/iBalance_refresh.log` 搜 `[Keychain]`。
 - ⚠️ **`swift/config.json` 必须保持零凭据**（API Key 留空 `""`、账号数组留空 `[]`）。它会被 build.sh 拷进 .app 作为内置 fallback，且 release.sh 会把整个 bundle 打包上传到**公开** Release。
   **2026-08-27 泄漏事故**：模板曾带真实 DeepSeek API Key 与 2 个 WorkBuddy 账号 token/refresh_token（JWT 内含手机号），被打进 v2026.8.27.48/.50/.52 三个公开 Release；已删除全部涉事 Release 并清洗模板，重发干净版 .53。**涉事凭据必须轮换（用户人工操作）：DeepSeek 平台作废重建 API Key；CodeBuddy 两账号重新登录刷新 token/refresh_token。**
   **运行时真实配置在 `~/Library/Application Support/com.local.ibalance/config.json`，不要把它当成模板改，更不要拷回模板位**。

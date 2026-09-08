@@ -3,7 +3,7 @@
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 //
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
-// 布局常量    DialogMetrics（内容宽 240 / 输入类 280 / 边距 8 / 图标 64，集中处）
+// 布局常量    DialogMetrics（内容宽 240 / 输入类 280 / 边距 8 / 图标 66，集中处）
 // 统一壳      DialogShell（原生 NSAlert 薄封装；新弹窗一律走它，不要另起 NSAlert）
 // 业务弹窗    InputDialog / DeepSeekSettingsDialog / PlatformAutomationSettingsDialog
 //
@@ -32,8 +32,8 @@ enum DialogMetrics {
     static let sidePadding: CGFloat = 8
     /// accessory 内富文本说明与控件区间距
     static let vSpacing: CGFloat = 8
-    /// 苹果 HIG：标准 alert 图标 64×64pt
-    static let iconSize: CGFloat = 64
+    /// 弹窗图标统一 66pt（2026-09-08 用户拍板，全弹窗唯一出处）
+    static let iconSize: CGFloat = 66
 }
 
 /// 统一弹窗：原生 NSAlert 薄封装
@@ -162,127 +162,25 @@ final class DialogShell {
         // 实例化 NSAlert 的私有 panel，orderFrontRegardless 不依赖 app active 态。
         let modalWindow = alert.window
         modalWindow.orderFrontRegardless()
-        // NSAlert 视图树在 runModal 后才完成真实布局，图标/标题居中需在模态运行中微调
-        DispatchQueue.main.async { [weak self] in
-            self?.centerIconAndTitle()
-            // 长内容 accessoryView 的最终布局可能晚于首帧完成，再校正一次标题区，
-            // 避免手动签到结果弹窗的图标/标题被 NSAlert 重新布局后偏移。
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.centerIconAndTitle()
-            }
-        }
         let resp = alert.runModal()
         return resp.rawValue >= 1000 ? resp.rawValue - 1000 : -1
-    }
-
-    /// 模态运行中：把系统图标与标题水平居中（说明文字/按钮/间距保持系统排版）。
-    /// ⚠️ v44 原生化后系统标题字段/图标视图的装配晚于 runModal 后的第一个 async tick，
-    /// 直接执行会因找不到视图而静默跳过（表现为不居中）——先探测就绪，未就绪则 50ms 重试。
-    private func centerIconAndTitle(retries: Int = 8) {
-        guard let cv = alert.window.contentView else {
-            return
-        }
-        cv.layoutSubtreeIfNeeded()
-
-        let title = alert.messageText
-        // 不同 macOS 版本的 NSAlert 图标私有类名可能不同；优先使用已知类名，
-        // 找不到时回退到内容树中的第一个 NSImageView，避免长内容弹窗无法进入居中逻辑。
-        let iconView = (findSubview(named: "_NSAlertImageView", in: cv) as? NSImageView)
-            ?? findFirstImageView(in: cv)
-        let titleField = title.isEmpty ? nil : findTextField(withText: title, in: cv)
-        if iconView == nil || titleField == nil {
-            if retries > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                    self?.centerIconAndTitle(retries: retries - 1)
-                }
-            }
-            return
-        }
-
-        if let iconView {
-            // NSAlert 会把图标放进一个约等于图标大小的左侧 slot；移动 imageView
-            // 本身会被 slot 裁住，因此优先移动这个窄容器，才能把整枚图标移到窗口中心。
-            if let iconSlot = iconView.superview,
-               iconSlot.bounds.width <= iconView.bounds.width + 2 {
-                centerViewHorizontally(iconSlot, in: cv)
-            } else {
-                centerViewHorizontally(iconView, in: cv)
-            }
-            // 图标顶部与窗口顶部的间距 +4pt（整体下移）
-            iconView.frame.origin.y -= 4
-        }
-
-        if let tf = titleField {
-            tf.alignment = .center
-            // ⚠️ 只设 cell.alignment 不生效：NSAlert 标题的 attributedStringValue 自带
-            // Alignment Natural 段落样式，渲染时段落样式优先，必须连同段落样式一起改为 center
-            let para = NSMutableParagraphStyle()
-            para.alignment = .center
-            let attr = NSMutableAttributedString(attributedString: tf.attributedStringValue)
-            attr.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: attr.length))
-            tf.attributedStringValue = attr
-            // 标题字段若为固有宽度（标题较短时），frame 也一并居中
-            centerViewHorizontally(tf, in: cv)
-        }
-    }
-
-    /// 将外层容器的水平中心转换到视图父容器坐标系后定位。
-    /// NSAlert 标题/图标通常嵌套在私有容器中，不能直接用 contentView 的宽度计算 frame.origin.x。
-    private func centerViewHorizontally(_ view: NSView, in container: NSView) {
-        guard let superview = view.superview else { return }
-        let centerInSuperview = container.convert(
-            NSPoint(x: container.bounds.midX, y: container.bounds.midY),
-            to: superview
-        ).x
-        var frame = view.frame
-        frame.origin.x = centerInSuperview - frame.width / 2
-        view.frame = frame
-    }
-
-    /// 按类名查找私有视图（如 _NSAlertImageView），找不到返回 nil
-    private func findSubview(named className: String, in view: NSView) -> NSView? {
-        if type(of: view).description().contains(className) {
-            return view
-        }
-        for sub in view.subviews {
-            if let found = findSubview(named: className, in: sub) {
-                return found
-            }
-        }
-        return nil
-    }
-
-    /// NSAlert 的图标视图在不同系统版本中使用不同私有类名，通用兜底查找。
-    private func findFirstImageView(in view: NSView) -> NSImageView? {
-        if let imageView = view as? NSImageView {
-            return imageView
-        }
-        for sub in view.subviews {
-            if let found = findFirstImageView(in: sub) {
-                return found
-            }
-        }
-        return nil
-    }
-
-    /// 在 NSAlert 内容视图树中查找显示指定文本的 NSTextField（即 messageText 对应的标题字段）
-    private func findTextField(withText text: String, in view: NSView?) -> NSTextField? {
-        guard let view else { return nil }
-        if let tf = view as? NSTextField, tf.stringValue == text {
-            return tf
-        }
-        for sub in view.subviews {
-            if let found = findTextField(withText: text, in: sub) {
-                return found
-            }
-        }
-        return nil
     }
 }
 
 /// WorkBuddy 品牌图标（PNG，保持原色非 template），用于添加账号选择弹窗
 func makeWbBrandIcon() -> NSImage? {
     guard let url = Bundle.main.url(forResource: "workbuddy", withExtension: "png"),
+          let img = NSImage(contentsOf: url) else { return nil }
+    img.isTemplate = false
+    img.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
+    return img
+}
+
+/// App 图标快照（App-Icon-Default-1024@1x.png，ictool 按 design-generation 27 导出的
+/// Default rendition，随 icons/*.png 打包）。操作磁贴类弹窗（手动签到/签到历史/检查更新/关于）
+/// 统一用它，不走 NSApp.applicationIconImage（后者受系统图标缓存影响）
+func makeAppIconSnapshot() -> NSImage? {
+    guard let url = Bundle.main.url(forResource: "App-Icon-Default-1024@1x", withExtension: "png"),
           let img = NSImage(contentsOf: url) else { return nil }
     img.isTemplate = false
     img.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
