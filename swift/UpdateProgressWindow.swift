@@ -14,8 +14,8 @@
 //            └ root：header（应用图标 + 标题 + 副标题）→ content（更新描述框 | 进度描述+进度条）
 //              → footer（上下文按钮，右对齐）→ InnerGlowView（内发光 + 彩色流光覆层，
 //                最上层恒穿透；一层 alpha 遮罩 + 两层反向旋转的锥形渐变）
-// 描述框     ConcentricScrollView：hover 卡片同款皮肤（暗色渐变 白@8%→5% 斜向 +
-//            白@18% 1.2pt 描边），高度按内容实高自适应、封顶 150pt，超出框内滚动
+// 描述框     ConcentricScrollView：hover 卡片同款皮肤（暗色黑@85% 底 +
+//            白@30% 1.5pt 描边），高度按内容实高自适应、封顶 150pt，超出框内滚动
 // 高度       窗口高度随 Phase 与描述实高自动伸缩（relayoutAndResize 唯一入口，
 //            保持左上角不动），宽度固定 440
 // 取消标志   UpdateCancelFlag（NSLock 保护；供 URLSession delegate 队列跨线程读）
@@ -571,7 +571,7 @@ final class UpdateProgressWindowController: NSObject, NSWindowDelegate {
     private let installBtn = NSButton(title: "立即更新", target: nil, action: nil)
     private let laterBtn = NSButton(title: "稍后再说", target: nil, action: nil)
 
-    /// 描述框背景：hover 卡片同款渐变（暗色 白@8%→5% 斜向），挂 scroll layer 最底层
+    /// 描述框背景：hover 卡片同款渐变（暗色 黑@85% 两端同色），挂 scroll layer 最底层
     private let notesBackdrop = CAGradientLayer()
     /// 描述框当前高度（relayoutAndResize 按文本实高计算，[64,150] 夹取）
     private var notesContentH: CGFloat = Metrics.notesMinH
@@ -833,8 +833,8 @@ final class UpdateProgressWindowController: NSObject, NSWindowDelegate {
         notesScroll.hasHorizontalScroller = false
         notesScroll.autohidesScrollers = true
         notesScroll.wantsLayer = true
-        // hover 卡片同款皮肤（动态色，随窗口外观深浅切换）：深色 白@18% 描边 +
-        // 白@8%→5% 斜向渐变 / 浅色 黑@18% 描边 + 黑@6% 底（Palette.hoverBorderBright /
+        // hover 卡片同款皮肤（动态色，随窗口外观深浅切换）：深色 白@30% 描边 +
+        // 黑@85% 底 / 浅色 黑@30% 描边 + 黑@6% 底（Palette.hoverBorderBright /
         // hoverGradient 取值，与面板 hover 卡片同源）；圆角由
         // ConcentricScrollView.cornerConfiguration（containerConcentric）驱动。
         // 帧/端点/颜色统一由 applyNotesBoxSkin() 上（布局后调用，见 relayoutAndResize）

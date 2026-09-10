@@ -414,30 +414,27 @@ enum Palette {
     /// 卡片 hover 提亮色 #333333 @ 30%
     static let cardBackgroundHover = NSColor(calibratedWhite: 51.0 / 255.0, alpha: 0.3)
     /// 统一 hover 渐变背景（余额卡片/操作磁贴/折叠标题条/用量条目共用）：
-    /// 深/浅色外观动态解析——深色 = 白色提亮 8%→5%，浅色 = 黑色压暗 5%→3%。
-    /// （2026-09-08 曾短暂改为深色黑@45% 纯色，用户澄清「统一成原来 token 标题
-    /// 那个 hover」后撤销恢复。）改色只动这四个分支。
-    /// 统一 hover 渐变背景（全部卡片共用）：深色 = 白色提亮 8%→5% 斜向渐变；
-    /// 浅色 = 黑@6% 两端同色（2026-09-08 用户「改成黑@6%」，10%→33% 实测过重回调）。
-    /// 改色只动这四个分支。
+    /// 深色 = 黑@85% 两端同色（2026-09-11 用户指定）；浅色 = 黑@6% 两端同色
+    ///（2026-09-08 用户「改成黑@6%」，10%→33% 实测过重回调）。改色只动这四个分支。
     static let hoverGradientBright = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.white.withAlphaComponent(0.08)
+            ? NSColor.black.withAlphaComponent(0.85)
             : NSColor.black.withAlphaComponent(0.06)
     }
     static let hoverGradientDark = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.white.withAlphaComponent(0.05)
+            ? NSColor.black.withAlphaComponent(0.85)
             : NSColor.black.withAlphaComponent(0.06)
     }
     /// 渐变端点数组（CAGradientLayer.colors 直接可用）
     static let hoverGradient: [NSColor] = [hoverGradientBright, hoverGradientDark]
     /// 拖拽幽灵背景定调色（2026-09-06 两段式幽灵：只背景加模糊、叠 hover 强背景色）：
-    /// 深色 = 黑@45%，浅色 = 点阵峰值色 heatPeakColor（跟随调色气泡色相/饱和）。
+    /// 深色 = 黑@85%（与卡片 hover 背景同色，2026-09-11 随用户指定同步）；
+    /// 浅色 = 点阵峰值色 heatPeakColor（跟随调色气泡色相/饱和）。
     /// （原平台卡 hover 强背景/烘焙位图管线已于 2026-09-08 删除，仅幽灵仍用此色）
     static let cardHoverStrongBright = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.black.withAlphaComponent(0.45)
+            ? NSColor.black.withAlphaComponent(0.85)
             : heatPeakColor.withAlphaComponent(0.7)
     }
     /// 渐变视觉角度：水平向右为 0°，顺时针偏移
