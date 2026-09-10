@@ -28,11 +28,18 @@ if [[ "${1:-}" == "--release" ]]; then
     BUILD_MODE="release"
 fi
 
+# 可选：外置卷 / 沙箱环境写项目内 .build 受限时，用 IBALANCE_SWIFT_SCRATCH 指定本地盘 scratch。
+# 不设置则保持既有 swift/.build 增量目录，行为不变。
+SCRATCH_PATH="${IBALANCE_SWIFT_SCRATCH:-}"
+
 echo "==> 编译源文件（SwiftPM 增量，配置：${SPM_CONF}，模式：${BUILD_MODE}）"
-# Clang 模块缓存落在项目的 .build（已被 .gitignore 忽略）中，
-# 避免沙箱环境无法写入 ~/.cache/clang；SwiftPM 原有 scratch 目录保持不变，
-# 以免破坏已有增量构建状态。
-MODULE_CACHE_DIR="$SCRIPT_DIR/.build/module-cache"
+# Clang 模块缓存落在 scratch 目录中，避免沙箱环境无法写入 ~/.cache/clang；
+echo "    scratch: ${SCRATCH_PATH:-$SCRIPT_DIR/.build}"
+if [[ -n "$SCRATCH_PATH" ]]; then
+    MODULE_CACHE_DIR="$SCRATCH_PATH/module-cache"
+else
+    MODULE_CACHE_DIR="$SCRIPT_DIR/.build/module-cache"
+fi
 mkdir -p "$MODULE_CACHE_DIR"
 export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR"
 
@@ -46,6 +53,9 @@ SWIFT_BUILD_ARGS=(
     -Xswiftc -module-cache-path
     -Xswiftc "$MODULE_CACHE_DIR"
 )
+if [[ -n "$SCRATCH_PATH" ]]; then
+    SWIFT_BUILD_ARGS+=(--scratch-path "$SCRATCH_PATH")
+fi
 
 # -explicit-module-build 不用：小项目固定开销大（SDK 预构建 55s、无改动仍 14s）
 # --build-system native：显式指定 llbuild 后端（新版 SwiftPM 默认 XCBuild 后端在
