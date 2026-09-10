@@ -59,3 +59,9 @@ Inter-4.1/
 /design/
 /docs/
 /plans/
+
+# mintform 参考实现（3D 硬币复刻的第三方本地副本，不入库）
+/mintform-react-main/
+
+# .icon / actool 构建中间产物（可由 swift/icons 源包重新生成）
+/swift/.icon_build/

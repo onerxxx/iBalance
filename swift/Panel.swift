@@ -66,13 +66,11 @@ struct PanelSnapshot: Equatable {
     var monoFontEnabled = false
     /// 数值滚动预览开关（开启后余额卡片周期随机变化，演示逐位滚动动画）
     var valueScrollPreviewEnabled = false
-    /// 状态调试预览开关（开启后三态光环轮派到前三张 Agent 卡，演示进行中/完成/中断动画）
-    var statusDebugPreview = false
     /// 长进度卡片开关（开启后余额卡片进度条独占整行 + 副标题下移一行）
     var longProgressCard = false
     /// 图标深浅互换开关（开启后卡片品牌 icon ClearDark/ClearLight 版本互换）
     var iconThemeSwap = false
-    /// 竖线进度条开关（长进度卡片整行条替换为 50 条 1.5pt 竖线，间隔自适应、无背景无边框）
+    /// 竖线进度条开关（长进度卡片整行条替换为等宽竖线，条数/线宽见 UsageDots.lineCount/lineWidth）
     var verticalLineProgress = false
     /// 自动检查更新开关（GitHub Releases 启动静默检查）
     var updateAutoCheckEnabled = true
@@ -107,6 +105,9 @@ enum Motion {
     static let press: CFTimeInterval = 0.12
     /// hover 态切换（文本提亮与背景渐变统一此时长）
     static let hover: CFTimeInterval = 0.25
+    /// hover 材质跨卡跟随时长（2026-09-10 用户「边框动画的跟随更快一点」）：
+    /// 跟手优先，比常规 hover 切换短——光标在卡片间游走时框要咬得住
+    static let hoverFollow: CFTimeInterval = 0.16
     /// 布局重排/换位：屏上位移
     static let layout: CFTimeInterval = 0.20
     /// 内容揭示/淡入：偶发动作稍从容
@@ -183,13 +184,13 @@ final class HeatAdjustView: NSView {
     var onHue: ((CGFloat) -> Void)?
     var onSaturation: ((CGFloat) -> Void)?
 
-    /// 本体（不含箭头）宽 174 = 内边距 14 + icon 16 + 距 6 + 轨道 124 + 内边距 14
+    /// 本体（不含箭头）宽 174 = 内边距 14 + icon 10 + 距 6 + 轨道 130 + 内边距 14
     ///（2026-09-07 用户「增加容器宽度 60pt」：106→166，容纳开关行、轨道加长；
     /// 2026-09-09 用户「左右缩进下缩进增加 4pt」：sideInset 10→14、底部 vPad 10→14，
-    /// 宽随边距 +8 保轨道 124 不变）
+    /// 宽随边距 +8 保轨道不变；2026-09-10 icon 16→10 与开关行统一，轨道 124→130）
     static let bodyWidth: CGFloat = 174
     private static let sideInset: CGFloat = 14
-    private static let iconSize: CGFloat = 16
+    private static let iconSize: CGFloat = 10
     private static let iconGap: CGFloat = 6
     /// 纵向：顶部内边距 10、底部内边距 14（2026-09-09 用户「下缩进 +4pt」）、
     /// 标题带 24（文字垂直居中——与面板 sectionTitleRow 同款）+ 带下 7（面板标题下
@@ -235,11 +236,14 @@ final class HeatAdjustView: NSView {
     private let panelTitle = makeTitle("Panel")
     private let cardTitle = makeTitle("Card")
 
-    /// 行首图标（模板图默认前景色染色，勿再设 contentTintColor）
+    /// 行首图标：与开关行 settingsRowIcon 同口径（SF Symbol 裁边 + 10×10 填满 +
+    /// systemGray）——2026-09-10 用户指定气泡内 icon 大小/右间距统一，
+    /// 旧设定（pointSize 16 / 16×16 frame / 默认前景色）已废
     private static func symbolImageView(_ name: String) -> NSImageView {
         let iv = NSImageView()
-        iv.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 16, weight: .medium))
+        iv.image = BalancePanelView.trimmedSymbolImage(name, size: 10)
+        iv.image?.isTemplate = true
+        iv.contentTintColor = .systemGray
         iv.imageScaling = .scaleProportionallyUpOrDown
         return iv
     }
@@ -497,6 +501,14 @@ enum Palette {
         if lightTheme { return NSAppearance(named: .aqua) }
         return nil
     }
+    /// 应用内主题（浅色主题开关）的全局镜像：自建顶层窗口（GlassModalShell 模态壳、
+    /// 更新窗口）不挂在面板视图树上，拿不到容器 appearance，只能读这里。
+    /// **写入点只有两个**：AppDelegate 启动载入配置处、onToggleLightTheme 切换处。
+    static var lightThemeActive = false
+    /// 自建顶层窗口的统一外观（nil = 跟随系统），与 panelAppearance 同口径
+    static var topLevelWindowAppearance: NSAppearance? {
+        panelAppearance(lightTheme: lightThemeActive, gradientOn: false)
+    }
     /// 渐变遮罩是否生效：渐变开关开即生效（浅色主题用亮白→透明遮罩，深色用深灰遮罩）
     static func gradientEffective(lightTheme: Bool, gradientOn: Bool) -> Bool {
         gradientOn
@@ -519,20 +531,23 @@ enum Palette {
     }
     /// 卡片边框色/分割线色（暗主题：浅灰半透明，1px 描边，统一白@10%）
     static let cardBorderColor = NSColor(calibratedWhite: 1.0, alpha: 0.10)
-    /// 卡片常态边框（2026-09-08 用户「粗 1.2pt alpha 18% 全部统一」）：恒显描边，
-    /// 深色白@18% / 浅色黑@18%（alpha 统一档，色相随外观取相对明暗）
+    /// 卡片边框 alpha 单一旋钮（2026-09-10 用户「边框在暗主题提亮、亮主题压暗」）：
+    /// 暗主题用白、亮主题用黑，同一 alpha 档 → 两边都相对面板底色拉开对比。
+    /// 原 0.18（2026-09-08「alpha 18% 全部统一」）太贴底，本次提到 0.30。
+    static let cardBorderAlpha: CGFloat = 0.30
+    /// 卡片常态边框（2026-09-08 用户「全 1.2pt alpha 18% 全部统一」）：恒显描边，
+    /// 深色白 / 浅色黑，alpha 见 cardBorderAlpha
     static let hoverBorderNormal = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.white.withAlphaComponent(0.18)
-            : NSColor.black.withAlphaComponent(0.18)
+            ? NSColor.white.withAlphaComponent(Palette.cardBorderAlpha)
+            : NSColor.black.withAlphaComponent(Palette.cardBorderAlpha)
     }
-    /// hover 边框提亮色（2026-09-08 用户「hover 时边框 1.2pt alpha 18% 全部统一」）：
-    /// 深色白@18% / 浅色黑@18%，与 hoverBorderNormal 同 alpha——hover 只动宽度，
-    /// 色动画链路保留（Normal→Bright 同值），日后单独调 hover 色只改此处
+    /// hover 边框色（2026-09-08 用户「hover 时边框 1.2pt alpha 18% 全部统一」）：
+    /// 与 hoverBorderNormal 同值——hover 只动宽度，色动画链路保留，日后单独调 hover 色只改此处
     static let hoverBorderBright = NSColor(name: nil) { appearance in
         appearance.isDark
-            ? NSColor.white.withAlphaComponent(0.18)
-            : NSColor.black.withAlphaComponent(0.18)
+            ? NSColor.white.withAlphaComponent(Palette.cardBorderAlpha)
+            : NSColor.black.withAlphaComponent(Palette.cardBorderAlpha)
     }
     /// 动态色落 CALayer 前按「视图生效外观」解算（hover 路径必须走这里）。
     /// 事件回调（mouseEntered/Exited）里 NSAppearance.current 是**系统**外观，
@@ -672,9 +687,9 @@ enum Palette {
             ? NSColor.systemGray.withAlphaComponent(0.75)
             : NSColor.systemGray
     }
-    /// 卡片边框宽度 1.2pt（2026-09-08 用户「粗 1.2pt 全部统一」，原 1pt 死常量改由
-    /// HoverCard 常态描边 / 拖拽 ghost / 各预设点统一引用）
-    static let cardBorderWidth: CGFloat = 1.2
+    /// 卡片边框宽度 1.5pt（2026-09-10 用户定稿：原 1pt 死常量 → 统一 1.2pt → 1.7pt → 1.5pt；
+    /// 由共享 hover 材质描边 / 拖拽 ghost / 各预设点统一引用）
+    static let cardBorderWidth: CGFloat = 1.5
     /// 卡片主标题（平台名）/ 数值字号：13pt。气泡 ID 行与之同号（2026-08-31 用户要求）
     static let cardTitleFontSize: CGFloat = 13
     /// 卡片副标题（到期/剩余分段）、其余账号积分 chip、气泡积分行：9pt（2026-08-31 统一，原 8pt）
@@ -1377,11 +1392,15 @@ enum BalancePlatform: String, CaseIterable {
 final class BalancePanelView: NSView {
 
     /// 固定在滚动视口顶部的 header 高度。
-    static let headerHeight: CGFloat = 30
+    /// 2026-09-10 用户指定 +3pt（原 30）。header 内部元素（更新时间 / 分段控件 /
+    /// 退出按钮）锚在 header **顶** + `panelTopPadding + panelBarHeight/2`，不随此值移动 →
+    /// 改大只会让分割线与正文整体下移、header 下缘留白变多。
+    static let headerHeight: CGFloat = 33
     /// 由布局构建，随后由 BalancePanelViewController 提升到滚动容器上层固定显示。
     var headerView: NSView?
-    /// header 点阵调色按钮（弹悬浮气泡：色相/饱和度滑杆 + 主题/样式开关组）
-    var themeTuneBtn: HoverIconButton?
+    /// header 右侧分段按钮组：0=主题调教（弹悬浮气泡：色相/饱和度滑杆 + 主题/样式开关组）、
+    /// 1=平台开关。2026-09-10 用户指定由独立图标按钮改为 NSSegmentedControl 统一样式。
+    var headerSegmentControl: NSSegmentedControl?
     /// 主题/样式开关行（面板渐变/浅色主题/Mono/长进度/图标互换/竖线进度，
     /// 2026-09-07 用户指定移出设置卡；行照常注册进 switchRows，气泡展示时挂入）
     var themeSwitchRows: [NSView] = []
@@ -1414,19 +1433,21 @@ final class BalancePanelView: NSView {
     var onToggleMonoFont: (() -> Void)?
     /// 数值滚动预览开关（设置卡片开关触发：余额数值周期随机变化演示滚动）
     var onToggleValueScrollPreview: (() -> Void)?
-    /// 状态调试预览开关（设置卡片开关触发：三态光环轮派前三张 Agent 卡演示动画）
-    var onToggleStatusDebugPreview: (() -> Void)?
     /// 长进度卡片开关（设置卡片开关触发：整行进度条 + 副标题下移，随快照重建卡片）
     var onToggleLongProgressCard: (() -> Void)?
     /// 图标深浅互换开关（设置卡片开关触发：品牌 icon ClearDark ↔ ClearLight 互换）
     var onToggleIconThemeSwap: (() -> Void)?
-    /// 竖线进度条开关（设置卡片开关触发：长进度卡片整行条替换为 50 条竖线）
+    /// 竖线进度条开关（设置卡片开关触发：长进度卡片整行条替换为等宽竖线）
     var onToggleVerticalLineProgress: (() -> Void)?
     /// 渐变开关状态变化通知（update 同步时触发，VC 据此刷新遮罩绘制）
     var onPanelGradientChanged: (() -> Void)?
+    /// 3D 硬币演示弹窗（操作磁贴；复刻 mintform 的 CSS 3D token）
+    var onShowCoinDemo: (() -> Void)?
     var onAbout: (() -> Void)?
     /// 手动检查更新（操作磁贴触发：GitHub Releases 检查 + 可选下载替换）
     var onCheckForUpdate: (() -> Void)?
+    /// 更新窗口演示（设置卡片行触发：演示数据走全流程 UI，不出网不真替换）
+    var onRunUpdateDemo: (() -> Void)?
     /// 自动检查更新开关（设置卡片开关触发）
     var onToggleUpdateAutoCheck: (() -> Void)?
     /// 管理各平台刷新、自动签到、卡片与用量显示开关
@@ -1651,7 +1672,11 @@ final class BalancePanelView: NSView {
         // 外观切换就地换肤（不重建卡片）：① 品牌 Clear 系图标随生效外观换版
         //（ClearDark ↔ ClearLight，2026-09-06 用户导出浅色资产，按 identifier 标签
         // brandIcon:<键> 识别）；② 预设边框色/hover 渐变经 .cgColor 落盘会定格当时
-        // 外观：重解算（hover 中 borderWidth > 0 的层跳过——动画路径每次取当前值）。
+        // 外观：重解算（hover 中 borderWidth > 0 的层跳过——动画路径每次取当前值。
+        // 现仅用量行等仍走 layer 边框；HoverCard 的 hover 材质（渐变背景块 + 描边框）
+        // 已由容器共享（HoverMaterialHost，挂 root），由 HoverCard
+        // .viewDidChangeEffectiveAppearance 转发宿主 refreshAppearance 重解算，
+        // 本轮回写对其无效）。
         let appearance = effectiveAppearance
         var stack = subviews
         while let v = stack.popLast() {
@@ -1817,8 +1842,6 @@ final class BalancePanelView: NSView {
     /// 「滚动预览」行副标题（静态文案；switchRow 默认隐藏，build 中统一显示）
     let valuePreviewSub = NSTextField(labelWithString: "余额数值周期随机变化")
     private(set) var valueScrollPreviewEnabled = false
-    /// 状态调试预览开关（设置卡片开关：三态光环轮派前三张 Agent 卡，演示进行中/完成/中断动画）
-    let statusDebugSwitch = MiniSwitch()
     /// 长进度卡片开关（余额卡片整行进度条 + 副标题下移；update 时随快照同步状态）
     let longProgressCardSwitch = MiniSwitch()
     private(set) var longProgressCardEnabled = false
@@ -1828,15 +1851,6 @@ final class BalancePanelView: NSView {
     /// 竖线进度条开关（设置卡片开关：长进度卡片整行条改竖线形态；update 时随快照同步）
     let verticalLineProgressSwitch = MiniSwitch()
     private(set) var verticalLineProgressEnabled = false
-    /// 状态调试副标题（开发调试行）：2026-09-01 加 90pt 宽度上限——原文案 ≈138pt 把
-    /// 设置卡 fittingSize 撑到 256（popover 撑宽元凶之一）；上限约束参与 fittingSize，
-    /// 防止开发调试行影响面板宽度
-    let statusDebugSub: NSTextField = {
-        let l = NSTextField(labelWithString: "三态光环轮派前三张 Agent 卡")
-        l.widthAnchor.constraint(lessThanOrEqualToConstant: 90).isActive = true
-        return l
-    }()
-    private(set) var statusDebugPreviewEnabled = false
     /// 设置卡片各开关行注册表（Mono 模式切换时统一显隐原生/字符开关）。
     /// handler 必须一并强持有：NSClickGestureRecognizer 的 target 是弱引用，
     /// 不持有则手势触发时 target 已释放，整行点击失效。
@@ -1969,18 +1983,6 @@ final class BalancePanelView: NSView {
         valuePreviewSwitch.state = s.valueScrollPreviewEnabled ? .on : .off
         // 预览定时器状态与配置保持一致（幂等：无变化不动）
         setValueScrollPreview(s.valueScrollPreviewEnabled)
-        // 状态调试预览开关同步；变化时清空 Agent 各平台 uid 缓存 → 强制重建卡片
-        //（状态光环现在全平台挂载；清缓存保留用于让调试预览切换时重置动画实例）
-        let statusDebugChanged = s.statusDebugPreview != statusDebugPreviewEnabled
-        statusDebugPreviewEnabled = s.statusDebugPreview
-        statusDebugSwitch.state = s.statusDebugPreview ? .on : .off
-        if statusDebugChanged {
-            wbCardUids = []
-            zcodeCardUids = []
-            traeCardUids = []
-            codexCardUids = []
-            contentSizeChanged = true
-        }
         // 长进度卡片开关同步：卡片第二行结构（整行进度条+副标题下移）随卡片重建切换，
         // 清全部平台 uid 缓存强制重建
         let longProgressCardChanged = s.longProgressCard != longProgressCardEnabled
@@ -2440,7 +2442,7 @@ final class BalancePanelView: NSView {
             // 平台 icon 视图（原渐变 fadeIcon 薄壳已随小白点指示替代而移除）
             let fadeIcon = NSImageView()
             // 任务状态光环引用：全平台卡片挂载——Agent 卡由快照 taskState 驱动（WB/ZCode/
-            // Codex 为真实任务态，状态调试开关三态轮派）；API 卡（DS/ZhiPu/Qwen）为脉冲驱动态
+            // Codex 为真实任务态）；API 卡（DS/ZhiPu/Qwen）为脉冲驱动态
             //（pulseDriven：进度条闪烁点亮进行中 + 颜色去饱和），由 apply 按 pulsing 合成
             weak var capturedStatusRing: CardTaskStatusRingView?
             let needsStatusRing = true
@@ -2851,8 +2853,8 @@ final class BalancePanelView: NSView {
             }
             // 到期副标题分段（无值时全部 isHidden 收起，占位保持行高稳定）；副标题统一中性灰
             // （2026-08-27：「套餐已到期」取消红色警告，与其他到期文本一致用 systemGray）
-            // TRAE 已停止维护：固定显示 xmark +「此平台不再维护」，不再显示套餐重置时间。
-            let segs = style.platformID == "trae" ? ["此平台不再维护"] : (ac.expireSegments ?? [])
+            // TRAE 已停止维护：副标题固定「不再维护」（2026-09-10 简化），xmark icon 不变。
+            let segs = style.platformID == "trae" ? ["不再维护"] : (ac.expireSegments ?? [])
             e.segBox?.full = segs
             // 账号条换入期间保持精简文案（单一事实源 = 账号条可见性）：hover 中途刷新
             // 不把完整文案顶回来，破坏副标题给账号条让位的约定
@@ -2956,6 +2958,26 @@ final class BalancePanelView: NSView {
     /// 当前生效遮罩色（用量子面板同口径）,按「圆角矩形+箭头」路径做 layer mask 裁切,
     /// 圆角统一 Palette.cardCornerRadius。默认弹卡片右侧（箭头顶点贴卡右缘）,
     /// 右侧屏幕空间不足时翻到左缘。
+    /// 面板容器渐变在指定视图中线处的采样色。
+    /// 气泡/子窗高度远小于面板：直接套用容器 tintColor…tintBottomColor 会把整条渐变
+    /// 压进几十 pt（顶过暗、底过灰），与锚点所在高度处的面板色完全不同 → 按位置插值取实色。
+    /// 容器无渐变（tintBottomColor = nil）时原样返回顶色（本来就是实色）。
+    private static func panelTintSample(container: TintedVisualEffectView,
+                                        at view: NSView) -> NSColor? {
+        guard let top = container.tintColor, let bottom = container.tintBottomColor,
+              container.bounds.height > 0 else { return container.tintColor }
+        // 容器 isFlipped（TintOverlayView）：minY = 视觉顶、maxY = 底，与渐变同向
+        let rect = container.convert(view.bounds, from: view)
+        let t = min(max(rect.midY / container.bounds.height, 0), 1)
+        guard let ca = top.usingColorSpace(.deviceRGB),
+              let cb = bottom.usingColorSpace(.deviceRGB) else { return top }
+        func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
+        return NSColor(deviceRed: mix(ca.redComponent, cb.redComponent),
+                       green: mix(ca.greenComponent, cb.greenComponent),
+                       blue: mix(ca.blueComponent, cb.blueComponent),
+                       alpha: mix(ca.alphaComponent, cb.alphaComponent))
+    }
+
     private func showSubAccountTip(nickname: String, value: String, tokenInvalid: Bool = false,
                                    checkin: (done: Bool, failed: Bool, risk: Bool)? = nil,
                                    anchorCard: NSView) {
@@ -3067,8 +3089,12 @@ final class BalancePanelView: NSView {
         glass.state = .active
         glass.isEmphasized = false
         if let pc = Self.findPanelContainer(from: self) {
-            glass.tintColor = pc.tintColor
-            glass.tintBottomColor = pc.tintBottomColor
+            // 继承面板颜色：按锚点卡在面板中的高度采样容器渐变（气泡只有几十 pt 高，
+            // 直接套用两端色会把整条渐变压进来，顶过暗/底过灰，与面板完全不同）——
+            // 顶/底同色 ⇒ 气泡呈现面板在该高度处的实色
+            let sampled = Self.panelTintSample(container: pc, at: anchorCard)
+            glass.tintColor = sampled
+            glass.tintBottomColor = sampled
         } else {
             let colors = Palette.containerColors(
                 lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
@@ -3188,9 +3214,10 @@ final class BalancePanelView: NSView {
         }
 
         override func draw(_ dirtyRect: NSRect) {
-            // 只描边（玻璃填充由 mask 后的 TintedVisualEffectView 承担）
+            // 只描边（玻璃填充由 mask 后的 TintedVisualEffectView 承担）；
+            // 描边色跟卡片走（hoverBorderNormal，深白/浅黑 @18%），不再是固定黑白 tooltip 色
             let path = Self.tipShapePath(bounds: bounds, edge: arrowEdge, tipY: tipY)
-            Palette.tooltipBorder.setStroke()
+            Palette.hoverBorderNormal.setStroke()
             path.lineWidth = 0.5
             path.stroke()
         }
@@ -3354,11 +3381,11 @@ final class BalancePanelView: NSView {
     }
     @objc func monoFontToggled() { onToggleMonoFont?() }
     @objc func valueScrollPreviewToggled() { onToggleValueScrollPreview?() }
-    @objc func statusDebugPreviewToggled() { onToggleStatusDebugPreview?() }
     @objc func longProgressCardToggled() { onToggleLongProgressCard?() }
     @objc func iconThemeSwapToggled() { onToggleIconThemeSwap?() }
     @objc func verticalLineProgressToggled() { onToggleVerticalLineProgress?() }
     @objc func checkUpdateTapped() { onCheckForUpdate?() }
+    @objc func updateDemoTapped() { onRunUpdateDemo?() }
     @objc func updateAutoCheckToggled() { onToggleUpdateAutoCheck?() }
 
     // MARK: - 数值滚动预览（保留设置卡片原「调试」开关，功能替换为演示滚动动画）
@@ -3475,6 +3502,7 @@ final class BalancePanelView: NSView {
     @objc func platformTogglesTapped() { onManagePlatformToggles?() }
 
     @objc func aboutTapped() { onAbout?() }
+    @objc func coinDemoTapped() { onShowCoinDemo?() }
     @objc func manualCheckinTapped() { onManualCheckin?() }
     @objc func checkinHistoryTapped() { onShowCheckinHistory?() }
     @objc func shareWbHistoryTapped() { onShareWbHistory?() }
@@ -3485,6 +3513,33 @@ final class BalancePanelView: NSView {
         onSetInterval?(intervalPopup.selectedItem?.tag ?? 300)
     }
     @objc func manualRefreshTapped() { onManualRefresh?() }
+    /// header 右侧分段控件分发：0=主题调教、1=平台开关（momentary，无选中态）
+    @objc func headerSegmentTapped(_ sender: NSSegmentedControl) {
+        switch sender.selectedSegment {
+        case 0: headerThemeTuneTapped()
+        case 1: platformTogglesTapped()
+        default: return
+        }
+    }
+
+    /// 调色气泡本体与主面板边缘的间隙：本体整体移到面板外侧，只留箭头三角压在面板上
+    private static let heatBubbleGap: CGFloat = -8
+    /// 气泡纵向微调（负 = 下移）：箭头顶点由 tipY 自动补偿，仍精确对准按钮中线
+    private static let heatBubbleNudgeY: CGFloat = -3
+    /// 气泡横向微调（负 = 左移）：同样在可见区钳制之后再加，否则会被钳制吃掉
+    private static let heatBubbleNudgeX: CGFloat = -2
+
+    /// 调色气泡瞄准分段控件「主题调教」段：0 段本地矩形 → 屏幕矩形。
+    /// NSSegmentedControl 无公开的 rectForSegment；两段构建时等宽（setWidth 同值），
+    /// 按 bounds 均分推算即可。
+    private func headerSegmentScreenRect(_ index: Int) -> NSRect? {
+        guard let seg = headerSegmentControl, seg.segmentCount > 0,
+              index >= 0, index < seg.segmentCount else { return nil }
+        let w = seg.bounds.width / CGFloat(seg.segmentCount)
+        let local = NSRect(x: w * CGFloat(index), y: 0, width: w, height: seg.bounds.height)
+        return seg.window.map { $0.convertToScreen(seg.convert(local, to: nil)) }
+    }
+
     /// header 点阵调色按钮：切换悬浮气泡（子账号气泡同款载体），内含色相/饱和度两行滑杆；
     /// 存续期间经 onHeatWindowActive 挂起主面板 transient
     @objc func headerThemeTuneTapped() {
@@ -3501,7 +3556,8 @@ final class BalancePanelView: NSView {
     /// 默认弹按钮右侧、屏幕空间不足翻左（tip 同款翻转）。与 tip 不同：要接收滑杆拖动，
     /// 不设 ignoresMouseEvents；「点气泡外收起」用本地/全局事件监视器自管。
     private func showHeatWindow() {
-        guard let button = themeTuneBtn, let anchorWindow = button.window else { return }
+        guard let seg = headerSegmentControl, let anchorWindow = seg.window,
+              let btnRect = headerSegmentScreenRect(0) else { return }
         let arrowLen = SubAccountTipBubbleView.arrowLength
         let totalW = HeatAdjustView.bodyWidth + arrowLen
         // 区块分组：Panel = 点阵色相滑杆 + 前 2 开关，Card = 下面 4 个开关
@@ -3511,19 +3567,28 @@ final class BalancePanelView: NSView {
                                           cardRows: cardRows.count)
         let screenVisible = anchorWindow.screen?.visibleFrame
         var edge: NSRectEdge = .maxX
-        if let visible = screenVisible,
-           visible.maxX - anchorWindow.frame.maxX < totalW + 16 {
+        // 本体挂在主面板外侧（rightOrigin = 面板右缘 + gap − 箭头长 → 箭头整支压在面板上，
+        // 只有三角与面板重叠，气泡不再遮住面板内容）：空间不够放整窗才翻到左侧
+        let panelFrame = anchorWindow.frame
+        let rightOrigin = panelFrame.maxX + Self.heatBubbleGap - arrowLen
+        if let visible = screenVisible, visible.maxX - rightOrigin < totalW + 6 {
             edge = .minX
         }
         // 先定窗位再画轮廓：header 按钮贴近屏幕顶、气泡高，居中放会顶出屏幕——
         // 整体钳进可见区，箭头顶点纵坐标（窗口局部）保持瞄准按钮中线
-        let btnRect = anchorWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        let originX = edge == .maxX ? btnRect.maxX - 2 : btnRect.minX + 2 - totalW
+        var originX = edge == .maxX
+            ? rightOrigin
+            : panelFrame.minX - Self.heatBubbleGap + arrowLen - totalW
         var originY = btnRect.midY - h / 2
         if let visible = screenVisible {
+            originX = min(max(originX, visible.minX + 6), visible.maxX - totalW - 6)
             originY = min(originY, visible.maxY - h - 6)
             originY = max(originY, visible.minY + 6)
         }
+        originX += Self.heatBubbleNudgeX
+        // ⚠️ 纵向微调必须在钳制之后加：气泡远高于「按钮到屏顶」的距离，originY 常态被
+        // visible.maxY 上边界钳死，先加偏移会被 min(...) 原样吃掉（−1/−3 都毫无变化）
+        originY += Self.heatBubbleNudgeY
         let tipMargin = Palette.cardCornerRadius + SubAccountTipBubbleView.arrowHalfWidth + 2
         let tipY = min(max(btnRect.midY - originY, tipMargin), h - tipMargin)
         let container = NSView(frame: NSRect(x: 0, y: 0, width: totalW, height: h))

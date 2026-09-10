@@ -38,20 +38,12 @@ extension BalancePanelView {
         view.subviews.flatMap { [$0] + allDescendants(of: $0) }
     }
 
-    /// 内容快照模式：递归隐藏/恢复路径上所有 HoverCard 的背景层（含清空边框），
-    /// 使缓存截图只含内容像素（透明底），供两段式幽灵合成
-    private func setGhostContentSnapshotMode(_ view: NSView, _ hidden: Bool) {
-        if let hc = view as? HoverCard { hc.setContentOnlySnapshotAppearance(hidden) }
-        for sub in view.subviews { setGhostContentSnapshotMode(sub, hidden) }
-    }
-
     /// 生成原卡静态截图（拖动幽灵源）
     private func makeDragSnapshot(of card: NSView) -> NSImage? {
         guard !card.bounds.isEmpty,
               let representation = card.bitmapImageRepForCachingDisplay(in: card.bounds) else { return nil }
-        // 先缓存拖动开始时的真实外观，让幽灵保留大卡片当前的 hover 样式；
-        // 原卡片随后才会切成无 hover 占位，避免两者同时显示 hover 背景。
-        // hover 背景是 CALayer 子层，拖动起手时先强制提交布局/绘制，避免截图拿到旧状态。
+        // 先缓存拖动开始时的真实内容，原卡片随后才切成无 hover 占位。
+        // 内容里有 CALayer 子层，拖动起手时先强制提交布局/绘制，避免截图拿到旧状态。
         card.layoutSubtreeIfNeeded()
         card.displayIfNeeded()
         card.layer?.displayIfNeeded()
@@ -113,11 +105,6 @@ extension BalancePanelView {
         let pointer = convert(locationInWindow, from: nil)
         draggingGhostOffset = NSPoint(x: pointer.x - ghostFrame.minX, y: pointer.y - ghostFrame.minY)
 
-        // 必须在锁住 hover 之前截图：幽灵保留按下瞬间的大卡片 hover 外观，
-        // 原卡片则继续留在排序流中并切成无 hover 占位。
-        // 快速按下拖动时 mouseEntered 的 hover 动画可能尚未完成，先同步补齐
-        // hover 背景，确保拖动中的卡片始终有明确的提亮反馈。
-        hoverCard?.prepareDragSnapshotAppearance()
         // 拖动中 icon 状态层不显示（2026-09-06 用户指定）：截图前隐藏，幽灵与原卡同步生效；
         // 恢复在 endPlatformDrag 的归位交接点
         draggingHiddenStatusRings = allDescendants(of: card).compactMap { $0 as? CardTaskStatusRingView }
@@ -126,11 +113,10 @@ extension BalancePanelView {
         // 两段式幽灵（2026-09-06 用户指定「只背景加模糊，边框和卡片内容不加」）：
         // ① 背景段 = 幽灵容器 layer 开 backgroundFilters 高斯模糊——只模糊身后的面板
         //    内容（GPU 合成、区域限于幽灵 frame），叠 hover 强背景色定调，边框清晰；
-        // ② 内容段 = 递归隐藏卡片背景层后重截的清晰内容位图（透明底）。
+        // ② 内容段 = 卡片子树的清晰内容位图（透明底）：hover 材质已不在卡片里
+        //    （容器共享、且画在卡片之下），截图天然只含内容像素，无需再临时隐藏。
         // 滤镜实例只在拖起时创建一次（勿移入 movePlatformGhost 逐帧重建）
-        setGhostContentSnapshotMode(ghostSourceView, true)
         let contentImage = makeDragSnapshot(of: ghostSourceView)
-        setGhostContentSnapshotMode(ghostSourceView, false)
         if let contentImage {
             let ghost = NSView(frame: ghostFrame)
             ghost.wantsLayer = true

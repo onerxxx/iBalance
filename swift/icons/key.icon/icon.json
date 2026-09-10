@@ -1,17 +1,13 @@
 {
-  "features" : [
-    "refractivity"
-  ],
   "fill" : "system-dark",
   "groups" : [
     {
-      "blur-material" : null,
       "layers" : [
         {
-          "image-name" : "main 6.svg",
-          "name" : "main 6",
+          "image-name" : "SVG Image.svg",
+          "name" : "SVG Image",
           "position" : {
-            "scale" : 1.14,
+            "scale" : 3.77,
             "translation-in-points" : [
               0,
               0
@@ -19,14 +15,9 @@
           }
         }
       ],
-      "refractivity" : {
-        "depth" : 0.25203125,
-        "enabled" : true,
-        "strength" : 0.21921875
-      },
       "shadow" : {
         "kind" : "neutral",
-        "opacity" : 0
+        "opacity" : 0.5
       },
       "translucency" : {
         "enabled" : true,

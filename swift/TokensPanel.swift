@@ -505,6 +505,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         didSet {
             hoveredListRow = nil
             metricsDirty = true
+            // 占位骨架扫光：真实数据到达即停（timer tick 亦自检）
+            if summary != nil { stopSkeletonShimmer() }
             // 平台切换换值：大数字走整组滑移（旧平台值滚到新值，与周期切换同款）
             let slide = slideNextTotalRoll
             slideNextTotalRoll = false
@@ -518,6 +520,16 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 总计词元大数字（逐位垂直滚动；左对齐贴版心，位次与原 drawText 排版一致）
     private let totalRollView = RollingNumberView()
+    /// 大数字左边那枚**小尺寸 3D 硬币**（用户 2026-09-11 指定）：参数与「3D 硬币」弹窗同源
+    /// （材质 / Logo / 边纹 / 厚度 / 浮雕深度按 `CoinSettings` 等比缩到 `inlineCoinDiameter`），
+    /// 只在主面板内嵌实例上显示（`showsInlineCoin`；hover 子面板保持原排版）。
+    private let inlineCoin = Coin3DView(frame: .zero)
+    /// 内嵌硬币直径（小尺寸记号：与大数字 26pt 视觉等高）
+    private static let inlineCoinDiameter: CGFloat = 24
+    /// 硬币与大数字之间的间距
+    private static let inlineCoinGap: CGFloat = 6
+    /// 是否显示内嵌硬币（由 `setupInlineTokens()` 打开）
+    var showsInlineCoin = false
     /// 总计占位 loading：数据未到时替代「—」横杆（2026-09-09 用户指定）
     private let totalSpinner = NSProgressIndicator()
     /// 大数字当前字号（超宽逐级缩 26→15；字号变化才重新 configure）
@@ -681,6 +693,14 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
                 ?? .monospacedDigitSystemFont(ofSize: s, weight: w)
         })
         addSubview(totalRollView)
+        // 内嵌小硬币：紧凑呈现（无弹跳/落地影、按自身尺寸收紧高度）。
+        // ⚠️ 交互保持开启（用户 2026-09-11 指定：任何时候都能点击自旋 / 拖拽翻转）——
+        // 它是可滚动面板里的一个「活的」控件，靠 hitTest 只吃硬币圆内那 24pt，
+        // 圈外的滚动 / hover 不受影响。
+        inlineCoin.compactInline = true
+        inlineCoin.interactive = true
+        inlineCoin.isHidden = true
+        addSubview(inlineCoin)
         // 总计占位 loading（2026-09-09 用户指定：替代原「—」横杆）：系统原生小转圈，
         // 停转自动隐藏（isDisplayedWhenStopped），起停在 syncTotalRoll 按 summary 有无切换
         totalSpinner.isIndeterminate = true
@@ -757,18 +777,62 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             dotsImagesDirty = true  // 点阵位图按新几何重烘
             invalidateIntrinsicContentSize()
         }
-        totalRollView.frame = NSRect(x: insets.left, y: numberRowY,
-                                     width: max(0, bounds.width - insets.left - insets.right),
+        totalRollView.frame = NSRect(x: insets.left + inlineCoinWidth, y: numberRowY,
+                                     width: max(0, bounds.width - insets.left - insets.right - inlineCoinWidth),
                                      height: 32)
+        // 内嵌小硬币：在数字行带（高 32）里与大数字垂直居中对齐、贴版心左缘；
+        // 宽高取硬币自身的紧凑边长（含厚度投影，比直径略大 1pt）
+        if showsInlineCoin {
+            let side = inlineCoin.compactFittingHeight
+            inlineCoin.frame = NSRect(x: insets.left, y: numberRowY + (32 - side) / 2,
+                                      width: side, height: side)
+        }
         // spinner 与大数字同带垂直居中、左对齐（小号系统转圈 ~16pt 见方）
         let spinSize = totalSpinner.intrinsicContentSize
-        totalSpinner.frame = NSRect(x: insets.left + 1, y: numberRowY + (32 - spinSize.height) / 2,
+        totalSpinner.frame = NSRect(x: insets.left + inlineCoinWidth + 1,
+                                    y: numberRowY + (32 - spinSize.height) / 2,
                                     width: spinSize.width, height: spinSize.height)
         // 布局就绪后复算缩字号（打开瞬间 summary 落位时 view 可能尚未布局，宽度不可判）
         if let text = totalDisplayText {
             applyTotalNumberSize(for: text)
         }
     }
+    /// 大数字行左侧内嵌硬币占掉的宽度（0 = 不显示）
+    private var inlineCoinWidth: CGFloat {
+        showsInlineCoin ? Self.inlineCoinDiameter + Self.inlineCoinGap : 0
+    }
+
+    /// 内嵌小硬币自转一圈（面板每次打开、以及 hover 换平台换数据时由外部调用）。
+    /// 起点在硬币当前姿态上叠加 360°，所以连点/连开不会跳姿态。
+    /// ⚠️ 程序化自旋做 0.3s 去抖：面板打开那一拍可能「开面板」与「换数据」两处同时触发，
+    /// 不去抖会叠成两圈（用户直接点硬币走 mouseUp 那条路，不受此限）。
+    func spinInlineCoin() {
+        guard showsInlineCoin else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastProgrammaticSpinAt > 0.3 else { return }
+        lastProgrammaticSpinAt = now
+        inlineCoin.spin()
+    }
+    private var lastProgrammaticSpinAt: CFTimeInterval = 0
+
+    /// 按 `CoinSettings`（「3D 硬币」弹窗落盘的那份参数）重灌内嵌小硬币。
+    /// **参数同源、尺寸等比**：直径固定为 `inlineCoinDiameter`，厚度 / 浮雕深度按
+    /// k = 直径 / 弹窗直径 缩放（它们与 size 同量纲），logoScale / 材质 / 轮廓 / 边纹原样照搬。
+    func reloadInlineCoinSettings() {
+        guard showsInlineCoin else { return }
+        let s = CoinSettings.load()
+        let k = Self.inlineCoinDiameter / CGFloat(max(1, s.size))
+        inlineCoin.size = Double(Self.inlineCoinDiameter)
+        inlineCoin.thickness = s.thickness * Double(k)
+        inlineCoin.markDepth = s.markDepth * Double(k)
+        inlineCoin.logoScale = s.logoScalePercent / 100
+        inlineCoin.material = s.material
+        inlineCoin.logoArt = s.logoArt
+        inlineCoin.edgeFinish = s.finish
+        inlineCoin.isHidden = false
+        needsLayout = true
+    }
+
     /// 上次布局宽度（intrinsic 高度依赖实际宽，宽度变化时需重算，见 layout()）
     private var lastLaidOutWidth: CGFloat = 0
 
@@ -828,7 +892,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 超出可用宽度时逐级缩字号（等宽 13 位数字也能放下；与原 draw 循环同参数）。
     /// 未布局（bounds 为 0）时跳过，等 layout() 就绪后复算
     private func applyTotalNumberSize(for text: String) {
-        let availWidth = bounds.width - insets.left - insets.right
+        // 可用宽要扣掉左侧内嵌硬币（它占的是同一行带），否则数字会压到硬币上
+        let availWidth = bounds.width - insets.left - insets.right - inlineCoinWidth
         guard availWidth > 40 else { return }
         var size: CGFloat = 26
         while size > 15,
@@ -1150,8 +1215,35 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             let nameRect = NSRect(x: nameX, y: y, width: nameWidths[i % nameWidths.count], height: barH)
             let valueRect = NSRect(x: valueRight - valueColWidth, y: y, width: valueColWidth, height: barH)
             let pctRect = NSRect(x: bounds.width - insets.right - 38, y: y, width: 38, height: barH)
-            for r in [nameRect, valueRect, pctRect] {
-                NSBezierPath(roundedRect: r, xRadius: barH / 2, yRadius: barH / 2).fill()
+            let shapes: [(NSRect, NSBezierPath)] = [
+                (iconRect, NSBezierPath(ovalIn: iconRect)),
+                (nameRect, NSBezierPath(roundedRect: nameRect, xRadius: barH / 2, yRadius: barH / 2)),
+                (valueRect, NSBezierPath(roundedRect: valueRect, xRadius: barH / 2, yRadius: barH / 2)),
+                (pctRect, NSBezierPath(roundedRect: pctRect, xRadius: barH / 2, yRadius: barH / 2)),
+            ]
+            // 渐变扫光（2026-09-10 用户指定）：每条灰条/圆点上叠一道左→右移动的高光
+            // 渐变带（透明→峰→透明），行程 = 形状宽 + 带宽，逐行错开 0.15 相位；
+            // clip 到形状路径内绘制，出带即熄、循环重扫。timer 驱动见 startSkeletonShimmerIfNeeded
+            startSkeletonShimmerIfNeeded()
+            let elapsed = CACurrentMediaTime() - (skeletonShimmerStart ?? CACurrentMediaTime())
+            let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let peak = isDark ? NSColor.white.withAlphaComponent(0.14) : NSColor.white.withAlphaComponent(0.65)
+            let gradient = NSGradient(colors: [peak.withAlphaComponent(0), peak, peak.withAlphaComponent(0)])
+            let rowPhase = elapsed / Self.shimmerDuration + Double(i) * 0.15
+            for (rect, path) in shapes {
+                path.fill()
+                guard let gradient else { continue }
+                let bandW = max(18, rect.width * 0.6)
+                let travel = rect.width + bandW
+                let phase = rowPhase.truncatingRemainder(dividingBy: 1)
+                let bandRect = NSRect(x: rect.minX - bandW + CGFloat(phase) * travel,
+                                      y: rect.minY, width: bandW, height: rect.height)
+                if let cg = NSGraphicsContext.current?.cgContext {
+                    cg.saveGState()
+                    path.addClip()
+                    gradient.draw(in: bandRect, angle: 0)
+                    cg.restoreGState()
+                }
             }
         }
     }
@@ -1277,6 +1369,36 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     private var lastLitDots: [(rect: NSRect, level: Int)] = []
     /// 动效期间参与淡出的旧点（起点自 lastLitDots 截取，动效结束清空）
     private var outgoingDots: [(rect: NSRect, level: Int)] = []
+
+    // MARK: 骨架行渐变扫光（占位态 shimmer，2026-09-10 用户指定）
+
+    /// 占位骨架行扫光起始时刻（nil = 非占位态）；60fps timer 每帧 needsDisplay 驱动 draw 现算相位
+    private var skeletonShimmerStart: CFTimeInterval?
+    private var skeletonShimmerTimer: Timer?
+    /// 扫光一个完整行程的时长；逐行错开 0.15 个相位
+    private static let shimmerDuration: Double = 1.6
+
+    /// 占位态扫光驱动：draw 里发现 summary 未到即启动；数据到达 / 离开窗口 / 隐藏自停
+    private func startSkeletonShimmerIfNeeded() {
+        guard skeletonShimmerTimer == nil, window != nil else { return }
+        if skeletonShimmerStart == nil { skeletonShimmerStart = CACurrentMediaTime() }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.summary == nil, self.window != nil, !self.isHidden else {
+                self.stopSkeletonShimmer()
+                return
+            }
+            self.needsDisplay = true
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        skeletonShimmerTimer = timer
+    }
+
+    private func stopSkeletonShimmer() {
+        skeletonShimmerTimer?.invalidate()
+        skeletonShimmerTimer = nil
+        skeletonShimmerStart = nil
+    }
 
     private func easeOutCubic(_ p: Double) -> Double { 1 - pow(1 - p, 3) }
     private func easeInOutCubic(_ p: Double) -> Double {
@@ -1860,6 +1982,16 @@ extension BalancePanelView {
 
     /// 创建唯一的内嵌内容视图并启动低频刷新。与卡片 hover 子面板共用 TokensPanelView
     /// 与数据仓缓存；显示平台由 refreshInlineTokens 按 Agent 组顶部平台动态解析。
+    /// 3D 硬币弹窗关闭后调用：内嵌小硬币按同一份 CoinSettings 重灌（参数同源，见 TokensPanelView）
+    func reloadInlineCoinSettings() {
+        inlineTokenView?.reloadInlineCoinSettings()
+    }
+
+    /// 面板每次打开时让内嵌小硬币自转一圈（用户 2026-09-11 指定；由 showPanel 调）
+    func spinInlineCoin() {
+        inlineTokenView?.spinInlineCoin()
+    }
+
     func setupInlineTokens() {
         let view = TokensPanelView()
         view.source = .zcode
@@ -1870,6 +2002,9 @@ extension BalancePanelView {
         view.horizontalInset = 8
         view.topInset = 4
         view.bottomInset = 3
+        // 大数字左边的内嵌小 3D 硬币：参数取自「3D 硬币」弹窗落盘的那份 CoinSettings
+        view.showsInlineCoin = true
+        view.reloadInlineCoinSettings()
         view.isHidden = true
         // 列表（项目/模型）/热力图（每日/每周）切换改变内容高度：与折叠标题同口径
         // 通知 VC 按新内容高度重算面板尺寸
@@ -1931,6 +2066,10 @@ extension BalancePanelView {
                 view.beginSwitchTransition()   // 启动平台切换动效
                 view.source = source
                 switched = true
+                // 换数据（hover Agent 卡片 / 离开回落）落地这一拍：大数字左边的小硬币也自转一圈
+                //（用户 2026-09-11 指定）。放在这里而不是 confirmTokensHover：只有**真的换了平台**
+                // 才转——同平台重复确认、取数期间来回 hover 都不会乱转。
+                view.spinInlineCoin()
                 // 注意：不在此清 summary——大数字要从旧平台值滚动到新值（slideNextTotalRoll），
                 // 先清会落 "—" 使滚动起点丢失。无数据的收尾清理由下方 guard else 分支接管
             }
@@ -1948,23 +2087,15 @@ extension BalancePanelView {
         }
     }
 
-    /// Token 板块显隐总闸：顶部平台有源 → 标题+卡片按折叠态显隐（数据未到时为
+    /// Token 板块显隐总闸：顶部平台有源 → 标题+卡片显示（数据未到时为
     /// 表头骨架空占位，2026-09-08 用户要求）；无源 → 标题+卡片一并隐藏，
-    /// 标题隐藏期间折叠态不变（点击入口已消失），数据恢复时按持久化的折叠态重新落地。
+    /// 数据恢复时重新落地。（板块已不可折叠，标题无点击入口）
     private func applyInlineTokensVisibility() {
         guard let view = inlineTokenView else { return }
         let hasData = !view.isHidden
         tokenTitleRef?.isHidden = !hasData
         guard let card = tokenCardRef else { return }
-        if hasData {
-            let collapsed = UserDefaults.standard.bool(forKey: UDKey.tokenSectionCollapsed)
-            card.isHidden = collapsed
-            if let title = tokenTitleRef {
-                (card.superview as? NSStackView)?.setCustomSpacing(collapsed ? 6 : 0, after: title)
-            }
-        } else {
-            card.isHidden = true
-        }
+        card.isHidden = !hasData
         onContentChanged?()
     }
 

@@ -4,10 +4,14 @@
 //
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
 // 布局常量    DialogMetrics（内容宽 240 / 输入类 280 / 边距 8 / 图标 66，集中处）
-// 统一壳      DialogShell（原生 NSAlert 薄封装；新弹窗一律走它，不要另起 NSAlert）
+// NSAlert 壳  DialogShell（原生 NSAlert 薄封装；轻量确认/输入类弹窗走它，别另起 NSAlert）
+// 玻璃模态壳  GlassModalShell（另一个文件：整窗 Liquid Glass 模态窗口，App 图标 header +
+//            内容块 + 保存/取消；更新窗口同配方。DeepSeek 设置 / 平台开关走它）
 // 业务弹窗    InputDialog / DeepSeekSettingsDialog / PlatformAutomationSettingsDialog
 //
-// ⚠️ 新弹窗三件套（血泪坑，详见 AGENT.md 陷阱 #6）：
+// ⚠️ 两个壳怎么选：要「和更新窗口 / 平台开关一样的玻璃浮窗」= GlassModalShell；
+//    只要一个系统小弹窗（如单行输入）= DialogShell。
+// ⚠️ DialogShell 三件套（血泪坑，详见 AGENT.md 陷阱 #6）：
 //    1) 标题/说明走 messageText + informativeText（系统排版），别自己堆 label；
 //    2) 需要自定义排版的内容放 accessoryView；
 //    3) 按钮用 addButton（第一个添加的在右侧 = 主操作、回车触发），取消按钮绑 Esc。
@@ -161,6 +165,9 @@ final class DialogShell {
         // 表现为「弹窗闪没/无任何界面可点、进程假死」。访问 alert.window 会强制
         // 实例化 NSAlert 的私有 panel，orderFrontRegardless 不依赖 app active 态。
         let modalWindow = alert.window
+        // NSAlert 是自建顶层窗口、不在面板视图树上：外观按全局镜像显式设，
+        // 否则应用内浅色主题（系统深色）时弹窗仍是系统深色
+        modalWindow.appearance = Palette.topLevelWindowAppearance
         modalWindow.orderFrontRegardless()
         let resp = alert.runModal()
         return resp.rawValue >= 1000 ? resp.rawValue - 1000 : -1
@@ -187,14 +194,46 @@ func makeAppIconSnapshot() -> NSImage? {
     return img
 }
 
-/// DeepSeek 设置弹窗：配置 DeepSeek API Key / 日常充值额度 + ZhiPu Token / Qwen Ticket 覆盖。
+/// 弹窗统一输入框（Key / 额度 弹窗四行共用）：**只用系统 bezel，不自定义外观**。
+///
+/// - 形状与内缩都交给 `bezelStyle = .roundedBezel`：系统画圆角 + 边框，并自带内缩
+///   （实测文字左起 = field 左缘 **+7pt**；关掉 bezel 只有 3pt、贴边）——
+///   不需要手写 padding，也不需要 layer 圆角 / masksToBounds。
+/// - 黑底：`NSTextField` 出厂就是 `drawsBackground = true` + `backgroundColor =
+///   .textBackgroundColor`（系统语义色），深色外观下实测渲染为近黑 0.09，
+///   一个颜色字段都不用写。
+/// - 单行：只需 `cell.wraps = false`。实测默认 `wraps = true` 会折行（长文本折成 2 行），
+///   而 `usesSingleLineMode` / `maximumNumberOfLines` / `lineBreakMode` 对是否折行毫无影响，
+///   故不再设；`cell.isScrollable = true` 保留，否则长 token 尾部滚不到。
+final class DarkInputField: NSTextField {
+    /// 统一口径：高 22 = macOS regular 尺寸控件的标准高（`cell.cellSize` 建议 23，
+    /// 系统偏好设置里的标准输入框就是 22）。探针实测：字 12 时 18 以上文字完整
+    /// （墨迹像素恒 209），16 起开始压字（207）—— 22 是下限之上的安全值。
+    static let defaultHeight: CGFloat = 22
+
+    init(value: String = "", placeholder: String? = nil) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 0, height: Self.defaultHeight))
+        stringValue = value
+        placeholderString = placeholder
+        bezelStyle = .roundedBezel
+        font = .systemFont(ofSize: 12)
+        cell?.wraps = false
+        cell?.isScrollable = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// DeepSeek 设置弹窗（面板「Key / 额度」磁贴入口）：配置 DeepSeek API Key / 日常充值额度
+/// + ZhiPu Token / Qwen Ticket 覆盖。窗口走 `GlassModalShell`（与更新窗口、平台开关弹窗同款
+/// 玻璃模态浮窗），内容为四行「label 在上、控件在下」表单；回车 = 保存、Esc = 取消。
 @MainActor
 final class DeepSeekSettingsDialog: NSObject {
-    private let apiKeyField = NSTextField()
+    private let apiKeyField: DarkInputField
     private let popup = NSPopUpButton()
-    private let customField = NSTextField()
-    private let zhipuTokenField = NSTextField()
-    private let qwenTicketField = NSTextField()
+    private let customField: DarkInputField
+    private let zhipuTokenField: DarkInputField
+    private let qwenTicketField: DarkInputField
     private let presets: [(label: String, value: Double)] = [
         ("未设置", 0),
         ("¥10", 10),
@@ -209,41 +248,15 @@ final class DeepSeekSettingsDialog: NSObject {
     ///   - zhipuToken: 当前 ZhiPu Token 覆盖（空 = 自动从浏览器登录态读取）
     ///   - qwenTicket: 当前 Qwen Ticket 覆盖（空 = 自动从浏览器登录态读取）
     init(apiKey: String, quota: Double, zhipuToken: String = "", qwenTicket: String = "") {
+        // 四个输入框一套口径（DarkInputField：系统默认外观 + 单行），不再各写一遍控件样式
+        apiKeyField = DarkInputField(value: apiKey)
+        zhipuTokenField = DarkInputField(value: zhipuToken)
+        qwenTicketField = DarkInputField(value: qwenTicket)
+        customField = DarkInputField(placeholder: "自定义额度")
         super.init()
-        apiKeyField.isBezeled = true
-        apiKeyField.bezelStyle = .roundedBezel
-        apiKeyField.isEditable = true
-        apiKeyField.isSelectable = true
-        apiKeyField.font = NSFont.systemFont(ofSize: 12)
-        apiKeyField.stringValue = apiKey
-        apiKeyField.cell?.isScrollable = true
-        apiKeyField.cell?.wraps = false
-        apiKeyField.lineBreakMode = .byTruncatingTail
-
-        zhipuTokenField.isBezeled = true
-        zhipuTokenField.bezelStyle = .roundedBezel
-        zhipuTokenField.isEditable = true
-        zhipuTokenField.isSelectable = true
-        zhipuTokenField.font = NSFont.systemFont(ofSize: 12)
-        zhipuTokenField.stringValue = zhipuToken
-        zhipuTokenField.cell?.isScrollable = true
-        zhipuTokenField.cell?.wraps = false
-        zhipuTokenField.lineBreakMode = .byTruncatingTail
-
-        qwenTicketField.isBezeled = true
-        qwenTicketField.bezelStyle = .roundedBezel
-        qwenTicketField.isEditable = true
-        qwenTicketField.isSelectable = true
-        qwenTicketField.font = NSFont.systemFont(ofSize: 12)
-        qwenTicketField.stringValue = qwenTicket
-        qwenTicketField.cell?.isScrollable = true
-        qwenTicketField.cell?.wraps = false
-        qwenTicketField.lineBreakMode = .byTruncatingTail
 
         for opt in presets { popup.addItem(withTitle: opt.label) }
         popup.menu?.addItem(withTitle: "自定义", action: nil, keyEquivalent: "")
-        customField.placeholderString = "自定义额度"
-        customField.font = NSFont.systemFont(ofSize: 12)
 
         if quota > 0 {
             if let idx = presets.firstIndex(where: { $0.value == quota }) {
@@ -268,13 +281,10 @@ final class DeepSeekSettingsDialog: NSObject {
     }
 
     func present() -> (apiKey: String?, quota: Double, zhipuToken: String?, qwenTicket: String?)? {
-        let shell = DialogShell()
-        if let icon = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: DialogMetrics.iconSize, weight: .regular)) {
-            icon.size = NSSize(width: DialogMetrics.iconSize, height: DialogMetrics.iconSize)
-            shell.addIcon(icon)
-        }
-        shell.addTitle("DeepSeek / ZhiPu / Qwen 设置")
+        // 窗口配方与平台开关弹窗 / 更新窗口同源（GlassModalShell：整窗玻璃 + 无红绿灯 +
+        // 系统 16pt 连续曲率圆角 + 同步模态）；宽度也吃壳的默认值，三个玻璃弹窗等宽
+        let shell = GlassModalShell()
+        shell.setWindowTitle("iBalance DeepSeek / ZhiPu / Qwen 设置")
         let infoAttr = NSMutableAttributedString(
             string: "配置 API Key 和日常充值额度。获取 API Key：",
             attributes: [.font: NSFont.systemFont(ofSize: 12),
@@ -285,13 +295,13 @@ final class DeepSeekSettingsDialog: NSObject {
                          .foregroundColor: NSColor.linkColor,
                          .underlineStyle: NSUnderlineStyle.single.rawValue,
                          .font: NSFont.systemFont(ofSize: 12)]))
-        shell.addInfo(infoAttr)
-        shell.contentWidth = DialogMetrics.inputWidth
+        shell.addHeader(title: "DeepSeek / ZhiPu / Qwen 设置", info: infoAttr)
 
-        // 四行设置共用一个 accessory 容器：文本在上、控件在下，统一左对齐。
-        let rowWidth = shell.contentWidth - DialogMetrics.sidePadding * 2
+        // 四行设置共用一个内容容器：文本在上、控件在下，统一左对齐。
+        let rowWidth = shell.contentWidth
         let labelHeight: CGFloat = 18
-        let controlHeight: CGFloat = 28
+        // 控件行高 = 输入框统一高（下拉也吃这个值，保证同行等高）
+        let controlHeight: CGFloat = DarkInputField.defaultHeight
         let labelControlGap: CGFloat = 4
         let rowHeight = labelHeight + labelControlGap + controlHeight
         let rowGap: CGFloat = 10
@@ -319,9 +329,9 @@ final class DeepSeekSettingsDialog: NSObject {
                                   width: rowWidth, height: labelHeight)
         let popupWidth: CGFloat = 110
         popup.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2, width: popupWidth, height: controlHeight)
-        customField.frame = NSRect(x: popupWidth + 8, y: rowHeight * 2 + rowGap * 2 + 2,
-                                   width: rowWidth - popupWidth - 8,
-                                   height: 24)
+        // 与同行下拉等高同基线（旧版这里是 24 高 + 下移 2 的例外，已统一）
+        customField.frame = NSRect(x: popupWidth + 8, y: rowHeight * 2 + rowGap * 2,
+                                   width: rowWidth - popupWidth - 8, height: controlHeight)
         content.addSubview(quotaLabel)
         content.addSubview(popup)
         content.addSubview(customField)
@@ -348,13 +358,13 @@ final class DeepSeekSettingsDialog: NSObject {
         content.addSubview(qwLabel)
         content.addSubview(qwenTicketField)
         shell.addContent(content, height: content.frame.height)
+        // 初始焦点落在内部真实输入控件上（容器本身不是响应者）
         shell.firstResponder = apiKeyField
 
-        // NSAlert 按钮顺序：先添加的在右边（默认按钮）
-        let save = shell.addButton("保存", keyEquivalent: "\r")
+        // 按钮：第一个添加的在最右 = 主操作（保存，回车）；取消绑 Esc
+        let save = shell.addButton("保存", keyEquivalent: "\r", primary: true)
         shell.addButton("取消", keyEquivalent: "\u{1b}")
-        let clicked = shell.present()
-        guard clicked == save else { return nil }
+        guard shell.present() == save else { return nil }
 
         let apiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let zpRaw = zhipuTokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -378,12 +388,17 @@ private func makeCheckbox(label: String, isOn: Bool) -> NSButton {
     return checkbox
 }
 
-/// 各平台刷新 / 自动签到 / 卡片显示开关弹窗：沿用 DialogShell 的原生标题、说明和按钮布局。
+/// 各平台刷新 / 自动签到 / 卡片显示开关弹窗：窗口配方走 `GlassModalShell`
+/// （titled + fullSizeContentView + NSGlassEffectView 整窗一块玻璃；窗口层参数、系统
+/// 16pt 连续曲率圆角与模态收口都在壳里，详见 docs/glass-modal-window-guide.md）。
+/// 内容为 NSGridView 开关表；回车 = 保存、Esc = 取消。
 @MainActor
 final class PlatformAutomationSettingsDialog: NSObject {
     private struct Row {
         let name: String
         let platformID: String
+        /// 平台名列前置图标：bundle SVG 资源名（与面板品牌卡同图，ZCode 用 "zhipu"）
+        let icon: String
         let refresh: NSButton
         let checkin: NSButton?
         let card: NSButton
@@ -429,6 +444,23 @@ final class PlatformAutomationSettingsDialog: NSObject {
         }
     }
 
+    /// 平台名列前置品牌图标：bundle SVG 裁边模板图（与面板品牌卡同名资源），
+    /// 固定 12×12 显示框 + 按比例填满，各 SVG 墨迹视觉大小统一（2026-09-10 用户指定）
+    ///
+    /// contentTintColor 必须显式设成 labelColor：模板图在 NSImageView 里的默认着色是
+    /// **secondaryLabelColor**（实测 α=0.549），比同一行的平台名 label（.labelColor，
+    /// α=0.847）淡一档，看起来像两个色号；显式指定后两者同色。
+    private static func brandIconView(_ resource: String) -> NSImageView {
+        let iv = NSImageView()
+        iv.image = BalancePanelView.trimmedBundleSvgIcon(resource, size: 12)
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        iv.contentTintColor = .labelColor
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        iv.widthAnchor.constraint(equalToConstant: 12).isActive = true
+        iv.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        return iv
+    }
+
     private let rows: [Row]
     private let initialConfig: AppConfig
     /// 行首「全选」checkbox 的控制器；action 目标需存活至弹窗关闭，由本类持有
@@ -438,6 +470,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
         initialConfig = config
         rows = [
             Row(name: "DeepSeek", platformID: "ds",
+                icon: "deepseek",
                 refresh: makeCheckbox(label: "DeepSeek 刷新", isOn: config.deepseekRefreshEnabled),
                 checkin: nil,
                 card: makeCheckbox(label: "DeepSeek 卡片显示",
@@ -445,6 +478,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
                 usage: makeCheckbox(label: "DeepSeek 用量显示",
                                     isOn: config.panelUsageVisible["ds"] ?? true)),
             Row(name: "ZhiPu", platformID: "zhipu",
+                icon: "zhipu",
                 refresh: makeCheckbox(label: "ZhiPu 刷新", isOn: config.bigmodelRefreshEnabled),
                 checkin: nil,
                 card: makeCheckbox(label: "ZhiPu 卡片显示",
@@ -452,6 +486,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
                 usage: makeCheckbox(label: "ZhiPu 用量显示",
                                     isOn: config.panelUsageVisible["zhipu"] ?? true)),
             Row(name: "Qwen", platformID: "qwen",
+                icon: "qwen",
                 refresh: makeCheckbox(label: "Qwen 刷新", isOn: config.qwenRefreshEnabled),
                 checkin: nil,
                 card: makeCheckbox(label: "Qwen 卡片显示",
@@ -459,6 +494,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
                 usage: makeCheckbox(label: "Qwen 用量显示",
                                     isOn: config.panelUsageVisible["qwen"] ?? true)),
             Row(name: "WorkBuddy", platformID: "wb",
+                icon: "workbuddy",
                 refresh: makeCheckbox(label: "WorkBuddy 刷新", isOn: config.workbuddyEnabled),
                 checkin: makeCheckbox(label: "WorkBuddy 自动签到", isOn: config.workbuddyAutoCheckin),
                 card: makeCheckbox(label: "WorkBuddy 卡片显示",
@@ -466,6 +502,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
                 usage: makeCheckbox(label: "WorkBuddy 用量显示",
                                     isOn: config.panelUsageVisible["wb"] ?? true)),
             Row(name: "TRAE", platformID: "trae",
+                icon: "trae-color",
                 refresh: makeCheckbox(label: "TRAE 刷新", isOn: config.traeRefreshEnabled),
                 checkin: makeCheckbox(label: "TRAE 自动签到", isOn: config.traeAutoCheckin),
                 card: makeCheckbox(label: "TRAE 卡片显示",
@@ -473,6 +510,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
                 usage: makeCheckbox(label: "TRAE 用量显示",
                                     isOn: config.panelUsageVisible["trae"] ?? true)),
             Row(name: "ZCode", platformID: "zcode",
+                icon: "zhipu",
                 refresh: makeCheckbox(label: "ZCode 刷新", isOn: config.zcodeRefreshEnabled),
                 checkin: nil,
                 card: makeCheckbox(label: "ZCode 卡片显示",
@@ -480,6 +518,7 @@ final class PlatformAutomationSettingsDialog: NSObject {
                 usage: makeCheckbox(label: "ZCode 用量显示",
                                     isOn: config.panelUsageVisible["zcode"] ?? true)),
             Row(name: "Codex", platformID: "codex",
+                icon: "codex",
                 refresh: makeCheckbox(label: "Codex 刷新", isOn: config.codexRefreshEnabled),
                 checkin: nil,
                 card: makeCheckbox(label: "Codex 卡片显示",
@@ -490,14 +529,17 @@ final class PlatformAutomationSettingsDialog: NSObject {
         super.init()
     }
 
+    /// 同步模态运行：保存回车 / 取消 Esc 结束模态；仅保存返回新配置。
     func present() -> AppConfig? {
-        let shell = DialogShell()
-        let icon = NSImage(systemSymbolName: "circle.grid.2x2.topleft.checkmark.filled", accessibilityDescription: nil)
-        shell.addIcon(icon)
-        shell.addTitle("平台开关")
-        shell.addInfo("选择各平台是否参与刷新、自动签到（支持签到的平台）、在面板显示余额卡片，以及是否显示该平台的用量行。")
-        shell.contentWidth = DialogMetrics.width + 8 + 60 + 54 + 4 + 30
+        let shell = GlassModalShell()
+        shell.setWindowTitle("iBalance 平台开关")
+        shell.addHeader(title: "平台开关",
+                        info: NSAttributedString(
+                            string: "选择各平台是否参与刷新、自动签到（支持签到的平台）、在面板显示余额卡片，以及是否显示该平台的用量行。",
+                            attributes: [.font: NSFont.systemFont(ofSize: 11),
+                                         .foregroundColor: NSColor.secondaryLabelColor]))
 
+        // ── 开关表格（NSGridView 列轨道对齐，口径同旧版）──
         let headerAll = NSTextField(labelWithString: "")
         let headerName = NSTextField(labelWithString: "平台")
         let headerRefresh = NSTextField(labelWithString: "刷新")
@@ -527,45 +569,46 @@ final class PlatformAutomationSettingsDialog: NSObject {
         for row in rows {
             let name = NSTextField(labelWithString: row.name)
             name.font = .systemFont(ofSize: 12)
-            name.textColor = .labelColor
+            name.textColor = .labelColor   // 图标 tint 同此色号（见 brandIconView）
+            // 平台名列：前置 bundle SVG 品牌图标（裁边模板图，12pt 显示框），
+            // 与面板品牌卡同图；取不到资源（表外平台）则只留文字
+            let nameCell = NSStackView(views: [Self.brandIconView(row.icon), name])
+            nameCell.orientation = .horizontal
+            nameCell.alignment = .centerY
+            nameCell.spacing = 5
             let rowAll = makeCheckbox(label: "\(row.name) 全选", isOn: false)
             rowAllHandlers.append(RowAllHandler(all: rowAll,
                                                 options: [row.refresh, row.checkin, row.card, row.usage].compactMap { $0 }))
             let checkinView = row.checkin ?? unavailablePlaceholder("该平台不支持签到")
             let usageView = row.usage ?? unavailablePlaceholder("该平台不支持用量显示")
-            gridRows.append([rowAll, name, row.refresh, checkinView, row.card, usageView])
+            gridRows.append([rowAll, nameCell, row.refresh, checkinView, row.card, usageView])
         }
-
-        // NSGridView 让每一列共享同一条轨道：全选列与各控件列居中，平台列左对齐，
-        // 表头、checkbox 和「—」占位符天然保持表格对齐，不再手算坐标。
         let grid = NSGridView(views: gridRows)
         let headerHeight: CGFloat = 22
         let rowHeight: CGFloat = 27
-        let rowSpacing: CGFloat = 4
-        grid.rowSpacing = rowSpacing
+        grid.rowSpacing = 4
         grid.columnSpacing = 4
         grid.xPlacement = .fill
         grid.yPlacement = .center
         grid.column(at: 0).width = 26
         grid.column(at: 0).xPlacement = .center
-        grid.column(at: 1).width = 116
+        // 平台列吃掉余量：26 + 130 + 54×4 + 间距 4×5 = 392 = 壳内容宽（旧 240 宽壳为 116）
+        grid.column(at: 1).width = 130
         grid.column(at: 1).xPlacement = .leading
-        grid.column(at: 2).width = 54
-        grid.column(at: 2).xPlacement = .center
-        grid.column(at: 3).width = 54
-        grid.column(at: 3).xPlacement = .center
-        grid.column(at: 4).width = 54
-        grid.column(at: 4).xPlacement = .center
-        grid.column(at: 5).width = 54
-        grid.column(at: 5).xPlacement = .center
+        for col in 2...5 {
+            grid.column(at: col).width = 54
+            grid.column(at: col).xPlacement = .center
+        }
         grid.row(at: 0).height = headerHeight
         for index in 1...rows.count {
             grid.row(at: index).height = rowHeight
         }
-        let gridHeight = headerHeight + CGFloat(rows.count) * rowHeight
-            + CGFloat(rows.count) * rowSpacing
-        shell.addContent(grid, height: gridHeight)
-        let save = shell.addButton("保存", keyEquivalent: "\r")
+        let gridH = headerHeight + CGFloat(rows.count) * rowHeight
+            + CGFloat(rows.count) * 4
+        shell.addContent(grid, height: gridH)
+
+        // 按钮：第一个添加的在最右 = 主操作（保存，回车）；取消绑 Esc
+        let save = shell.addButton("保存", keyEquivalent: "\r", primary: true)
         shell.addButton("取消", keyEquivalent: "\u{1b}")
         guard shell.present() == save else { return nil }
 

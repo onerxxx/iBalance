@@ -271,6 +271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         config = ConfigStore.load()
+        // 自建顶层窗口（模态壳 / 更新窗）的外观来源：必须在任何窗口弹出前与配置同步
+        Palette.lightThemeActive = config.lightThemeEnabled
         // Codex 登录态来自本机 auth.json；启动时自动纳入账号列表，按钮仍可手动重新导入/更新凭据。
         if case .success(let account) = CodexService.importCurrentAccount(),
            !config.codexAccounts.contains(where: { $0.uid == account.uid }) {
@@ -339,6 +341,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         menu.addItem(apiKeyMenuItem)
 
         menu.addItem(NSMenuItem.separator())
+
+        // 检查更新：手动入口，全程复用更新窗口（发现新版拉窗，无新版/失败走 NSAlert 终态）
+        let checkUpdateItem = NSMenuItem(title: "检查更新…", action: #selector(onCheckForUpdate), keyEquivalent: "")
+        checkUpdateItem.target = self
+        menu.addItem(checkUpdateItem)
 
         let aboutItem = NSMenuItem(title: "关于 iBalance", action: #selector(onAbout), keyEquivalent: "")
         aboutItem.target = self
@@ -733,12 +740,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onToggleLightTheme = { [weak self] in self?.onToggleLightTheme() }
         panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
         panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
-        panel.onToggleStatusDebugPreview = { [weak self] in self?.onToggleStatusDebugPreview() }
         panel.onToggleLongProgressCard = { [weak self] in self?.onToggleLongProgressCard() }
         panel.onToggleIconThemeSwap = { [weak self] in self?.onToggleIconThemeSwap() }
         panel.onToggleVerticalLineProgress = { [weak self] in self?.onToggleVerticalLineProgress() }
         panel.onAbout = { [weak self] in self?.onAbout() }
+        panel.onShowCoinDemo = { [weak self] in self?.onShowCoinDemo() }
         panel.onCheckForUpdate = { [weak self] in self?.onCheckForUpdate() }
+        panel.onRunUpdateDemo = { [weak self] in self?.runUpdateDemo() }
         panel.onToggleUpdateAutoCheck = { [weak self] in self?.onToggleUpdateAutoCheck() }
         panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
         panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
@@ -900,6 +908,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // popover 窗口默认不是 key window：.transient 只在 key window 状态下
         // 才会响应「面板外点击」关闭，且非 key 时玻璃材质同样偏暗 → 强制置 key。
         popover.contentViewController?.view.window?.makeKey()
+        // 每次打开面板：Token 板块大数字左边那枚小硬币自转一圈（用户 2026-09-11 指定）
+        panel.spinInlineCoin()
         // 锁定面板原始 origin，并用 KVO 监听 popover window frame 变化：
         // 菜单栏 title 更新导致 button 宽度变化、popover 自动 reposition 时，
         // 立即（无动画）把 window 拉回原位，避免面板跳动后归位的视觉抖动。
@@ -985,6 +995,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 为系统 NSAlert 让路的关闭不 hide：hide 会把刚弹出的 modal alert 一起
         // 藏掉（弹窗一闪即逝的根因）；alert 结束后自行归还焦点
         if isPresentingSystemAlert { return }
+        // 非模态更新窗口已打开（演示/手动更新在面板打开时触发 → 窗口成为 key →
+        // popover 收起走到这里）：hide 会连它一起藏掉（同一「一闪即逝」根因），
+        // 焦点已由该窗口接管，跳过归还
+        if updateProgressWinRef?.isVisible ?? false { return }
         NSApp.hide(nil)
     }
 
@@ -1111,12 +1125,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.checkinDone = UserDefaults.standard.string(forKey: UDKey.traeCheckinDate(ac.uid)) == today
-            // 签到已关闭的平台不显示失败角标（当日失败标记仍保留，重新开启后可见）；
-            // 风控（9074/操作太频繁）也显示角标，但颜色为橙黄（checkinRisk）
-            let traeRiskToday = UserDefaults.standard.string(forKey: UDKey.traeCheckinRiskDate(ac.uid)) == today
-            snap.checkinFailed = config.traeAutoCheckin
-                && (UserDefaults.standard.string(forKey: UDKey.traeCheckinFailDate(ac.uid)) == today || traeRiskToday)
-            snap.checkinRisk = config.traeAutoCheckin && traeRiskToday
+            // TRAE 卡片不再显示任何签到角标（2026-09-10 用户定稿）：失败/风控标记仍照常
+            // 写入 UserDefaults（菜单栏统计、签到历史口径不变），仅卡片快照不置位
+            // checkinFailed/checkinRisk，角标（红失败/橙风控）随之隐藏
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
             snap.pulsing = traePulsingTracker.isPulsing(ac.uid)
@@ -1232,34 +1243,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 snap.taskState = AgentTaskStatusStore.codexVisible
             }
             s.codexAccounts.append(snap)
-        }
-        // 状态调试预览（设置卡片开关）：按面板 Agent 板块显示序，把三态光环轮派
-        // 前三张实际存在的 Agent 当前账号卡（进行中/完成/中断），覆盖真实状态供预览；
-        // 关闭即恢复：WB/ZCode/Codex 回到上方 store 真实值，TRAE 恒 nil（光环隐藏）。
-        // 光环视图全平台挂载，开关翻转由 Panel.update 清 uid 缓存重置调试动画实例，
-        // 此处只负责写入调试数据。
-        s.statusDebugPreview = config.statusDebugPreview
-        if config.statusDebugPreview {
-            let agentIDs = (panelView?.platformOrder ?? BalancePlatform.defaultOrder).filter {
-                panelView?.isAgentPlatform($0) ?? ($0 != "ds" && $0 != "zhipu" && $0 != "qwen")
-            }
-            let debugStates: [AgentTaskState] = [.running, .completed, .interrupted]
-            var slot = 0
-            func assignDebug(_ accounts: inout [AccountCardSnapshot]) {
-                guard slot < debugStates.count,
-                      let i = accounts.firstIndex(where: { $0.isCurrent }) else { return }
-                accounts[i].taskState = debugStates[slot]
-                slot += 1
-            }
-            for pid in agentIDs {
-                switch pid {
-                case "wb": assignDebug(&s.wbAccounts)
-                case "zcode": assignDebug(&s.zcodeAccounts)
-                case "trae": assignDebug(&s.traeAccounts)
-                case "codex": assignDebug(&s.codexAccounts)
-                default: break
-                }
-            }
         }
         // ── 日/周用量（本地差值基线，见 UsageStore；平台行 = 全部账号用量加总）──
         func fmtUsage(_ v: Double, percent: Bool, decimals: Int) -> String {
@@ -1495,6 +1478,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func onToggleLightTheme() {
         config.lightThemeEnabled = !config.lightThemeEnabled
         ConfigStore.save(config)
+        // 自建顶层窗口的外观镜像：模态壳在 present 时读它，已开着的更新窗立即重染
+        Palette.lightThemeActive = config.lightThemeEnabled
+        updateProgressWinRef?.applyThemeAppearance()
         // popover 窗口外观（含箭头）必须同步重设，否则停留在启动时的主题
         popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
                                                                 gradientOn: config.panelGradientEnabled)
@@ -1516,13 +1502,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// 状态调试预览：切换开关（三态光环轮派前三张 Agent 卡演示动画；关闭恢复真实状态）。
-    @objc private func onToggleStatusDebugPreview() {
-        config.statusDebugPreview.toggle()
-        ConfigStore.save(config)
-        syncPanel()
-    }
-
     /// 长进度卡片：余额卡片进度条独占整行（左缘=主标题最左）+ 副标题下移一行
     ///（design/balance-card-mode.html 口径），保存后经快照同步重建卡片
     @objc private func onToggleLongProgressCard() {
@@ -1538,7 +1517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// 竖线进度条：切换开关（长进度卡片整行条替换为 50 条 1.5pt 竖线，间隔自适应、无背景无边框）
+    /// 竖线进度条：切换开关（长进度卡片整行条替换为等宽竖线，条数/线宽见 UsageDots.lineCount/lineWidth）
     @objc private func onToggleVerticalLineProgress() {
         config.verticalLineProgress.toggle()
         ConfigStore.save(config)
@@ -1601,6 +1580,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         _ = keepPanelAliveDuring { shell.present() }
     }
 
+    // MARK: - 3D 硬币演示
+
+    /// 操作磁贴「3D 硬币」：玻璃模态里放一版 native 复刻的 mintform CSS 3D token。
+    /// 弹窗内容是自绘实时动画，必须包在 keepPanelAliveDuring 内（否则 .transient popover
+    /// 会把与弹窗的交互当成「点击面板外」先关面板）。
+    @objc private func onShowCoinDemo() {
+        keepPanelAliveDuring { CoinDemoDialog.present() }
+        // 弹窗里改的参数刚落盘：Token 板块大数字左边那枚小硬币按同一份 CoinSettings 重灌，
+        // 保证「同一个币、两种尺寸」始终一致
+        panelView?.reloadInlineCoinSettings()
+    }
+
     // MARK: - App 自更新（GitHub Releases）
 
     @objc private func onToggleUpdateAutoCheck() {
@@ -1629,7 +1620,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// 更新进度窗（手动检查全程复用同一实例；关闭后再开自动重建）
-    private lazy var updateProgressWin = UpdateProgressWindowController()
+    private var updateProgressWinRef: UpdateProgressWindowController?
+    /// 取（必要时创建）更新窗——只在真正要展示时访问；仅问「开着没」用 updateProgressWinRef
+    private var updateProgressWin: UpdateProgressWindowController {
+        if let existing = updateProgressWinRef { return existing }
+        let created = UpdateProgressWindowController()
+        updateProgressWinRef = created
+        return created
+    }
     /// 更新流程进行中标志：防止连点磁贴/自动检查与手动检查并发跑两条流程
     private var updateFlowRunning = false
 
@@ -1715,9 +1713,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: "好")
+        // 同上：NSAlert 窗口不在面板视图树上，外观按全局镜像显式设
+        alert.window.appearance = Palette.topLevelWindowAppearance
         _ = alert.runModal()
         // 归还焦点：仅当无其它可见窗口时（避免把更新窗口/浮窗连坐隐藏）
-        if !updateProgressWin.isVisible && !(floatingPanel?.isVisible ?? false) {
+        if !(updateProgressWinRef?.isVisible ?? false) && !(floatingPanel?.isVisible ?? false) {
             NSApp.hide(nil)
         }
     }
@@ -1754,20 +1754,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 点取消 = 结束演示（与真实流程的取消语义一致：关窗）。
     @MainActor
     private func runUpdateDemo() {
-        let notes = """
-        · 更新窗口重构：固定尺寸 + Phase 状态机，状态切换零重置零闪烁
-        · 检查更新后台化：无新版/网络故障改用系统弹窗提示
-        · 修复发现新版后弹窗与窗口闪退（runModal 连坐问题）
-        · 修复更新日志文本框选中复制、滚动体验
-        """
-        updateProgressWin.showUpdateAvailable(
-            version: "999.0.0",
-            current: UpdateService.currentVersion(),
-            notes: notes,
-            onInstall: { [weak self] in
-                Task { @MainActor in await self?.runInstallDemo() }
-            },
-            onLater: {})
+        // 更新描述读真实 GitHub Releases 最新版文本（与真实流程同一数据源与清洗规则，
+        // 调试所见即线上所得）；版本号仍用 999.0.0 标记演示态。取不到时在框内明示失败。
+        Task { @MainActor in
+            var notes = "（获取 Release 文本失败，检查网络后重试）"
+            if let rel = try? await UpdateService.fetchLatestRelease() {
+                let trimmed = rel.notes
+                    .split(separator: "\n")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty && !$0.lowercased().contains("sha256") }
+                    .joined(separator: "\n")
+                if !trimmed.isEmpty { notes = trimmed }
+            }
+            updateProgressWin.showUpdateAvailable(
+                version: "999.0.0",
+                current: UpdateService.currentVersion(),
+                notes: notes,
+                glowTuning: true,       // 演示窗口附「发光参数」调试区（可拖动实时预览）
+                onInstall: { [weak self] in
+                    Task { @MainActor in await self?.runInstallDemo() }
+                },
+                onLater: {})
+        }
     }
 
     @MainActor
@@ -2882,7 +2890,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 通过 Bundle ID 启动应用，找不到时弹出 alert 提示并保持面板不关闭。
     private func openApp(bundleId: String, missingTitle: String, missingMsg: String) {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
+        // 仅用于存在性检查（缺失时提示），真正启动交给 ProcessUtil
+        guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) != nil else {
             let shell = DialogShell()
             shell.addTitle(missingTitle)
             shell.addInfo(missingMsg)
@@ -2890,7 +2899,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             _ = keepPanelAliveDuring { shell.present() }
             return
         }
-        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+        // 走 ProcessUtil（/usr/bin/open + 净化环境）：NSWorkspace.openApplication 会把
+        // iBalance 的进程环境原样传给目标 Electron 应用，毒变量会让它 Node 模式秒退
+        ProcessUtil.openApp(bundleId: bundleId, label: bundleId)
     }
 
     // MARK: - 工具
@@ -2983,19 +2994,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return 1
     }
 
-    /// 到期倒计时文案分段（ZCode/Codex/Qwen/WB/TRAE 共用）：返回 ["剩余","x天","HH:MM"]
-    /// 或 ["剩余","HH:MM"]；已到期 → nil（由调用方给各自的提示文案）。
+    /// 到期倒计时文案分段（ZCode/Codex/Qwen/WB/TRAE 共用）：剩余 ≥1 天 → ["剩余","x天"]
+    /// （2026-09-10 简化：只显示天数）；剩余 <1 天 → ["剩余","HH:MM"]；
+    /// 已到期 → nil（由调用方给各自的提示文案）。
     /// 段间 2pt 间距由面板副标题 stack 布局提供（stack.spacing=2），不再用空格字符做间隔。
     private static func expireCountdownText(endsAt: TimeInterval) -> [String]? {
         let remainSec = endsAt - Date().timeIntervalSince1970
         guard remainSec > 0 else { return nil }
         let total = Int(remainSec)
         let days = total / 86400
+        if days > 0 {
+            return ["剩余", "\(days)天"]
+        }
         let h = (total % 86400) / 3600
         let m = (total % 3600) / 60
-        if days > 0 {
-            return ["剩余", "\(days)天", String(format: "%02d:%02d", h, m)]
-        }
         return ["剩余", String(format: "%02d:%02d", h, m)]
     }
 

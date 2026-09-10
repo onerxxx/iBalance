@@ -662,7 +662,7 @@ final class UsageDots: NSView {
     /// 未点亮 = 热力图底点色 heatDotEmpty；无背景无边框（draw 直绘，隐藏轨道/填充层）。
     /// 历史口径：09-06 为连续竖条（1pt 边框+内缩填充），已被本点阵替换。须在进视图层级前置位
     var isVertical = false { didSet { needsLayout = true } }
-    /// 竖线模式（2026-09-07 用户指定，仅长进度卡片整行条替换形态）：50 条 1.5pt 竖线横向排列，
+    /// 竖线模式（2026-09-07 用户指定，仅长进度卡片整行条替换形态）：等宽竖线横向排列，条数与线宽见下方常量，
     /// 间隔自适应容器宽；已填充=轨道同款绿渐变按横向位置采样、未填充=浅灰线；
     /// 无轨道背景无边框（隐藏 track/progress 层，draw 直绘）。与 isVertical 互斥，勿同开
     var lineBarMode = false {
@@ -674,10 +674,11 @@ final class UsageDots: NSView {
             needsDisplay = true
         }
     }
-    /// 竖线条数与线宽（间隔 = (容器宽 − 条数×线宽) ÷ (条数−1)，自适应；
-    /// 2026-09-07 用户多轮调参：30×1 → 60×1 → 50×1.5）
-    private static let lineCount = 50
-    private static let lineWidth: CGFloat = 1.5
+    // ══ 竖线模式几何：**唯一改参入口**（其他任何文件的注释一律不写数值，避免与实现漂移）══
+    /// 间隔 = (容器宽 − 条数×线宽) ÷ (条数−1)，自适应且 clamp ≥ 0；总占宽 = 条数 × 线宽。
+    /// 历史调参：30×1 → 60×1 → 50×1.5 → 40×5.5 → 32×4 → 30×3 → 33×3 → 36×3 → 40×3
+    private static let lineCount = 40
+    private static let lineWidth: CGFloat = 3
     /// 未填充线透明度（dotsDim 再乘此系数；比轨道 0.45 更浅，避免整排灰线读作背景）
     private static let emptyLineAlpha: CGFloat = 0.35
     /// 竖排点阵：点数与圆角比例（圆角 = 边长 × 0.2，2026-09-07 用户「减小圆角」，原 0.3 同热力图口径）
@@ -808,7 +809,7 @@ final class UsageDots: NSView {
             NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
         }
     }
-    /// 竖线模式直绘：50 条 1.5pt 竖线，间隔 = (宽 − 条数×线宽) ÷ (条数−1) 自适应；线位按
+    /// 竖线模式直绘：条数与线宽见上方常量，间隔 = (宽 − 条数×线宽) ÷ (条数−1) 自适应；线位按
     /// backing 像素取整防亚像素发糊（coin 图标同款教训）；无轨道背景无边框
     private func drawLineBar() {
         let count = Self.lineCount

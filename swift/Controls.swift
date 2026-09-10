@@ -5,9 +5,11 @@
 // 开关          MiniSwitch（原生 NSSwitch .mini 视觉缩 0.81）/ MonoCharSwitch（Mono 模式字符开关）
 //               SwitchRowTapHandler（整行点击手势的 target，必须被行强持有否则失效）
 // 下拉          CompactPopUpButton（9pt 字号）
-// 卡片容器       HoverCard（hover 渐变 + 整卡 hitTest 接管）/ ActionTileButton（操作磁贴，继承 HoverCard）
+// 卡片容器       HoverCard（hover 材质由容器共享 HoverMaterialHost + 整卡 hitTest 接管）
+//               ActionTileButton（操作磁贴，继承 HoverCard）
 // 行容器         HoverRowView（hover 提亮背景+文本）/ SubAccountItemView（其余账号 chip，点击切号）
 // 图标按钮       HoverIconButton / RefreshIconButton（刷新自转，CAAnimationDelegate）
+// 分段 hover      SegmentedHoverOverlay（NSSegmentedControl 无公开 hover API：穿透层自绘高光）
 // 玻璃与遮罩      TintedVisualEffectView（面板玻璃，继承面板遮罩色）/ TintOverlayView
 // 滚动提示层      ScrollFadeHint（顶/底缘渐隐，参数 FadeHintParams，config.json 的 fade_hint_* 可覆盖）
 // pin 浮窗 resize  PanelResizeHandle（浮窗自绘把手；**仅高度可调**，宽度恒等于起拖宽）
@@ -182,6 +184,15 @@ final class SwitchRowTapHandler: NSObject {
         if char.lastMouseDownHandled {
             char.lastMouseDownHandled = false
             return
+        }
+        // 点击落在行内按钮上（如「自动检查更新」行的手动检查按钮）不翻转开关，
+        // 按钮自身 action 已处理该次点击；hitTest 沿 superview 链回溯，覆盖按钮的子视图。
+        if let row = sender.view, let hit = row.hitTest(sender.location(in: row)) {
+            var v: NSView? = hit
+            while let cur = v, cur !== row {
+                if cur is NSButton { return }
+                v = cur.superview
+            }
         }
         let active: NSControl = char.isHidden ? sw : char
         active.performClick(nil)
@@ -863,6 +874,161 @@ final class HoverIconButton: NSButton, PanelScrollHoverSync {
     }
 }
 
+/// NSSegmentedControl 的 hover 高光层（2026-09-10：header 分段控件 hover 反馈）
+///
+/// 为什么必须自绘：AppKit 对分段控件**没有任何公开 hover API**（AppKit 头文件里
+/// hover 关键字零命中；NSSegmentedCell 虽有私有 rollover 开关
+/// `_inactiveStateShowsRollovers:forSegment:`，实测默认已是 true，且 macOS 26+ 的分段
+/// 控件绘制已交给内部 SwiftUI hosting view（_NSCoreHostingView<AppKitSegmentedControl>），
+/// cell 层状态不再驱动外观）→ 只能在控件之上叠一层自己画。
+///
+/// 形态：与控件四边严格对齐、盖在其上的**鼠标穿透**视图，只画「当前悬停段」的圆角胶囊高光。
+/// ⚠️ hitTest 恒 nil：点击/菜单/tooltip 必须落回分段控件；
+///    tracking area 也直接挂在**控件**上（owner = 本视图），不依赖 hitTest 是否命中本视图。
+final class SegmentedHoverOverlay: NSView, PanelScrollHoverSync {
+    /// 高光相对段矩形的内缩（上下多缩 1pt 于左右，避让玻璃边框的镜面高光线）
+    private static let inset = NSSize(width: 1.5, height: 2.5)
+    /// 高光填充透明度：深色下叠白提亮、浅色下叠黑压暗（两个外观都看得见）
+    private static let highlightAlpha: CGFloat = 0.10
+
+    private weak var control: NSSegmentedControl?
+    private let highlightLayer = CALayer()
+    private var trackingArea: NSTrackingArea?
+    private var hoveredSegment: Int?
+    /// 已挂 tracking area 时控件的 bounds：变化才重建（layout 会高频调用）
+    private var trackedBounds: NSRect = .zero
+
+    init(control: NSSegmentedControl) {
+        self.control = control
+        super.init(frame: .zero)
+        wantsLayer = true
+        highlightLayer.opacity = 0
+        highlightLayer.masksToBounds = true
+        layer?.addSublayer(highlightLayer)
+        applyHighlightColor()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 鼠标穿透：本视图只负责画高光，不参与事件命中
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// 挂到控件的父视图（必须在控件之后 addSubview，否则高光被控件盖住）
+    func attach(to parent: NSView) {
+        guard let c = control else { return }
+        translatesAutoresizingMaskIntoConstraints = false
+        parent.addSubview(self)
+        NSLayoutConstraint.activate([
+            leadingAnchor.constraint(equalTo: c.leadingAnchor),
+            trailingAnchor.constraint(equalTo: c.trailingAnchor),
+            topAnchor.constraint(equalTo: c.topAnchor),
+            bottomAnchor.constraint(equalTo: c.bottomAnchor),
+        ])
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // 换窗（popover ↔ pin 浮窗）不派发 mouseExited：高光会卡在亮态 → 强制归零，
+        // 鼠标仍在段上时系统会补发 entered（同 HoverIconButton）
+        clearHover(animated: false)
+        installTrackingArea()
+    }
+
+    override func layout() {
+        super.layout()
+        installTrackingArea()
+        // 尺寸随系统外观/控件高度浮动：已显示时静默跟随（无动画，避免隐式位移）
+        if let i = hoveredSegment { applyHighlightGeometry(i) }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyHighlightColor()
+    }
+
+    // MARK: - tracking（区域挂在控件上，owner 是本视图）
+
+    private func installTrackingArea() {
+        guard let c = control, window != nil, !c.bounds.isEmpty, c.bounds != trackedBounds else { return }
+        if let ta = trackingArea { c.removeTrackingArea(ta) }
+        trackedBounds = c.bounds
+        let ta = NSTrackingArea(rect: c.bounds,
+                                options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways],
+                                owner: self, userInfo: nil)
+        c.addTrackingArea(ta)
+        trackingArea = ta
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard HoverEnterValidation.isPlausible(event, in: self) else { return }
+        updateHoveredSegment(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) { updateHoveredSegment(with: event) }
+
+    override func mouseExited(with event: NSEvent) { setHoveredSegment(nil) }
+
+    /// 按事件位置解算悬停段（段等宽：与 Panel.headerSegmentScreenRect 同口径均分）
+    private func updateHoveredSegment(with event: NSEvent) {
+        guard let c = control, c.segmentCount > 0, event.window != nil else { return }
+        let p = c.convert(event.locationInWindow, from: nil)
+        let w = c.bounds.width / CGFloat(c.segmentCount)
+        guard w > 0 else { return }
+        let idx = max(0, min(c.segmentCount - 1, Int(p.x / w)))
+        setHoveredSegment(idx)
+    }
+
+    private func setHoveredSegment(_ index: Int?) {
+        guard index != hoveredSegment else { return }
+        let wasVisible = hoveredSegment != nil
+        hoveredSegment = index
+        guard let i = index else {
+            animateLayerKey(highlightLayer, keyPath: "opacity", to: 0)
+            return
+        }
+        applyHighlightGeometry(i)
+        // 首次进入淡入；段间切换直接跳位（与原生 hover 一致，不做滑动）
+        if wasVisible {
+            highlightLayer.opacity = 1
+        } else {
+            animateLayerKey(highlightLayer, keyPath: "opacity", to: 1)
+        }
+    }
+
+    private func applyHighlightGeometry(_ index: Int) {
+        let w = bounds.width / CGFloat(max(1, control?.segmentCount ?? 1))
+        var rect = CGRect(x: CGFloat(index) * w, y: 0, width: w, height: bounds.height)
+        rect = rect.insetBy(dx: Self.inset.width, dy: Self.inset.height)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)   // 禁止 layer 隐式动画（位置只按显式动画走）
+        highlightLayer.frame = rect
+        highlightLayer.cornerRadius = rect.height / 2
+        CATransaction.commit()
+    }
+
+    private func applyHighlightColor() {
+        let c = NSColor.labelColor.withAlphaComponent(Self.highlightAlpha).cgColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        highlightLayer.backgroundColor = c
+        CATransaction.commit()
+    }
+
+    private func clearHover(animated: Bool) {
+        hoveredSegment = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        highlightLayer.removeAllAnimations()
+        highlightLayer.opacity = 0
+        CATransaction.commit()
+    }
+
+    // MARK: - 面板滚动 hover 同步
+    func syncHoverState(_ inside: Bool) {
+        if !inside { setHoveredSegment(nil) }
+    }
+}
+
 /// 手动刷新按钮：点击时图标顺时针旋转一圈。
 /// AppKit layer-backed 视图经 Auto Layout 同步会把 anchorPoint 重置为 (0,0)，
 /// 直接旋转会绕左下角转；需在 layout() 里恢复中心锚点 + 补偿 position（同 MiniSwitch 思路）。
@@ -1024,7 +1190,9 @@ extension RefreshIconButton: CAAnimationDelegate {
     }
 }
 
-/// 余额卡片容器：hover 时显示 8% 背景圆角，并切换签到信息子视图颜色。
+/// 余额卡片容器：hover 材质（渐变背景 + 1.2pt 发丝描边）由容器共享的
+/// `HoverMaterialHost` 统一承载——材质是**一个实体**，hover 在卡片之间转移时整块
+/// 滑过去并停住；本卡只报告进出与自己的几何，并切换签到信息子视图颜色。
 /// 点击卡片触发 onClick 回调（如打开对应平台主页或应用）。
 class HoverCard: NSView, PanelScrollHoverSync {
     private var trackingArea: NSTrackingArea?
@@ -1051,8 +1219,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
     var onDragEnded: (() -> Void)?
     /// hover 状态回调：true=进入，false=离开（如「悬停显示昵称」）
     var onHover: ((Bool) -> Void)?
-    /// hover 确认时长（Agent 卡 Token 板块切换用）：设置后进入卡片按常规淡入 hover
-    /// 背景，驻留满时长触发 onHoverConfirmed；提前真实离开取消并复位。几何变化补发的
+    /// hover 确认时长（Agent 卡 Token 板块切换用）：设置后进入卡片按常规亮起 hover
+    /// 材质，驻留满时长触发 onHoverConfirmed；提前真实离开取消并复位。几何变化补发的
     /// exit（事件位置仍在卡内）与补发 enter（isMouseInside 未清）均不重置计时，
     /// 避免确认切换引发高度变化后重跑。
     /// （原「光晕下移进度填充」视觉随烘焙位图一起删除——2026-09-08 用户要求去掉
@@ -1062,32 +1230,29 @@ class HoverCard: NSView, PanelScrollHoverSync {
     var onHoverConfirmed: (() -> Void)?
     private var dwellWork: DispatchWorkItem?
     private var dwellConfirmed = false
-    /// hover 效果容器：背景淡入淡出
-    private let hoverEffectLayer = CALayer()
-    /// hover 背景层：统一 hover 渐变（Palette.hoverGradient*）
-    private let hoverGradientLayer = CAGradientLayer()
+    /// 最近一次用过的共享 hover 材质宿主（卡片被移出层级后 superview 链已断，靠它收材质）
+    private weak var cachedMaterialHost: HoverMaterialHost?
 
-    /// 卡片默认无边框；hover 时出现 1.2pt 描边（2026-09-08 用户澄清口径：
-    /// 「卡片默认无边框, hover 时 1.2pt alpha 18% 全部统一」）。
-    /// hover 色 = hoverBorderBright（深浅统一 18%）；常态色 = hoverBorderNormal 仅作
-    /// 动画起点/模型值。全部卡片同走外层描边（烘焙位图边框带已删）。
-    private func setHoverBorder(isVisible: Bool, animated: Bool) {
-        let width: CGFloat = isVisible ? Palette.cardBorderWidth : 0
-        let targetColor = Palette.borderCGColor(
-            isVisible ? Palette.hoverBorderBright : Palette.hoverBorderNormal, in: self)
-        // borderColor 模型值若为 nil（外部 reset 或初始化未配置卡背景），先补常态色：
-        // 否则 animateLayerKey 的 fromValue 会读空为零色 → 第一帧从纯黑透明闪到目标色，
-        // 视觉上像"边框先消失再出现"的抖动。
-        if layer?.borderColor == nil {
-            layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
-        }
-        if animated {
-            animateLayerKey(layer, keyPath: "borderWidth", to: width)
-            animateLayerKey(layer, keyPath: "borderColor", to: targetColor)
+    /// hover 材质（渐变背景 + 发丝描边）由容器共享（`HoverMaterialHost`），本卡不自持图层：
+    /// 材质是**一个实体**，hover 在卡片之间转移时整块滑过去并停住，而不是两卡各自
+    /// 淡入 / 被自身边界裁成蒙版式的滑入（2026-09-10 用户口径：「这个框要完整的从一个卡片
+    /// 位置移动到另个卡片的位置然后停住」、「背景色现在也跟随边框移动，而不是蒙版」）。
+    /// 未安装宿主的窗口（若将来有）只是没有 hover 材质，其余外观不受影响。
+    private func syncHoverMaterial(_ visible: Bool, immediate: Bool = false) {
+        let host = hoverMaterialHost ?? cachedMaterialHost
+        guard let host else { return }
+        cachedMaterialHost = host
+        if visible {
+            host.show(for: self, immediate: immediate)
         } else {
-            layer?.borderWidth = width
-            layer?.borderColor = targetColor
+            host.cardDidExit(self)
         }
+    }
+
+    /// 卡片被移出层级（账号重建）时 superview 链已断，靠缓存的宿主通知收材质
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { cachedMaterialHost?.cardDidExit(self) }
     }
 
     var dragContentLayer: CALayer? { dragContentView?.layer }
@@ -1108,47 +1273,6 @@ class HoverCard: NSView, PanelScrollHoverSync {
         dragContentView?.layer?.opacity = opacity
     }
 
-    /// 拖拽截图前同步准备 hover 外观。
-    ///
-    /// 拖拽通常发生在 mouseEntered 的 hover 动画尚未完成时；如果直接截图，
-    /// 幽灵卡片会偶尔缺少 hover 背景。这里只同步绘制层，不改变 hover 状态、
-    /// 不触发 onHover，避免拖动起手误触发账号条/Token 板块切换。
-    func prepareDragSnapshotAppearance() {
-        hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
-        layer?.removeAnimation(forKey: "borderWidthTransition")
-        layer?.removeAnimation(forKey: "borderColorTransition")
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        hoverEffectLayer.isHidden = false
-        hoverEffectLayer.opacity = 1
-        // 尺寸若改变导致渐变端点过期，截图角上会露出断层——截图前主动对齐一次。
-        let pts = Palette.gradientEndpoints(angleDeg: Palette.hoverGradientAngleDeg, in: bounds)
-        hoverGradientLayer.startPoint = pts.start
-        hoverGradientLayer.endPoint = pts.end
-        setHoverBorder(isVisible: true, animated: false)
-        CATransaction.commit()
-    }
-
-    /// 内容快照模式的边框色暂存（setContentOnlySnapshotAppearance 配对恢复）
-    private var snapshotSavedBorderColor: CGColor?
-
-    /// 内容快照模式（拖拽幽灵两段式合成用）：临时隐藏背景层（hover 渐变）并
-    /// 清空 layer 边框，使缓存截图只含内容像素（透明底）；用后必须配对恢复。
-    /// 任务状态光环由拖拽侧独立隐藏（draggingHiddenStatusRings），此处不涉及
-    func setContentOnlySnapshotAppearance(_ hidden: Bool) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        hoverEffectLayer.isHidden = hidden
-        if hidden {
-            snapshotSavedBorderColor = layer?.borderColor
-            layer?.borderColor = NSColor.clear.cgColor
-        } else if let saved = snapshotSavedBorderColor {
-            layer?.borderColor = saved
-            snapshotSavedBorderColor = nil
-        }
-        CATransaction.commit()
-    }
-
     /// 幽灵卡片移除后，实际卡片可能没有收到新的 mouseEntered/mouseExited，
     /// 因此归位时必须用窗口当前光标位置重新判断 hover，而不是只依赖旧状态。
     private func isPointerInsideCard() -> Bool {
@@ -1166,16 +1290,15 @@ class HoverCard: NSView, PanelScrollHoverSync {
         return isPointerInsideCard()
     }
 
-    /// 离开收尾：取消进度 + 状态复位 + hover 材质淡出 + onHover(false)。
-    /// mouseExited 真实离开路径与 dwell 计时落点自检共用（保证两条路径视觉/回调一致）。
+    /// 离开收尾：取消进度 + 状态复位 + hover 材质交给宿主（宽限后淡出 / 下一张卡接管）
+    /// + onHover(false)。mouseExited 真实离开路径与 dwell 计时落点自检共用
+    /// （保证两条路径视觉/回调一致）。
     private func performHoverExitVisuals() {
         cancelHoverDwell()
         isMouseInside = false
         suppressEnterUntilExit = false
         if isDragHoverLocked { return }
-        // hover 背景淡出，露出容器统一背景
-        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
-        setHoverBorder(isVisible: false, animated: true)
+        syncHoverMaterial(false)
         onHover?(false)
     }
 
@@ -1189,86 +1312,47 @@ class HoverCard: NSView, PanelScrollHoverSync {
         if inside { mouseEntered(with: NSEvent()) } else { mouseExited(with: NSEvent()) }
     }
 
-    /// 拖拽期间锁住 hover 材质，避免卡片随幽灵位置移动到光标下方时重新淡入变亮。
-    /// 归位交接时传入 animated=false，直接切换到最终状态，避免与幽灵卡片重叠一帧。
+    /// 拖拽期间收起 hover 材质，避免卡片随幽灵位置移动到光标下方时重新亮起。
+    /// 归位交接时传入 animated=false，直接落到最终状态，避免与幽灵卡片重叠一帧。
     func setDragHoverLocked(_ locked: Bool, animated: Bool = true) {
         guard isDragHoverLocked != locked else { return }
         isDragHoverLocked = locked
         if locked {
             cancelHoverDwell()
-            hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
-            layer?.removeAnimation(forKey: "borderWidthTransition")
-            layer?.removeAnimation(forKey: "borderColorTransition")
-            // 占位卡片只保留静态内容，不继承按下拖动前已经存在的 hover 材质。
-            // 关闭隐式动画，避免从 hover 状态切到占位状态时再闪一帧。
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            hoverEffectLayer.opacity = 0
-            hoverEffectLayer.isHidden = true
             layer?.backgroundColor = dragNormalBackgroundColor ?? kCardBackground.cgColor
-            setHoverBorder(isVisible: false, animated: false)
-            CATransaction.commit()
+            // 材质不该跟着幽灵卡片跑
+            hoverMaterialHost?.hideNow()
             return
         }
 
         let showing = isPointerInsideCard()
         isMouseInside = showing
-        hoverEffectLayer.isHidden = false
         layer?.backgroundColor = dragNormalBackgroundColor ?? kCardBackground.cgColor
-        if !animated {
-            hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
-            layer?.removeAnimation(forKey: "borderWidthTransition")
-            layer?.removeAnimation(forKey: "borderColorTransition")
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            hoverEffectLayer.opacity = showing ? 1 : 0
-            setHoverBorder(isVisible: showing, animated: false)
-            CATransaction.commit()
-            onHover?(showing)
-            return
-        }
-        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: showing ? 1 : 0)
-        setHoverBorder(isVisible: showing, animated: true)
+        // 拖拽已把材质收起（hideNow），归位按「首次出现」落位；animated=false 时直接显示
+        syncHoverMaterial(showing, immediate: !animated)
         onHover?(showing)
     }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        setupHoverGradient()
+        wantsLayer = true
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    private func setupHoverGradient() {
-        wantsLayer = true
-        // 渐变层颜色恒用淡渐变（Palette.hoverGradient）：全部卡片（含平台卡）统一管线。
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            self.hoverGradientLayer.colors = Palette.hoverGradient.map { $0.cgColor }
-        }
-        hoverEffectLayer.opacity = 0
-        hoverEffectLayer.addSublayer(hoverGradientLayer)
-        layer?.addSublayer(hoverEffectLayer)
-    }
-    /// 子层 frame 不随 AutoLayout 同步，布局时手动贴满 bounds（圆角由父 layer masksToBounds 裁出）
+    /// 尺寸变化后（驻留切换高度等）让共享材质贴回卡片轮廓
     override func layout() {
         super.layout()
-        hoverEffectLayer.frame = bounds
-        hoverGradientLayer.frame = hoverEffectLayer.bounds
-        let pts = Palette.gradientEndpoints(angleDeg: Palette.hoverGradientAngleDeg, in: bounds)
-        hoverGradientLayer.startPoint = pts.start
-        hoverGradientLayer.endPoint = pts.end
+        // 本卡不再自持 hover 图层：尺寸变化时让共享材质贴回卡片轮廓
+        // （驻留切换高度 / 内容变化都会走到这里）
+        hoverMaterialHost?.updateGeometry(for: self)
     }
 
     /// 动态色经 .cgColor 落盘会定格当时外观：系统主题切换时按新 effectiveAppearance 重解算
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        // hover 渐变色在 setupHoverGradient 定格为当时外观的 cgColor（深白系/浅黑系），
-        // 外观切换后必须重解算，否则深色下启动的 App 切到浅色后是白纱叠浅玻璃 = 背景隐形
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            self.hoverGradientLayer.colors = Palette.hoverGradient.map { $0.cgColor }
-        }
-        // 边框 cgColor 同理随外观重解算
-        setHoverBorder(isVisible: isMouseInside && !isDragHoverLocked, animated: false)
+        // 共享材质的渐变颜色与描边色都是定格色，交给宿主重解算
+        hoverMaterialHost?.refreshAppearance()
     }
 
     override func updateTrackingAreas() {
@@ -1285,24 +1369,12 @@ class HoverCard: NSView, PanelScrollHoverSync {
 
     /// 点击后鼠标通常仍停留在卡片内，AppKit 不会重新派发 mouseExited；
     /// 主动清除 hover 材质，避免点击可折叠标题后高亮一直残留。
-    func clearHoverEffect(animated: Bool = true) {
+    func clearHoverEffect() {
         cancelHoverDwell()
         isMouseInside = false
         suppressEnterUntilExit = true
         guard !isDragHoverLocked else { return }
-        if animated {
-            animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 0)
-            setHoverBorder(isVisible: false, animated: true)
-        } else {
-            hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
-            layer?.removeAnimation(forKey: "borderWidthTransition")
-            layer?.removeAnimation(forKey: "borderColorTransition")
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            hoverEffectLayer.opacity = 0
-            setHoverBorder(isVisible: false, animated: false)
-            CATransaction.commit()
-        }
+        syncHoverMaterial(false)
         onHover?(false)
     }
 
@@ -1374,10 +1446,8 @@ class HoverCard: NSView, PanelScrollHoverSync {
         if let dwell = hoverDwellDuration, !dwellConfirmed {
             startHoverDwell(duration: dwell)
         } else {
-            // hover 背景淡入（与用量条目同色）
-            animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 1)
+            syncHoverMaterial(true)
         }
-        setHoverBorder(isVisible: true, animated: true)
         onHover?(true)
     }
 
@@ -1400,11 +1470,10 @@ class HoverCard: NSView, PanelScrollHoverSync {
         syncInteractiveHover(at: event)
     }
 
-    /// 启动 hover 确认：hover 背景按常规淡入，排驻留计时（满时长落点自检 +
-    /// onHoverConfirmed）。（原「光晕位图下移」进度视觉已随烘焙位图删除）
+    /// 启动 hover 确认：材质照常就位，排驻留计时（满时长落点自检 + onHoverConfirmed）。
+    /// （原「光晕位图下移」进度视觉已随烘焙位图删除）
     private func startHoverDwell(duration: CFTimeInterval) {
-        hoverEffectLayer.removeAnimation(forKey: "opacityTransition")
-        animateLayerKey(hoverEffectLayer, keyPath: "opacity", to: 1)
+        syncHoverMaterial(true)
         dwellWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.dwellWork != nil else { return }
@@ -1549,9 +1618,7 @@ final class ActionTileButton: HoverCard {
         layer?.cornerRadius = 10
         layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
-        // 边框色预设：默认无边框（width=0），hover 时由 HoverCard 动画出 1.2pt
-        layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
-        layer?.borderWidth = 0
+        // hover 材质（背景 + 框）由容器共享（HoverMaterialHost），卡片自身恒无边框
 
         // 只缩不放：SVG 微调尺寸（如 14.45）在 16pt 盒内保持原大居中，
         // 不会被放大抹掉微调；Mono ASCII（1.25:1）按盒等比缩小

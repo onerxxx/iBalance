@@ -134,10 +134,13 @@ fi
 
 # 拷贝 Assets.car 到 Resources（Liquid Glass 分层图标，macOS 26+ 经 CFBundleIconName=App
 # 优先使用；由 swift/icons/App.icon 经 Xcode 的 actool 编译，产物为静态文件：
-# DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun actool App.icon \
-#   --compile <out> --app-icon App --include-all-app-icons --enable-on-demand-resources NO \
+# DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun actool icons/App.icon \
+#   --compile /tmp/icon_build --app-icon App --include-all-app-icons --enable-on-demand-resources NO \
 #   --target-device mac --platform macosx --minimum-deployment-target 26.0 \
-#   --output-partial-info-plist <out>/gen.plist ｜ .icon 改动后重跑一次即可，无需常驻 Xcode
+#   --output-partial-info-plist /tmp/icon_build/gen.plist
+#   ｜ ⚠️ 输出目录必须用 /tmp 等本地盘：actool 在外置盘输出目录写兜底 App.icns 会报
+#   "Operation not permitted"（Assets.car 反而能写出，但整体 exit=1）；编完拷回本目录。
+#   .icon 改动后重跑一次即可，无需常驻 Xcode
 if [[ -f "$SCRIPT_DIR/Assets.car" ]]; then
     cp "$SCRIPT_DIR/Assets.car" "$RESOURCES_DIR/Assets.car"
 fi

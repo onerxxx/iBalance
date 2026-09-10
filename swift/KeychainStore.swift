@@ -12,9 +12,14 @@
 // 为什么单条目：2026-09-08 首版逐键 7 条目，钥匙串锁定时每次 SecItem 操作各弹一次
 // 解锁密码，首次迁移连续弹 6-7 次。打包成 1 条后迁移/保存各 1 次操作，至多弹 1 次；
 // 条目创建后日常保存走 update（创建者 App 静默），正常情况零弹窗。
-// 为什么路径 ACL：App 是 ad-hoc 签名，rebuild 后签名变化会让签名 ACL 视新二进制为
-// 陌生 App（每次构建弹 1 次）。条目以 SecTrustedApplicationCreateFromPath 的路径
-// 信任创建（dict 内嵌 acl_v=2 标记），ACL 与签名解耦，rebuild 不再弹授权。
+// 为什么路径 ACL：App 用本地自签证书「iBalance Local Sign」签名，rebuild 后二进制
+// 哈希变化，签名 ACL 会视新二进制为陌生 App（每次构建弹 1 次）。条目以
+// SecTrustedApplicationCreateFromPath 的路径信任创建（dict 内嵌 acl_v 标记），
+// ACL 与签名解耦。2026-09-10 探针实测：同路径 + 同证书 rebuild 后新二进制静默读写
+// （裸二进制 / .app bundle / 外置盘三种配置全通过），机制健康；坏 ACL 只出现在
+// 历史 ad-hoc 签名时代创建的条目上，靠版本标记（v3）删除重建自愈。
+// ⚠️ build.sh 若某次构建落到 ad-hoc 兜底分支（找不到签名身份），该次二进制会弹
+// 一次授权，属预期行为。
 //
 // 数据形态：account = "credentials_bundle" 的 generic password，value = JSON dict
 // {legacy键名: 字符串值}；空值键不入 dict，全空 = 删除条目。
@@ -31,9 +36,10 @@ enum CredentialVault {
     static let bundleAccount = "credentials_bundle"
 
     /// bundle dict 内嵌版本标记（非 Key 枚举键位，merge 时被自然跳过）。
-    /// 缺失 = 条目还是签名 ACL（v51 旧条目），启动时重建为路径 ACL。
+    /// 缺失或非当前值 = 条目 ACL 已过期（v51 签名 ACL / v2 可能为 ad-hoc 时代坏 ACL），
+    /// 启动时删除重建为当前二进制的路径 ACL。
     private static let versionKey = "acl_v"
-    private static let versionValue = "2"
+    private static let versionValue = "3"
 
     /// 7 个敏感字段的键位（rawValue 与 config.json legacy 键名一致，即 bundle dict 的键名）
     enum Key: String, CaseIterable {
@@ -234,18 +240,19 @@ enum CredentialVault {
         }
     }
 
-    /// bundle 已存在：先做一次性「签名 ACL → 路径 ACL」重建（v51 旧条目），再常规合并。
-    /// 重建 = 删旧条目 + 按路径 ACL 重写；无论重建成败都返回 true 触发 save——
+    /// bundle 已存在：ACL 版本不匹配时一次性删除重建（路径 ACL 与签名解耦，实测 2026-09-10：
+    /// 同路径同证书 rebuild 后新二进制静默读写，机制健康；坏 ACL 只会出现在旧版本标记的
+    /// 条目上，靠版本标记迁移自愈）。无论重建成败都返回 true 触发 save——
     /// 成功时 dict 已含版本标记，失败时由 persist 用 config 内存值重试写入，数据不丢。
     private static func mergeExisting(_ dict: [String: String], into config: inout AppConfig) -> Bool {
         var needsSave = false
         var d = dict
-        if dict[versionKey] == nil, !dict.isEmpty {
+        if dict[versionKey] != versionValue, !dict.isEmpty {
             _ = deleteItem(bundleAccount)
             if writeBundle(dict) {
-                Logger.log(.refresh, "[Keychain] bundle 条目已重建为路径 ACL（一次性，此后 rebuild 不再弹授权）")
+                Logger.log(.refresh, "[Keychain] bundle 条目已重建（ACL v\(dict[versionKey] ?? "无") → v\(versionValue)，旧 ACL 过期条目一次性迁移）")
             } else {
-                Logger.log(.refresh, "[Keychain] 路径 ACL 重建失败，将由 save 重试写入")
+                Logger.log(.refresh, "[Keychain] bundle 重建失败，将由 save 重试写入")
             }
             d[versionKey] = versionValue
             needsSave = true

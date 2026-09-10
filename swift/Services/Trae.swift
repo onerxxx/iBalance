@@ -155,11 +155,11 @@ enum TraeService {
         // 2. 写回 storage.json 的 iCubeAuthInfo 字段
         guard writeStorageJson(account: account, storagePath: storagePath) else {
             Logger.log(.switchAccount, "[iBalance] TRAE writeStorageJson FAILED, rollback: restart with original account")
-            restartTrae()
+            restartTrae(storagePath: storagePath)
             return false
         }
         // 3. 重启 TRAE
-        restartTrae()
+        restartTrae(storagePath: storagePath)
         Logger.log(.switchAccount, "[iBalance] TRAE switchAccount done, total \(ProcessUtil.ms(since: t0))ms")
         return true
     }
@@ -188,13 +188,18 @@ enum TraeService {
         }
     }
 
-    /// 重启 TRAE SOLO CN
-    private static func restartTrae() {
-        let task = Process()
-        task.launchPath = "/usr/bin/open"
-        task.arguments = ["-n", "-a", "TRAE SOLO CN"]
-        do { try task.run() } catch {
-            Logger.log(.switchAccount, "[iBalance] restart TRAE failed: \(error.localizedDescription)")
+    /// 重启 TRAE SOLO CN：带 userData 目录（storage.json 上溯三级 = Electron userData，
+    /// 单实例锁所在处），走 ProcessUtil.relaunch 三件套（清锁 → 清孤儿 → open -b + 验证重试）
+    private static func restartTrae(storagePath: String) {
+        let userDataDir = URL(fileURLWithPath: storagePath)
+            .deletingLastPathComponent()      // .../globalStorage
+            .deletingLastPathComponent()      // .../User
+            .deletingLastPathComponent()      // userData 根
+            .path
+        let launched = ProcessUtil.relaunch(bundleId: "cn.trae.solo.app", label: "TRAE",
+                                            lockDirs: [userDataDir])
+        if !launched {
+            Logger.log(.switchAccount, "[iBalance] TRAE relaunch failed: no main process after retry")
         }
     }
 

@@ -165,9 +165,6 @@ struct AppConfig: Codable {
     var valueScrollPreviewEnabled: Bool = false
     /// 自动检查更新（GitHub Releases 启动静默检查；手动「检查更新」磁贴不受此开关限制）
     var updateAutoCheck: Bool = true
-    /// 状态调试预览开关：true = 三态光环演示——按 Agent 平台序轮派
-    /// 进行中/完成/中断到前三张 Agent 卡（WB/ZCode/TRAE/Codex 中实际存在者），预览动画效果
-    var statusDebugPreview: Bool = false
     /// 长进度卡片（原「新卡片模式」，2026-09-06 改名）：true = 余额卡片进度条独占整行
     ///（左缘=主标题最左）+ 副标题下移一行（design/balance-card-mode.html 口径）；
     /// false = 现行副标题+窄进度条同行
@@ -176,7 +173,7 @@ struct AppConfig: Codable {
     ///（深色外观取浅色版、浅色外观取深色版；仅影响卡片 icon，面板外观不动）。
     /// 2026-09-07 用户定稿默认开启（旧配置无此键时解码兜底同为 true）
     var iconThemeSwap: Bool = true
-    /// 竖线进度条开关：true = 长进度卡片的整行进度条替换为 50 条 1.5pt 竖线横向排列
+    /// 竖线进度条开关：true = 长进度卡片的整行进度条替换为等宽竖线（条数/线宽见 UsageDots.lineCount/lineWidth）
     ///（间隔自适应容器宽，无轨道背景无边框）；仅影响长进度卡片模式，默认关
     var verticalLineProgress: Bool = false
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
@@ -229,7 +226,6 @@ struct AppConfig: Codable {
         case lightThemeEnabled = "light_theme_enabled"
         case monoFontEnabled = "mono_font_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
-        case statusDebugPreview = "status_debug_preview"
         case longProgressCard = "long_progress_card"
         case iconThemeSwap = "icon_theme_swap"
         case verticalLineProgress = "vertical_line_progress"
@@ -286,7 +282,6 @@ struct AppConfig: Codable {
         monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
         updateAutoCheck = try c.decodeIfPresent(Bool.self, forKey: .updateAutoCheck) ?? true
-        statusDebugPreview = try c.decodeIfPresent(Bool.self, forKey: .statusDebugPreview) ?? false
         // 新键 long_progress_card；旧键 balance_card_new_mode 兼容读取（改名不丢已存开关值）
         longProgressCard = try c.decodeIfPresent(Bool.self, forKey: .longProgressCard)
             ?? decoder.container(keyedBy: LegacyKeys.self)
@@ -352,7 +347,6 @@ struct AppConfig: Codable {
         try c.encode(monoFontEnabled, forKey: .monoFontEnabled)
         try c.encode(valueScrollPreviewEnabled, forKey: .valueScrollPreviewEnabled)
         try c.encode(updateAutoCheck, forKey: .updateAutoCheck)
-        try c.encode(statusDebugPreview, forKey: .statusDebugPreview)
         try c.encode(longProgressCard, forKey: .longProgressCard)
         try c.encode(iconThemeSwap, forKey: .iconThemeSwap)
         try c.encode(verticalLineProgress, forKey: .verticalLineProgress)
@@ -553,12 +547,31 @@ enum UDKey {
     static var settingsSectionCollapsed: String { "panel_settings_section_collapsed" }
     static var actionsSectionCollapsed: String { "panel_actions_section_collapsed" }
     static var usageSectionCollapsed: String { "panel_usage_section_collapsed" }
-    static var tokenSectionCollapsed: String { "panel_token_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
     /// 热力点阵峰值色相/饱和（Double 0..1，header 调色弹层滑杆写入，Palette 读写）
     static var heatDotHue: String { "heat_dot_hue" }
     static var heatDotSaturation: String { "heat_dot_saturation" }
+
+    // 3D 硬币弹窗（CoinDemo）：整页参数自动保存，下次打开还原（读写见 CoinSettings）
+    /// Coin color（"#RRGGBB"）
+    static var coinMaterialColor: String { "coin_material_color" }
+    /// Coin size（Double，px，CoinMetrics.sizeRange）
+    static var coinSize: String { "coin_size" }
+    /// Thickness（Double，px，CoinMetrics.thicknessRange）
+    static var coinThickness: String { "coin_thickness" }
+    /// Logo size（Double，**百分数** 50…125）。键名带 percent 是刻意的：早期版本把
+    /// 0.5…1.25 的倍率写进过 `coin_logo_scale`（双除 100），那批值落盘是 0.x、
+    /// 读回来会被夹成 50%；换成新键即作废旧值，不用写迁移
+    static var coinLogoScalePercent: String { "coin_logo_scale_percent" }
+    /// Logo 厚度（Double，px/160 盒）：mark 沿盖面法线挤出的深度，0 = 平贴
+    static var coinMarkDepth: String { "coin_mark_depth" }
+    /// Edge finish（Int = CoinEdgeFinish.rawValue）
+    static var coinEdgeFinish: String { "coin_edge_finish" }
+    /// 上传的 logo SVG 原文（空 = 内置 GHO 预设）
+    static var coinLogoSVG: String { "coin_logo_svg" }
+    /// 上传的 logo 文件名（行内展示用，空 = 内置 GHO 预设）
+    static var coinLogoSVGName: String { "coin_logo_svg_name" }
 
     // App 自更新（GitHub Releases）：静默检查节流与「暂不」提醒抑制
     static var updateLastCheckDate: String { "update_last_check_date" }

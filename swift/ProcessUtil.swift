@@ -89,6 +89,118 @@ enum ProcessUtil {
         return out.split(separator: "\n").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
     }
 
+    // MARK: - Electron 应用重启（清锁 → 清孤儿 → open -b → 验证重试）
+
+    /// 各 Electron 应用 userData 目录下可能出现的单实例锁文件名
+    private static let singletonLockNames = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+
+    /// 删除 userData 目录里残留的单实例锁：SIGKILL 强杀后锁不会自动清理，且进程僵尸期
+    /// kill(pid,0) 仍判存活 → 紧随其后的 open 被锁误判「已有实例」，新实例静默退出
+    ///（WorkBuddy 2026-09-01 实测「App 起不来」根因；TRAE/ZCode 同为 Electron，同病）。
+    /// 只删锁文件，不碰业务数据；目录不存在/无锁文件时静默跳过。
+    static func clearSingletonLocks(in dirs: [String], label: String) {
+        let fm = FileManager.default
+        for dir in dirs {
+            for name in singletonLockNames {
+                let p = (dir as NSString).appendingPathComponent(name)
+                guard fm.fileExists(atPath: p) else { continue }
+                try? fm.removeItem(atPath: p)
+                Logger.log(.switchAccount, "[iBalance] \(label) cleared stale singleton lock: \(p)")
+            }
+        }
+    }
+
+    /// 应用主可执行文件完整路径（清孤儿进程时给 pgrep 用）：由 bundle id 定位 .app，
+    /// 再从 Info.plist 取 CFBundleExecutable，避免各平台硬编码路径失配
+    ///（TRAE 可执行名 Electron、ZCode 可执行名 ZCode，写死必错其一）。
+    static func appExecutablePath(bundleId: String) -> String? {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) else {
+            return nil
+        }
+        return Bundle(url: url)?.executablePath
+    }
+
+    /// 启动 GUI 应用前清掉会污染 Electron / LaunchServices 的环境变量。
+    /// iBalance 若被 WorkBuddy（或终端 CLI 模式）拉起，会继承：ELECTRON_RUN_AS_NODE=1、
+    /// NODE_OPTIONS=--require …shim、__CFBundleIdentifier、XPC_SERVICE_NAME、全套
+    /// WORKBUDDY_*。这些变量泄漏给 `open` 启动的新实例：
+    /// ① ELECTRON_RUN_AS_NODE=1 → 目标以 Node 模式启动，无窗口、0.5s 内 exit(0) 秒退；
+    /// ② __CFBundleIdentifier / XPC_SERVICE_NAME → LaunchServices 实例归属判断错乱；
+    /// ③ WORKBUDDY_USER_DATA_DIR / WORKBUDDY_STARTUP_PID 等强制旧实例路径与归属。
+    /// 参照 cockpit-tools sanitize_macos_gui_launch_env。
+    static func sanitizedLaunchEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let before = Set(env.keys)
+        let toxicKeys: Set<String> = [
+            "NODE_OPTIONS", "NODE_PATH", "NODE_ENV",
+            "ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ASAR",
+            "ELECTRON_FORCE_WINDOW_MENU_BAR", "ELECTRON_NO_ATTACH_CONSOLE",
+            "__CFBundleIdentifier", "XPC_SERVICE_NAME",
+            "npm_config_prefix", "npm_config_devdir",
+        ]
+        for key in toxicKeys { env.removeValue(forKey: key) }
+        let wbKeys = env.keys.filter { $0.hasPrefix("WORKBUDDY_") }
+        for key in wbKeys { env.removeValue(forKey: key) }
+        let removed = before.subtracting(env.keys).sorted()
+        if !removed.isEmpty {
+            Logger.log(.switchAccount, "[iBalance] sanitized env, removed: \(removed.joined(separator: ","))")
+        }
+        return env
+    }
+
+    /// 按 bundle id 启动应用（**不带 -n**：旧进程死后残留锁 + 僵尸期误判，新实例会静默退出）。
+    /// 卡片点击「打开应用」与切号重启共用：都走 /usr/bin/open + 净化环境，避免
+    /// NSWorkspace 把 iBalance 的进程环境（可能含 ELECTRON_RUN_AS_NODE 等）直接传给
+    /// Electron 目标应用导致其 Node 模式秒退。
+    static func openApp(bundleId: String, label: String) {
+        let task = Process()
+        task.launchPath = "/usr/bin/open"
+        task.arguments = ["-b", bundleId]
+        task.environment = sanitizedLaunchEnvironment()
+        do {
+            try task.run()
+        } catch {
+            Logger.log(.switchAccount, "[iBalance] open \(label) failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// 切号后重启 Electron 应用的统一收尾（WorkBuddy / TRAE / ZCode 共用）：
+    /// 清单例锁 → 清残留 Electron 进程（孤儿 helper/prewarm 会让 LaunchServices 误判
+    /// 「仍在运行」，open 被路由到死实例）→ open -b → 5s 内验证主进程出现
+    ///（冷启动 3.5-4.5s，2s 窗口会误判而重复 open）→ 未出现则再清一次并重试。
+    /// lockDirs：该应用 userData 目录候选（Singleton* 锁文件所在处）。
+    /// 返回：重试后主进程是否确认出现（false = 启动失败，调用方记日志/提示）
+    @discardableResult
+    static func relaunch(bundleId: String, label: String, lockDirs: [String] = []) -> Bool {
+        let execPath = appExecutablePath(bundleId: bundleId)
+        if execPath == nil {
+            Logger.log(.switchAccount, "[iBalance] \(label) app not found for bundleId=\(bundleId)")
+        }
+        clearSingletonLocks(in: lockDirs, label: label)
+        if let execPath {
+            _ = cleanupRemainingElectronProcesses(executablePath: execPath, label: label)
+        }
+        openApp(bundleId: bundleId, label: label)
+        let deadline = Date().addingTimeInterval(5.0)
+        while Date() < deadline {
+            if !mainPids(bundleId: bundleId).isEmpty { return true }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        Logger.log(.switchAccount, "[iBalance] \(label) not running after open, cleaning and retrying")
+        clearSingletonLocks(in: lockDirs, label: label)
+        if let execPath {
+            _ = cleanupRemainingElectronProcesses(executablePath: execPath, label: label)
+        }
+        openApp(bundleId: bundleId, label: label)
+        let retryDeadline = Date().addingTimeInterval(5.0)
+        while Date() < retryDeadline {
+            if !mainPids(bundleId: bundleId).isEmpty { return true }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        Logger.log(.switchAccount, "[iBalance] \(label) STILL not running after retry, give up")
+        return false
+    }
+
     /// 清理应用残留的 Electron 进程（孤儿子进程/守护）：SIGTERM 等 1.5s，超时 SIGKILL。
     /// 返回清理后仍存活的进程数（0 = 干净）。切号时在 open 重启前调用，确保旧实例
     /// 彻底终结、LaunchServices 完成注销，新实例 open 才能可靠启动。

@@ -13,6 +13,9 @@ enum ZcodeImportResult {
 enum ZcodeService {
     /// ZCode Desktop 配置文件（明文存 start-plan JWT / coding-plan API Key，登录后自动更新）
     private static let configPath = NSHomeDirectory() + "/.zcode/v2/config.json"
+    /// ZCode (Electron) 的 userData 目录，单实例锁文件所在处
+    private static let zcodeUserDataDir =
+        NSHomeDirectory() + "/Library/Application Support/ZCode"
     /// 余额查询端点（zai 渠道 JWT 走此网关；Anthropic 兼容网关同域）。
     /// 服务端要求客户端身份：URL 带 app_version（对齐客户端 buildZaiStartPlanBalanceUrl）、
     /// 头带 X-Device-Mid（ZCode 遥测设备标识），缺任一返回 3001 parameter error。
@@ -248,13 +251,14 @@ enum ZcodeService {
         }
     }
 
-    /// 重启 ZCode（仿 WorkBuddy：open -n -a 强制新实例）
+    /// 重启 ZCode：走 ProcessUtil.relaunch 通用三件套（清单实例锁 → 清孤儿 Electron 进程 →
+    /// open -b + 5s 验证重试）。⚠️ 不能 open -n：旧进程死后残留锁会让新实例静默退出
+    ///（WorkBuddy 2026-09-01 实测根因，ZCode 同为 Electron）。
     private static func restartZcode() {
-        let task = Process()
-        task.launchPath = "/usr/bin/open"
-        task.arguments = ["-n", "-a", "ZCode"]
-        do { try task.run() } catch {
-            Logger.log(.switchAccount, "[iBalance] restart ZCode failed: \(error.localizedDescription)")
+        let launched = ProcessUtil.relaunch(bundleId: "dev.zcode.app", label: "ZCode",
+                                            lockDirs: [zcodeUserDataDir])
+        if !launched {
+            Logger.log(.switchAccount, "[iBalance] ZCode relaunch failed: no main process after retry")
         }
     }
 
