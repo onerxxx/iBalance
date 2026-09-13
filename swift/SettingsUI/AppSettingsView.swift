@@ -15,7 +15,6 @@ public enum SettingsSidebarItem: String, CaseIterable, Identifiable, Hashable {
     case checkin
     case platforms
     case accounts
-    case keyQuota
     case coinDemo
     case animation
     case about
@@ -27,9 +26,8 @@ public enum SettingsSidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .platforms: "平台"
         case .accounts: "账号"
         case .checkin: "签到"
-        case .keyQuota: "Key / 额度"
         case .coinDemo: "3D 硬币"
-        case .animation: "动画"
+        case .animation: "菜单栏"
         case .about: "关于"
         }
     }
@@ -39,9 +37,10 @@ public enum SettingsSidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .platforms: "circle.grid.2x2"
         case .accounts: "person.crop.circle.badge.plus"
         case .checkin: "checkmark.seal"
-        case .keyQuota: "key.horizontal"
         case .coinDemo: "rotate.3d"
-        case .animation: "circle.dotted"
+        // 菜单栏（原 `circle.dotted`，2026-09-13 用户「icon 换掉」）：换成系统那张菜单栏示意图，
+        // 与 pane 名「菜单栏」同义
+        case .animation: "menubar.rectangle"
         case .about: "info.circle"
         }
     }
@@ -71,24 +70,36 @@ public struct AppSettingsView: View {
                 }
             }
             .listStyle(.sidebar)
-            // 宽度上下限（用户 2026-09-12 定稿）：拖不窄于 180、拖不宽于 240
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+            // 侧栏宽度**固定 180pt、不可拖动**（2026-09-13 用户要求；原为 min 180 / ideal 200 / max 240）。
+            // min = ideal = max 就是锁死：离线取证（/tmp/layoutprobe/sidebar.swift）实测这一条声明式
+            // 会把 `NSSplitViewItem.minimumThickness/maximumThickness` 都置成 180，此后强行
+            // `setPosition(300)`、`setPosition(120)`、窗口拉宽到 900，侧栏宽度恒为 180。
+            // ⚠️ SwiftUI 会重配 split item（见宿主 `pinSidebarItem` 里 canCollapse 被反复打回的现象），
+            // 所以宿主侧还在每次变 key / 每帧 resize 时再钉一遍，两处一起才稳
+            .navigationSplitViewColumnWidth(min: SettingsWindowMetrics.sidebarWidth,
+                                            ideal: SettingsWindowMetrics.sidebarWidth,
+                                            max: SettingsWindowMetrics.sidebarWidth)
         } detail: {
             // pane 直接 switch（不再套一层 Group：`detail:` 本身就是 ViewBuilder）
-            switch model.selection {
-            case .appearance: ThemePane(model: model)
-            case .platforms:
-                HostedPane(model: model, item: .platforms,
-                           fallbackIcon: .symbol("circle.grid.2x2"), fallbackTitle: "平台开关")
-            case .accounts: AccountsPane(model: model)
-            case .checkin: CheckinPane(model: model)
-            case .keyQuota: KeyQuotaPane(model: model)
-            case .coinDemo:
-                HostedPane(model: model, item: .coinDemo,
-                           fallbackIcon: .symbol("rotate.3d"), fallbackTitle: "3D 硬币")
-            case .animation: AnimationPane(model: model)
-            case .about: AboutPane(model: model)
+            Group {
+                switch model.selection {
+                case .appearance: ThemePane(model: model)
+                case .platforms:
+                    HostedPane(model: model, item: .platforms,
+                               fallbackIcon: .symbol("circle.grid.2x2"), fallbackTitle: "平台开关")
+                case .accounts: AccountsPane(model: model)
+                case .checkin: CheckinPane(model: model)
+                case .coinDemo:
+                    HostedPane(model: model, item: .coinDemo,
+                               fallbackIcon: .symbol("rotate.3d"), fallbackTitle: "3D 硬币")
+                case .animation: AnimationPane(model: model)
+                case .about: AboutPane(model: model)
+                }
             }
+            // 首个 Section 标题与侧栏首行同高（2026-09-13 用户要求）：grouped Form 的
+            // 顶部自带留白比侧栏 List 多 ~13pt，负 contentMargins 只收详情列这一段
+            //（侧栏列不受影响）；只作用滚动内容， pane 想再微调改这一个数
+            .contentMargins(.top, -13, for: .scrollContent)
             // 「后退/前进胶囊 + pane 标题」2026-09-12 暂时去掉（模型侧历史栈保留，
             // 恢复即把 toolbar 块加回，见 BackForwardControl 与 model.navigate*）。
             // ⚠️ toolbar 保持**空的**：同日试过在里面挂「侧栏显隐」按钮，用户当日退回 ——
@@ -101,13 +112,25 @@ public struct AppSettingsView: View {
     }
 }
 
-// MARK: - 账号 pane（原「操作→账号」栏目）
+// MARK: - 账号 pane（原「操作→账号」栏目；2026-09-13 并入原「Key / 额度」pane）
 
+/// Key/额度草稿提交时机不变（回车 / 离开本 pane / 关窗，见模型 `commitKeyQuotaIfDirty`）。
 private struct AccountsPane: View {
-    let model: AppSettingsModel
+    // 官方口径：需要给注入的 @Observable 属性生成 Binding 时用 @Bindable（属性包装器形态），
+    // 直接 `$model.keyQuotaDraft.apiKey`；不必再手写 Binding(get:set:) 桥。
+    @Bindable var model: AppSettingsModel
 
     var body: some View {
         Form {
+            // 2026-09-13 用户要求：「WB 同步」移到页面第一栏并加标题
+            //（原独立「WB 同步」pane 并入本页时无标题，挂在页面中部）
+            Section {
+                OperationRow(model: model, icon: .symbol("square.and.arrow.up.on.square"), title: "WB 同步",
+                             subtitle: "全部历史会话与记忆同步给当前登录的 WorkBuddy 账号",
+                             actionTitle: "同步") { model.actions.shareWbHistory() }
+            } header: {
+                Text("同步")
+            }
             Section {
                 // 平台品牌 PNG（dark 版，键与面板卡片图标名同源）
                 // 四行统一：无小字副标题 + 同一个按钮文案（2026-09-12 用户指定；各平台取账号的
@@ -120,102 +143,29 @@ private struct AccountsPane: View {
                              subtitle: nil, actionTitle: "本机JSON导入") { model.actions.addZcodeAccount() }
                 OperationRow(model: model, icon: .platform("codex"), title: "Codex",
                              subtitle: nil, actionTitle: "本机JSON导入") { model.actions.addCodexAccount() }
+            } header: {
+                Text("添加账号")
             }
-            // 2026-09-13 由独立「WB 同步」pane 并入（原 SingleActionPane 整体删除）
-            Section {
-                OperationRow(model: model, icon: .symbol("square.and.arrow.up.on.square"), title: "WB 同步",
-                             subtitle: "全部历史会话与记忆同步给当前登录的 WorkBuddy 账号",
-                             actionTitle: "同步") { model.actions.shareWbHistory() }
-            }
-        }
-    }
-}
-
-// MARK: - 签到 pane（原「操作→签到」栏目；2026-09-13 并入原「设置」的自动签到段）
-
-private struct CheckinPane: View {
-    let model: AppSettingsModel
-
-    var body: some View {
-        Form {
-            Section {
-                OperationRow(model: model, icon: .symbol("checkmark.seal"), title: "一键签到",
-                             subtitle: "手动为全部账号签到", actionTitle: "签到") { model.actions.manualCheckin() }
-                OperationRow(model: model, icon: .symbol("list.bullet.rectangle"), title: "签到历史",
-                             subtitle: "查看各账号签到记录", actionTitle: "查看") { model.actions.showCheckinHistory() }
-            }
-            Section {
-                Toggle("自动签到", isOn: autoCheckinBinding)
-                if !model.snapshot.autoCheckinSub.isEmpty {
-                    LabeledContent("今日签到") {
-                        Text(model.snapshot.autoCheckinSub).foregroundStyle(.secondary)
+            // 「已保存账号」（2026-09-13 用户要求）：逐平台列出已保存账号，行内「删除」移除单个账号。
+            // 删除转交宿主（二次确认 + 落盘 + 面板/菜单栏刷新），model.deleteAccount 里的 sync() 回读刷新本列表；
+            // 空平台不出现，全空时整段不渲染（下方「删除账号」行的副标题会说明当前没有凭据）
+            ForEach(model.snapshot.savedAccountGroups) { group in
+                Section {
+                    ForEach(group.accounts) { acc in
+                        OperationRow(model: model, icon: .platform(group.iconKey),
+                                     title: acc.name, subtitle: acc.detail,
+                                     actionTitle: "删除", destructive: true) {
+                            model.deleteAccount(platform: group.id, uid: acc.id)
+                        }
                     }
+                } header: {
+                    Text(group.platform)
                 }
-            } footer: {
-                Text("WorkBuddy 与 TRAE 账号每日自动错峰签到。")
             }
-        }
-    }
-
-    // ⚠️ 刻意用闭包 Binding 而不是 `$model.xxx`：写入必须转交宿主动作（落盘 / 推给
-    //    菜单栏控制器），keyPath 绑定表达不了这个 transform —— 官方口径里
-    //    「没有合适 keyPath 或 subscript 时才用闭包 Binding」的那个例外。
-    private var autoCheckinBinding: Binding<Bool> {
-        Binding(get: { model.snapshot.autoCheckin }, set: { model.setAutoCheckin($0) })
-    }
-}
-
-// MARK: - 关于 pane（关于行 + 2026-09-13 由「设置」迁入的自动检查更新段）
-
-private struct AboutPane: View {
-    let model: AppSettingsModel
-
-    var body: some View {
-        Form {
+            // 2026-09-13 由独立「Key / 额度」pane 并入（原 KeyQuotaPane struct 删除）
             Section {
-                OperationRow(model: model, icon: .symbol("info.circle"), title: "关于 iBalance",
-                             subtitle: "版本与项目信息", actionTitle: "打开") { model.actions.about() }
-            }
-            Section {
-                Toggle("自动检查更新", isOn: autoUpdateBinding)
-                // 两个动作合用一行、整体靠右：Button 直接作 Section 行会被 Form 各占一行且左对齐，
-                // 所以包进 HStack 并用 Spacer 顶到行尾（两条文案等长，宽度天然一致）
-                HStack(spacing: 10) {
-                    Spacer(minLength: 0)
-                    Button("立即检查更新") { model.actions.checkForUpdate() }
-                    Button("更新窗口演示") { model.actions.runUpdateDemo() }
-                }
-            } footer: {
-                Text("每日静默检查一次 GitHub Releases 新版本；「更新窗口演示」走全流程，但不出网、不真替换。")
-            }
-        }
-    }
-
-    private var autoUpdateBinding: Binding<Bool> {
-        Binding(get: { model.snapshot.autoUpdateCheck }, set: { model.setAutoUpdateCheck($0) })
-    }
-}
-
-// MARK: - Key / 额度 pane（原 AppKit 玻璃弹窗的内联表单版）
-
-/// DeepSeek API Key / 日常额度 + ZhiPu Token / Qwen Ticket 覆盖。
-///
-/// 无「保存」按钮（2026-09-12 用户移除）：凭据类输入逐键落盘不合适，所以改成
-/// **编辑结束即生效** —— 提交时机由模型侧的 `commitKeyQuotaIfDirty()` 统一负责：
-/// ① 回车（各输入框 `.onSubmit`）；② 离开本 pane（`selection.didSet`）；
-/// ③ 关窗（`SettingsWindowController.windowWillClose`）。
-/// ⚠️ 改档位（Picker）不在其中：选「自定义」时输入框还是空的，立刻提交会把额度先写成 0。
-/// 草稿存在模型的 `keyQuotaDraft` 里而不是视图 `@State` —— `@State` 是 SwiftUI 宏，本机 CLT
-/// 工具链缺 SwiftUIMacros 插件编不过；窗口每次打开 `beginSession()` 仍按真实配置重置草稿。
-private struct KeyQuotaPane: View {
-    // 官方口径：需要给注入的 @Observable 属性生成 Binding 时用 @Bindable（属性包装器形态），
-    // 直接 `$model.keyQuotaDraft.apiKey`；不必再手写 Binding(get:set:) 桥。
-    @Bindable var model: AppSettingsModel
-
-    var body: some View {
-        Form {
-            Section {
-                TextField("API Key", text: $model.keyQuotaDraft.apiKey, prompt: Text("sk-…"))
+                // API Key 用 SecureField（2026-09-13 用户「换成密码字符」）：显示圆点不落明文
+                SecureField("API Key", text: $model.keyQuotaDraft.apiKey, prompt: Text("sk-…"))
                     .onSubmit { model.commitKeyQuotaIfDirty() }
                 Picker("日常额度", selection: $model.keyQuotaDraft.quotaChoice) {
                     // ForEach 走 Identifiable（preset.value 即 id），不用 index；
@@ -250,14 +200,114 @@ private struct KeyQuotaPane: View {
             } footer: {
                 Text("留空则解密浏览器 Cookies 取登录态，填了以手填值为准（浏览器登出后仍可用）。回车 / 换页 / 关窗即保存。")
             }
+            // 2026-09-13 用户要求：底部加「删除账号」——清空已保存的各平台凭据。
+            // 破坏性操作：按钮染红 + 置灰（没东西可删时）；二次确认与结果提示都在宿主（见 onDeleteAllAccounts）
+            Section {
+                OperationRow(model: model, icon: .symbol("trash"), title: "删除账号",
+                             subtitle: savedCredentialSummary,
+                             actionTitle: "删除",
+                             destructive: true,
+                             enabled: model.snapshot.savedAccountCount
+                                 + model.snapshot.savedOverrideCount > 0) {
+                    model.actions.deleteAllAccounts()
+                }
+            } footer: {
+                Text("清除已保存的全部平台凭据：WorkBuddy / TRAE / ZCode / Codex 账号，以及 DeepSeek Key、ZhiPu Token、Qwen Ticket 手填覆盖。\n只删 iBalance 里存的这份，不会退出各平台本机的登录状态。")
+            }
         }
+    }
+
+    /// 「删除账号」行的副标题：已保存的账号数 + 手填凭据数（都没存时说清楚，免得以为按钮坏了）
+    private var savedCredentialSummary: String {
+        let accounts = model.snapshot.savedAccountCount
+        let overrides = model.snapshot.savedOverrideCount
+        var parts: [String] = []
+        if accounts > 0 { parts.append("\(accounts) 个账号") }
+        if overrides > 0 { parts.append("\(overrides) 项 Key / Token") }
+        return parts.isEmpty ? "当前没有已保存的凭据" : "已保存 " + parts.joined(separator: " · ")
     }
 }
 
-// MARK: - 动画 pane（菜单栏「进行中」蓝点的小球弹跳参数）
+// MARK: - 签到 pane（原「操作→签到」栏目；2026-09-13 并入原「设置」的自动签到段）
+
+private struct CheckinPane: View {
+    let model: AppSettingsModel
+
+    var body: some View {
+        Form {
+            Section {
+                OperationRow(model: model, icon: .symbol("checkmark.seal"), title: "一键签到",
+                             subtitle: "手动为全部账号签到", actionTitle: "签到") { model.actions.manualCheckin() }
+                OperationRow(model: model, icon: .symbol("list.bullet.rectangle"), title: "签到历史",
+                             subtitle: "查看各账号签到记录", actionTitle: "查看") { model.actions.showCheckinHistory() }
+            } header: {
+                Text("手动签到")
+            }
+            Section {
+                // 今日签到结果并入开关行小字（2026-09-13 用户要求：不再单占一行）
+                Toggle(isOn: autoCheckinBinding) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("自动签到")
+                        if !model.snapshot.autoCheckinSub.isEmpty {
+                            Text(model.snapshot.autoCheckinSub)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } footer: {
+                Text("WorkBuddy 与 TRAE 账号每日自动错峰签到。")
+            }
+        }
+    }
+
+    // ⚠️ 刻意用闭包 Binding 而不是 `$model.xxx`：写入必须转交宿主动作（落盘 / 推给
+    //    菜单栏控制器），keyPath 绑定表达不了这个 transform —— 官方口径里
+    //    「没有合适 keyPath 或 subscript 时才用闭包 Binding」的那个例外。
+    private var autoCheckinBinding: Binding<Bool> {
+        Binding(get: { model.snapshot.autoCheckin }, set: { model.setAutoCheckin($0) })
+    }
+}
+
+// MARK: - 关于 pane（关于行 + 2026-09-13 由「设置」迁入的自动检查更新段）
+
+private struct AboutPane: View {
+    let model: AppSettingsModel
+
+    var body: some View {
+        Form {
+            Section {
+                OperationRow(model: model, icon: .symbol("info.circle"), title: "关于 iBalance",
+                             subtitle: "版本与项目信息", actionTitle: "打开") { model.actions.about() }
+            } header: {
+                Text("应用信息")
+            }
+            Section {
+                Toggle("自动检查更新", isOn: autoUpdateBinding)
+                // 两个动作合用一行、整体靠右：Button 直接作 Section 行会被 Form 各占一行且左对齐，
+                // 所以包进 HStack 并用 Spacer 顶到行尾（两条文案等长，宽度天然一致）
+                HStack(spacing: 10) {
+                    Spacer(minLength: 0)
+                    Button("立即检查更新") { model.actions.checkForUpdate() }
+                    Button("更新窗口演示") { model.actions.runUpdateDemo() }
+                }
+            } footer: {
+                Text("每日静默检查一次 GitHub Releases 新版本；「更新窗口演示」走全流程，但不出网、不真替换。")
+            }
+        }
+    }
+
+    private var autoUpdateBinding: Binding<Bool> {
+        Binding(get: { model.snapshot.autoUpdateCheck }, set: { model.setAutoUpdateCheck($0) })
+    }
+}
+
+// MARK: - 菜单栏 pane（菜单栏「进行中」蓝点的小球弹跳参数；侧栏项原叫「动画」，2026-09-13 定名「菜单栏」）
 
 /// 菜单栏状态点弹跳参数：顶部实时预览 + 五项滑杆。改动即时生效并落盘
 /// （与「设置」pane 的刷新间隔同口径：不留「保存」按钮）。
+/// 2026-09-13 用户要求：侧栏项「动画」→「菜单栏」（图标一并换成 `menubar.rectangle`）、
+/// 预览段标题「预览」→「进行中状态动画」、并去掉下方「恢复默认」按钮及其整张 Section 卡。
 private struct AnimationPane: View {
     let model: AppSettingsModel
 
@@ -267,7 +317,7 @@ private struct AnimationPane: View {
                 BouncePreview(settings: model.snapshot.bounce)
                     .frame(height: 92)
             } header: {
-                Text("预览")
+                Text("进行中状态动画")
             } footer: {
                 Text("菜单栏图标前的「进行中」蓝点，按当前参数实时演算。")
             }
@@ -279,9 +329,6 @@ private struct AnimationPane: View {
                 sliderRow("顶点拉伸", \.stretchMax, MenuBarBounceSettings.stretchRange, 0.01, "%.2f")
             } footer: {
                 Text("「腾空占比」越小，落地压扁驻留越久；「触地压扁 / 顶点拉伸」是纵向形变，横向按体积守恒自动反向补偿。参数只影响「进行中」蓝点。")
-            }
-            Section {
-                Button("恢复默认") { model.setBounce(.initial) }
             }
         }
     }
@@ -375,8 +422,8 @@ private struct BouncePreview: View {
 
 // MARK: - 主题外观 pane（原面板右上角「主题调教」玻璃弹窗的 SwiftUI 原生版）
 
-/// 点阵主题色 + 面板 / 卡片 / 侧栏玻璃外观。全部即时生效（不留「保存」按钮）——
-/// 与「动画」「关于」等 pane 同口径：写入转交宿主动作（落盘 + 触发重绘）后
+/// 点阵主题色 + 面板 / 卡片外观。全部即时生效（不留「保存」按钮）——
+/// 与「菜单栏」「关于」等 pane 同口径：写入转交宿主动作（落盘 + 触发重绘）后
 /// 由模型 `sync()` 回读真实配置，所以这里用闭包 Binding 而不是 keyPath。
 private struct ThemePane: View {
     let model: AppSettingsModel
@@ -388,18 +435,31 @@ private struct ThemePane: View {
                 sliderRow("饱和度", get: { model.snapshot.heatSaturation }, set: model.setHeatSaturation)
                 sliderRow("亮度", get: { model.snapshot.heatBrightness }, set: model.setHeatBrightness)
             } header: {
-                Text("主题色")
+                // 标题右侧实时色样（2026-09-13 用户要求）：由三根滑杆当前值合成；
+                // 滑杆写入都经 sync() 回读快照，拖动中色样同步变色。描边兜底近黑/近白主题色在卡底上的可辨性
+                HStack(spacing: 6) {
+                    Text("主题色")
+                    Circle()
+                        .fill(Color(nsColor: NSColor(hue: model.snapshot.heatHue,
+                                                     saturation: model.snapshot.heatSaturation,
+                                                     brightness: model.snapshot.heatBrightness,
+                                                     alpha: 1)))
+                        .frame(width: 10, height: 10)
+                        .overlay(Circle().strokeBorder(.quaternary, lineWidth: 1))
+                }
             } footer: {
                 Text("点阵峰值配色（卡片边框同源）：色相转一圈，饱和度决定鲜艳程度，亮度决定明暗。")
             }
             Section {
-                Toggle("高对比背景", isOn: toggle(\.panelGradientEnabled, model.setPanelGradient))
+                // 强度滑杆（0…100%，与下方主题色滑杆同款）：拖动实时回读快照即时生效
+                sliderRow("高对比背景",
+                          get: { model.snapshot.panelMaskOpacity },
+                          set: model.setPanelMaskOpacity)
                 Toggle("浅色主题", isOn: toggle(\.lightThemeEnabled, model.setLightTheme))
-                Toggle("Mono 风格", isOn: toggle(\.monoFontEnabled, model.setMonoFont))
             } header: {
                 Text("面板")
             } footer: {
-                Text("「高对比背景」= 底色走明暗渐变；「浅色主题」= 强制浅色外观（忽略系统深色）。")
+                Text("「高对比背景」= 底色明暗遮罩强度，0% = 原生玻璃；「浅色主题」= 强制浅色外观（忽略系统深色）。")
             }
             Section {
                 Toggle("图标深浅互换", isOn: toggle(\.iconThemeSwap, model.setIconThemeSwap))
@@ -432,16 +492,6 @@ private struct ThemePane: View {
                 Text("卡片")
             } footer: {
                 Text("「主标题字号」= 余额卡平台名（数值字号不变）；「Sharp Grotesk 字体」用本机安装的 Sharp Grotesk（字重×宽度任选组合，未装该字重自动回落系统字体）。")
-            }
-            // 2026-09-12 由「设置」pane 迁入（用户要求：侧栏玻璃属外观，归主题外观）
-            Section {
-                sliderRow("透明度",
-                          get: { model.snapshot.sidebarGlassTransparency },
-                          set: model.setSidebarGlassTransparency)
-            } header: {
-                Text("侧栏玻璃")
-            } footer: {
-                Text("100% = 系统原生 Liquid Glass（随系统偏好自适应），越低越实。改动立即生效并落盘。")
             }
         }
     }
@@ -501,10 +551,23 @@ private struct ThemePane: View {
     }
 }
 
-/// 内嵌 AppKit 内容的 pane（3D 硬币 / 平台）：宿主注入的视图钉在滚动视口顶部
-/// （`safeAreaInset` 不参与滚动，窗口再矮也恒可见），下方是页脚说明 + 可选动作按钮。
-/// 内容由宿主装配（`AppSettingsModel.hostedPanes`）；未注入只可能是 Xcode 预览，
-/// 此时回退成一行说明（无按钮 —— 这几个入口已经没有独立弹窗可开）。
+/// 非首段标题的**上移量**（pt）。macOS grouped Form 会在每段标题上方留一大截（实测 76pt 段间距，
+/// 其中标题上方 ~35pt），比系统设置松得多 —— 用户 2026-09-13 看着 3D 硬币那几段说「去掉多余的间隔」。
+/// 离线取证 `/tmp/layoutprobe/gapprobe.swift`：段间距 76pt，标题加 `.padding(.top, -20)` 后 → **60pt**，
+/// 再往下加（-28 / -36）不再变 —— 60pt 是这套布局能压到的下限，所以取 -20。
+///
+/// ⚠️ 只压**每块 Form 里的非首段**：负边距会把该段整体往上顶，而首段头顶就是滚动视口的边缘
+/// —— 顶上去会被裁掉／被上一块 Form（钉住的预览框）盖住（用户 2026-09-13 第二轮：
+/// 「最顶部的间距要加上，不然标题被预览框遮挡」）。所以首段标题一律不动。
+private let sectionHeaderPull: CGFloat = 20
+
+/// 内嵌 AppKit 内容的 pane（3D 硬币 / 平台）：宿主注入的视图按**段**铺在滚动视口里，
+/// 一段 = 一个 Form Section（各画各的卡片，标题 / 脚注 / 卡底全由 Form 原生绘制）。
+/// 段数由宿主装配（`AppSettingsModel.hostedPanes`）——「3D 硬币」给四段，
+/// 于是「3D 预览框」与下方「表单框」是分开的卡，前者不包裹后者（2026-09-13 用户要求）。
+/// 标了 `pinned` 的段（3D 硬币的「标题 + 预览框」）另走一块**只吃自身内容高度**的 Form，
+/// 钉在页面顶部不参与滚动（同日用户要求）。
+/// 未注入只可能是 Xcode 预览，此时回退成一行说明（无按钮 —— 这几个入口已经没有独立弹窗可开）。
 private struct HostedPane: View {
     let model: AppSettingsModel
     let item: SettingsSidebarItem
@@ -513,56 +576,69 @@ private struct HostedPane: View {
     let fallbackTitle: String
 
     var body: some View {
-        if let content = model.hostedPanes[item] {
-            // 分区卡独立置顶：safeAreaInset 钉在滚动视口顶部（不参与滚动，窗口再矮
-            // 也恒可见）；卡背景手绘（采样系统设置分区卡：暗 #2B2B2B / 亮 白），
-            // 与 Form 分区卡同观感。下方提示行 + 保存按钮为可滚内容
-            ScrollView {
-                HStack(spacing: 12) {
-                    Text(content.footnote)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if let actionTitle = content.actionTitle {
-                        Button(actionTitle) { content.action?() }
-                    }
+        if let sections = model.hostedPanes[item], !sections.isEmpty {
+            // 钉住的段与滚动的段各用一块 Form：两块叠在 VStack 里，
+            // 上面那块 `fixedSize(vertical:)` 只吃自身内容高度（离线取证 /tmp/layoutprobe/pinned.swift：
+            // 声明 120pt 行 → 该 Form 实测高 245pt，正好是「标题 + 卡片 + 段尾留白」，且不滚动），
+            // 下面那块吃满剩余空间并滚动。两块的卡片都由 Form 原生绘制，观感一致
+            let pinned = sections.filter { $0.pinned }
+            let scrolling = sections.filter { !$0.pinned }
+            VStack(spacing: 0) {
+                if !pinned.isEmpty {
+                    sectionsForm(pinned)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                VStack(alignment: .leading, spacing: 0) {
-                    // 分区标题（Form Section header 同位：分区卡外、左对齐；nil = 无标题）
-                    if let header = content.header {
-                        Text(header)
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .padding(.horizontal, 20)
-                            .padding(.top, 8)
-                            .padding(.bottom, 7)
-                    }
-                    HostedContentView(make: content.view)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: content.height)
-                        .background {
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(SectionCardColor.background)
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.top, content.header == nil ? 8 : 0)
-                        .padding(.bottom, 4)
+                if !scrolling.isEmpty {
+                    sectionsForm(scrolling)
                 }
             }
-            // ⚠️ 必须自己铺窗底：设置窗口为了侧栏玻璃是 isOpaque=false + backgroundColor=.clear，
-            // 详情区的底色平时由 Form(.grouped) 自己铺 —— 本 pane 是裸 ScrollView，没有 Form，
-            // 不铺底就会把窗口后面的东西（桌面/别的窗口）直接透出来，表现为「背景消失」。
-            .background(Color(nsColor: .windowBackgroundColor))
         } else {
             Form {
                 Section {
                     OperationRow(model: model, icon: fallbackIcon, title: fallbackTitle,
                                  subtitle: "内容由宿主装配，此处为预览占位", actionTitle: nil) {}
+                }
+            }
+        }
+    }
+
+    /// 一组段 → 一块 Form（每段一个原生 Section）。与普通 pane 同构：标题/脚注/分区卡全部由
+    /// Form 原生绘制，位置、字号、卡底与所有 Form 页完全一致（此前 hosted 页手绘钉顶标题与之不齐，
+    /// 2026-09-13 用户要求统一）。行内边距清零让宿主视图铺满卡内；内容超高时 Form 整页自然滚动。
+    /// **首段标题不动**（每块 Form 各自算）：负边距会把首段往上顶出滚动视口被裁／被上面那块
+    /// 钉住的 Form 盖住，见 `sectionHeaderPull` 注释
+    private func sectionsForm(_ sections: [SettingsHostedContent]) -> some View {
+        Form {
+            ForEach(sections.indices, id: \.self) { index in
+                let content = sections[index]
+                Section {
+                    let hosted = HostedContentView(make: content.view)
+                        .frame(maxWidth: .infinity)
+                        .listRowInsets(EdgeInsets())
+                    if let height = content.height {
+                        hosted.frame(height: height)
+                    } else {
+                        hosted   // 高度随内容：视图 fittingSize 决定（3D 硬币自然高）
+                    }
+                } header: {
+                    if let header = content.header {
+                        if index > 0 {
+                            Text(header).padding(.top, -sectionHeaderPull)
+                        } else {
+                            Text(header)
+                        }
+                    }
+                } footer: {
+                    // 空脚注且无按钮 = 不画页脚（分段内嵌时「预览框」那一段就没有脚注）
+                    if !content.footnote.isEmpty || content.actionTitle != nil {
+                        HStack(spacing: 12) {
+                            Text(content.footnote)
+                            Spacer()
+                            if let actionTitle = content.actionTitle {
+                                Button(actionTitle) { content.action?() }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -579,28 +655,6 @@ private struct HostedContentView: NSViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSView, context: Context) -> CGSize? {
         CGSize(width: proposal.width ?? nsView.fittingSize.width,
                height: proposal.height ?? nsView.fittingSize.height)
-    }
-}
-
-/// 分区卡背景色（对齐 macOS 26 系统设置 grouped 分区卡，截图采样定值）：
-/// 暗 = #2B2B2B（窗底 #222222 上浮一档），亮 = 白卡
-private enum SectionCardColor {
-    static var background: Color {
-        Color(nsColor: NSColor(name: nil) { appearance in
-            appearance.isDarkAppearance
-                ? NSColor(red: 43 / 255.0, green: 43 / 255.0, blue: 43 / 255.0, alpha: 1)
-                : .white
-        })
-    }
-}
-
-private extension NSAppearance {
-    /// NSAppearance 无 isDark（App 侧 Palette 同款自建），库内独立实现
-    var isDarkAppearance: Bool {
-        switch bestMatch(from: [.aqua, .darkAqua, .vibrantLight, .vibrantDark]) {
-        case .darkAqua, .vibrantDark: true
-        default: false
-        }
     }
 }
 
@@ -700,6 +754,10 @@ private struct OperationRow: View {
     let title: String
     let subtitle: String?
     let actionTitle: String?
+    /// 破坏性动作（「删除账号」）：按钮走 destructive 语义 + 显式染红
+    var destructive = false
+    /// 动作按钮是否可用（如「删除账号」在没有任何已保存凭据时置灰）
+    var enabled = true
     let action: () -> Void
 
     var body: some View {
@@ -715,7 +773,15 @@ private struct OperationRow: View {
             }
             Spacer(minLength: 16)
             if let actionTitle {
-                Button(actionTitle) { action() }
+                // macOS 的 push button 文本色由样式主导，role 有时压不住，所以破坏性动作再显式染一层红
+                Button(role: destructive ? .destructive : nil) { action() } label: {
+                    if destructive {
+                        Text(actionTitle).foregroundStyle(Color.red)
+                    } else {
+                        Text(actionTitle)
+                    }
+                }
+                .disabled(!enabled)
             }
         }
     }
@@ -751,12 +817,10 @@ private struct AppSettingsPreviews: PreviewProvider {
                 .previewDisplayName("签到")
             AppSettingsView(model: .preview(selection: .accounts))
                 .previewDisplayName("账号")
-            AppSettingsView(model: .preview(selection: .keyQuota))
-                .previewDisplayName("Key / 额度")
             AppSettingsView(model: .preview(selection: .appearance))
                 .previewDisplayName("主题外观")
             AppSettingsView(model: .preview(selection: .animation))
-                .previewDisplayName("动画")
+                .previewDisplayName("状态栏")
         }
     }
 }

@@ -23,19 +23,18 @@ enum SmallTable {
     /// 数据行字重
     static let rowWeight: NSFont.Weight = .medium
 
-    /// 按字体开关取小表格字体（Mono > 系统；monoDigits 仅系统态生效，与 Panel.uiFont 同逻辑）
-    static func font(size: CGFloat, weight: NSFont.Weight, monoDigits: Bool = false, mono: Bool) -> NSFont {
-        if mono { return MonoFontProvider.font(size: size, weight: weight) }
-        return monoDigits
+    /// 小表格字体（monoDigits = 等宽数字系统字体，数值右对齐列用）
+    static func font(size: CGFloat, weight: NSFont.Weight, monoDigits: Bool = false) -> NSFont {
+        monoDigits
             ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
             : .systemFont(ofSize: size, weight: weight)
     }
     /// 表头/区块标题字体
-    static func titleFont(mono: Bool) -> NSFont {
-        font(size: titleSize, weight: titleWeight, mono: mono)
+    static func titleFont() -> NSFont {
+        font(size: titleSize, weight: titleWeight)
     }
     /// 数据行字体
-    static func rowFont(mono: Bool, monoDigits: Bool = false) -> NSFont {
-        font(size: rowSize, weight: rowWeight, monoDigits: monoDigits, mono: mono)
+    static func rowFont(monoDigits: Bool = false) -> NSFont {
+        font(size: rowSize, weight: rowWeight, monoDigits: monoDigits)
     }
 }

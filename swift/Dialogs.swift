@@ -109,6 +109,13 @@ final class DialogShell {
         return idx
     }
 
+    /// 把某个按钮标成**破坏性操作**（删除类）：系统按 destructive 渲染（红色）。
+    /// `present()` 之前调用，索引即 `addButton` 的返回值。
+    func markDestructive(_ index: Int) {
+        guard index >= 0, index < alert.buttons.count else { return }
+        alert.buttons[index].hasDestructiveAction = true
+    }
+
     /// 显示模态弹窗，返回点击的按钮索引（取消/关闭 = -1）
     func present() -> Int {
         // 组装 accessoryView：富文本说明（如有）在上、控件区在下
@@ -251,6 +258,15 @@ private func makeCheckbox(label: String, isOn: Bool) -> NSButton {
 ///   行间留距改**行底分隔线**；
 /// - 卡片内留白 12pt（原来 0，内容贴卡缘）+ 表头下一条分隔线；
 /// - 名字列由 `layout()` 吸收余量 → 四个开关列恒贴卡片右缘，窗口变宽不再在右侧留空档。
+///
+/// 2026-09-13 水平对齐整备（用户：「表格最左应该和标题对齐」）：
+/// 面板由 `HostedPane` 内嵌在 Form Section 里，占的正是**行内容区**——
+/// 离线取证（/tmp/layoutprobe：680×700 窗口，标记线实测）得到 macOS grouped Form 的三条水平基准：
+/// 卡片左缘 220pt、Section 标题 = 行内容区 = 系统行分隔线左缘同为 **230pt**（卡片再内缩 10pt）。
+/// 所以面板自己那 12pt 内缩是**重复留白**：表格最左会被推到标题右方 12pt，正是用户看到的那条缝。
+/// - `horizontalInset` 12→**0**：表格左缘落到标题左缘；自绘行分隔线也随之与系统行分隔线同宽（230…649.5pt）。
+/// - 全选列 24→20pt 且 `xPlacement` 居中→**靠左**：让行首那个框的**左缘**（而不是列中线）压在表格左缘，
+///   与标题左缘像素级对齐；名字列跟着左移后，与行首框仍留 ~10pt 间距（原来是 ~9.5pt）。
 @MainActor
 final class PlatformTogglesPanelView: NSView {
     override var isFlipped: Bool { true }
@@ -297,8 +313,11 @@ final class PlatformTogglesPanelView: NSView {
     }
 
     private enum Metrics {
-        // ── 卡片内留白（对齐 macOS 设置分区卡：内容不贴卡缘）──
-        static let horizontalInset: CGFloat = 12
+        // ── 水平留白：**恒为 0**（2026-09-13 起）──
+        // 面板占的是 Form Section 的行内容区，卡片已在它外面给了 10pt 留白
+        // （离线取证见类注释），这里再给一次就会让表格最左比 Section 标题右移一截。
+        // 0 = 表格左缘 / 右缘分别落在标题左缘、行内容区右缘。
+        static let horizontalInset: CGFloat = 0
         static let topInset: CGFloat = 6
         static let bottomInset: CGFloat = 6
         // ── 表格节奏（对齐 macOS 表格：行高 36 + 行间细分隔线，不留行距）──
@@ -308,7 +327,8 @@ final class PlatformTogglesPanelView: NSView {
         /// 列宽：行首全选 / 平台名（最小宽，实际由 layout 吸收余量）/ 四个开关列
         /// 名字列下限 108 = 最长平台名（WorkBuddy，13pt ≈ 74pt）+ 图标 16 + 间距 6 再留余量；
         /// 取值要保证「侧栏拉到 240 上限 + 窗口收到 640」的极限卡片宽 380 也放得下
-        static let allColumnWidth: CGFloat = 24
+        /// 全选列 20 = 框 14 + 6pt 余量：该列靠左放（见 buildGrid），不再为居中留白
+        static let allColumnWidth: CGFloat = 20
         static let nameColumnMinWidth: CGFloat = 108
         static let toggleColumnWidth: CGFloat = 50
         /// 除名字列外的固定占宽：左右留白 + 全选列 + 四个开关列 + 5 条列间距
@@ -462,7 +482,9 @@ final class PlatformTogglesPanelView: NSView {
         grid.xPlacement = .fill
         grid.yPlacement = .center
         grid.column(at: 0).width = Metrics.allColumnWidth
-        grid.column(at: 0).xPlacement = .center
+        // 靠左（不是居中）：行首全选框的**左缘**要压在表格左缘 = Section 标题左缘上
+        // （2026-09-13 用户要求「表格最左和标题对齐」，居中会让框右移半个列宽）
+        grid.column(at: 0).xPlacement = .leading
         // 名字列起步宽 = 最小宽，实际宽度由 layout() 按卡片可用宽度吸收余量
         grid.column(at: 1).width = Metrics.nameColumnMinWidth
         grid.column(at: 1).xPlacement = .leading

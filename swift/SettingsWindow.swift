@@ -29,35 +29,68 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     override init() {
         super.init()
         model.hostedPanes = [
-            // 内嵌 3D 硬币：面板实例惰性创建；高度 = 舞台 + 参数滚动视口（静态常量推导）；
-            // 标题由 HostedPane 画在分区卡上方（Form Section header 同位，参考「动画」pane 预览区）
-            .coinDemo: SettingsHostedContent(
-                header: "3D硬币预览",
-                view: { [weak self] in self?.coinDemoPanelIfNeeded() ?? NSView() },
-                height: CoinDemoPanelView.coinHeight + CoinDemoPanelView.gap
-                    + CoinDemoPanelView.paramsViewportHeight,
-                footnote: "点击自旋、拖动翻转；调整实时生效，保存后按此还原。",
-                actionTitle: "保存为默认",
-                action: { [weak self] in self?.coinDemoPanelIfNeeded().persistDefaults() }),
+            // 内嵌 3D 硬币：**分四段**（预览 + Control / Edge / Motion），一段一个 Form Section。
+            // 2026-09-13 用户两轮要求定下：「3D 预览框不要包裹下方的 forms」+「硬币下面的参数
+            // 放在普通的 forms 里不要嵌套」—— 所以预览单独一张卡，三块参数区各自当普通 Form
+            // 段（标题交给 Section header、卡底交给 Form，区块内部只留行与分隔线）。
+            // 面板实例仍保活复用（切页再回来不丢未保存调参），内容由它的 stageHost /
+            // splitGroupViews 提供；高度都随内容（fittingSize）
+            .coinDemo: [
+                SettingsHostedContent(
+                    header: "3D硬币预览",
+                    view: { [weak self] in self?.coinStageHostIfNeeded() ?? NSView() },
+                    footnote: "",
+                    // 标题 + 预览框**钉在页面顶部、不参与滚动**（2026-09-13 用户要求）；
+                    // 容器尺寸也固定（面板那边舞台取满量程高，不随参数收窄）
+                    pinned: true),
+                SettingsHostedContent(
+                    header: CoinControlSectionView.sectionTitle,
+                    view: { [weak self] in self?.coinParamsGroupIfNeeded(0) ?? NSView() },
+                    footnote: ""),
+                SettingsHostedContent(
+                    header: CoinEdgeSectionView.sectionTitle,
+                    view: { [weak self] in self?.coinParamsGroupIfNeeded(1) ?? NSView() },
+                    footnote: ""),
+                SettingsHostedContent(
+                    header: CoinMotionSectionView.sectionTitle,
+                    view: { [weak self] in self?.coinParamsGroupIfNeeded(2) ?? NSView() },
+                    footnote: "点击自旋、拖动翻转；调整实时生效并自动保存。"),
+            ],
             // 内嵌平台开关：定高表格，**勾选即生效**（无页脚按钮）
-            .platforms: SettingsHostedContent(
-                view: { [weak self] in self?.platformPanelIfNeeded() ?? NSView() },
-                height: PlatformTogglesPanelView.contentHeight,
-                footnote: "逐平台勾选：参与刷新、自动签到、面板余额卡片、用量行。勾选即生效。",
-                refresh: { [weak self] in
-                    // 每次开窗回读真实配置（归一勾选态）；面板还没建时不必回读，
-                    // 建的时候就会按当时的配置初始化
-                    guard let self, let config = self.platformConfig?() else { return }
-                    self.platformPanel?.reload(config: config)
-                }),
+            .platforms: [
+                SettingsHostedContent(
+                    header: "平台开关",
+                    view: { [weak self] in self?.platformPanelIfNeeded() ?? NSView() },
+                    height: PlatformTogglesPanelView.contentHeight,
+                    footnote: "逐平台勾选：参与刷新、自动签到、面板余额卡片、用量行。勾选即生效。",
+                    refresh: { [weak self] in
+                        // 每次开窗回读真实配置（归一勾选态）；面板还没建时不必回读，
+                        // 建的时候就会按当时的配置初始化
+                        guard let self, let config = self.platformConfig?() else { return }
+                        self.platformPanel?.reload(config: config)
+                    }),
+            ],
         ]
     }
 
+    /// 3D 硬币面板：**分段内嵌**模式建（见 `SettingsHostedContent` 那段注释）——
+    /// 面板自身不上屏，只作为预览框与三块参数区的宿主
     private func coinDemoPanelIfNeeded() -> CoinDemoPanelView {
         if let coinDemoPanel { return coinDemoPanel }
-        let panel = CoinDemoPanelView(frame: .zero)
+        let panel = CoinDemoPanelView(frame: .zero, splitHosting: true)
         coinDemoPanel = panel
         return panel
+    }
+
+    /// 「3D硬币预览」Section 的内容 = 预览框（只装 3D 舞台）
+    private func coinStageHostIfNeeded() -> NSView {
+        coinDemoPanelIfNeeded().stageHost
+    }
+
+    /// Control / Edge / Motion 三个 Section 的内容 = 三块参数区（裸模式，当普通 Form 行）
+    private func coinParamsGroupIfNeeded(_ index: Int) -> NSView {
+        let groups = coinDemoPanelIfNeeded().splitGroupViews
+        return index < groups.count ? groups[index] : NSView()
     }
 
     /// 平台开关表格：**必须**按真实配置建（不回退默认 AppConfig，否则一屏勾选全错），
@@ -130,8 +163,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             // 玻璃背后是一块不透明底，采不到任何东西 → 渲染成一块平的着色板，没有玻璃感。
             // 与 GlassModalShell / UpdateProgressWindow 的玻璃配方同口径（那两处也显式设了
             // 这两条，文档原话「背景交给玻璃，必须与上一条同时设」）。
-            // ⚠️ 窗口透明只负责「让玻璃有东西可采」；侧栏那层是 regular 还是 clear 由
-            // `applySidebarGlass` 决定 —— 别再回头去改写 `style`（见那里的 HIG 依据）。
+            // ⚠️ 窗口透明只负责「让玻璃有东西可采」；侧栏那层玻璃保持系统默认
+            // （`.regular` + tintColor=nil，HIG sidebar 变体），不做任何着色/改写。
             win.isOpaque = false
             win.backgroundColor = .clear
             win.isReleasedWhenClosed = false
@@ -181,14 +214,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     // MARK: - 侧栏
 
-    /// 侧栏的两项「按类型找出来改」后处理。两者都是**视图树懒建**的产物（上屏后首次布局才有），
-    /// 所以只在 open 的两拍兜底 + 每次变 key 时统一走这里；拖滑杆这类树已就绪的路径只需单跑玻璃那条。
+    /// 侧栏「按类型找出来改」的后处理。视图树懒建（上屏后首次布局才有），
+    /// 所以只在 open 的两拍兜底 + 每次变 key 时统一走这里。
     private func applySidebarTweaks() {
-        applySidebarGlass()
-        forbidSidebarCollapse()
+        pinSidebarItem()
     }
 
-    /// 禁止侧栏折叠（用户 2026-09-12：「拖到最左不要触发隐藏」）。
+    /// 侧栏「禁折叠 + 锁宽」（用户 2026-09-12：拖到最左不要触发隐藏；2026-09-13：**固定 180pt、不可拖动**）。
     ///
     /// ⚠️ 关键：SwiftUI 的 `NavigationSplitView` **只铺一层 `NSSplitView`**，那个管理它的
     /// `NSSplitViewController` 私有子类（实测类链 `NavigationSplitViewController < SplitViewController
@@ -204,7 +236,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     /// 判据用 `splitViewItems[0].isCollapsed`）：基线折叠 = true；设 `canCollapse = false` 后 = false，
     /// 且 `minPossiblePositionOfDivider(0)` 自动从 −1 变 180（拖到底停在 min 宽度）。
     /// `canCollapseFromWindowResize` 会被系统联动成 false，**不必**单独设。
-    private func forbidSidebarCollapse() {
+    ///
+    /// 宽度同理逐帧钉：视图侧那条 `.navigationSplitViewColumnWidth(min:ideal:max:)` 声明式已经把
+    /// item 的 minimum/maximumThickness 设成 180（离线取证 `/tmp/layoutprobe/sidebar.swift`：
+    /// 强行 `setPosition(300)` / `(120)`、窗口拉宽到 900，侧栏恒 180），但 SwiftUI 重配 split item 时
+    /// 同样会打回默认（`canCollapse` 就是这么被打回的），所以在同一个守卫里再钉一遍 —— 拖拽时每帧
+    /// 都会经过这里，拖不动。
+    private func pinSidebarItem() {
         guard let root = window?.contentViewController?.view else { return }
         for split in Self.splitViews(in: root) {
             installSplitResizeGuard(split)
@@ -217,6 +255,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             sidebarItem.canCollapse = false
             // 掰回可能被 autosave / 上一次拖拽留下的折叠态
             if sidebarItem.isCollapsed { sidebarItem.isCollapsed = false }
+            // 宽度钉死（用户 2026-09-13：固定 180pt、不可拖动）
+            let width = SettingsWindowMetrics.sidebarWidth
+            if sidebarItem.minimumThickness != width { sidebarItem.minimumThickness = width }
+            if sidebarItem.maximumThickness != width { sidebarItem.maximumThickness = width }
         }
     }
 
@@ -241,7 +283,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             forName: NSSplitView.willResizeSubviewsNotification, object: sv, queue: .main
         ) { [weak self] _ in
             // 重新走一遍扫描：期间 SwiftUI 若把 split view / item 换掉（新对象），这里也能跟上
-            self?.forbidSidebarCollapse()
+            self?.pinSidebarItem()
         }
     }
 
@@ -257,69 +299,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         var found: [NSSplitView] = []
         if let split = view as? NSSplitView { found.append(split) }
         for sub in view.subviews { found.append(contentsOf: splitViews(in: sub)) }
-        return found
-    }
-
-    // MARK: - 侧栏玻璃
-
-    /// 侧栏玻璃透明度（0…1，1 = 最透）：落盘值，见 `SidebarGlass`
-    static var sidebarGlassTransparency: Double {
-        get {
-            let defaults = UserDefaults.standard
-            guard defaults.object(forKey: UDKey.settingsSidebarGlassTransparency) != nil else {
-                return SidebarGlass.defaultTransparency
-            }
-            let raw = defaults.double(forKey: UDKey.settingsSidebarGlassTransparency)
-            return min(max(raw, SidebarGlass.transparencyRange.lowerBound),
-                       SidebarGlass.transparencyRange.upperBound)
-        }
-        set {
-            UserDefaults.standard.set(newValue, forKey: UDKey.settingsSidebarGlassTransparency)
-        }
-    }
-
-    /// 设置窗口拖动「主题外观 → 侧栏玻璃」滑杆：落盘 + 立即重灌侧栏玻璃
-    func setSidebarGlassTransparency(_ t: Double) {
-        Self.sidebarGlassTransparency = t
-        applySidebarGlass()
-    }
-
-    /// SwiftUI 的 `NavigationSplitView` 会给侧栏铺一层 `NSGlassEffectView`
-    /// （dump 视图树可见：`_NSSplitViewItemViewWrapper > NSGlassEffectView`），
-    /// **默认就是 `.regular` + `tintColor = nil`** —— 这正是系统按 HIG 选定的 sidebar 变体。
-    ///
-    /// ⚠️ 2026-09-12 修正：先前为「更透」把它改写成 `.clear`，是**反 HIG** 的。
-    /// HIG《Materials》原话：clear 变体「Only use clear Liquid Glass for components that appear
-    /// over visually rich backgrounds」（图片 / 视频之上的浮层）；而 regular 变体
-    /// 「Use the regular variant … when components have a significant amount of text,
-    /// such as alerts, **sidebars**, or popovers」。且 `style` 是系统统一驱动的：
-    /// `.regular` 会随「外观 → Liquid Glass」偏好与辅助功能（降低透明度 / 提高对比度）自适应，
-    /// 写死 `.clear` 等于把这些系统设置全部绕过 —— 观感自然「不像原生」。
-    /// 所以**不再碰 `style`**，交回系统。
-    ///
-    /// 保留的 `tintColor` = 玻璃上的**着色层**：透明度 100% 时为 nil（完全原生），
-    /// 用户主动调低时才按 (1 − 透明度) 给窗口底色上 alpha，让侧栏更实。
-    ///
-    /// ⚠️ 这层玻璃由 SwiftUI 内部创建、没有对外 API，只能在视图树建好后**按类型找出来改**。
-    /// 视图树是懒建的，所以每次窗口变 key（= 每次打开）都重扫一遍兜底；
-    /// 侧栏内容切换不会重建它（它是 split item 的背景层，不是列表内容）。
-    private func applySidebarGlass() {
-        guard let root = window?.contentView else { return }
-        // style 交给系统（`.regular`）；这里只施加可选的着色层
-        let alpha = SidebarGlass.tintAlpha(forTransparency: Self.sidebarGlassTransparency)
-        let tint: NSColor? = alpha <= 0.001
-            ? nil
-            : NSColor.windowBackgroundColor.withAlphaComponent(CGFloat(alpha))
-        for glass in Self.glassEffectViews(in: root) {
-            glass.tintColor = tint
-        }
-    }
-
-    /// 深度优先收集视图树里的 `NSGlassEffectView`（本窗口只有侧栏那一层）
-    private static func glassEffectViews(in view: NSView) -> [NSGlassEffectView] {
-        var found: [NSGlassEffectView] = []
-        if let glass = view as? NSGlassEffectView { found.append(glass) }
-        for sub in view.subviews { found.append(contentsOf: glassEffectViews(in: sub)) }
         return found
     }
 

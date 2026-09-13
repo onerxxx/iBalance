@@ -845,10 +845,20 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     }
 }
 
+/// header 图标按钮共有的「点击 / 拖动换位」分流挂点（2026-09-13 起无需按住 Cmd）：
+/// mouseDown 转交面板做阈值判断（PanelDrag.beginHeaderIconDrag），未超阈值原地松手
+/// 由按钮回放自己的点击链路，超阈值进入拖拽重排。
+protocol HeaderIconDraggable: NSView {
+    /// 起手回调：把 mouseDown 事件原样转交面板
+    var onDragStart: ((NSEvent) -> Void)? { get set }
+    /// 阈值内原地松手 = 普通点击（各按钮回放自己的点击链路）
+    func performClickAction()
+}
+
 /// 无边框图标按钮：使用 macOS 原生 bezelStyle 实现 hover 时自动显示圆角背景，
 /// 系统自动处理背景绘制，仅用 tracking area 管理图标颜色变化。
 /// hover 时系统渲染浅色圆角背景（略大于图标），图标同步提亮为 labelColor。
-final class HoverIconButton: NSButton, PanelScrollHoverSync {
+final class HoverIconButton: NSButton, PanelScrollHoverSync, HeaderIconDraggable {
     /// 按钮容器尺寸（正方形）
     static let buttonSize: CGFloat = 22
     /// 非 hover 常态 tint；默认保持现有系统灰，header 可按主题指定黑色动态色。
@@ -859,6 +869,8 @@ final class HoverIconButton: NSButton, PanelScrollHoverSync {
     }
     /// hover 时的 tint；默认使用系统标签色，特殊按钮可单独指定。
     var hoverTintColor: NSColor = .labelColor
+    /// 拖动换位起手回调（header 图标；nil = 未接入分流，mouseDown 走普通按钮链路）
+    var onDragStart: ((NSEvent) -> Void)?
     private var trackingArea: NSTrackingArea?
     /// 当前 hover 状态（滚动同步时用于判断是否需要切换）
     private var isMouseInside = false
@@ -932,6 +944,17 @@ final class HoverIconButton: NSButton, PanelScrollHoverSync {
         isMouseInside = false
         contentTintColor = normalTintColor
         animateLayerKey(hoverBgLayer, keyPath: "backgroundColor", to: NSColor.clear.cgColor)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // 按下即转交面板做点击/拖拽分流（阈值判断在 PanelDrag）；未接入时走普通点击链路
+        guard let onDragStart else { super.mouseDown(with: event); return }
+        onDragStart(event)
+    }
+
+    func performClickAction() {
+        // 阈值内原地松手 = 普通点击：直接走 target/action（不走 performClick，免按压视觉二次驱动）
+        sendAction(action, to: target)
     }
 
     // MARK: - 面板滚动 hover 同步
@@ -1112,7 +1135,7 @@ extension RefreshIconButton: CAAnimationDelegate {
 /// 周期数据由 cycleProvider 直读 AppDelegate 的 repeating Timer（fireDate 恒为
 /// 下次自动刷新时刻，本轮起点 = fireDate − 间隔）：手动刷新不重建定时器、饼图
 /// 不跳变，改间隔重建定时器后自动跟随，面板侧零状态推送。
-final class RefreshPieButton: NSView, PanelScrollHoverSync {
+final class RefreshPieButton: NSView, PanelScrollHoverSync, HeaderIconDraggable {
     static let buttonSize = HoverIconButton.buttonSize
     /// 饼图直径：与 header 图标 11pt 同尺寸，视觉分量对齐
     private let pieDiameter: CGFloat = 11
@@ -1126,6 +1149,8 @@ final class RefreshPieButton: NSView, PanelScrollHoverSync {
     var onSelectRefresh: (() -> Void)?
     /// 右键菜单选中回调（秒数）
     var onSelectInterval: ((TimeInterval) -> Void)?
+    /// 拖动换位起手回调（header 图标；nil = 未接入分流，mouseDown 保持按下即刷新）
+    var onDragStart: ((NSEvent) -> Void)?
 
     private var trackingArea: NSTrackingArea?
     private var isMouseInside = false
@@ -1234,6 +1259,16 @@ final class RefreshPieButton: NSView, PanelScrollHoverSync {
     // MARK: - 点击（左键 = 手动刷新，右键 = 间隔单选菜单）
 
     override func mouseDown(with event: NSEvent) {
+        // 按下即转交面板做点击/拖拽分流（阈值判断在 PanelDrag）；未接入时保持原「按下即刷新」
+        guard let onDragStart else {
+            onSelectRefresh?()
+            needsDisplay = true
+            return
+        }
+        onDragStart(event)
+    }
+
+    func performClickAction() {
         onSelectRefresh?()
         // onRefresh 已同步重建定时器 → provider 锚点=现在，立即重绘即归零
         needsDisplay = true
@@ -1709,7 +1744,14 @@ final class TintOverlayView: NSView {
     /// 渐变起始位置（距视觉顶部的 pt 数，isFlipped 语义：顶部为 0）；默认 0 = 从顶部渐变
     var gradientStartY: CGFloat = 0 { didSet { needsDisplay = true } }
     override var isFlipped: Bool { true }
+    /// [GradProbe] 诊断去重键：只在「有无颜色/尺寸」变化时记一条，避免每次重绘刷屏
+    private var probeKey = ""
     override func draw(_ dirtyRect: NSRect) {
+        let key = "\(color != nil)+\(bottomColor != nil)+\(Int(bounds.width))x\(Int(bounds.height))"
+        if key != probeKey {
+            probeKey = key
+            Logger.log(.layout, "[GradProbe] TintOverlay.draw id=\(ObjectIdentifier(self).hashValue) color=\(color != nil) bottom=\(bottomColor != nil) frame=\(bounds) hidden=\(isHidden) alpha=\(alphaValue) inWindow=\(window != nil)")
+        }
         guard let c = color else { return }
         if let b = bottomColor {
             let startY = min(max(bounds.minY + gradientStartY, bounds.minY), bounds.maxY)
@@ -1756,6 +1798,11 @@ final class TintedVisualEffectView: NSVisualEffectView {
             guard abs(oldValue - tintGradientStartY) > 0.5 else { return }
             tintView.gradientStartY = tintGradientStartY
         }
+    }
+
+    /// [GradProbe] 遮罩子视图几何/显隐快照（诊断 body 遮罩不生效用）
+    var tintProbe: String {
+        "tintFrame=\(tintView.frame) hidden=\(tintView.isHidden) alpha=\(tintView.alphaValue) containerFrame=\(frame) inWindow=\(tintView.window != nil)"
     }
 
     override init(frame frameRect: NSRect) {

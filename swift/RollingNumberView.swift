@@ -11,6 +11,9 @@
 // 水平对齐口径（与原单 label 右对齐连续排版像素级一致）：
 //   - 所有槽宽取字形精确 advance（不 ceil）——逐槽连续排布 == 连续文本排版，
 //     消除逐槽取整累积出的额外字距（实测 "1,234.56" Inter 13pt：精确 54.5pt vs 逐槽 ceil 60pt）；
+//   - 默认字体（系统 SF）下槽间另施固定负字距 slotTracking（2026-09-13 用户要求
+//     字距收一点；Mono / Sharp Grotesk 不施）：槽宽本身仍 = advance，收紧只发生在
+//     排布推进量上，数字轮裁剪窗口与右缘 advance 对齐口径均不受影响；
 //   - 数字位槽宽 = **当前显示数字的真实 advance**（非 tabular 统一位宽）：
 //     比例数字字体（Inter 默认数字 "1"=5.5 vs "0"=8.58）下静止排版与单 label 完全一致；
 //     滚动时槽宽由车轮的连续滚动位置推导（与滚动同参数插值）——右缘固定、
@@ -47,6 +50,36 @@ private extension Int {
         let r = self % 10
         return r >= 0 ? r : r + 10
     }
+}
+
+// MARK: - 裁剪窗口边缘渐隐（数字轮/滚字槽共用）
+
+/// 边缘渐隐 mask 固定主体：clear→black→black→clear 垂直渐变，挂在 layer.mask 上
+/// 只削 alpha，不影响内容颜色（hover 提亮、主题换色、位图定格色均不受影响）。
+private func makeEdgeFadeMask() -> CAGradientLayer {
+    let l = CAGradientLayer()
+    l.colors = [NSColor.clear.cgColor, NSColor.black.cgColor,
+                NSColor.black.cgColor, NSColor.clear.cgColor]
+    l.startPoint = CGPoint(x: 0.5, y: 0)
+    l.endPoint = CGPoint(x: 0.5, y: 1)
+    return l
+}
+
+/// 按窗口高度刷新渐隐带（NumberFlow 同款）：带高 = 字号 × 0.125em/缘（其默认
+/// mask-height 0.25em 总量的一半），0.5pt 栅格取整。落定字形墨迹距窗口缘 ≥0.15em
+/// （基线/大写字高留白，含逗号/百分号等最低低位），恒在带外；只有滚动中经过
+/// 窗口缘的字形被柔化。高度未定或带高过半（极端小窗）不挂 mask，行为同旧硬裁剪。
+private func attachEdgeFadeMask(_ mask: CAGradientLayer, to view: NSView, font: NSFont) {
+    guard let layer = view.layer, layer.bounds.height > 0 else { return }
+    let h = layer.bounds.height
+    let fade = max(1, (font.pointSize * 0.25).rounded() / 2)
+    guard fade * 2 < h else {
+        if layer.mask === mask { layer.mask = nil }
+        return
+    }
+    mask.frame = layer.bounds
+    mask.locations = [0, fade / h, 1 - fade / h, 1].map { NSNumber(value: $0) }
+    if layer.mask !== mask { layer.mask = mask }
 }
 
 // MARK: - DigitWheelView（单个数字位的车轮）
@@ -102,6 +135,8 @@ final class DigitWheelView: NSView {
     /// 这是流畅度的根本保障（此前逐帧 draw 是掉帧根因；计数频率反而是次要的）。
     private let stripLayer = CALayer()
     private var stripCGImage: CGImage?
+    /// 窗口上下边缘渐隐（主体/刷新见 makeEdgeFadeMask / attachEdgeFadeMask）
+    private let edgeFadeMask = makeEdgeFadeMask()
 
     override var isFlipped: Bool { true }
 
@@ -173,6 +208,7 @@ final class DigitWheelView: NSView {
     override func layout() {
         super.layout()
         applyStripOrigin()
+        attachEdgeFadeMask(edgeFadeMask, to: self, font: font)
     }
 
     /// 设置目标数字。animated=false 直接落位（含槽宽）；true 从当前连续位置向
@@ -305,6 +341,17 @@ final class DigitWheelView: NSView {
     private var targetPos: Double = 0
 
     private func applyStripOrigin() {
+        // 落定态（无 tween）pos 必为整数——非动画 setDigit / 落点精确停 / normalize
+        // 三处共同保证。分数残留会把整条数字带推出窗口：等宽数字字体下横位不变，
+        // 视觉即「数值顶部平齐截断、底缘完好」（2026-09-13 用户偶发上报）。就地取整
+        // 恢复不变量（可见数字 = round(pos)，不变）并打点取证，[RollDbg] 定位后移除
+        if tweenDuration == 0 {
+            let frac = pos - pos.rounded()
+            if abs(frac) > 0.01 {
+                Logger.log(.layout, "[RollDbg] FRACTIONAL-POS pos=\(String(format: "%.3f", pos)) frac=\(String(format: "%.3f", frac)) cellH=\(String(format: "%.1f", cellH))")
+                pos = pos.rounded()
+            }
+        }
         // cell i 的顶边 = (i-1-pos)*cellH；strip 首行(cell 0)的顶边 = -(1+pos)*cellH
         let y = -(1.0 + CGFloat(pos)) * cellH
         // 像素网格对齐（2x 屏 = 0.5pt 步进）：连续小数位置会让合成器把预渲染位图
@@ -327,11 +374,17 @@ final class TextSlotView: NSView {
     /// 外部读它求墨迹空档（`trailingInkGap` / `leadingInkGap`）与结构配对判据。
     private(set) var text: String = ""
     var font: NSFont = NSFont.systemFont(ofSize: 13) {
-        didSet { guard font != oldValue else { return }; needsDisplay = true }
+        didSet {
+            guard font != oldValue else { return }
+            needsDisplay = true
+            attachEdgeFadeMask(edgeFadeMask, to: self, font: font)
+        }
     }
     var textColor: NSColor = .labelColor {
         didSet { guard textColor != oldValue else { return }; needsDisplay = true }
     }
+    /// 窗口上下边缘渐隐（与数字轮同款，见 makeEdgeFadeMask / attachEdgeFadeMask）
+    private let edgeFadeMask = makeEdgeFadeMask()
 
     /// 基线居中补偿（与 DigitWheelView.baselinePad 同口径，见彼处注释）：
     /// ceil 补白的一半，换字体时随字体变化，保证静态槽与数字轮/探针基线一致
@@ -417,6 +470,11 @@ final class TextSlotView: NSView {
         return true
     }
 
+    override func layout() {
+        super.layout()
+        attachEdgeFadeMask(edgeFadeMask, to: self, font: font)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         let cellH = ceil(font.ascender - font.descender + font.leading)
         let outP = rollOut > 0 ? min(1, rollElapsed / rollOut) : 1
@@ -490,6 +548,11 @@ final class RollingNumberView: NSView {
     private var lineH: CGFloat = 16
     private var prefixLineH: CGFloat = 10
     private var digitWidth: CGFloat = 8   // 仅诊断日志用（字体等宽性验证）
+    /// 默认字体（系统 SF）下的槽间负字距（pt，负 = 收紧）：逐槽排布的间距 = 各字符
+    /// advance 连续相接，等宽数字档字形侧边距偏宽，用户要求默认字体下字距收一点
+    /// （2026-09-13）。随 refreshFont 按主字体重算；Mono / Sharp Grotesk 恒 0 保持
+    /// 字体自带度量（fontName 带 "." 前缀 = 系统私有 SF 家族）
+    private var slotTracking: CGFloat = 0
     private var textColor: NSColor = Palette.cardForeground
 
     // —— 基础字体档（configure 注入）：chip 态切走、退出态复原的复原锚点 ——
@@ -591,6 +654,8 @@ final class RollingNumberView: NSView {
     /// 槽位统一加此偏移，数字墨迹精确落在探针基线上；任何字体×字号自动成立
     ///（实测校准，勿改回纯模型推导）。随 refreshFont 按当前字体对（主/探针）重算。
     private var baselineAlignShift: CGFloat = 0
+    /// NEG-SHIFT 哨兵去重（进入坏态打一次点，复健后复位）
+    private var loggedNegShiftState = false
     /// 实测基线缓存（key = 字体名|字号|盒高）：测量要离屏渲染一次小位图，逐参数只做一次
     private static var probeBaselineCache: [String: CGFloat] = [:]
 
@@ -642,7 +707,7 @@ final class RollingNumberView: NSView {
     private var contentLeadingConstraint: NSLayoutConstraint!
 
     override var intrinsicContentSize: NSSize {
-        var w = slots.reduce(0) { $0 + slotWidth($1) }
+        var w = slotsTotalWidth(slots)
         if prefixIcon != nil { w += prefixIconGap + prefixIconSize }
         // 高度取基础档行高：chip 态字体缩小行高变小，但视图高度保持 16（row1 基线
         // 探针/标题基线约束稳定，标题不随 hover 态跳动）；槽位在 relayoutSlots 垂直居中
@@ -716,6 +781,7 @@ final class RollingNumberView: NSView {
         lineH = ceil(mainFont.ascender - mainFont.descender + mainFont.leading)
         prefixLineH = ceil(prefixFont.ascender - prefixFont.descender + prefixFont.leading)
         digitWidth = DigitWheelView.tabularWidth(mainFont)
+        slotTracking = mainFont.fontName.hasPrefix(".") ? -mainFont.pointSize * 0.01 : 0
         // 基线探针恒用基础档字体：对外 firstBaselineAnchor 稳定，标题行不随 chip 态跳动
         let probeFont = fontProvider(baseSize, baseWeight, true)
         baseLineH = ceil(probeFont.ascender - probeFont.descender + probeFont.leading)
@@ -756,7 +822,9 @@ final class RollingNumberView: NSView {
     /// totalDuration：整段式时长（开面板补发口径，非 nil 时忽略 rollDuration）——先求本轮
     /// 最大行进格数，把预算换算成「最长轮恰好占满 totalDuration」，其余车轮按格数等比
     /// 提前落定（共享角速度、错峰到达的设计不变），整段动画从开始到停下恒为 totalDuration。
-    func setText(_ text: String, animated: Bool, rollDuration: CFTimeInterval = 0.9,
+    /// rollDuration 默认预算 1.2s（2026-09-13 用户指定，原 0.9 → 1.5 → 1.2 定稿）：
+    /// 未显式传时长的调用方（Token 总计窗口外刷新等）的「10 格一圈」预算口径
+    func setText(_ text: String, animated: Bool, rollDuration: CFTimeInterval = 1.2,
                  slideOnRebuild: Bool = false, totalDuration: CFTimeInterval? = nil) {
         endSwap()    // 在途单位换值（纵向换位）立即落定：滚出槽清掉、偏移归零
         endSlide()   // 在途滑移立即落定，防陈旧槽位干扰结构比对
@@ -961,7 +1029,7 @@ final class RollingNumberView: NSView {
         for s in slots.reversed() { reusePool.append(s.view) }
         for s in slots { oldX[ObjectIdentifier(s.view)] = s.view.frame.origin.x }
         let oldViews = slots.map { $0.view }
-        let oldWidth = slots.reduce(0) { $0 + slotWidth($1) }
+        let oldWidth = slotsTotalWidth(slots)
         let oldHadContent = !slots.isEmpty
 
         // 标记每个新槽位复用了哪个旧视图（数字对数字、同字符静态对同字符静态）。
@@ -1074,7 +1142,7 @@ final class RollingNumberView: NSView {
         slideDelta = 0
         slideElapsed = 0
         slideDuration = 0
-        let newWidth = newSlots.reduce(0) { $0 + slotWidth($1) }
+        let newWidth = slotsTotalWidth(newSlots)
         if deferRemoval {
             // 复用轮旧 x 存档：数字顺序配对下复用轮会落到与旧位不同的下标，
             // 横向位移由 relayoutSlots 插值抹平（旧 x 就是本帧的实际位置）
@@ -1169,6 +1237,12 @@ final class RollingNumberView: NSView {
         (s.view as? DigitWheelView)?.currentWidth ?? s.width
     }
 
+    /// 槽组总占宽：Σadvance + 槽间负字距（n 个槽共 n−1 个间隙）。固有宽度与滑移
+    /// slideDelta（整组平移量）都以它为口径，漏加会让滑移起点/终点差出一个字距
+    private func slotsTotalWidth(_ list: [Slot]) -> CGFloat {
+        list.reduce(0) { $0 + slotWidth($1) } + slotTracking * CGFloat(max(0, list.count - 1))
+    }
+
     /// 右对齐排布 slots（与原右对齐 label 一致；总宽超出外部宽度时左溢裁掉）。
     /// 滚动期间每帧调用（槽宽插值），静止时随 layout()/setText 调用。
     ///
@@ -1188,6 +1262,16 @@ final class RollingNumberView: NSView {
         // （曾按 2026-09-06 需求 hover 点亮时整组上移 3pt，同日用户撤销「不再位移」，
         // 并已实测上移会与账号条/标题行产生叠影，勿加回）
         let yShift = max(0, (bounds.height - lineH) / 2) + baselineAlignShift
+        // [RollDbg] 基线偏移哨兵：yShift 明显为负 = 数字带被推出窗口顶部（顶部截字
+        // 的另一嫌疑：探针实测基线缓存中毒）。进入坏态打一次点、复健复位，定位后移除
+        if yShift < -1 {
+            if !loggedNegShiftState {
+                loggedNegShiftState = true
+                Logger.log(.layout, "[RollDbg] NEG-SHIFT '\(currentText)' yShift=\(String(format: "%.2f", yShift)) lineH=\(lineH) baseLineH=\(baseLineH) boundsH=\(String(format: "%.1f", bounds.height)) alignShift=\(String(format: "%.2f", baselineAlignShift)) font=\(mainFont.fontName)@\(mainFont.pointSize)")
+            }
+        } else {
+            loggedNegShiftState = false
+        }
         // 单位换值的横向位移进度（非换值期恒 1 = 直接落最终 x）
         let swapShiftP: CGFloat = (swapPhase != .idle && !swapShiftStarts.isEmpty)
             ? swapShiftProgress() : 1
@@ -1202,10 +1286,11 @@ final class RollingNumberView: NSView {
             var fx: CGFloat
             if alignsLeft {
                 fx = x
-                x += w
+                x += w + slotTracking      // 负字距：后续槽左移收紧（左缘锚定）
             } else {
                 x -= w
                 fx = x
+                x -= slotTracking          // 负字距：下一槽（左侧）右移收紧（右缘锚定）
             }
             if p < 1 {
                 let id = ObjectIdentifier(s.view)

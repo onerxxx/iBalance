@@ -3,7 +3,7 @@
 //   - 圆点本体常亮（直径 = 图标 × dotScale，不闪烁）；进行中（蓝）额外做小球弹跳
 //     （抛物线上下位移 + 触地压扁/顶点拉伸，光晕同幅跟随，见 updateBounce）
 //   - 圆点外沿呼吸光晕（同色模糊晕，余弦淡入淡出，周期与面板光环一致）
-// 实现：光晕位图预烘焙 + 60Hz Timer 逐帧写模型 opacity——多屏菜单栏镜像已提交的
+// 实现：光晕位图预烘焙 + DisplayTicker 逐帧写模型 opacity（帧率 = 显示器刷新率）——多屏菜单栏镜像已提交的
 // 图层内容、不传播 CA presentation 动画，只有模型值逐帧提交才能让所有屏同步呼吸
 // （见 breathStep 注释）；图标本体（template 位图）与点击链路不接触。
 import AppKit
@@ -32,7 +32,7 @@ final class MenuBarStatusGlowController {
     // （SettingsUI，设置窗口预览共用同一份），这里只按用途起别名
     private static let glowPadding = MenuBarStatusDotStyle.glowPadding // 光晕画布外扩（点），须容纳模糊扩散
     // 小球弹跳（仅「进行中」蓝点；光晕亮度仍走上面的呼吸，只跟随位移）
-    // 参数改由设置窗口「动画」pane 开放（落盘 + 实时生效），取值域/默认值/解算
+    // 参数改由设置窗口「菜单栏」pane 开放（落盘 + 实时生效），取值域/默认值/解算
     // 统一在 MenuBarBounceSettings（SettingsUI），本文件只负责把帧画出来
 
     /// 状态点平台在标题烘焙时插入的预留空隙（点左侧间距）。点出现才插入、消失即随
@@ -48,7 +48,7 @@ final class MenuBarStatusGlowController {
 
     private let stateProvider: (String) -> AgentTaskState?
 
-    /// 小球弹跳参数（设置窗口「动画」pane 写入；见 `setBounce`）
+    /// 小球弹跳参数（设置窗口「菜单栏」pane 写入；见 `setBounce`）
     private var bounce = MenuBarBounceSettings.initial
 
     private weak var button: NSStatusBarButton?
@@ -74,7 +74,7 @@ final class MenuBarStatusGlowController {
         self.button = button
     }
 
-    /// 设置窗口「动画」pane 改参后调用：立刻按新参数重算当前帧（不必等下一拍 60Hz），
+    /// 设置窗口「菜单栏」pane 改参后调用：立刻按新参数重算当前帧（不必等下一拍出帧），
     /// 拖动滑杆时菜单栏是跟手的。无进行中圆点时是空操作。
     func setBounce(_ s: MenuBarBounceSettings) {
         bounce = s
@@ -95,7 +95,7 @@ final class MenuBarStatusGlowController {
         DispatchQueue.main.async { [weak self] in self?.sync() }
     }
 
-    // MARK: - 排序切换滑动动画（快照层 + 状态点帧插值，60Hz 模型值驱动，多屏同步）
+    // MARK: - 排序切换滑动动画（快照层 + 状态点帧插值，DisplayTicker 模型值驱动，多屏同步）
 
     /// 面板拖拽排序提交后的过渡（回归最初朴素版，并入后续修复）：动画期间
     /// button.image = 透明占位（强制 layout 后按钮即终态宽），每个条目一层
@@ -212,15 +212,18 @@ final class MenuBarStatusGlowController {
 
         isReordering = true
         Logger.log(.refresh, "[Glow] reorder anim: plain sprites=\(sprites.count) dots=\(dotAnim.count) glows=\(glowAnim.count)")
-        let timer = Timer(timeInterval: 1.0 / 60.0, target: self,
-                          selector: #selector(reorderStep), userInfo: nil, repeats: true)
-        RunLoop.main.add(timer, forMode: .common)
-        reorder = (timer, CACurrentMediaTime(), sprites, dotAnim, glowAnim, newImage,
+        // 出帧源 = 显示器刷新率（DisplayTicker，非 60Hz 定频）：插值密度随屏幕走
+        let ticker = DisplayTicker(host: button) { [weak self] in
+            guard let self else { return false }
+            return self.reorderStep()
+        }
+        reorder = (ticker, CACurrentMediaTime(), sprites, dotAnim, glowAnim, newImage,
                    quickReorder ? 0.12 : Self.reorderDuration)
+        ticker.start()
         return true
     }
 
-    private var reorder: (timer: Timer, t0: CFTimeInterval,
+    private var reorder: (ticker: DisplayTicker, t0: CFTimeInterval,
                           sprites: [(layer: CALayer, x0: CGFloat, x1: CGFloat, a0: Float)],
                           dots: [(layer: CALayer, f0: CGRect, f1: CGRect, o0: Float, o1: Float)],
                           glows: [(layer: CALayer, f0: CGRect, f1: CGRect)],
@@ -228,8 +231,9 @@ final class MenuBarStatusGlowController {
 
     private static let reorderDuration: CFTimeInterval = 0.25
 
-    @objc private func reorderStep() {
-        guard let r = reorder, let button else { finishReorder(); return }
+    /// 每帧插值；返回 false = 动画结束（自停，无需外部 invalidate）
+    private func reorderStep() -> Bool {
+        guard let r = reorder, button != nil else { finishReorder(); return false }
         let p = min(1, (CACurrentMediaTime() - r.t0) / r.duration)
         // 二次 easeInOut
         let e = p < 0.5 ? 2 * p * p : 1 - pow(-2 * p + 2, 2) / 2
@@ -253,14 +257,15 @@ final class MenuBarStatusGlowController {
         }
         for (l, f0, f1) in r.glows { l.frame = lerpRect(f0, f1) }
         CATransaction.commit()
-        if button.window == nil || p >= 1 { finishReorder() }
+        if button?.window == nil || p >= 1 { finishReorder(); return false }
+        return true
     }
 
     /// 动画收尾：换上新位图、撤快照层、sync 落定（可安全重复调用）
     private func finishReorder() {
         guard let r = reorder else { return }
         reorder = nil
-        r.timer.invalidate()
+        r.ticker.stop()
         button?.image = r.newImage
         for (l, _, _, _) in r.sprites { l.removeFromSuperlayer() }
         isReordering = false
@@ -392,27 +397,31 @@ final class MenuBarStatusGlowController {
         ensureBreathing()
     }
 
-    // MARK: - 呼吸动画（60Hz Timer 逐帧驱动模型 opacity，仅光晕层）
+    // MARK: - 呼吸动画（DisplayTicker 逐帧驱动模型 opacity，仅光晕层）
 
     /// 为什么不用 CAKeyframeAnimation：多屏菜单栏镜像的是「已提交的图层内容」，
     /// CA 动画属 presentation 层瞬态、不随镜像传播——副屏拿到的是冻结帧（2026-09-08 实测）。
-    /// 改用 60Hz Timer 逐帧写模型值 opacity：每次提交都进图层树，所有屏同步呼吸。
-    private var breathTimer: Timer?
+    /// 改用 DisplayTicker（displayLink，帧率 = 屏幕刷新率）逐帧写模型值 opacity：
+    /// 每次提交都进图层树，所有屏同步呼吸。
+    private var breathTicker: DisplayTicker?
     private var breathStart: CFTimeInterval = 0
 
     private func ensureBreathing() {
-        guard breathTimer == nil, !glowLayers.isEmpty else { return }
+        guard breathTicker == nil, !glowLayers.isEmpty, let button else { return }
         breathStart = CACurrentMediaTime()
-        // 60Hz 主循环驱动（.common 保证菜单栏追踪中也持续）；2.8s 周期下足够平滑
-        let t = Timer(timeInterval: 1.0 / 60.0, target: self, selector: #selector(breathStep),
-                      userInfo: nil, repeats: true)
-        RunLoop.main.add(t, forMode: .common)
-        breathTimer = t
+        // 显示器刷新率驱动（.common 保证菜单栏追踪中也持续）；2.8s 余弦周期本已平滑，
+        // 高刷屏上亮度与弹跳位移都随屏幕逐帧推进
+        let ticker = DisplayTicker(host: button) { [weak self] in
+            guard let self else { return false }
+            return self.breathStep()
+        }
+        breathTicker = ticker
+        ticker.start()
     }
 
     private func stopBreathing() {
-        breathTimer?.invalidate()
-        breathTimer = nil
+        breathTicker?.stop()
+        breathTicker = nil
     }
 
     /// 余弦呼吸当前 alpha（breathStep 与排序画布共用，保证光晕亮度跨动画连续）；
@@ -421,9 +430,10 @@ final class MenuBarStatusGlowController {
         Float(MenuBarStatusDotStyle.breathOpacity(at: CACurrentMediaTime() - breathStart))
     }
 
-    /// 余弦呼吸：0 → 峰值（半周期处）→ 0；圆点本体不参与（常亮），仅进行中圆点走弹跳
-    @objc private func breathStep() {
-        guard !glowLayers.isEmpty else { stopBreathing(); return }
+    /// 余弦呼吸：0 → 峰值（半周期处）→ 0；圆点本体不参与（常亮），仅进行中圆点走弹跳。
+    /// 返回 false = 无光晕层，自停
+    private func breathStep() -> Bool {
+        guard !glowLayers.isEmpty else { stopBreathing(); return false }
         let now = CACurrentMediaTime()
         let opacity = currentBreathAlpha()
         CATransaction.begin()
@@ -431,9 +441,10 @@ final class MenuBarStatusGlowController {
         for (_, l) in glowLayers { l.opacity = opacity }
         CATransaction.commit()
         updateBounce(at: now)
+        return true
     }
 
-    // MARK: - 小球弹跳（仅「进行中」蓝点，60Hz 模型值驱动，多屏同步）
+    // MARK: - 小球弹跳（仅「进行中」蓝点，模型值逐帧驱动，多屏同步）
 
     /// 进行中蓝点＝弹跳小球：在静止基准帧上叠加抛物线弹跳（上下位移 + 触地压扁/顶点拉伸），
     /// 光晕同幅上下跟随（亮度仍由呼吸驱动，观感不变）。与呼吸同理走模型值逐帧提交——
@@ -500,7 +511,7 @@ final class MenuBarStatusGlowController {
     }
 }
 
-// MARK: - 小球弹跳参数的落盘（设置窗口「动画」pane）
+// MARK: - 小球弹跳参数的落盘（设置窗口「菜单栏」pane）
 
 /// 取值域/默认值/解算都在 `MenuBarBounceSettings`（SettingsUI），这里只补 UserDefaults 读写。
 /// 逐项独立落盘、逐次改动即写（滑杆拖动过程中也在写）—— 用户调完即是最终值，

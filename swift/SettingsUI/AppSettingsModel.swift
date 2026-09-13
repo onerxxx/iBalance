@@ -7,7 +7,7 @@ import AppKit
 import CoreImage
 import SwiftUI
 
-/// 菜单栏「进行中」状态点的小球弹跳参数（设置窗口「动画」pane 可调）。
+/// 菜单栏「进行中」状态点的小球弹跳参数（设置窗口「菜单栏」pane 可调）。
 /// 刻意放在 SettingsUI 里：**宿主与设置界面共用同一份取值域与默认值** ——
 /// 宿主 `MenuBarStatusGlowController` 按这份参数逐帧算小球帧，界面按同一份画实时预览，
 /// 两边各写一份常量迟早会漂移。落盘读写见宿主侧的 `MenuBarBounceSettings.load()/save()`。
@@ -70,7 +70,7 @@ public struct MenuBarBounceSettings: Equatable {
 }
 
 /// 菜单栏状态点（任务指示圆点）的**绘制规格**：本体常亮圆 + 状态色高斯模糊光晕 + 余弦呼吸。
-/// 菜单栏宿主（`MenuBarStatusGlowController`）与设置窗口「动画」pane 的实时预览共用本规格
+/// 菜单栏宿主（`MenuBarStatusGlowController`）与设置窗口「菜单栏」pane 的实时预览共用本规格
 /// —— 预览把所有 pt 量纲乘 `visualScale` 等比放大，其余参数（透明度 / 模糊增益 / 呼吸）
 /// 逐值同源；与 `MenuBarBounceSettings.solve(at:)` 同一条「两边各画一份迟早漂移」的共存铁律。
 public enum MenuBarStatusDotStyle {
@@ -143,28 +143,6 @@ public enum MenuBarStatusDotStyle {
     }
 }
 
-/// 设置窗口**左侧栏玻璃**的透明度取值域（宿主与界面共用，避免两边各写一份常量）。
-///
-/// 侧栏那层玻璃是 SwiftUI `NavigationSplitView` 内部铺的 `NSGlassEffectView`，
-/// **`.regular` 变体**（HIG 指定的 sidebar 变体，随系统「外观 → Liquid Glass」偏好与
-/// 辅助功能设置自适应；详见 `SettingsWindowController.applySidebarGlass` 的注释）。
-/// 它对外只有 `style`（两档枚举）和 `tintColor` 两个旋钮、**没有 0–1 的透明度数值**，
-/// 所以连续可调只能靠 `tintColor` 的 alpha —— 那是叠在玻璃上的**着色层**：
-/// alpha 0 = 不着色（完全交给系统原生玻璃），alpha 1 = 整块偏向窗口底色（最实）。
-public enum SidebarGlass {
-    /// 透明度取值域：1 = 不做着色（原生玻璃），0 = 完全着色（最实）
-    public static let transparencyRange: ClosedRange<Double> = 0...1
-    /// 出厂默认：**不做任何着色** = 系统原生侧栏玻璃。
-    /// （2026-09-12 起不再把 `style` 改写成 `.clear`；想要更清透的观感请改系统
-    /// 「外观 → Liquid Glass」偏好 —— 那是唯一的正统入口。）
-    public static let defaultTransparency: Double = 1
-
-    /// 透明度 → `tintColor` 的 alpha（着色量 = 1 − 透明度），顺带夹回取值域
-    public static func tintAlpha(forTransparency t: Double) -> Double {
-        1 - min(max(t, transparencyRange.lowerBound), transparencyRange.upperBound)
-    }
-}
-
 /// 设置窗口尺寸口径：**宿主（`SettingsWindowController`）与视图共用同一份常量**，
 /// 免得「视图 min 640×460」和「窗口 setContentSize 680×700」各写一遍后漂移。
 public enum SettingsWindowMetrics {
@@ -174,6 +152,41 @@ public enum SettingsWindowMetrics {
     /// 内容最小尺寸 = 根视图 `.frame(minWidth:minHeight:)`，宿主据此设 `contentMinSize`
     public static let minWidth: CGFloat = 640
     public static let minHeight: CGFloat = 460
+    /// 侧栏宽度：**固定值**（2026-09-13 用户要求「固定 180pt、不可拖动」；原为 min 180 / ideal 200 / max 240）。
+    /// 视图侧 `.navigationSplitViewColumnWidth(min:ideal:max:)` 与宿主侧 `NSSplitViewItem` 的
+    /// minimum/maximumThickness 共用这一个数 —— 两处都钉死才是真「拖不动」
+    public static let sidebarWidth: CGFloat = 180
+}
+
+/// 「已保存账号」分组（2026-09-13 用户要求）：账号页逐平台列出已保存账号并支持逐个删除。
+public struct SavedAccountGroup: Equatable, Identifiable {
+    /// 平台键（workbuddy / trae / zcode / codex）：删除动作回传宿主，用于定位账号数组与菜单栏前缀
+    public let id: String
+    /// 平台展示名（Section header）
+    public let platform: String
+    /// 平台品牌图标键（与面板卡片图标名同源，经宿主 iconProvider 解析）
+    public let iconKey: String
+    public let accounts: [SavedAccountEntry]
+
+    public init(id: String, platform: String, iconKey: String, accounts: [SavedAccountEntry]) {
+        self.id = id
+        self.platform = platform
+        self.iconKey = iconKey
+        self.accounts = accounts
+    }
+}
+
+/// 单个已保存账号：name = 展示名（昵称 / 用户名 / 邮箱），detail = 次要标识（uid 等，可空）
+public struct SavedAccountEntry: Equatable, Identifiable {
+    public let id: String      // uid
+    public let name: String
+    public let detail: String
+
+    public init(id: String, name: String, detail: String) {
+        self.id = id
+        self.name = name
+        self.detail = detail
+    }
 }
 
 /// 设置窗口各项的当前值快照：宿主从真实状态（config / 面板快照）装配，预览给静态值。
@@ -184,21 +197,17 @@ public struct AppSettingsSnapshot: Equatable {
     /// 今日签到统计文案（如 "9-12 3成功 1失败"），空 = 今天尚未产生签到结果
     public var autoCheckinSub: String = ""
     public var autoUpdateCheck: Bool = false
-    /// 菜单栏状态点小球弹跳参数（「动画」pane）
+    /// 菜单栏状态点小球弹跳参数（「菜单栏」pane）
     public var bounce: MenuBarBounceSettings = .initial
-    /// 设置窗口左侧栏玻璃透明度（0…1，1 = 最透；见 `SidebarGlass`；「主题外观」pane）
-    public var sidebarGlassTransparency: Double = SidebarGlass.defaultTransparency
-    /// ── 「主题外观」pane：以下 8 项 + 上面的侧栏玻璃（原「主题调教」玻璃弹窗内容）──
-    /// 面板渐变背景开关（高对比背景）
-    public var panelGradientEnabled = true
+    /// ── 「主题外观」pane：以下各项（原「主题调教」玻璃弹窗内容）──
+    /// 「高对比背景」强度（0…1，0 = 无遮罩原生玻璃；面板遮罩 alpha 随此值缩放）
+    public var panelMaskOpacity: Double = 1
     /// 浅色主题开关（强制浅色外观，即使系统是深色主题）
     public var lightThemeEnabled = false
     /// 品牌 icon 深浅版互换
     public var iconThemeSwap = false
     /// 品牌 icon 裁圆（宽高不变，仅形状裁切；任务状态光环同步翻圆形）
     public var circularIcon = false
-    /// Mono 字体（余额卡片与用量列表切 JetBrainsMono）
-    public var monoFontEnabled = false
     /// 长进度卡片（整行进度条 + 副标题下移）
     public var longProgressCard = false
     /// 卡片主标题字号（pt，10…18）
@@ -223,16 +232,22 @@ public struct AppSettingsSnapshot: Equatable {
     public var zhipuToken: String = ""
     /// Qwen Ticket 手填覆盖（空 = 自动读浏览器登录态）
     public var qwenTicket: String = ""
+    /// 「账号」pane 底部「删除账号」用：已保存的**账号数**（WorkBuddy / TRAE / ZCode / Codex 四个数组之和）
+    public var savedAccountCount: Int = 0
+    /// 同上：已保存的**手填凭据数**（DeepSeek Key / ZhiPu Token / Qwen Ticket 里非空的条数）
+    public var savedOverrideCount: Int = 0
+    /// 「已保存账号」列表（2026-09-13 用户要求）：逐平台分组，空平台不出现；全空 = 空数组
+    public var savedAccountGroups: [SavedAccountGroup] = []
 
     public init(refreshInterval: Int = 300, autoCheckin: Bool = false,
                 autoCheckinSub: String = "", autoUpdateCheck: Bool = false,
                 bounce: MenuBarBounceSettings = .initial,
-                sidebarGlassTransparency: Double = SidebarGlass.defaultTransparency,
                 apiKey: String = "", commonQuota: Double = 0,
                 zhipuToken: String = "", qwenTicket: String = "",
-                panelGradientEnabled: Bool = true, lightThemeEnabled: Bool = false,
+                savedAccountCount: Int = 0, savedOverrideCount: Int = 0,
+                savedAccountGroups: [SavedAccountGroup] = [],
+                panelMaskOpacity: Double = 1, lightThemeEnabled: Bool = false,
                 iconThemeSwap: Bool = false, circularIcon: Bool = false,
-                monoFontEnabled: Bool = false,
                 longProgressCard: Bool = false,
                 cardTitleFontSize: Double = 13, cardTitleSharpGrotesk: Bool = false,
                 cardTitleSGWeight: Int = 3, cardTitleSGWidth: Int = 3,
@@ -242,16 +257,17 @@ public struct AppSettingsSnapshot: Equatable {
         self.autoCheckinSub = autoCheckinSub
         self.autoUpdateCheck = autoUpdateCheck
         self.bounce = bounce
-        self.sidebarGlassTransparency = sidebarGlassTransparency
         self.apiKey = apiKey
         self.commonQuota = commonQuota
         self.zhipuToken = zhipuToken
         self.qwenTicket = qwenTicket
-        self.panelGradientEnabled = panelGradientEnabled
+        self.savedAccountCount = savedAccountCount
+        self.savedOverrideCount = savedOverrideCount
+        self.savedAccountGroups = savedAccountGroups
+        self.panelMaskOpacity = panelMaskOpacity
         self.lightThemeEnabled = lightThemeEnabled
         self.iconThemeSwap = iconThemeSwap
         self.circularIcon = circularIcon
-        self.monoFontEnabled = monoFontEnabled
         self.longProgressCard = longProgressCard
         self.cardTitleFontSize = cardTitleFontSize
         self.cardTitleSharpGrotesk = cardTitleSharpGrotesk
@@ -275,14 +291,21 @@ public struct AppSettingsActions {
     public var addTraeAccount: () -> Void = {}
     public var addZcodeAccount: () -> Void = {}
     public var addCodexAccount: () -> Void = {}
-    /// 「Key / 额度」pane 保存（apiKey、日常额度、ZhiPu Token、Qwen Ticket；空串 = 清除该项覆盖）
+    /// Key/额度表单保存（2026-09-13 并入账号 pane；apiKey、日常额度、ZhiPu Token、Qwen Ticket；空串 = 清除该项覆盖）
     public var saveKeyQuota: (String, Double, String, String) -> Void = { _, _, _, _ in }
-    /// ── 「主题外观」pane：6 个外观开关（传期望值，宿主比对当前配置后再落盘）──
-    public var setPanelGradient: (Bool) -> Void = { _ in }
+    /// 「账号」pane 底部「删除账号」（2026-09-13 用户要求）：清空全部已保存的平台凭据 ——
+    /// WorkBuddy / TRAE / ZCode / Codex 的账号数组 + DeepSeek Key / ZhiPu Token / Qwen Ticket 手填覆盖。
+    /// 二次确认与结果提示都由宿主负责（破坏性操作，UI 这边只发一个意图）
+    public var deleteAllAccounts: () -> Void = {}
+    /// 「已保存账号」列表的逐个删除（2026-09-13 用户要求）：platform = 平台键
+    /// （workbuddy / trae / zcode / codex），uid = 账号 uid。二次确认由宿主负责（破坏性操作）
+    public var deleteAccount: (String, String) -> Void = { _, _ in }
+    /// ── 「主题外观」pane：外观开关（传期望值，宿主比对当前配置后再落盘）+ 强度滑杆 ──
+    /// 「高对比背景」强度（0…1，0 = 原生玻璃；宿主：落盘 + 快照同步重绘遮罩）
+    public var setPanelMaskOpacity: (Double) -> Void = { _ in }
     public var setLightTheme: (Bool) -> Void = { _ in }
     public var setIconThemeSwap: (Bool) -> Void = { _ in }
     public var setCircularIcon: (Bool) -> Void = { _ in }
-    public var setMonoFont: (Bool) -> Void = { _ in }
     public var setLongProgressCard: (Bool) -> Void = { _ in }
     /// 「主题外观」pane 点阵色相 / 饱和度 / 明度（0…1；宿主：落 UserDefaults + 就地重绘点阵与边框）
     public var setHeatHue: (Double) -> Void = { _ in }
@@ -293,8 +316,6 @@ public struct AppSettingsActions {
     public var shareWbHistory: () -> Void = {}
     /// 菜单栏小球弹跳参数变更（宿主：写内存 + 落盘 + 推给 MenuBarStatusGlowController）
     public var setBounce: (MenuBarBounceSettings) -> Void = { _ in }
-    /// 侧栏玻璃透明度变更（「主题外观」pane；宿主：落盘 + 立即重灌侧栏那层 NSGlassEffectView 的 tintColor）
-    public var setSidebarGlassTransparency: (Double) -> Void = { _ in }
     /// 卡片主标题字号 / Sharp Grotesk 开关与字重×宽度档（「主题外观 → 卡片」；
     /// 宿主：写 config + 落盘 + syncPanel，面板快照比对变化后就地重刷标题）
     public var setCardTitleFontSize: (Double) -> Void = { _ in }
@@ -306,7 +327,7 @@ public struct AppSettingsActions {
     public init() {}
 }
 
-/// 「Key / 额度」pane 的编辑草稿（原 DeepSeek / ZhiPu / Qwen 玻璃弹窗的四项内容）。
+/// Key/额度表单的编辑草稿（原 DeepSeek / ZhiPu / Qwen 玻璃弹窗的四项内容；2026-09-13 并入账号 pane）。
 ///
 /// 草稿刻意放模型而不是视图的 `@State`：本机工具链是 CLT，SwiftUI 的 `@State` 是宏
 /// （`SwiftUIMacros.StateMacro`），没有 Xcode 就没有那个插件，编不过 —— 见本文件头注释。
@@ -384,8 +405,8 @@ public struct SettingsHostedContent {
     public let header: String?
     /// 构造/返回内容视图（宿主持有实例，pane 切走再回来不丢未保存调参）
     public let view: () -> NSView
-    /// 内容区定高（内嵌视图是手工 frame 布局，不参与 SwiftUI 自适应）
-    public let height: CGFloat
+    /// 内容区定高（nil = 高度随内容，视图 fittingSize 决定）
+    public let height: CGFloat?
     /// 内容下方（可滚动区）的说明文字
     public let footnote: String
     /// 页脚按钮标题（nil = 该 pane 即时生效、无保存动作）
@@ -394,10 +415,15 @@ public struct SettingsHostedContent {
     /// 每次打开设置窗口时回调：丢弃未保存编辑、回读真实状态
     /// （窗口是保活复用的，不做这一步上次没保存的勾选会一直留在框里）
     public let refresh: (() -> Void)?
+    /// **钉住不滚**（2026-09-13 用户：「该容器和标题不参与页面滚动」）：
+    /// 该段连同它的标题被放进页面顶部那块「只吃自身内容高度」的 Form 里，页面滚动只发生在
+    /// 它下面的段上。⚠️ 同一个 pane 里 pinned 段必须排在前面（顺序即上屏顺序）
+    public let pinned: Bool
 
-    public init(header: String? = nil, view: @escaping () -> NSView, height: CGFloat,
-                footnote: String, actionTitle: String? = nil, action: (() -> Void)? = nil,
-                refresh: (() -> Void)? = nil) {
+    public init(header: String? = nil, view: @escaping () -> NSView, height: CGFloat? = nil,
+                footnote: String, actionTitle: String? = nil,
+                action: (() -> Void)? = nil, refresh: (() -> Void)? = nil,
+                pinned: Bool = false) {
         self.header = header
         self.view = view
         self.height = height
@@ -405,6 +431,7 @@ public struct SettingsHostedContent {
         self.actionTitle = actionTitle
         self.action = action
         self.refresh = refresh
+        self.pinned = pinned
     }
 }
 
@@ -417,9 +444,10 @@ public final class AppSettingsModel {
     public var selection: SettingsSidebarItem = .appearance {
         didSet {
             guard !isRestoringHistory, selection != oldValue else { return }
-            // 离开「Key / 额度」= 一次编辑结束 → 未保存草稿就地落盘（该 pane 已无「保存」按钮，
-            // 提交时机见 KeyQuotaPane 的注释：回车 / 改档位 / 换页 / 关窗）
-            if oldValue == .keyQuota { commitKeyQuotaIfDirty() }
+            // 离开「账号」= Key/额度表单一次编辑结束 → 未保存草稿就地落盘（2026-09-13
+            // 起 Key/额度并入账号 pane，原独立 keyQuota pane 删除；提交时机：
+            // 回车 / 离开账号 pane / 关窗）
+            if oldValue == .accounts { commitKeyQuotaIfDirty() }
             history.removeSubrange((historyIndex + 1)...)
             history.append(selection)
             historyIndex += 1
@@ -432,10 +460,13 @@ public final class AppSettingsModel {
     /// 平台品牌图标解析（宿主注入：键 → 品牌 PNG，App 侧固定取 dark 版）；
     /// nil 或缺图时行视图回退通用 SF Symbol（预览环境即走回退）
     public var iconProvider: ((String) -> NSImage?)?
-    /// 内嵌 AppKit 内容的 pane（3D 硬币 / 平台开关）；缺项 = 预览 → 回退单动作行
+    /// 内嵌 AppKit 内容的 pane（3D 硬币 / 平台开关）；缺项 = 预览 → 回退单动作行。
+    /// **数组 = 该 pane 的若干段**，每段一个 Form Section（各画各的卡片）——
+    /// 「3D 硬币」用它把预览框与表单框拆成两块（2026-09-13 用户：预览框不要包裹下方 forms），
+    /// 单段 pane 就给一个元素的数组。顺序即上屏顺序。
     /// 「主题外观」是原生 SwiftUI `ThemePane`，不走这里
-    public var hostedPanes: [SettingsSidebarItem: SettingsHostedContent] = [:]
-    /// 「Key / 额度」pane 的编辑草稿（窗口打开时按真实配置重置，见 `beginSession`）
+    public var hostedPanes: [SettingsSidebarItem: [SettingsHostedContent]] = [:]
+    /// Key/额度表单的编辑草稿（窗口打开时按真实配置重置，见 `beginSession`）
     public var keyQuotaDraft = KeyQuotaDraft()
 
     /// pane 导航历史（系统设置同款后退/前进）；初始 = [初始 pane]，两侧按钮初始均禁用
@@ -469,17 +500,24 @@ public final class AppSettingsModel {
         if let snapshotProvider { snapshot = snapshotProvider() }
     }
 
-    /// 窗口每次打开时：回读真实状态 + 用真实配置重置「Key / 额度」草稿与各内嵌内容。
+    /// 窗口每次打开时：回读真实状态 + 用真实配置重置 Key/额度草稿与各内嵌内容。
     /// 窗口是保活复用的（关闭只收起、视图不重建），不做这一步的话上次没保存的草稿/勾选会一直留在框里。
     public func beginSession() {
         sync()
         resetKeyQuotaDraft()
-        for content in hostedPanes.values { content.refresh?() }
+        for sections in hostedPanes.values {
+            for content in sections { content.refresh?() }
+        }
     }
 
     // 设置项写路径：先交宿主动作、再回读真实状态（翻转式实现下回读是唯一事实源）
     public func setRefreshInterval(_ seconds: Int) {
         actions.setRefreshInterval(seconds)
+        sync()
+    }
+    /// 删除单个已保存账号（宿主：二次确认 + 落盘 + 刷新面板/菜单栏），随后回读快照刷新列表
+    public func deleteAccount(platform: String, uid: String) {
+        actions.deleteAccount(platform, uid)
         sync()
     }
     public func setAutoCheckin(_ on: Bool) {
@@ -495,16 +533,12 @@ public final class AppSettingsModel {
         actions.setBounce(s)
         sync()
     }
-    /// 侧栏玻璃透明度：同上，拖动即时生效 + 落盘
-    public func setSidebarGlassTransparency(_ t: Double) {
-        actions.setSidebarGlassTransparency(t)
-        sync()
-    }
 
-    // ── 「主题外观」pane：6 个开关 + 2 根滑杆，全部即时生效（改完 sync() 回读真实配置）──
+    // ── 「主题外观」pane：开关 + 滑杆，全部即时生效（改完 sync() 回读真实配置）──
 
-    public func setPanelGradient(_ on: Bool) {
-        actions.setPanelGradient(on)
+    /// 「高对比背景」强度（0…1，滑杆实时拖动）：动作转交宿主，随后回读快照
+    public func setPanelMaskOpacity(_ opacity: Double) {
+        actions.setPanelMaskOpacity(opacity)
         sync()
     }
     public func setLightTheme(_ on: Bool) {
@@ -517,10 +551,6 @@ public final class AppSettingsModel {
     }
     public func setCircularIcon(_ on: Bool) {
         actions.setCircularIcon(on)
-        sync()
-    }
-    public func setMonoFont(_ on: Bool) {
-        actions.setMonoFont(on)
         sync()
     }
     public func setCardTitleFontSize(_ size: Double) {
@@ -581,7 +611,7 @@ public final class AppSettingsModel {
         saveKeyQuotaDraft()
     }
 
-    /// 「Key / 额度」保存：先落盘（凭据走钥匙串）再回读，随后按真实值重置草稿
+    /// Key/额度保存：先落盘（凭据走钥匙串）再回读，随后按真实值重置草稿
     /// （顺带把「 10 」这类手输归一）
     public func saveKeyQuotaDraft() {
         let d = keyQuotaDraft
@@ -607,8 +637,8 @@ extension AppSettingsModel {
             refreshInterval: 180, autoCheckin: true,
             autoCheckinSub: "9-12 3成功 1失败", autoUpdateCheck: true,
             apiKey: "sk-preview-key", commonQuota: 20,
-            panelGradientEnabled: true, lightThemeEnabled: false,
-            iconThemeSwap: true, monoFontEnabled: false,
+            panelMaskOpacity: 1, lightThemeEnabled: false,
+            iconThemeSwap: true,
             longProgressCard: true,
             heatHue: 0.25, heatSaturation: 0.6, heatBrightness: 0.996)
         m.resetKeyQuotaDraft()   // 「Key / 额度」pane 的草稿也要有值，否则预览是空框

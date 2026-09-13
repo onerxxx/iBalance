@@ -16,7 +16,7 @@
 //           它的 offset 纯 ∝ normal.x，正面（normal.x = 0）时两项都退化成 `inset 0 0`、
 //           只剩被裁掉外半圈的模糊环（峰值 50%）→ 正面的盘面发平，故补；
 //           ② 硬边月牙（`inset −2·shadow-x 0 <色>`）③ 模糊月牙（blur 4px·sizeScale）
-// 动效/配色 弹簧自旋、pitchArc 俯仰弧、惰性弹跳、落地影；材质 = sgho 预设或
+// 动效/配色 弹簧自旋、pitchArc 俯仰弧、惰性弹跳；材质 = sgho 预设或
 //           Coin Color 派生（CoinMaterial.derived，core/material.ts deriveMaterialTokens 移植）；
 //           lowerField 色场颜色独立可调（Field color 色井，不参与派生，CoinSettings.fieldColor）；
 //           Preset 两档（CoinPreset：GHO 关色场 / sGHO 开色场）照 Mintform.tsx MintformPreset
@@ -38,8 +38,8 @@
 //           ⚠️ 必须排在侧壁/顶面**之前**（内侧半圈靠后两层盖掉），且全程**一次填充**
 // 调参      CoinMetrics（几何/动效旋钮）+ CoinFormMetrics（表单行高/列宽，Control·Edge 共用）
 //           参数区 Control / Edge / Motion 三块；调参实时上币 + 通知同步主面板小硬币
-// 落盘      CoinSettings（UserDefaults，key 见 UDKey.coin*）：**显式保存** —— 改动只进内存
-//           快照，弹窗「保存」按钮（关闭左边）才整份写盘为默认；没保存关弹窗 = 改动作废。
+// 落盘      CoinSettings（UserDefaults，key 见 UDKey.coin*）：**自动保存**（2026-09-13 起，
+//           原显式「保存」按钮已删）—— 每次参数变更即时整份写盘；实时同步主面板小硬币。
 //           一个控件一条；上传的 logo 存 SVG 原文 + 文件名
 // mark 适配 上传件按 viewBox 撑满 160 盒会冲出 r=61.5 的裁剪圆 → drawMark 按 radialReach
 //           把它整体缩回圆的外接方形内（只缩不放，预设不动）
@@ -47,8 +47,8 @@
 //           / CoinFormRowView（一行一参数、等高）/ CoinSliderRowView（滑杆行）；
 //           Control 区 = CoinControlSectionView（排最前），Edge 区 = CoinEdgeSectionView，
 //           Motion 区 = CoinMotionSectionView —— 三块装进 CoinDemoPanelView 里的
-//           NSScrollView（视口定高 paramsViewportHeight，弹窗高度因此定值），
-//           「保存 / 关闭」按钮固定在 GlassModalShell 的 footer
+//           NSScrollView（设置窗口内嵌时视口 = 参数区自然高、整卡随页面滚动；
+//           弹窗壳内同参数区自然高），「保存 / 关闭」按钮固定在 GlassModalShell 的 footer
 // 入口      CoinDemoDialog.present()（GlassModalShell；面板侧接线见 PanelLayout/Panel/main）
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -61,14 +61,16 @@ import UniformTypeIdentifiers
 
 /// 硬币几何 / 动效的全部旋钮。`size`（160）是**参考盒**：mintform 的 CSS 把这些 px 值
 /// 写死在 size=160 的基准上，运行时尺寸（`Coin3DView.size`）变了就按
-/// sizeScale = size / 160 换算 —— 随尺寸缩放的只有内缩 / 落地影偏移 / mark 裁剪半径，
+/// sizeScale = size / 160 换算 —— 随尺寸缩放的只有内缩 / mark 裁剪半径，
 /// 影的模糊·扩散与惰性弹跳在参考实现里**不**乘 sizeScale，这里同样不乘。
 enum CoinMetrics {
     /// 参考盒边长（= mintform 默认 size；下面所有数值的基准盒）
     static let size: CGFloat = 160
-    /// Coin Size 滑杆范围（上限同时决定弹窗内容区高度，见 `Coin3DView.contentHeight`）
+    /// Coin Size 滑杆范围（上限同时决定弹窗内容区高度，见 `Coin3DView.contentHeight`）。
+    /// 上限 192 → **170**（2026-09-13 用户要求「coin size 上限为 170」）；
+    /// 落盘值超过上限的由 `CoinSettings.load` 的夹取自动收进 170。
     static let defaultSize = 160.0
-    static let sizeRange: ClosedRange<Double> = 96...192
+    static let sizeRange: ClosedRange<Double> = 96...170
     /// 「Panel coin size」默认值与滑杆范围（pt）：主面板 Token 板块里那枚内嵌硬币的直径。
     /// 与弹窗的 `size` 相互独立 —— 弹窗是「浮在舞台上的大币」，内嵌是「贴着数字的记号」
     /// （2026-09-12 用户指定可单独调）。厚度 / 浮雕深度仍按内嵌直径 ÷ 弹窗直径等比缩放。
@@ -166,14 +168,13 @@ enum CoinMetrics {
     /// 这里补一圈「从 radius − w 渐深到 radius 满值」的环，任何朝向都在。
     static let surfaceRimShadow = 8.0
     static let surfaceRimShadowAlpha = 0.35
-    /// 落地影：bottom −40px、宽 75%、box-shadow 0 0 4px 4px、组不透明度 0.1
-    static let shadowBottom = 40.0
-    static let shadowWidthRatio = 0.75
-    /// scaleX 随朝向收窄的幅度（%）：scaleX = (75 − 55·屏幕法线长)/100
-    static let shadowWidthReduction = 55.0
+    /// 盖面内阴影的模糊半径（CSS `inset 0 0 4px`，随尺寸缩放）——
+    /// 落地影的 blur 用的是同一个数，两者同源。
+    /// ⚠️ 落地影（bottom −40px / 宽 75% / spread 4px / 组不透明度 0.1）与它那套常量
+    /// （`shadowBottom` / `shadowWidthRatio` / `shadowWidthReduction` / `shadowSpread` /
+    /// `shadowOpacity`）已按用户 2026-09-13 要求「3D 硬币去掉地上的阴影」整段移除；
+    /// 这个 `shadowBlur` 因为盖面也在用，保留。
     static let shadowBlur = 4.0
-    static let shadowSpread = 4.0
-    static let shadowOpacity = 0.1
     /// 惰性弹跳（--mintform-idle-height / duration，缓动 cubic-bezier(.45,0,.55,1)）
     static let idleBounceHeight = 20.0
     static let idleBounceDuration = 3.0
@@ -471,7 +472,7 @@ enum CoinPreset: Int, CaseIterable {
 /// UI 名叫 **Style**（用户 2026-09-11 指定）；`default` = 现在的材质渲染（mintform 复刻）；
 /// - `outline` = 线稿外观：硬币**外轮廓**（两盖圆投影的凸包描边）+ 盖面**边框**
 ///   （innerRing / surface 内缩圆细线）+ **mark 填充实色**（贴可见盖面平面）。
-///   线与填充全用 `material.faceBase`（跟 Coin color 走），不画材质层与落地影。
+///   线与填充全用 `material.faceBase`（跟 Coin color 走），不画材质层。
 enum CoinAppearance: Int, CaseIterable {
     case `default`, outline
 
@@ -755,21 +756,22 @@ struct CoinFrame {
 final class Coin3DView: NSView {
 
     /// 弹窗内容区高度（定值，按滑杆上界一次性算死）：
-    /// 硬币投影半径（最大尺寸×最大厚度）+ 惰性弹跳 + 尺寸缩放后的落地影偏移 + 影的模糊/扩散。
-    /// 运行时「整组（币顶到影底）在这个舞台里垂直居中」——于是任何尺寸下都不裁、重心不跳。
+    /// 硬币投影半径（最大尺寸×最大厚度）+ 惰性弹跳。**不含落地影**（2026-09-13 用户要求
+    /// 「3D 硬币去掉地上的阴影」，相关代码与高度预算一并移除）。
+    /// 运行时「整组（币顶到币底）在这个舞台里垂直居中」——于是任何尺寸下都不裁、重心不跳。
     static let contentHeight: CGFloat = {
         let s = CoinMetrics.sizeRange.upperBound
         let t = CoinMetrics.thicknessRange.upperBound
         let top = (s * s + t * t).squareRoot() / 2 + CoinMetrics.idleBounceHeight + 1
-        let bottom = s / 2 + CoinMetrics.shadowBottom * s / Double(CoinMetrics.size)
-            + CoinMetrics.shadowBlur + CoinMetrics.shadowSpread
+        let bottom = s / 2
         return CGFloat((top + bottom).rounded(.up))
     }()
 
     /// 静止时硬币中心（y 自视图顶向下）：整组垂直居中。上留「投影半径 + 弹跳」、
-    /// 下留「半径 + 缩放后落地影 + 柔光」—— contentHeight 按滑杆上界算死，
-    /// 这两条在滑杆范围内恒成立，不做运行时钳制。
-    /// 紧凑实例（见 `compactInline`）没有弹跳与落地影，按自身 size/thickness 收紧的盒居中。
+    /// 下留「半径」—— 满量程实例按 contentHeight（滑杆上界算死）居中，
+    /// 设置窗口内嵌实例舞台收窄（stageHeight = fit 当前参数），两条在滑杆范围内
+    /// 恒成立，不做运行时钳制。
+    /// 紧凑实例（见 `compactInline`）没有弹跳，按自身 size/thickness 收紧的盒居中。
     private var restCenterY: CGFloat {
         let reach = (size * size + thickness * thickness).squareRoot() / 2
         if compactInline {
@@ -777,9 +779,18 @@ final class Coin3DView: NSView {
         }
         let top = max(size / 2 + CoinMetrics.idleBounceHeight,
                       reach + CoinMetrics.idleBounceHeight + 1)
-        let bottom = size / 2 + CoinMetrics.shadowBottom * sizeScale
-            + CoinMetrics.shadowBlur + CoinMetrics.shadowSpread
-        return (Self.contentHeight - top - bottom) / 2 + top
+        let bottom = size / 2
+        return (stageHeight - top - bottom) / 2 + top
+    }
+
+    /// 舞台高度（宿主按需收窄，默认 = contentHeight 满量程）：内嵌面板用 fit 当前
+    /// size/thickness 的值省掉用不到的滑杆上界留白（「缩小预览视图」2026-09-13）；
+    /// 居中公式随它走，任何高度下整组垂直居中不裁
+    var stageHeight: CGFloat = contentHeight {
+        didSet {
+            guard stageHeight != oldValue else { return }
+            needsDisplay = true   // coinCenter 在 draw 链路读取，重绘即重居中
+        }
     }
 
     /// 紧凑实例所需的正方形边长：投影半径（含厚度）×2 + 1pt 余量 + **弹跳余量**。
@@ -808,7 +819,7 @@ final class Coin3DView: NSView {
     /// 尺寸换算：所有随尺寸缩放的 CSS px 值都乘它（参考盒 160 不变）
     private var sizeScale: Double { size / Double(CoinMetrics.size) }
 
-    /// 硬币直径（px）：驱动侧壁几何、盖面半径、位图尺寸与落地影 → 重建几何 + 丢缓存
+    /// 硬币直径（px）：驱动侧壁几何、盖面半径、位图尺寸 → 重建几何 + 丢缓存
     var size: Double = CoinMetrics.defaultSize {
         didSet {
             guard size != oldValue else { return }
@@ -979,7 +990,7 @@ final class Coin3DView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 
     /// 内嵌紧凑实例（Token 板块大数字左边那枚小硬币）：只保留硬币本体渲染 ——
-    /// 不画落地影，高度按 `compactFittingHeight` 收紧到行带内。
+    /// 高度按 `compactFittingHeight` 收紧到行带内。
     /// **惰性弹跳保留**（2026-09-12 用户指定「硬币在主面板时也会上下移动」），
     /// 但幅度按 sizeScale 缩放、且以静止位为中心上下对称（见 `bounceOffset`）。
     /// ⚠️ 材质 / logo / 边纹 / 厚度 / 浮雕深度这些**参数**与弹窗完全同源（见 CoinSettings），
@@ -1230,12 +1241,6 @@ final class Coin3DView: NSView {
         // 惰性弹跳：弹窗与内嵌都跑（相位口径不同，见 bounceOffset）；幅度按实例缩放
         let bounce = bounceOffset
 
-        // 落地影是「大币浮在舞台上」的一部分；内嵌小币贴着文字，不画（也没有它的高度预算）。
-        // Outline 外观是纯线稿，落地影一并省去
-        if !compactInline, style == .default {
-            drawGroundShadow(ctx, pose: pose, bounce: bounce)
-        }
-
         guard let image = coinImage(pose: pose, scale: window?.backingScaleFactor ?? 2) else { return }
         let side = size + thickness * 2
         let rect = NSRect(x: coinCenter.x - side / 2,
@@ -1246,36 +1251,6 @@ final class Coin3DView: NSView {
         ctx.translateBy(x: rect.minX, y: rect.maxY)
         ctx.scaleBy(x: 1, y: -1)
         ctx.draw(image, in: CGRect(origin: .zero, size: rect.size))
-        ctx.restoreGState()
-    }
-
-    /// 落地影：1px 高的椭圆 + `box-shadow 0 0 4px 4px` 的柔光带。
-    /// 宽度随朝向收窄、随惰性弹跳缩小变淡（参考实现里是两条同相位的 CSS keyframes）。
-    private func drawGroundShadow(_ ctx: CGContext, pose: (rotation: Double, pitch: Double),
-                                  bounce: Double) {
-        let normal = CoinMath.projectedNormal(yaw: pose.rotation, pitch: pose.pitch)
-        let screenNormalLength = hypot(normal.x, normal.y)
-        let widthScale = (CoinMetrics.shadowWidthRatio * 100
-            - CoinMetrics.shadowWidthReduction * screenNormalLength) / 100
-        let opacity = CoinMetrics.shadowOpacity * (1 - 0.5 * bounce)
-        let scale = 1 - 0.2 * bounce
-
-        let width = size * widthScale * scale
-        let centerY = coinCenter.y + size / 2
-            + CGFloat(CoinMetrics.shadowBottom * sizeScale) - 0.5
-        let band = CGRect(x: coinCenter.x - width / 2, y: centerY, width: width, height: 1)
-
-        // 柔光：把 box-shadow 的 blur+spread 近似成若干层逐级外扩、逐级变淡的椭圆
-        let reach = CoinMetrics.shadowBlur + CoinMetrics.shadowSpread
-        let steps = 5
-        ctx.saveGState()
-        for step in 0..<steps {
-            let grow = reach * Double(step) / Double(steps - 1)
-            ctx.setFillColor(material.field.cgColor(alpha: opacity * (1 - Double(step) / Double(steps))))
-            ctx.fillEllipse(in: band.insetBy(dx: -CGFloat(grow) - 1, dy: -CGFloat(grow)))
-        }
-        ctx.setFillColor(material.field.cgColor(alpha: opacity))
-        ctx.fillEllipse(in: band)
         ctx.restoreGState()
     }
 
@@ -1897,12 +1872,11 @@ final class Coin3DView: NSView {
     }
 }
 
-// MARK: - 参数落盘（「保存」按钮显式写入；改动本身只活在内存里，实时同步靠通知）
+// MARK: - 参数落盘（自动保存：每次变更即时整份写盘，实时同步靠通知）
 
 /// 弹窗参数变更时发出的通知（CoinDemoPanelView 的每个 apply 发出，主线程同步）。
-/// ⚠️ 落盘语义是「显式保存」：改动**不**自动写盘，所以通知必须**带上最新内存快照**
-/// （CoinSettingsBox）—— 主面板内嵌小硬币靠它实时重灌，不能回头读磁盘（那是旧的已存值）。
-/// 弹窗关闭后由 main.swift 再灌一次磁盘值：保存过 = 无害复位，没保存 = 撤掉实时同步。
+/// 通知带**内存快照**（CoinSettingsBox）—— 主面板内嵌小硬币靠它实时重灌；
+/// 落盘已由 notifyLiveChange 先行完成，磁盘与内存恒一致。
 extension Notification.Name {
     static let coinSettingsDidChange = Notification.Name("coinSettingsDidChange")
 }
@@ -1914,8 +1888,8 @@ final class CoinSettingsBox {
 }
 
 /// 弹窗整页参数的落盘快照：一个控件一条（key 见 `UDKey.coin*`；Logo 行占两条 = 原文 + 文件名）。
-/// **改动只进内存快照（CoinDemoPanelView.settings），点「保存」才整份写一次**；
-/// 开弹窗从磁盘还原，重启 App 也按已保存的默认值还原。取值域与控件同域
+/// **每次变更即时整份写盘**（2026-09-13 起自动保存）；开面板从磁盘还原，重启 App
+/// 也按这份还原。取值域与控件同域
 /// （size / thickness 用 px、Logo size 用百分数）—— 还原时先夹回滑杆范围，
 /// 将来范围收窄了老值也不会把滑杆顶歪。
 struct CoinSettings {
@@ -2051,7 +2025,8 @@ struct CoinSettings {
             logoName: defaults.string(forKey: UDKey.coinLogoSVGName) ?? "")
     }
 
-    /// 「保存」按钮：把当前内存快照整份写入磁盘（此后重启 / 重开弹窗都按这份还原）。
+    /// 把当前内存快照整份写入磁盘（此后重启 / 重开弹窗都按这份还原）。
+    /// 自动保存（notifyLiveChange）与弹窗壳显式保存共用；persistDefaults 转发到此。
     /// ⚠️ 不发 coinSettingsDidChange —— 改动过程中的实时同步已由 apply() 发过，
     /// 落盘本身不改变任何值。
     func save() {
@@ -2118,6 +2093,10 @@ enum CoinEdgeStyle {
 final class CoinFormCardView: NSView {
     /// 分隔线位置（容器坐标系，y 自顶向下）
     var separatorYs: [CGFloat] = [] { didSet { needsDisplay = true } }
+    /// 是否铺卡底。弹窗里铺（白 7%）；设置窗口把区块当**普通 Form 行**内嵌时不铺 ——
+    /// 外层 Form Section 的卡就是它的框，再铺一层就成了「卡中卡」
+    ///（2026-09-13 用户：参数放普通 forms 里，不要嵌套）
+    var drawsFill = true { didSet { needsDisplay = true } }
 
     override var isFlipped: Bool { true }
 
@@ -2132,8 +2111,10 @@ final class CoinFormCardView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func draw(_ dirtyRect: NSRect) {
-        CoinEdgeStyle.cardFill.setFill()
-        bounds.fill()
+        if drawsFill {
+            CoinEdgeStyle.cardFill.setFill()
+            bounds.fill()
+        }
         guard !separatorYs.isEmpty else { return }
         let hairline = 1 / (window?.backingScaleFactor ?? 2)
         CoinEdgeStyle.separatorFill.setFill()
@@ -2158,17 +2139,31 @@ class CoinFormRowView: NSView {
 class CoinFormSectionView: NSView {
     override var isFlipped: Bool { true }
 
+    /// 区块标题。弹窗里画在卡上方；设置窗口「分段内嵌」时交给 Form Section header ——
+    /// 那时宿主**建 pane 时就要拿到标题字符串**（实例还没建），所以子类把它做成静态常量。
+    let sectionTitle: String
+    /// 裸模式（设置窗口分段内嵌，2026-09-13 用户「参数放普通 forms 里不要嵌套」）：
+    /// 不画标题、不铺卡底 —— 标题与卡片都由外层 Form Section 提供，本区块只是一叠普通行。
+    /// 行内容仍落在**行内容区左缘**（= Section 标题左缘）：行容器左右各外扩 `padX`
+    /// （见 `relayout`），正好抵消行内那层 `padX`，控件不左不右（离线实测同口径）。
+    let bare: Bool
+
     private let titleLabel: NSTextField
     private let card = CoinFormCardView(frame: .zero)
     /// 子类通过 `addRow(_:)` 注册的行（下标即行号）
     private var rows: [NSView] = []
+    /// 裸模式上下留白（与平台表格同口径 6pt）：卡底由 Form 画，这里只是行与卡缘的呼吸
+    private static let bareInset: CGFloat = 6
 
-    init(title: String) {
+    init(title: String, bare: Bool = false) {
+        sectionTitle = title
+        self.bare = bare
         titleLabel = NSTextField(labelWithString: title)
         super.init(frame: .zero)
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         titleLabel.textColor = .labelColor
-        addSubview(titleLabel)
+        if !bare { addSubview(titleLabel) }
+        card.drawsFill = !bare
         addSubview(card)
     }
 
@@ -2179,10 +2174,17 @@ class CoinFormSectionView: NSView {
         card.addSubview(row)
     }
 
-    /// 区块总高 = 标题 + 间距 + 容器（行数 × 统一行高）
+    /// 区块总高 = 标题 + 间距 + 容器（行数 × 统一行高）；裸模式无标题、上下各 6pt
     var preferredHeight: CGFloat {
-        CoinFormMetrics.titleH + CoinFormMetrics.titleGap
-            + CGFloat(rows.count) * CoinFormMetrics.rowH
+        let rowsH = CGFloat(rows.count) * CoinFormMetrics.rowH
+        return bare
+            ? Self.bareInset * 2 + rowsH
+            : CoinFormMetrics.titleH + CoinFormMetrics.titleGap + rowsH
+    }
+
+    /// 供 SwiftUI 内嵌用（手工 frame 布局的视图不参与自适应，靠 fittingSize 报高）
+    override var fittingSize: NSSize {
+        NSSize(width: super.fittingSize.width, height: preferredHeight)
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -2193,22 +2195,34 @@ class CoinFormSectionView: NSView {
     private func relayout() {
         let w = bounds.width
         guard w > 0 else { return }
-        titleLabel.frame = NSRect(x: 0, y: 0, width: w, height: CoinFormMetrics.titleH)
-        card.frame = NSRect(x: 0, y: CoinFormMetrics.titleH + CoinFormMetrics.titleGap,
-                            width: w, height: CGFloat(rows.count) * CoinFormMetrics.rowH)
+        let rowsH = CGFloat(rows.count) * CoinFormMetrics.rowH
+        // 裸模式：行容器左右各外扩 padX（行内容因此落在行内容区左缘），且从顶部起排（无标题）。
+        // 越出的那点透明边不会被看见（卡片本身的圆角裁切也在更外面）。
+        let cardX: CGFloat = bare ? -CoinFormMetrics.padX : 0
+        let cardW = bare ? w + CoinFormMetrics.padX * 2 : w
+        let cardY: CGFloat = bare ? Self.bareInset
+                                  : CoinFormMetrics.titleH + CoinFormMetrics.titleGap
+        if !bare {
+            titleLabel.frame = NSRect(x: 0, y: 0, width: w, height: CoinFormMetrics.titleH)
+        }
+        card.frame = NSRect(x: cardX, y: cardY, width: cardW, height: rowsH)
         card.separatorYs = (1..<rows.count).map { CGFloat($0) * CoinFormMetrics.rowH }
         for (index, row) in rows.enumerated() {
             row.frame = NSRect(x: 0, y: CGFloat(index) * CoinFormMetrics.rowH,
-                               width: w, height: CoinFormMetrics.rowH)
+                               width: cardW, height: CoinFormMetrics.rowH)
         }
-        layoutControls(width: w)
+        layoutControls(width: cardW)
     }
 
-    /// 行内控件排版（行 frame 就位后调用；行坐标 x 与区块坐标 x 同轴）
+    /// 行内控件排版（行 frame 就位后调用；行坐标 x 与区块坐标 x 同轴。
+    /// 裸模式下传的是**外扩后**的宽度，行内 `padX` 恰好抵消外扩，控件落在行内容区内）
     func layoutControls(width: CGFloat) {}
 
     /// 行右缘列位（数值列 / 各控件右对齐共用）
-    var controlRight: CGFloat { bounds.width - CoinFormMetrics.padX }
+    var controlRight: CGFloat {
+        let contentW = bare ? bounds.width + CoinFormMetrics.padX * 2 : bounds.width
+        return contentW - CoinFormMetrics.padX
+    }
 
     /// 标签贴左列、垂直居中（挂在某个行视图里用）
     static func place(_ label: NSTextField, inWidth width: CGFloat) {
@@ -2310,6 +2324,10 @@ final class CoinSliderRowView: CoinFormRowView {
 /// 所以这里只有两个颜色井（Coin color + Field color）。
 final class CoinControlSectionView: CoinFormSectionView {
 
+    /// 区块标题：弹窗里画在卡上方；设置窗口「分段内嵌」时作为 Form Section header
+    ///（宿主建 pane 时就要拿到它，所以是静态常量，见基类 `sectionTitle`）
+    static let sectionTitle = "Control"
+
     var onCoinColorChange: ((CoinRGB) -> Void)?
     /// lowerField 色场：盖面下方那层「透明渐显」的颜色（独立 prop，不随 Coin color 派生）
     var onFieldColorChange: ((CoinRGB) -> Void)?
@@ -2390,7 +2408,7 @@ final class CoinControlSectionView: CoinFormSectionView {
     /// ⚠️ 不叫 `appearance`：NSView 自带 `appearance: NSAppearance?`，子类撞名报 override
     private(set) var selectedAppearance: CoinAppearance
 
-    init(settings: CoinSettings) {
+    init(settings: CoinSettings, bare: Bool = false) {
         preset = settings.preset
         selectedAppearance = settings.appearance
         outlineLevelRow = CoinSliderRowView(label: "Outline level",
@@ -2414,7 +2432,7 @@ final class CoinControlSectionView: CoinFormSectionView {
         // Logo 厚度：0 = 平贴（参考实现原样），> 0 时 mark 被挤出成硬币的实体部分
         logoDepthRow = CoinSliderRowView(label: "Logo depth", range: CoinMetrics.markDepthRange,
                                          value: settings.markDepth) { "\(Int($0)) px" }
-        super.init(title: "Control")
+        super.init(title: CoinControlSectionView.sectionTitle, bare: bare)
 
         for row in [appearanceRow, outlineLevelRow, outlineWidthRow, presetRow, coinColorRow,
                     fieldColorRow, coinSizeRow, panelSizeRow, logoSizeRow, logoDepthRow, logoRow,
@@ -2652,6 +2670,9 @@ final class CoinControlSectionView: CoinFormSectionView {
 /// 「Edge」参数区：Thickness（滑杆）+ Edge finish（原生拉下按钮）。
 final class CoinEdgeSectionView: CoinFormSectionView {
 
+    /// 区块标题（同 `CoinControlSectionView.sectionTitle`）
+    static let sectionTitle = "Edge"
+
     var onThicknessChange: ((Double) -> Void)?
     var onFinishChange: ((CoinEdgeFinish) -> Void)?
 
@@ -2665,11 +2686,11 @@ final class CoinEdgeSectionView: CoinFormSectionView {
     /// 拉下按钮按**最长档名**量出的宽度：切档时按钮不跳，右缘始终贴同一列
     private var finishPopUpWidth: CGFloat = 0
 
-    init(settings: CoinSettings) {
+    init(settings: CoinSettings, bare: Bool = false) {
         finish = settings.finish
         thicknessRow = CoinSliderRowView(label: "Thickness", range: CoinMetrics.thicknessRange,
                                          value: settings.thickness) { "\(Int($0)) px" }
-        super.init(title: "Edge")
+        super.init(title: CoinEdgeSectionView.sectionTitle, bare: bare)
         addRow(thicknessRow)
         addRow(finishRow)
         // 滑杆 → 硬币：连续上报（拖动中实时改厚度）。漏了这句滑杆就只是自娱自乐
@@ -2739,6 +2760,9 @@ final class CoinEdgeSectionView: CoinFormSectionView {
 /// 三行都是滑杆、整数步进（`CoinSliderRowView` 自带 rounded），改动经回调实时上币。
 final class CoinMotionSectionView: CoinFormSectionView {
 
+    /// 区块标题（同 `CoinControlSectionView.sectionTitle`）
+    static let sectionTitle = "Motion"
+
     var onRestingTiltChange: ((Double) -> Void)?
     var onRestingRotationChange: ((Double) -> Void)?
     var onTurnsChange: ((Double) -> Void)?
@@ -2747,7 +2771,7 @@ final class CoinMotionSectionView: CoinFormSectionView {
     let restingRotationRow: CoinSliderRowView
     let turnsRow: CoinSliderRowView
 
-    init(settings: CoinSettings) {
+    init(settings: CoinSettings, bare: Bool = false) {
         restingTiltRow = CoinSliderRowView(label: "Resting tilt",
                                            range: CoinMetrics.restingTiltRange,
                                            value: settings.restingTilt) { "\(Int($0))°" }
@@ -2758,7 +2782,7 @@ final class CoinMotionSectionView: CoinFormSectionView {
                                      range: CoinMetrics.turnsRange,
                                      value: settings.turns,
                                      ticks: 5) { "\(Int($0))" }
-        super.init(title: "Motion")
+        super.init(title: CoinMotionSectionView.sectionTitle, bare: bare)
         addRow(restingTiltRow)
         addRow(restingRotationRow)
         addRow(turnsRow)
@@ -2784,39 +2808,73 @@ final class CoinParamsStackView: NSView {
     override var isFlipped: Bool { true }
 }
 
-/// 弹窗内容：硬币舞台（固定）+ 参数区滚动容器（Control / Edge / Motion 三块，视口定高）。
-/// 弹窗整体高度因此**定值不随参数区长短变**；「保存 / 关闭」按钮在壳 footer，天然固定。
-/// 参数是内存快照 + 显式保存（见 `CoinSettings`）；开弹窗时从磁盘还原。
+/// 弹窗内容：硬币舞台（fit 当前参数）+ 参数区（Control / Edge / Motion 三块自然高）。
+/// 设置窗口内嵌：整卡高度随内容（舞台 fit + 参数区不裁不滚），卡片随设置页滚动，
+/// 提示行钉在页面底部；GlassModalShell 弹窗壳内同自然高。
+/// 参数自动保存（见 `notifyLiveChange()`）；开面板时从磁盘还原。
 final class CoinDemoPanelView: NSView {
 
-    static let coinHeight: CGFloat = Coin3DView.contentHeight
     static let gap: CGFloat = 10
-    /// 参数区滚动视口高度（定值）：约一整个 Control 区的高度，Edge / Motion 滚动可见；
-    /// 窗口总高 ≈ 舞台 276 + 视口 260 + 壳 chrome ≈ 716pt，小屏也放得下
-    static let paramsViewportHeight: CGFloat = 260
+
+    /// 舞台高度。`fixed = true`（设置窗口「分段内嵌」，2026-09-13 用户要求「容器固定尺寸」）
+    /// 恒取满量程 `Coin3DView.contentHeight` —— 拖 size / thickness 只换硬币、框不动；
+    /// false（弹窗）按当前参数收窄，省掉用不到的滑杆上界留白（「缩小预览视图」2026-09-13）。
+    /// 公式与 Coin3DView.contentHeight 同口径，不含落地影的高度预算（阴影已移除）。
+    private static func stageHeight(size: Double, thickness: Double, fixed: Bool) -> CGFloat {
+        guard !fixed else { return Coin3DView.contentHeight }
+        let s = CGFloat(size), t = CGFloat(thickness)
+        let top = (s * s + t * t).squareRoot() / 2 + CoinMetrics.idleBounceHeight + 1
+        let bottom = s / 2
+        return (top + bottom).rounded(.up)
+    }
 
     let coin = Coin3DView(frame: .zero)
-    /// 参数区滚动容器（内容 = Control / Edge / Motion）
+    /// 参数区滚动容器（内容 = Control / Edge / Motion；设置窗口内嵌时视口 = 自然高，不再滚动）
     private let paramsScroll = NSScrollView(frame: .zero)
     private let paramsStack = CoinParamsStackView(frame: .zero)
     let control: CoinControlSectionView
     let edge: CoinEdgeSectionView
     let motion: CoinMotionSectionView
-    /// 整页参数的内存快照：每个回调写一份并实时上币 / 实时同步主面板小硬币（通知）；
-    /// 「保存」按钮才把这份快照落盘（见 `persistDefaults()`）
+    /// 整页参数的内存快照：每个回调写一份并实时上币 / 实时落盘 / 实时同步主面板
+    /// 小硬币（通知，见 `notifyLiveChange()`）
     private var settings: CoinSettings
+
+    /// 「分段内嵌」模式（设置窗口，2026-09-13 用户：「3D 预览框不要包裹下方的 forms」）：
+    /// 为 true 时本面板**自己不上屏**，只作为两块容器的宿主 —— 预览框（`stageHost`）与
+    /// 表单框（`paramsHost`）分别被设置窗口的两个 Form Section 内嵌，卡片因此各归各的。
+    /// 为 false（玻璃弹窗壳）时两块照旧上下排在面板里，行为与改造前完全一致。
+    let splitHosting: Bool
+    /// 预览框内容：只装 3D 舞台（硬币本体）
+    let stageHost: CoinStageHostView
+    /// 表单框内容：只装 Control / Edge / Motion 三块参数区
+    let paramsHost: CoinParamsHostView
 
     override var isFlipped: Bool { true }
 
-    override init(frame frameRect: NSRect) {
+    init(frame frameRect: NSRect, splitHosting: Bool = false) {
         // 控件要按落盘参数摆初值，所以先取快照再建控件、再回填硬币本体
         let settings = CoinSettings.load()
+        // 分段内嵌（设置窗口）：三块参数区用**裸模式**建 —— 无标题、不铺卡底，
+        // 它们各自进一个 Form Section，标题与卡片都由 Form 画（2026-09-13 用户：
+        // 「硬币下面的参数放在普通的 forms 里，不要嵌套」）
+        let controlSection = CoinControlSectionView(settings: settings, bare: splitHosting)
+        let edgeSection = CoinEdgeSectionView(settings: settings, bare: splitHosting)
+        let motionSection = CoinMotionSectionView(settings: settings, bare: splitHosting)
         self.settings = settings
-        control = CoinControlSectionView(settings: settings)
-        edge = CoinEdgeSectionView(settings: settings)
-        motion = CoinMotionSectionView(settings: settings)
+        self.splitHosting = splitHosting
+        control = controlSection
+        edge = edgeSection
+        motion = motionSection
+        // 两块宿主容器先建好：弹窗模式挂进面板，分段模式交给设置窗口的两个 Section
+        stageHost = CoinStageHostView(coin: coin)
+        paramsHost = CoinParamsHostView(scroll: paramsScroll, stack: paramsStack,
+                                        sections: [controlSection, edgeSection, motionSection],
+                                        gap: Self.gap)
         super.init(frame: frameRect)
-        addSubview(coin)
+        // 舞台高度：分段内嵌（设置窗口）恒取满量程 → 容器固定尺寸；弹窗按当前参数收窄。
+        // 先于入窗定值，draw 链路的居中即按此算
+        coin.stageHeight = Self.stageHeight(size: settings.size, thickness: settings.thickness,
+                                           fixed: splitHosting)
         // 参数区装进一个滚动容器：三块参数区都挂在 paramsStack（documentView）上
         paramsScroll.hasVerticalScroller = true
         paramsScroll.autohidesScrollers = true
@@ -2826,10 +2884,16 @@ final class CoinDemoPanelView: NSView {
         paramsScroll.hasHorizontalScroller = false
         paramsScroll.horizontalScrollElasticity = .none
         paramsScroll.documentView = paramsStack
-        paramsStack.addSubview(control)
-        paramsStack.addSubview(edge)
-        paramsStack.addSubview(motion)
-        addSubview(paramsScroll)
+        // ⚠️ 分段模式（设置窗口）：三块参数区**不**挂进 paramsStack、面板自身也不上屏 ——
+        //    它们各自作为普通 Form 行被内嵌（见 `splitGroupViews`）。挂进来会让它们被
+        //    面板的 layout 抢走父子关系，设置窗口那边就内嵌不进去了
+        if !splitHosting {
+            paramsStack.addSubview(control)
+            paramsStack.addSubview(edge)
+            paramsStack.addSubview(motion)
+            addSubview(stageHost)
+            addSubview(paramsHost)
+        }
 
         coin.material = settings.material
         coin.size = settings.size
@@ -2872,14 +2936,16 @@ final class CoinDemoPanelView: NSView {
 
     // MARK: 单个参数 → 硬币 + 内存快照 + 通知
 
-    /// apply 的统一出口：实时同步主面板内嵌小硬币（通知带**内存快照**——落盘是显式保存，
-    /// 磁盘上还是旧值，读盘会拿到旧参数）
+    /// 参数变更统一出口（17 个 apply 全走这里）：快照即时落盘（2026-09-13 起自动
+    /// 保存，显式「保存为默认」按钮已删）+ 通知实时同步主面板小硬币
+    ///（通知带**内存快照**，主面板靠它重灌、不读盘）
     private func notifyLiveChange() {
+        settings.save()
         NotificationCenter.default.post(name: .coinSettingsDidChange,
                                         object: CoinSettingsBox(settings))
     }
 
-    /// 「保存」按钮：当前内存快照整份落盘为默认（重启 / 重开弹窗都按这份还原）
+    /// 兼容弹窗壳的显式保存入口（入口已随操作磁贴退场）：快照整份落盘，与自动保存同函数
     func persistDefaults() {
         settings.save()
     }
@@ -2928,6 +2994,7 @@ final class CoinDemoPanelView: NSView {
     private func apply(size: Double) {
         settings.size = size
         coin.size = size
+        syncStageHeight()
         notifyLiveChange()
     }
 
@@ -2948,7 +3015,20 @@ final class CoinDemoPanelView: NSView {
     private func apply(thickness: Double) {
         settings.thickness = thickness
         coin.thickness = thickness
+        syncStageHeight()
         notifyLiveChange()
+    }
+
+    /// 舞台随参数即时重算：弹窗里硬币在现有面板框内重新居中；分段内嵌（设置窗口）下舞台是
+    /// **固定尺寸**（满量程），这里算出来仍是同一个数，等于不动 —— 拖 size/thickness 只换硬币。
+    /// 整卡总高（fittingSize）由宿主 SwiftUI 侧按需重查——拖动滑杆过程中的总高变化到下次布局/重开才落定
+    private func syncStageHeight() {
+        coin.stageHeight = Self.stageHeight(size: settings.size, thickness: settings.thickness,
+                                            fixed: splitHosting)
+        needsLayout = true
+        // 分段内嵌（设置窗口）时本面板自己不上屏，`needsLayout` 传不到预览框宿主 ——
+        // 点名让它重排，硬币 frame 才会跟着新舞台高走（否则会按旧高度偏心）
+        stageHost.needsLayout = true
     }
 
     /// Logo size：入参是滑杆**百分数**（50…125），硬币吃 0.5…1.25 的倍率 ——
@@ -3001,32 +3081,134 @@ final class CoinDemoPanelView: NSView {
         notifyLiveChange()
     }
 
-    var preferredHeight: CGFloat {
-        Self.coinHeight + Self.gap + Self.paramsViewportHeight
+    /// 面板自然总高 = fit 舞台 + 间距 + 参数区自然高（HostedContentView 以 fittingSize 取）
+    override var fittingSize: NSSize {
+        NSSize(width: super.fittingSize.width, height: preferredHeight)
     }
+
+    var preferredHeight: CGFloat {
+        coin.stageHeight + Self.gap + paramsHost.preferredHeight
+    }
+
+    /// 分段内嵌（设置窗口）时三块参数区各自的宿主，按 Control / Edge / Motion 顺序 ——
+    /// 裸模式（无标题、不铺卡底），由设置窗口各放进一个 Form Section 当普通 Form 行内嵌；
+    /// 标题取 `CoinControlSectionView.sectionTitle` 等静态常量（那时实例已建，但宿主要提前拿到）
+    var splitGroupViews: [NSView] { [control, edge, motion] }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         syncLayout()
     }
 
+    /// 弹窗模式的排布：两块容器上下排（分段内嵌模式下两块由各自宿主容器排，这里直接跳过）
     private func syncLayout() {
+        guard !splitHosting, bounds.width > 0 else { return }
+        let w = bounds.width
+        stageHost.frame = NSRect(x: 0, y: 0, width: w, height: coin.stageHeight)
+        paramsHost.frame = NSRect(x: 0, y: coin.stageHeight + Self.gap,
+                                  width: w, height: paramsHost.preferredHeight)
+    }
+}
+
+/// 预览框内容（设置窗口「分段内嵌」用）：只装 3D 舞台本体。
+/// 高度 = 舞台高（随 size / thickness 参数收窄），宽度铺满行内容区 ——
+/// 于是承载它的那个 Form Section 的卡片就是「3D 预览框」本身，不再包裹下方表单。
+final class CoinStageHostView: NSView {
+    let coin: Coin3DView
+
+    override var isFlipped: Bool { true }
+
+    init(coin: Coin3DView) {
+        self.coin = coin
+        super.init(frame: .zero)
+        addSubview(coin)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 行高由舞台高决定（手工 frame 布局的视图不参与 SwiftUI 自适应，靠 fittingSize 报高）
+    override var fittingSize: NSSize {
+        NSSize(width: super.fittingSize.width, height: coin.stageHeight)
+    }
+
+    /// 与改造前面板 `setFrameSize → syncLayout` 同口径：frame 一变就摆硬币，
+    /// 不依赖 AppKit 是否判定「需要 layout」（相等尺寸重复设置时它不一定会调 `layout()`）
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        syncCoin()
+    }
+
+    override func layout() {
+        super.layout()
+        syncCoin()
+    }
+
+    private func syncCoin() {
+        // 高度取 `coin.stageHeight`（不是 bounds.height）：与改造前面板的
+        // `coin.frame = (0, 0, w, stageHeight)` 完全同口径 —— 舞台高变了而 SwiftUI
+        // 那一拍还没重新量高时，硬币仍按自己的舞台居中，不会因行高滞后而偏心
+        coin.frame = NSRect(x: 0, y: 0, width: bounds.width, height: coin.stageHeight)
+    }
+}
+
+/// 表单框内容（设置窗口「分段内嵌」用）：只装 Control / Edge / Motion 三块参数区
+/// （每块自带标题 + 卡片，块内排布仍由 `CoinFormSectionView` 自己负责）。
+/// 高度 = 三块自然高之和 + 块间距；宽度铺满行内容区。
+final class CoinParamsHostView: NSView {
+    private let scroll: NSScrollView
+    private let stack: CoinParamsStackView
+    private let sections: [CoinFormSectionView]
+    private let gap: CGFloat
+
+    override var isFlipped: Bool { true }
+
+    init(scroll: NSScrollView, stack: CoinParamsStackView,
+         sections: [CoinFormSectionView], gap: CGFloat) {
+        self.scroll = scroll
+        self.stack = stack
+        self.sections = sections
+        self.gap = gap
+        super.init(frame: .zero)
+        addSubview(scroll)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 三块参数区自然总高（含块间距）
+    var preferredHeight: CGFloat {
+        sections.reduce(0) { $0 + $1.preferredHeight }
+            + gap * CGFloat(max(sections.count - 1, 0))
+    }
+
+    override var fittingSize: NSSize {
+        NSSize(width: super.fittingSize.width, height: preferredHeight)
+    }
+
+    /// 同 `CoinStageHostView`：frame 一变就摆三块参数区（不依赖 AppKit 的 layout 判定）
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        syncSections()
+    }
+
+    override func layout() {
+        super.layout()
+        syncSections()
+    }
+
+    private func syncSections() {
         guard bounds.width > 0 else { return }
         let w = bounds.width
-        coin.frame = NSRect(x: 0, y: 0, width: w, height: Self.coinHeight)
-        paramsScroll.frame = NSRect(x: 0, y: Self.coinHeight + Self.gap,
-                                    width: w, height: Self.paramsViewportHeight)
+        // 参数区视口 = 自然高：整卡高度随内容（2026-09-13 用户要求不固定高度），
+        // NSScrollView 保留做容器但永不滚动
+        scroll.frame = bounds
         // 滚动内容（documentView）：宽度铺满、高度 = 三块参数区自然高之和。
         // 翻转坐标下 origin 在顶，NSScrollView 从顶端开始显示
-        let stackH = control.preferredHeight + Self.gap + edge.preferredHeight
-            + Self.gap + motion.preferredHeight
-        paramsStack.frame = NSRect(x: 0, y: 0, width: w, height: stackH)
+        stack.frame = NSRect(x: 0, y: 0, width: w, height: preferredHeight)
         var y: CGFloat = 0
-        control.frame = NSRect(x: 0, y: y, width: w, height: control.preferredHeight)
-        y += control.preferredHeight + Self.gap
-        edge.frame = NSRect(x: 0, y: y, width: w, height: edge.preferredHeight)
-        y += edge.preferredHeight + Self.gap
-        motion.frame = NSRect(x: 0, y: y, width: w, height: motion.preferredHeight)
+        for section in sections {
+            section.frame = NSRect(x: 0, y: y, width: w, height: section.preferredHeight)
+            y += section.preferredHeight + gap
+        }
     }
 }
 

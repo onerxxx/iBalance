@@ -152,14 +152,11 @@ struct AppConfig: Codable {
     var workbuddyEnabled: Bool = true
     var traeAutoCheckin: Bool = true
     var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
-    /// 面板背景渐变开关：true = 顶部暗 → 底部中灰纵向渐变；false = 恢复单色近黑遮罩
-    var panelGradientEnabled: Bool = true
+    /// 「高对比背景」强度（0…1）：0 = 无遮罩（原生玻璃）；遮罩 alpha 按此值等比缩放（containerColors）
+    var panelMaskOpacity: Double = 1
     /// 浅色主题开关：true = 强制浅色外观（即使系统是深色主题）；优先级高于渐变开关
     /// （浅色生效时不用深色遮罩，走原生浅色玻璃 + Palette 浅色分支）
     var lightThemeEnabled: Bool = false
-    /// Mono 字体开关：true = 余额卡片与用量列表使用 JetBrainsMono（拉丁字符），
-    /// 缺字（中文等）通过 cascade 级联回退系统字体
-    var monoFontEnabled: Bool = false
     /// 数值滚动预览开关：true = 余额卡片数值周期随机变化，演示逐位滚动动画
     ///（替换原「调试用量样例数据」功能；关闭后恢复真实数值）
     var valueScrollPreviewEnabled: Bool = false
@@ -231,9 +228,8 @@ struct AppConfig: Codable {
         case workbuddyEnabled = "workbuddy_enabled"
         case traeAutoCheckin = "trae_auto_checkin"
         case hideWbNickname = "hide_wb_nickname"
-        case panelGradientEnabled = "panel_gradient_enabled"
+        case panelMaskOpacity = "panel_mask_opacity"
         case lightThemeEnabled = "light_theme_enabled"
-        case monoFontEnabled = "mono_font_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case longProgressCard = "long_progress_card"
         case iconThemeSwap = "icon_theme_swap"
@@ -263,7 +259,10 @@ struct AppConfig: Codable {
 
     // 仅解码用的 legacy 字段（旧版统一 "decimals"，新版按服务拆分；读取兼容两者；
     // balanceCardNewMode = 长进度卡片改名前的旧键）
-    private enum LegacyKeys: String, CodingKey { case decimals, balanceCardNewMode = "balance_card_new_mode" }
+    private enum LegacyKeys: String, CodingKey {
+        case decimals, balanceCardNewMode = "balance_card_new_mode"
+        case panelGradientEnabled = "panel_gradient_enabled"
+    }
 
     init() {}
 
@@ -290,9 +289,14 @@ struct AppConfig: Codable {
         workbuddyEnabled = try c.decodeIfPresent(Bool.self, forKey: .workbuddyEnabled) ?? true
         traeAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .traeAutoCheckin) ?? true
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? false
-        panelGradientEnabled = try c.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true
+        // 新键 panel_mask_opacity（0…1 强度）；旧键 panel_gradient_enabled（布尔开关）兼容读取：开=1 / 关=0
+        if let v = try c.decodeIfPresent(Double.self, forKey: .panelMaskOpacity) {
+            panelMaskOpacity = min(max(v, 0), 1)
+        } else {
+            let legacyContainer = try decoder.container(keyedBy: LegacyKeys.self)
+            panelMaskOpacity = (try legacyContainer.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true) ? 1 : 0
+        }
         lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? false
-        monoFontEnabled = try c.decodeIfPresent(Bool.self, forKey: .monoFontEnabled) ?? false
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
         updateAutoCheck = try c.decodeIfPresent(Bool.self, forKey: .updateAutoCheck) ?? true
         // 新键 long_progress_card；旧键 balance_card_new_mode 兼容读取（改名不丢已存开关值）
@@ -359,9 +363,8 @@ struct AppConfig: Codable {
         try c.encode(workbuddyEnabled, forKey: .workbuddyEnabled)
         try c.encode(traeAutoCheckin, forKey: .traeAutoCheckin)
         try c.encode(hideWbNickname, forKey: .hideWbNickname)
-        try c.encode(panelGradientEnabled, forKey: .panelGradientEnabled)
+        try c.encode(panelMaskOpacity, forKey: .panelMaskOpacity)
         try c.encode(lightThemeEnabled, forKey: .lightThemeEnabled)
-        try c.encode(monoFontEnabled, forKey: .monoFontEnabled)
         try c.encode(valueScrollPreviewEnabled, forKey: .valueScrollPreviewEnabled)
         try c.encode(updateAutoCheck, forKey: .updateAutoCheck)
         try c.encode(longProgressCard, forKey: .longProgressCard)
@@ -569,6 +572,8 @@ enum UDKey {
     static var usageSectionCollapsed: String { "panel_usage_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
+    /// header 图标按钮顺序（[String] id，header 图标 ⌘+拖动换位落盘）
+    static var headerButtonOrder: String { "panel_header_button_order" }
     /// 热力点阵峰值色相/饱和/明度（Double 0..1，设置窗口「主题外观」滑杆写入，Palette 读写）
     static var heatDotHue: String { "heat_dot_hue" }
     static var heatDotSaturation: String { "heat_dot_saturation" }
@@ -610,8 +615,6 @@ enum UDKey {
     static var coinOutlineWidth: String { "coin_outline_width" }
     /// Logo 反色（Bool）：把 logo 与硬币面互为负形显示（原为 false，未写过即关闭）
     static var coinLogoInverted: String { "coin_logo_inverted" }
-    /// SwiftUI 设置窗口左侧栏玻璃透明度（Double，0…1，1 = 最透；见 `SidebarGlass`）
-    static var settingsSidebarGlassTransparency: String { "settings_sidebar_glass_transparency" }
     /// 上传的 logo SVG 原文（空 = 内置 GHO 预设）
     static var coinLogoSVG: String { "coin_logo_svg" }
     /// 上传的 logo 文件名（行内展示用，空 = 内置 GHO 预设）
@@ -621,7 +624,7 @@ enum UDKey {
     static var updateLastCheckDate: String { "update_last_check_date" }
     static var updateSnoozeDate: String { "update_snooze_date" }
 
-    // 菜单栏状态点「小球弹跳」（设置窗口「动画」pane）：
+    // 菜单栏状态点「小球弹跳」（设置窗口「菜单栏」pane）：
     // 逐项独立落盘，读写与取值域见 MenuBarBounceSettings.load()/save()
     /// 弹跳高度（Double，pt，MenuBarBounceSettings.amplitudeRange）
     static var menuBarBounceAmplitude: String { "menubar_bounce_amplitude" }
@@ -716,7 +719,7 @@ enum BalanceCacheStore {
 /// increasing=true：数值随消耗上升（已用，如 TRAE used / Codex usedPercent）。
 struct UsageBaselines: Codable {
     struct Entry: Codable {
-        /// 近 1 小时滚动窗口内的观测点（时间戳 + 数值），用于「1小时」列差值
+        /// 单次观测点（时间戳 + 数值）
         struct Sample: Codable {
             var ts: Double
             var value: Double
@@ -727,15 +730,13 @@ struct UsageBaselines: Codable {
         var weekBase: Double
         /// 当天累计用量快照：yyyy-MM-dd → 用量；保留最近 60 天用于趋势统计。
         var dailyUsage: [String: Double]
-        /// 近 1 小时观测点（滚动裁剪：窗口内全保留 + 窗口外留 1 个锚点）
-        var samples: [Sample] = []
-        /// 余额 24h 采样历史（副标题右侧 24h 变化用）：与 samples 同构但窗口 24h，
-        /// **跨空窗不清空**——App 休眠后变化量跨越空窗仍是真实余额变化。
+        /// 余额 24h 采样历史（副标题右侧 24h 变化 + 反向跳变检测的「上一观测点」用）：
+        /// 窗口 24h，**跨空窗不清空**——App 休眠后变化量跨越空窗仍是真实余额变化。
         /// 裁剪保留窗口内全部点 + 窗口外最近 1 个锚点（供查询取 ≤24h 前的基准值）
         var balanceHistory: [Sample] = []
 
         private enum CodingKeys: String, CodingKey {
-            case dayKey, dayBase, weekKey, weekBase, dailyUsage, samples, balanceHistory
+            case dayKey, dayBase, weekKey, weekBase, dailyUsage, balanceHistory
         }
 
         init(dayKey: String, dayBase: Double, weekKey: String, weekBase: Double) {
@@ -754,7 +755,6 @@ struct UsageBaselines: Codable {
             weekKey = try c.decode(String.self, forKey: .weekKey)
             weekBase = try c.decode(Double.self, forKey: .weekBase)
             dailyUsage = try c.decodeIfPresent([String: Double].self, forKey: .dailyUsage) ?? [:]
-            samples = try c.decodeIfPresent([Sample].self, forKey: .samples) ?? []
             balanceHistory = try c.decodeIfPresent([Sample].self, forKey: .balanceHistory) ?? []
         }
     }
@@ -795,9 +795,9 @@ enum UsageStore {
     }
 
     /// 记录一次观测：跨天/跨周重置基线为当前值。
-    /// 充值（余额型上升）或重置（已用型下降）时不重置用量：检测到与上次观测相比
-    /// 的反向跳变 J，将日/周基线与小时窗内样本同步平移 J，差值序列保持「仅反映消耗」
-    /// （今日/本周累计不归零，趋势图快照与近 1 小时列均连续）。
+    /// 充值（余额型上升）或重置（已用型下降）时不重置用量：检测到与上一观测点相比
+    /// 的反向跳变 J，将日/周基线同步平移 J，差值序列保持「仅反映消耗」
+    /// （今日/本周累计不归零，趋势图快照连续）。
     static func observe(platform: String, uid: String, value: Double, increasing: Bool) {
         let key = "\(platform):\(uid)"
         let now = Date()
@@ -807,9 +807,10 @@ enum UsageStore {
         var changed = memory.entries[key] == nil
 
         // 反向跳变检测：余额型（值升高）或已用型（值回落）超过阈值视为充值/重置事件。
-        // 优先用上一观测点对比（覆盖同一刷新周期内多次小额充值的合成）；无样本（旧数据迁移）退回与当日基线比。
+        // 优先用上一观测点（balanceHistory 末点）对比（覆盖同一刷新周期内多次小额
+        // 充值的合成）；无观测记录（旧数据迁移）退回与当日基线比。
         var carry: Double = 0
-        if let lastVal = e.samples.last?.value {
+        if let lastVal = e.balanceHistory.last?.value {
             carry = increasing ? lastVal - value : value - lastVal
         } else if e.dayKey == dk {
             carry = increasing ? e.dayBase - value : value - e.dayBase
@@ -833,8 +834,6 @@ enum UsageStore {
             changed = true
         }
         if carry > 0 {
-            // 小时窗内已有锚点同步抬升，近 1 小时差值不被充值事件清零
-            for i in e.samples.indices { e.samples[i].value += carry }
             Logger.log(.refresh, "[Usage] \(key): 反向跳变 +\(String(format: "%.2f", carry))，基线同步平移（用量不清零）")
         }
 
@@ -846,17 +845,8 @@ enum UsageStore {
             e.dailyUsage[dk] = todayUsage
             changed = true
         }
-        // 近 1 小时滚动窗口：每次观测追加一个点；断档超过 1 小时（休眠/长期未刷新）
-        // 视为窗口重开，丢弃旧点——否则跨越空窗的差值会把 >1 小时的用量算进「近 1 小时」
         let nowTs = now.timeIntervalSince1970
-        if let last = e.samples.last, nowTs - last.ts > 3600 { e.samples = [] }
-        e.samples.append(UsageBaselines.Entry.Sample(ts: nowTs, value: value))
-        // 裁剪：保留窗口内全部点 + 窗口外最近 1 个锚点（供查询取 ≤1 小时前的基准值）
-        if let firstIn = e.samples.firstIndex(where: { $0.ts >= nowTs - 3600 }) {
-            let keepFrom = max(0, firstIn - 1)
-            if keepFrom > 0 { e.samples.removeFirst(keepFrom) }
-        }
-        // 余额 24h 采样历史（副标题 24h 变化用）：同构裁剪但跨空窗不清空——
+        // 余额 24h 采样历史（副标题 24h 变化 + 反向跳变检测用）：窗口 24h，跨空窗不清空——
         // 变化量跨空窗仍真实；全部点超窗时只留最后一个锚点
         e.balanceHistory.append(UsageBaselines.Entry.Sample(ts: nowTs, value: value))
         if let firstIn = e.balanceHistory.firstIndex(where: { $0.ts >= nowTs - 86400 }) {
@@ -974,15 +964,6 @@ enum UsageStore {
         return any ? sum : nil
     }
 
-    /// 近 1 小时用量：取 ≤1 小时前最新的观测点做锚点（窗口内无更早点时用最早的点），
-    /// 与当前值求差并 clamp ≥ 0；余额充值等反向变动与「今日」同口径（差值归零重新累计）。
-    static func hourlyUsage(platform: String, uid: String, current: Double, increasing: Bool) -> Double? {
-        guard let e = memory.entries["\(platform):\(uid)"] else { return nil }
-        let cutoff = Date().timeIntervalSince1970 - 3600
-        guard let anchor = e.samples.last(where: { $0.ts <= cutoff }) ?? e.samples.first else { return nil }
-        return increasing ? max(0, current - anchor.value) : max(0, anchor.value - current)
-    }
-
     /// 过去 24h 余额/积分**变化量**（观察值口径带符号：余额型负 = 消耗、已用型正 =
     /// 消耗；方向箭头由调用方按 increasing 翻成卡片显示值口径）。
     /// 锚点 = 时间上 ≤24h 前最近的余额采样（balanceHistory，真实值含充值/签到跳变）。
@@ -1015,18 +996,6 @@ enum UsageStore {
         for a in accounts where !a.uid.isEmpty {
             sum += balanceChange24h(platform: platform, uid: a.uid,
                                     current: a.current, increasing: increasing)
-        }
-        return sum
-    }
-
-    /// 平台级汇总：全部账号近 1 小时用量相加（无观测记录的账号贡献 0，升级后首小时从此起算）
-    static func hourlyUsage(platform: String, accounts: [(uid: String, current: Double)],
-                            increasing: Bool) -> Double {
-        var sum: Double = 0
-        for a in accounts where !a.uid.isEmpty {
-            if let h = hourlyUsage(platform: platform, uid: a.uid, current: a.current, increasing: increasing) {
-                sum += h
-            }
         }
         return sum
     }

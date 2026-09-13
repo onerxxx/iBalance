@@ -4,14 +4,14 @@
 //
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
 // 数据模型    UsageRowSnapshot（用量行）/ UsageWeekData（一周 7 天数值 + 表头 + 累计）
-// 趋势图      UsageHistoryChartView（**自绘**折线 + 面积 + 今日标注，走 draw(_:)，非控件）
+// 趋势图      UsageHistoryChartView（**自绘**柱状图 + 今日标注，走 draw(_:)，非控件）
 // 子弹窗      UsageHistoryPopoverController + UsageHistoryPopoverAnchorView
 //             （锚点固定为「用量标题」而非 hover 行，避免换行时错位）
 // 进度条      UsageDots（渐变进度条：灰轨道 + 蓝渐变填充，按剩余比例填充；类名沿用旧点阵）
 // 面板用量行    extension BalancePanelView：makeUsageRow / makeUsageHeaderRow / 列宽计算
 //
-// ⚠️ 自绘层不参与 AppKit 的字体/外观自动传播：Mono 开关与浅色主题由
-//    UsageHistoryPopoverController 的 monoFontEnabled / lightThemeEnabled didSet **显式转发**。
+// ⚠️ 自绘层不参与 AppKit 的字体/外观自动传播：浅色主题由
+//    UsageHistoryPopoverController 的 lightThemeEnabled didSet **显式转发**。
 //    改图表字体或配色，要确认这条转发链还在，别指望动态色自动生效。
 
 import Cocoa
@@ -27,19 +27,18 @@ struct UsageWeekData: Equatable {
     var totalText: String = ""
 }
 
-/// 1小时/日/周用量行快照：icon + 平台名 + 已格式化的近1小时/今日/本周用量文本 + 周历史浏览页。
+/// 日/周用量行快照：icon + 平台名 + 已格式化的今日/本周用量文本 + 周历史浏览页。
 struct UsageRowSnapshot: Equatable {
     var platform: String
     var icon: String
     var name: String
-    var hourText: String = ""
     var todayText: String
     var weekText: String
     /// 周历史浏览页：index 0 = 本周，1 = 上周……（usage.json 60 天保留窗口内最多 8 页）
     var historyWeeks: [UsageWeekData] = []
 }
 
-/// 用量行右侧趋势图：使用 AppKit 原生 NSView + NSBezierPath 绘制一周面积图。
+/// 用量行右侧趋势图：使用 AppKit 原生 NSView + NSBezierPath 绘制一周柱状图。
 /// 视图本身承担 hover 追踪，保证鼠标从用量行移动到 popover 时不会立即关闭。
 final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     var row: UsageRowSnapshot? {
@@ -58,25 +57,15 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     private var rightArrowRect = NSRect.zero
     private var cursorPushed = false
     var onHoverChanged: ((Bool) -> Void)?
-    /// Mono 字体开关：开启时图表内所有文本（标题/刻度/数值/日期）用 JetBrainsMono
-    var monoFontEnabled = false {
-        didSet { needsDisplay = true }
-    }
     private var trackingArea: NSTrackingArea?
-    /// 当日圆点 Pulse Dot 相位（0~1 线性周期位置）：驱动光环扩散进度
-    private var blinkPhase: CGFloat = 0
-    /// 闪烁驱动：NSView.displayLink（macOS 15+），随屏幕刷新出帧；
-    /// 视图移出 window（子弹窗关闭）时暂停，重新出现时复用。
-    private weak var blinkLink: CADisplayLink?
 
-    /// 按当前字体开关取字体（优先级：Mono 风格 > 系统字体，与面板 uiFont 同策略）
+    /// 图表文本字体（系统字体）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
-        return .systemFont(ofSize: size, weight: weight)
+        .systemFont(ofSize: size, weight: weight)
     }
 
     override var isFlipped: Bool { true }
-    // 面积图保持紧凑，同时保留两行表头（平台名 + 本周用量两行标签、大号右对齐数值）、
+    // 柱状图保持紧凑，同时保留两行表头（平台名 + 本周用量两行标签、大号右对齐数值）、
     // 坐标日期和底部留白。2026-08-21 表头改两行结构，高度 158 → 172；
     // 2026-08-23 图表区高度降 15%（~86pt → ~73pt），总高 172 → 159（表头与底部 36pt 日期轴不动）；
     // 同日宽度降 10%（232 → 209），图表绘图区随宽度自适应收窄；
@@ -148,44 +137,11 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         onHoverChanged?(inside)
     }
 
-    // MARK: - 当日圆点 Pulse Dot（1.8s 周期：中心点常亮 + 光环向外扩散淡出，前 70% 扩散后 30% 停顿）
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if window != nil { startBlink() } else { stopBlink() }
-    }
-
-    private func startBlink() {
-        if let link = blinkLink {
-            link.isPaused = false
-            return
-        }
-        let link = displayLink(target: self, selector: #selector(onBlinkTick(_:)))
-        link.add(to: .main, forMode: .common)
-        blinkLink = link
-    }
-
-    private func stopBlink() {
-        blinkLink?.isPaused = true
-    }
-
-    @objc private func onBlinkTick(_ link: CADisplayLink) {
-        // Pulse Dot 周期 1.8s；相位量化到 1/60 步长，120Hz 屏也不全速重绘
-        let cycle: Double = 1.8
-        let phase = (link.targetTimestamp.truncatingRemainder(dividingBy: cycle)) / cycle
-        let q = (phase * 60).rounded() / 60
-        if abs(q - blinkPhase) > 0.0001 {
-            blinkPhase = q
-            needsDisplay = true
-        }
-    }
-
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard let row else { return }
 
-        let titleFont = monoFontEnabled
-            ? MonoFontProvider.font(size: 9)
-            : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+        let titleFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
         let detailFont = uiFont(size: 10)
         let axisFont = titleFont
         let titleColor = Palette.cardForeground
@@ -194,16 +150,13 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         let yAxisLabelWidth: CGFloat = 30
         let yAxisGap: CGFloat = 5
         let yAxisRightInset: CGFloat = 4
-        let graphLineColor = Palette.chartLine
         let headerY: CGFloat = 12
 
         // 表头两行式：第一行「平台名 + 本周累计用量」标签（同行同字号同色，与 Token 子面板
         // 首行同款，右缘同一纵坐标为周切换箭头）；第二行周用量数值换行左对齐（字号不变）。
         let plotFullWidth = max(1, bounds.width - plotInset - yAxisGap
                                 - yAxisLabelWidth - yAxisRightInset)
-        let valueFont = monoFontEnabled
-            ? MonoFontProvider.font(size: 17, weight: .semibold)
-            : NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
         // 当前浏览的周页（weekOffset 由右上角箭头切换；越界防御性夹取）
         let pageCount = max(1, row.historyWeeks.count)
         let safeOffset = min(max(0, weekOffset), pageCount - 1)
@@ -249,7 +202,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             rightArrowRect = .zero
         }
 
-        // 表头块下保留 4pt 基础间距，随后将面积图、数值和日期轴整体下移 10pt。
+        // 表头块下保留 4pt 基础间距，随后将柱状图、数值和日期轴整体下移 10pt。
         let headerHeight = headerBlockHeight
         let graphOffsetY: CGFloat = 10
         let plotTop = headerY + headerHeight + 4 + graphOffsetY
@@ -278,7 +231,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         let axisMaxValue = max(1, ceil(maxValue))
         let axisSampleText = texts.first(where: { $0 != "—" }) ?? row.todayText
 
-        // 网格线分两层：基线（0 位）更实，为面积提供「地面」；其余网格线更虚，纯读数辅助。
+        // 网格线分两层：基线（0 位）更实，为柱状图提供「地面」；其余网格线更虚，纯读数辅助。
         let grid = NSBezierPath()
         let baseline = NSBezierPath()
         for ratio in [CGFloat(0), CGFloat(0.5), CGFloat(1)] {
@@ -325,59 +278,20 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                 NSPoint(x: plot.minX + plot.width * CGFloat(index) / 6,
                         y: plot.maxY - graphHeight * CGFloat(value / axisMaxValue))
             }
-            // 本周只把线/面积画到今天为止，未来日期保留坐标轴与标签但无曲线；
-            // 历史周仍是完整 7 天（todayIndex 已置为 6）。
-            let drawPoints = isCurrentWeek ? Array(points[0...todayIndex]) : points
-            let area = NSBezierPath()
-            area.move(to: NSPoint(x: drawPoints[0].x, y: plot.maxY))
-            appendSmoothSegments(drawPoints, to: area)
-            area.line(to: NSPoint(x: drawPoints.last!.x, y: plot.maxY))
-            area.close()
-            // 渐变锚点固定在绘图区上下边界，不随曲线最高点变化：顶部最实、向下渐隐。
-            fillAreaGradient(area, in: plot)
-
-            let line = NSBezierPath()
-            appendSmoothSegments(drawPoints, to: line, movesToFirst: true)
-            graphLineColor.setStroke()
-            line.lineWidth = 2.2
-            line.lineCapStyle = .round
-            line.stroke()
-
-            // 圆点尺寸按数值相对比例：本周最大值 8.2pt，最小 3.2pt，
-            // 其余在区间内按 value/maxValue 线性映射；只画到今天为止（未来占位天不画）。
-            // 当日圆点为 Pulse Dot：中心实心点常亮（峰值色区分于其余灰点，动态色随主题反转），
-            // 光环按 blinkPhase 相位向外扩散并淡出（雷达 ping，1.8s 周期）。
-            let dotMaxSize: CGFloat = 8.2
-            let dotMinSize: CGFloat = 3.2
-            let scale = maxValue > 0.000001 ? (dotMaxSize - dotMinSize) / maxValue : 0
-            let dotBaseColor = Palette.pulseDotBase
-            let dotPeakColor = Palette.pulseDotPeak
-            for (index, point) in points.enumerated() where index <= todayIndex {
-                let size = dotMinSize + values[index] * scale
-                let radius = size / 2
-                // 圆点必须以数据点为中心，保持与平滑曲线使用同一组坐标。
-                let dot = NSBezierPath(ovalIn: NSRect(x: point.x - radius, y: point.y - radius,
-                                                       width: size, height: size))
-                (index == todayIndex && isCurrentWeek ? dotPeakColor : dotBaseColor).setFill()
-                dot.fill()
-                // 当日 Pulse 光环（仅本周）：前 70% 相位 ease-out 扩散到 ~2.4x 并淡出，后 30% 停顿（alpha=0 天然隐形）
-                if index == todayIndex, isCurrentWeek {
-                    let ping = min(blinkPhase / 0.7, 1)
-                    let ease = 1 - (1 - ping) * (1 - ping)
-                    let ringRadius = radius * (1 + 1.4 * ease)
-                    let ringAlpha = 0.65 * pow(1 - ping, 1.5)
-                    let ring = NSBezierPath(ovalIn: NSRect(x: point.x - ringRadius,
-                                                           y: point.y - ringRadius,
-                                                           width: ringRadius * 2,
-                                                           height: ringRadius * 2))
-                    // 动态色 + 随相位变化的 alpha：withAlphaComponent 不保证保留动态解析，
-                    // 改用图形上下文全局 alpha（draw 内上下文外观即本视图 effectiveAppearance）
-                    NSGraphicsContext.current?.cgContext.setAlpha(ringAlpha)
-                    dotPeakColor.setStroke()
-                    ring.lineWidth = max(0.8, 2.6 * (1 - ping))
-                    ring.stroke()
-                    NSGraphicsContext.current?.cgContext.setAlpha(1)
-                }
+            // 柱状图（2026-09-13 用户要求替换面积图）：每天一根圆顶柱从基线拔起到数值高度，
+            // 今日柱峰值色、其余中性灰；本周只画到今天为止（未来占位天留空），
+            // 历史周仍是完整 7 天（todayIndex 已置为 6）。零值天高度为 0 不画柱。
+            let slot = plot.width / 6
+            let barWidth = slot * 0.52
+            let drawCount = (isCurrentWeek ? todayIndex : 6) + 1
+            for index in 0..<drawCount {
+                let top = points[index].y
+                let barHeight = plot.maxY - top
+                guard barHeight > 0.5 else { continue }
+                let bar = NSRect(x: points[index].x - barWidth / 2, y: top,
+                                 width: barWidth, height: barHeight)
+                (index == todayIndex && isCurrentWeek ? Palette.pulseDotPeak : Palette.chartLine).setFill()
+                roundedTopBar(bar, radius: 2).fill()
             }
 
             // 数值标注：本周标当日数值（与高亮日期同一列）；历史周标峰值天数值，其余天不标
@@ -470,23 +384,23 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         }
     }
 
-    /// 在面积路径内绘制固定锚点的白→白透明垂直渐变（顶部 40% 白向下渐变到 2% 白）。
-    private func fillAreaGradient(_ area: NSBezierPath, in plot: NSRect) {
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let colors = [
-            Palette.chartAreaTop.cgColor,
-            Palette.chartAreaBottom.cgColor,
-        ] as CFArray
-        guard let gradient = CGGradient(colorsSpace: colorSpace, colors: colors,
-                                        locations: [0, 1]) else { return }
-        context.saveGState()
-        area.addClip()
-        context.drawLinearGradient(gradient,
-                                   start: CGPoint(x: plot.midX, y: plot.minY),
-                                   end: CGPoint(x: plot.midX, y: plot.maxY),
-                                   options: [])
-        context.restoreGState()
+    /// 柱状图圆顶柱路径：仅视觉顶部两角圆角（本视图 isFlipped，rect.minY 即视觉顶），
+    /// 底部直角贴基线；radius 钳制不超过半宽与柱高。
+    /// ⚠️ isFlipped 下角度约定随坐标系翻转：90° 指向视觉下方，圆顶角要用
+    /// 180°→270°/270°→360° 逆时针扫（clockwise:false），不能用 y 向上惯用的 180°→90°
+    private func roundedTopBar(_ rect: NSRect, radius: CGFloat) -> NSBezierPath {
+        let r = min(radius, rect.width / 2, rect.height)
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: rect.minX, y: rect.maxY))
+        path.line(to: NSPoint(x: rect.minX, y: rect.minY + r))
+        path.appendArc(withCenter: NSPoint(x: rect.minX + r, y: rect.minY + r),
+                       radius: r, startAngle: 180, endAngle: 270, clockwise: false)
+        path.line(to: NSPoint(x: rect.maxX - r, y: rect.minY))
+        path.appendArc(withCenter: NSPoint(x: rect.maxX - r, y: rect.minY + r),
+                       radius: r, startAngle: 270, endAngle: 360, clockwise: false)
+        path.line(to: NSPoint(x: rect.maxX, y: rect.maxY))
+        path.close()
+        return path
     }
 
     /// 根据已有数据文本保留货币前缀、百分号和小数位，格式化纵轴刻度。
@@ -523,35 +437,9 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         let number = formatter.string(from: NSNumber(value: value)) ?? fallback
         return prefix + number + suffix
     }
-
-    /// 用分段三次 Bézier 曲线连接数据点：曲线经过每个数据点，且相邻段在点位处保持连续切线。
-    /// smoothness 控制弯曲强度：0 = 直线折线，1 = 完全平滑（控制点拉到相邻段中点）。
-    private func appendSmoothSegments(_ points: [NSPoint], to path: NSBezierPath,
-                                      movesToFirst: Bool = false) {
-        guard let first = points.first else { return }
-        if movesToFirst {
-            path.move(to: first)
-        } else {
-            path.line(to: first)
-        }
-        guard points.count > 1 else { return }
-
-        let smoothness: CGFloat = 0.6
-        for index in 0..<(points.count - 1) {
-            let start = points[index]
-            let end = points[index + 1]
-            let middleX = (start.x + end.x) / 2
-            // 控制点在中点与端点之间按 smoothness 插值：值越小曲线越贴近直线
-            let cp1X = middleX + (start.x - middleX) * (1 - smoothness)
-            let cp2X = middleX + (end.x - middleX) * (1 - smoothness)
-            path.curve(to: end,
-                       controlPoint1: NSPoint(x: cp1X, y: start.y),
-                       controlPoint2: NSPoint(x: cp2X, y: end.y))
-        }
-    }
 }
 
-/// 一周用量面积图的原生 popover 控制器。
+/// 一周用量趋势图（柱状图）的原生 popover 控制器。
 final class UsageHistoryPopoverController: NSViewController {
     private let chartView = UsageHistoryChartView()
     private let backgroundView = TintedVisualEffectView(frame: .zero)
@@ -560,7 +448,8 @@ final class UsageHistoryPopoverController: NSViewController {
     /// 左侧额外缩进：在基础 inset 上再内推 4pt，让标题/图表更远离容器左缘。
     private let leadingExtraInset: CGFloat = 4
     var onHoverChanged: ((Bool) -> Void)?
-    var panelGradientEnabled = true {
+    /// 「高对比背景」强度（0…1，0 = 无遮罩原生玻璃；主面板滑杆拖动时同步）
+    var panelMaskOpacity: Double = 1 {
         didSet { applyPanelBackground() }
     }
     /// 浅色主题开关：开启即强制浅色外观（优先级高于渐变，主面板切换时同步）
@@ -574,22 +463,16 @@ final class UsageHistoryPopoverController: NSViewController {
     var panelTintBottomColor: NSColor? = Palette.containerTintBottom {
         didSet { applyPanelBackground() }
     }
-    /// Mono 字体开关：图表内文本（标题/刻度/日期）与数值随开关切换字体
-    var monoFontEnabled = false {
-        didSet { chartView.monoFontEnabled = monoFontEnabled }
-    }
 
     override func loadView() {
         backgroundView.material = .menu
         backgroundView.blendingMode = .behindWindow
         backgroundView.state = .active
         backgroundView.isEmphasized = false
-        // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；其余（含渐变开）跟随系统
-        backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                            gradientOn: panelGradientEnabled)
+        // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；其余跟随系统
+        backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
         backgroundView.tintColor = panelTintColor
-        backgroundView.tintBottomColor = Palette.gradientEffective(lightTheme: lightThemeEnabled,
-                                                                   gradientOn: panelGradientEnabled)
+        backgroundView.tintBottomColor = Palette.maskEffective(panelMaskOpacity)
             ? panelTintBottomColor : nil
         backgroundView.wantsLayer = true
         backgroundView.layer?.cornerRadius = Palette.cardCornerRadius
@@ -629,11 +512,9 @@ final class UsageHistoryPopoverController: NSViewController {
     private func applyPanelBackground() {
         guard isViewLoaded else { return }
         // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
-        backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                            gradientOn: panelGradientEnabled)
+        backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
         backgroundView.tintColor = panelTintColor
-        backgroundView.tintBottomColor = Palette.gradientEffective(lightTheme: lightThemeEnabled,
-                                                                   gradientOn: panelGradientEnabled)
+        backgroundView.tintBottomColor = Palette.maskEffective(panelMaskOpacity)
             ? panelTintBottomColor : nil
     }
 }
@@ -895,7 +776,7 @@ final class UsageDots: NSView {
 
 extension BalancePanelView {
 
-    /// 用量表头行：「1小时 / 今日 / 本周」列名，右对齐固定列宽，与下方数值上下对齐
+    /// 用量表头行：「今日 / 本周」列名，右对齐固定列宽，与下方数值上下对齐
     func makeUsageHeaderRow() -> NSView {
         func headerLabel(_ text: String, width: CGFloat) -> NSTextField {
             let l = NSTextField(labelWithString: text)
@@ -906,12 +787,11 @@ extension BalancePanelView {
             l.widthAnchor.constraint(equalToConstant: width).isActive = true
             return l
         }
-        // 左列名「平台」左对齐（与下方 icon 左缘同起点），右侧三列列名右对齐
+        // 左列名「平台」左对齐（与下方 icon 左缘同起点），右侧两列列名右对齐
         let platformHeader = NSTextField(labelWithString: "平台")
         registerFont(platformHeader, size: SmallTable.titleSize, weight: SmallTable.titleWeight)
         platformHeader.textColor = SmallTable.textColor
         let row = NSStackView(views: [platformHeader, stretchSpacer(),
-                                      headerLabel("1H", width: usageColWidths.hour),
                                       headerLabel("1D", width: usageColWidths.today),
                                       headerLabel("1W", width: usageColWidths.week)])
         row.orientation = .horizontal
@@ -930,7 +810,7 @@ extension BalancePanelView {
         return container
     }
 
-    /// 1小时/日/周用量行：品牌 icon + 平台名 + 右侧三列数值（固定列宽右对齐，对齐表头）
+    /// 日/周用量行：品牌 icon + 平台名 + 右侧两列数值（固定列宽右对齐，对齐表头）
     func makeUsageRow(_ row: UsageRowSnapshot) -> NSView {
         let usageIconSize: CGFloat = 10
         let iconView = NSImageView()
@@ -953,14 +833,13 @@ extension BalancePanelView {
             return l
         }
         let rowStack = NSStackView(views: [iconView, nameLabel, stretchSpacer(),
-                                           valueLabel(row.hourText, width: usageColWidths.hour),
                                            valueLabel(row.todayText, width: usageColWidths.today),
                                            valueLabel(row.weekText, width: usageColWidths.week)])
         rowStack.orientation = .horizontal
         rowStack.alignment = .centerY
         rowStack.spacing = usageColumnSpacing
         // icon↔标题 4pt、标题↔数值区 6pt（平台列整体收紧）；
-        // 数值三列之间保持 8pt 列距节奏，表头右缘与数值列右缘锚 trailing 对齐不受影响
+        // 数值两列之间保持 8pt 列距节奏，表头右缘与数值列右缘锚 trailing 对齐不受影响
         rowStack.setCustomSpacing(4, after: iconView)
         rowStack.setCustomSpacing(6, after: nameLabel)
         rowStack.translatesAutoresizingMaskIntoConstraints = false
@@ -1035,7 +914,7 @@ extension BalancePanelView {
     /// （lightTint 与 Token 子面板同口径：浅色主题开关开或生效外观为浅色）
     func syncUsageHistoryPanelBackground() {
         guard let controller = usageHistoryController else { return }
-        controller.panelGradientEnabled = panelGradientEnabled
+        controller.panelMaskOpacity = panelMaskOpacity
         controller.lightThemeEnabled = lightThemeEnabled
         if let container = Self.findPanelContainer(from: self) {
             controller.panelTintColor = container.tintColor
@@ -1043,12 +922,11 @@ extension BalancePanelView {
         } else {
             let colors = Palette.containerColors(
                 lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
-                gradientOn: panelGradientEnabled)
+                opacity: panelMaskOpacity)
             controller.panelTintColor = colors.top
             controller.panelTintBottomColor = colors.bottom
         }
-        usageHistoryPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                                  gradientOn: panelGradientEnabled)
+        usageHistoryPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
     }
 
     private func showUsageHistory(row: UsageRowSnapshot, from anchor: NSView?) {
@@ -1085,8 +963,7 @@ extension BalancePanelView {
             popover.behavior = .applicationDefined
             // 三角箭头由 NSPopover 窗口本身绘制，外观与主面板同策略：
             // 统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
-            popover.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                         gradientOn: panelGradientEnabled)
+            popover.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
             // 让内容背景延伸覆盖系统三角箭头区域，箭头与主面板背景保持一致。
             popover.hasFullSizeContent = true
             // hover 反馈需要即时出现；跨行切换时也不让系统 popover 动画制造延迟感。
@@ -1101,13 +978,10 @@ extension BalancePanelView {
 
         let anchorChanged = usageHistoryAnchor !== fixedAnchor
         usageHistoryAnchor = fixedAnchor
-        // 背景/字体开关与主面板保持一致（主题/渐变切换时的唯一重同步入口，见下方同名方法）
+        // 背景/遮罩开关与主面板保持一致（主题/渐变切换时的唯一重同步入口，见下方同名方法）
         syncUsageHistoryPanelBackground()
-        // Mono 开关在面板打开期间切换时，子弹窗是懒创建的——每次 show 前同步当前状态
-        usageHistoryController?.monoFontEnabled = monoFontEnabled
-        // 外观与渐变/浅色开关每次 show 前重设（开关可能在面板存在期间切换：深色 ↔ 浅色玻璃）
-        usageHistoryPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                                  gradientOn: panelGradientEnabled)
+        // 外观与浅色开关每次 show 前重设（开关可能在面板存在期间切换：深色 ↔ 浅色玻璃）
+        usageHistoryPopover?.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
         let wasShown = usageHistoryPopover?.isShown == true
         usageHistoryController?.update(row: row)
         usageHistoryChartHovered = false

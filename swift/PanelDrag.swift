@@ -1,5 +1,6 @@
 // PanelDrag.swift — iBalance
 // 平台卡片拖拽排序框架:拖动状态机、幽灵卡片、重排动画、drop highlight
+// header 图标拖动换位（2026-09-13，无需修饰键）：五颗 header 按钮链式约束实时重排
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 
 import Cocoa
@@ -356,6 +357,118 @@ extension BalancePanelView {
         }
         // 主面板 Token 板块跟随 Agent 组顶部平台：排序变化（拖拽实时重排/账号重建）后立即重解析取数
         refreshInlineTokens()
+    }
+
+    // MARK: - header 图标拖动换位
+
+    /// 起手阈值（pt）：按下后移动超过它才认定换位手势，手抖点击不误入拖拽
+    private static let headerDragStartThreshold: CGFloat = 4
+
+    /// header 图标按下起手（2026-09-13 起无需按住 Cmd）：第一段做点击/拖拽阈值判断——
+    /// 位移超过阈值进入换位循环；未超阈值松手 = 普通点击，由按钮回放自己的点击链路
+    /// （协议 performClickAction，与各按钮原点击行为一致）。
+    func beginHeaderIconDrag(for id: String, event: NSEvent) {
+        guard draggingHeaderButtonID == nil,
+              let view = headerButtonRegistry[id],
+              let header = headerView,
+              let panelWindow = header.window else { return }
+        let start = header.convert(event.locationInWindow, from: nil)
+        while let next = panelWindow.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            guard next.type == .leftMouseDragged else {
+                // 阈值内松手 = 普通点击
+                (view as? HeaderIconDraggable)?.performClickAction()
+                return
+            }
+            let p = header.convert(next.locationInWindow, from: nil)
+            guard hypot(p.x - start.x, p.y - start.y) > Self.headerDragStartThreshold else { continue }
+            runHeaderIconReorder(for: id, firstPointerX: p.x)
+            return
+        }
+    }
+
+    /// 换位主循环（已过阈值）：按指针 x 实时重排，松手落盘（有变化时）。
+    /// 同步事件循环会吞掉 tracking area 的 entered/exited 派发，被拖按钮的 hover
+    /// 须按光标是否在其框内手动同步（离框即灭、回框复亮，松手后归正常事件接管）。
+    private func runHeaderIconReorder(for id: String, firstPointerX: CGFloat) {
+        guard let header = headerView, let panelWindow = header.window,
+              let view = headerButtonRegistry[id] else { return }
+        draggingHeaderButtonID = id
+        let orderAtStart = headerButtonOrder
+        reorderHeaderButtons(pointerX: firstPointerX)
+        while let next = panelWindow.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            let inside = view.bounds.contains(view.convert(next.locationInWindow, from: nil))
+            (view as? PanelScrollHoverSync)?.syncHoverState(inside)
+            guard next.type == .leftMouseDragged else { break }
+            reorderHeaderButtons(pointerX: header.convert(next.locationInWindow, from: nil).x)
+        }
+        draggingHeaderButtonID = nil
+        if headerButtonOrder != orderAtStart {
+            UserDefaults.standard.set(headerButtonOrder, forKey: UDKey.headerButtonOrder)
+        }
+    }
+
+    /// 指针 x 决定插入位：统计位于其左侧（midX < pointerX）的其他图标数。
+    /// 换位边界是相邻按钮中点、按钮等宽，来回过界自带一整个按钮宽的迟滞，不抖动。
+    private func reorderHeaderButtons(pointerX: CGFloat) {
+        guard let id = draggingHeaderButtonID, let header = headerView else { return }
+        let others = headerButtonOrder.filter { $0 != id }
+        let insertIndex = others.filter { otherID in
+            guard let view = headerButtonRegistry[otherID] else { return false }
+            return view.convert(view.bounds, to: header).midX < pointerX
+        }.count
+        var next = others
+        next.insert(id, at: min(insertIndex, next.count))
+        guard next != headerButtonOrder else { return }
+        headerButtonOrder = next
+        applyHeaderButtonOrder(animated: true)
+    }
+
+    /// 按当前顺序重建 header 图标链式 leading 约束：首颗钉 header 左缘（距容器缘 =
+    /// 容器缩进 + 正文缩进 7 + 2.6，2026-09-06 用户「header 左右缩进增加2pt」后再
+    /// 「再增加0.6pt」，原 +7 与 root 内容左右缘对齐），其余依次 +2pt。
+    /// animated 时给让位按钮加 X 轴位移动画（口径同 applyPlatformOrder）。
+    func applyHeaderButtonOrder(animated: Bool) {
+        guard let header = headerView else { return }
+        let orderedViews = headerButtonOrder.compactMap { headerButtonRegistry[$0] }
+        guard orderedViews.count == BalancePanelView.headerButtonIdentifiers.count else { return }
+        let oldFrames = Dictionary(uniqueKeysWithValues: orderedViews.map {
+            (ObjectIdentifier($0), $0.frame)
+        })
+        NSLayoutConstraint.deactivate(headerButtonChainConstraints)
+        headerButtonChainConstraints.removeAll()
+        let leadInset = BalancePanelViewController.contentHorizontalInset + 9.6
+        for (index, view) in orderedViews.enumerated() {
+            let leading: NSLayoutConstraint
+            if index == 0 {
+                leading = view.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: leadInset)
+            } else {
+                leading = view.leadingAnchor.constraint(
+                    equalTo: orderedViews[index - 1].trailingAnchor, constant: 2)
+            }
+            headerButtonChainConstraints.append(leading)
+        }
+        NSLayoutConstraint.activate(headerButtonChainConstraints)
+        header.layoutSubtreeIfNeeded()
+        guard animated, !shouldReduceMotion else { return }
+        for view in orderedViews {
+            guard let oldFrame = oldFrames[ObjectIdentifier(view)],
+                  oldFrame != view.frame,
+                  let layer = view.layer else { continue }
+            let animation = CABasicAnimation(keyPath: "transform.translation.x")
+            animation.fromValue = oldFrame.minX - view.frame.minX
+            animation.toValue = 0
+            animation.duration = Motion.layout
+            animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer.add(animation, forKey: "headerButtonReorder")
+        }
+    }
+
+    /// 还原落盘的 header 图标顺序：未知 id 丢弃、缺失 id 按固定清单补尾（新增按钮向前兼容）
+    func savedHeaderButtonOrder() -> [String] {
+        let saved = UserDefaults.standard.stringArray(forKey: UDKey.headerButtonOrder) ?? []
+        var order = saved.filter { BalancePanelView.headerButtonIdentifiers.contains($0) }
+        for id in BalancePanelView.headerButtonIdentifiers where !order.contains(id) { order.append(id) }
+        return order
     }
 
 }

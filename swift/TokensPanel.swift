@@ -576,11 +576,14 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     var onHoverChanged: ((Bool) -> Void)?
     /// 词元活动视图切换每日/每周时回调（控制器据此刷新 popover 尺寸）
     var onActivityModeChanged: (() -> Void)?
-    var monoFontEnabled = false {
+    /// Sharp Grotesk 字体名（主标题字体档，2026-09-13）：开启时大数字同套该字体，
+    /// 字重×宽度档由面板注入（与卡片标题/余额数值同源）；nil = 未开启，
+    /// 本机未装该档时 totalFont 回落原字体策略
+    var sharpGroteskFontName: String? {
         didSet {
+            guard sharpGroteskFontName != oldValue else { return }
             totalRollView.refreshFont()
             metricsDirty = true   // 字体变了 → 所有文本度量缓存作废
-            // 行距随墨迹推导（大数字 ascender 同理）：字体切换后固有高度已变，需失效重排
             invalidateIntrinsicContentSize()
             needsDisplay = true
         }
@@ -763,7 +766,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
                 ?? .monospacedDigitSystemFont(ofSize: s, weight: w)
         })
         addSubview(totalRollView)
-        // 内嵌小硬币：紧凑呈现（无弹跳/落地影、按自身尺寸收紧高度）。
+        // 内嵌小硬币：紧凑呈现（无弹跳、按自身尺寸收紧高度）。
         // ⚠️ 交互保持开启（用户 2026-09-11 指定：任何时候都能点击自旋 / 拖拽翻转）——
         // 它是可滚动面板里的一个「活的」控件，靠 hitTest 只吃硬币圆内那 24pt，
         // 圈外的滚动 / hover 不受影响。
@@ -802,28 +805,25 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     /// 9pt 小注释字体：仅「项目/模型」「每日/每周」切换文案与热力图月份轴（非标题）
     private func makeLabelFont() -> NSFont {
-        monoFontEnabled ? MonoFontProvider.font(size: 9)
-            : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+        NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
     }
     /// 选中周期字体：字重加一档（regular → medium，2026-09-08 用户指定；未选中仍 regular）。
-    /// mono 模式 JetBrains 仅打包 SemiBold 单 face，无更高档可选，维持原字体。
     /// 宽度度量（cachedPeriodWidths）按此字体测——槽位取较宽态，选中切换不跳动。
     private func makePeriodSelectedFont() -> NSFont {
-        monoFontEnabled ? MonoFontProvider.font(size: 9)
-            : NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
     }
     /// 标签墨迹高度（9pt 小注释）
     private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
     /// 区块标题字体（「项目」「词元活动」）：与用量表头同款（小表格口径）
-    private func makeTitleFont() -> NSFont { SmallTable.titleFont(mono: monoFontEnabled) }
+    private func makeTitleFont() -> NSFont { SmallTable.titleFont() }
     /// 首行「平台名 总计」标题字体：同字号降一档字重（semibold → medium，2026-09-02 用户指定）
     private func makeHeaderTitleFont() -> NSFont {
-        SmallTable.font(size: SmallTable.titleSize, weight: .medium, mono: monoFontEnabled)
+        SmallTable.font(size: SmallTable.titleSize, weight: .medium)
     }
     /// 标题墨迹高度（10pt semibold）
     private var titleInkHeight: CGFloat { ceil(makeTitleFont().boundingRectForFont.height) }
     /// 列表行墨迹高度（小表格行字体 10pt medium）
-    private var rowInkHeight: CGFloat { ceil(SmallTable.rowFont(mono: monoFontEnabled).boundingRectForFont.height) }
+    private var rowInkHeight: CGFloat { ceil(SmallTable.rowFont().boundingRectForFont.height) }
     /// 大数字字体（与 totalRollView configure 同参；数字轮行带贴顶排版，墨迹底 = 带顶 + ascender）
     private var numberFont: NSFont { totalFont(size: totalNumberSize, weight: .semibold, monoDigits: true) }
 
@@ -1001,9 +1001,11 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         totalRollView.setText(text, animated: true, slideOnRebuild: slideOnRebuild, totalDuration: effectiveTotal)
     }
 
-    /// 大数字字体：系统字体态用等宽数字变体（滚轮槽宽恒定）；Mono 按主面板策略
+    /// 大数字字体：Sharp Grotesk 开启优先（与卡片数值同策略，本机未装回落）；
+    /// 系统字体态用等宽数字变体（滚轮槽宽恒定）
     private func totalFont(size: CGFloat, weight: NSFont.Weight, monoDigits: Bool) -> NSFont {
-        if monoDigits, !monoFontEnabled {
+        if let sg = sharpGroteskFontName, let f = NSFont(name: sg, size: size) { return f }
+        if monoDigits {
             return .monospacedDigitSystemFont(ofSize: size, weight: weight)
         }
         return uiFont(size: size, weight: weight)
@@ -1016,8 +1018,10 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         let availWidth = bounds.width - insets.left - insets.right - inlineCoinWidth
         guard availWidth > 40 else { return }
         var size: CGFloat = 26
+        // 度量须用实际渲染字体（totalFont 与 totalRollView 同源）：Sharp Grotesk /
+        // 等宽数字档按比例系统字体测宽会低估，超宽数字溢出版心
         while size > 15,
-              text.size(withAttributes: [.font: uiFont(size: size, weight: .semibold)]).width > availWidth {
+              text.size(withAttributes: [.font: totalFont(size: size, weight: .semibold, monoDigits: true)]).width > availWidth {
             size -= 1
         }
         guard size != totalNumberSize else { return }
@@ -1093,10 +1097,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         return NSSize(width: Self.contentWidth, height: height)
     }
 
-    /// 按当前字体开关取字体（优先级 Mono > 系统，与面板/用量图表同策略）
+    /// 图表文本字体（系统字体）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
-        return .systemFont(ofSize: size, weight: weight)
+        .systemFont(ofSize: size, weight: weight)
     }
 
     override func updateTrackingAreas() {
@@ -1285,9 +1288,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         if !projects.isEmpty && summary != nil {
             // 行字体 = 用量行同款（小表格口径）：名称/百分比 medium，数值等宽数字；
             // 切换过渡期按逐行交错进度绘制(行遮罩显影:行带内自下缘上滑入位),常态直绘零开销
-            let nameFont = SmallTable.rowFont(mono: monoFontEnabled)
-            let valueFont = SmallTable.rowFont(mono: monoFontEnabled, monoDigits: true)
-            let pctFont = SmallTable.rowFont(mono: monoFontEnabled)
+            let nameFont = SmallTable.rowFont()
+            let valueFont = SmallTable.rowFont(monoDigits: true)
+            let pctFont = SmallTable.rowFont()
             if let start = switchTransitionStart {
                 let elapsed = CACurrentMediaTime() - start
                 listEndY = drawProjectRows(projects, baseTotal: listBaseTotal, topY: listStartTop,
@@ -1485,10 +1488,11 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 进行中的切换动效起始时刻;nil = 常态直绘
     private var switchTransitionStart: CFTimeInterval?
-    private var switchTimer: Timer?
+    /// 出帧源 = 显示器刷新率（DisplayTicker），非 60Hz 定频：120Hz 屏上逐帧推进
+    private var switchTicker: DisplayTicker?
     /// 「每日/每周」切换专用的点阵波次起始（平台切换进行中恒为 nil，点阵随切换波次走）
     private var dotFadeStart: CFTimeInterval?
-    private var dotFadeTimer: Timer?
+    private var dotFadeTicker: DisplayTicker?
     /// 点阵淡出/淡入时长（用户指定 2026-08-31：0.6s，双向 ease-in-out，
     /// 独立于列表行 0.4s 节奏；平台切换 timer 总时长 0.7s 覆盖之）
     private static let dotFadeDuration: Double = 0.6
@@ -1499,31 +1503,33 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     // MARK: 骨架行渐变扫光（占位态 shimmer，2026-09-10 用户指定）
 
-    /// 占位骨架行扫光起始时刻（nil = 非占位态）；60fps timer 每帧 needsDisplay 驱动 draw 现算相位
+    /// 占位骨架行扫光起始时刻（nil = 非占位态）；出帧源 = 显示器刷新率，
+    /// 每帧 needsDisplay 驱动 draw 现算相位
     private var skeletonShimmerStart: CFTimeInterval?
-    private var skeletonShimmerTimer: Timer?
+    private var skeletonShimmerTicker: DisplayTicker?
     /// 扫光一个完整行程的时长；逐行错开 0.15 个相位
     private static let shimmerDuration: Double = 1.6
 
     /// 占位态扫光驱动：draw 里发现 summary 未到即启动；数据到达 / 离开窗口 / 隐藏自停
     private func startSkeletonShimmerIfNeeded() {
-        guard skeletonShimmerTimer == nil, window != nil else { return }
+        guard skeletonShimmerTicker == nil, window != nil else { return }
         if skeletonShimmerStart == nil { skeletonShimmerStart = CACurrentMediaTime() }
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
+        let ticker = DisplayTicker(host: self) { [weak self] in
+            guard let self else { return false }
             guard self.summary == nil, self.window != nil, !self.isHidden else {
                 self.stopSkeletonShimmer()
-                return
+                return false
             }
             self.needsDisplay = true
+            return true
         }
-        RunLoop.main.add(timer, forMode: .common)
-        skeletonShimmerTimer = timer
+        skeletonShimmerTicker = ticker
+        ticker.start()
     }
 
     private func stopSkeletonShimmer() {
-        skeletonShimmerTimer?.invalidate()
-        skeletonShimmerTimer = nil
+        skeletonShimmerTicker?.stop()
+        skeletonShimmerTicker = nil
         skeletonShimmerStart = nil
     }
 
@@ -1537,32 +1543,32 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 从旧平台值整组滑移滚到新值（与周期切换同款）；列表行在 draw 内按逐行交错进度绘制。
     /// 系统「减弱动态效果」开启时直接落定不做行/点阵动效。
     func beginSwitchTransition() {
-        switchTimer?.invalidate()
-        switchTimer = nil
+        switchTicker?.stop()
+        switchTicker = nil
         stopDotFade()   // 平台切换接管点阵波次，独立波次作废
         slideNextTotalRoll = true   // 大数字：下一次 summary 落值走整组滑移滚动
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         outgoingDots = lastLitDots   // 旧平台点亮出（此时 summary 未清，快照仍是旧数据）
         switchTransitionStart = CACurrentMediaTime()
         let total = Self.switchTotalDuration
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
-            guard let self, let start = self.switchTransitionStart else { t.invalidate(); return }
-            let elapsed = CACurrentMediaTime() - start
-            if elapsed >= total {
-                t.invalidate()
+        let ticker = DisplayTicker(host: self) { [weak self] in
+            guard let self, let start = self.switchTransitionStart else { return false }
+            if CACurrentMediaTime() - start >= total {
                 self.endSwitchTransition()
-            } else {
-                // 行块动效在 draw 内按当前时刻计算进度,每帧驱动宿主重绘
-                // (大数字滚动由 RollingNumberView 自管,列表行是 draw 自绘,漏了就整段不动)
-                self.needsDisplay = true
+                return false
             }
+            // 行块动效在 draw 内按当前时刻计算进度,每帧驱动宿主重绘
+            // (大数字滚动由 RollingNumberView 自管,列表行是 draw 自绘,漏了就整段不动)
+            self.needsDisplay = true
+            return true
         }
-        switchTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        switchTicker = ticker
+        ticker.start()
     }
 
     private func endSwitchTransition() {
         switchTransitionStart = nil
+        switchTicker = nil   // link 已由 ticker 自停（step 返回 false），这里只清引用
         outgoingDots.removeAll()
         releaseDotsImages()   // 淡变结束：位图释放，常态回逐点直绘
         needsDisplay = true
@@ -1570,7 +1576,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     /// 「每日/每周」切换入口：点阵独立重挂旧点亮出→新点亮入（0.6s 双向 ease-in-out），
     /// 只动点阵不碰大数字/列表行；平台切换进行中不另起（点阵已在切换淡入里）。
-    /// 自绘点阵无图层可挂动画，靠 60fps timer 每帧 needsDisplay 驱动 draw 现算进度
+    /// 自绘点阵无图层可挂动画，靠 DisplayTicker 每帧 needsDisplay 驱动 draw 现算进度
     func restartDotFade() {
         stopDotFade()
         guard switchTransitionStart == nil,
@@ -1578,25 +1584,25 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         outgoingDots = lastLitDots   // 旧模式点亮出（didSet 时上一帧 draw 仍是旧模式几何）
         dotFadeStart = CACurrentMediaTime()
         let total = Self.dotFadeDuration
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
-            guard let self, self.dotFadeStart != nil else { t.invalidate(); return }
-            if CACurrentMediaTime() - self.dotFadeStart! >= total {
-                t.invalidate()
-                self.dotFadeTimer = nil
+        let ticker = DisplayTicker(host: self) { [weak self] in
+            guard let self, let start = self.dotFadeStart else { return false }
+            if CACurrentMediaTime() - start >= total {
+                self.dotFadeTicker = nil
                 self.dotFadeStart = nil
                 self.outgoingDots.removeAll()
                 self.releaseDotsImages()   // 淡变结束：位图释放
-            } else {
-                self.needsDisplay = true
+                return false
             }
+            self.needsDisplay = true
+            return true
         }
-        dotFadeTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        dotFadeTicker = ticker
+        ticker.start()
     }
 
     private func stopDotFade() {
-        dotFadeTimer?.invalidate()
-        dotFadeTimer = nil
+        dotFadeTicker?.stop()
+        dotFadeTicker = nil
         dotFadeStart = nil
         outgoingDots.removeAll()
         releaseDotsImages()   // 中断/重启：位图作废，新 wave 首帧按需重烘
@@ -1905,8 +1911,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         for i in labels.indices { labels[i].x = insets.left + CGFloat(i) * step }
         cachedMonthLabels = labels
         // 列表行数值/百分比文本与宽度
-        let valueFont = SmallTable.rowFont(mono: monoFontEnabled, monoDigits: true)
-        let pctFont = SmallTable.rowFont(mono: monoFontEnabled)
+        let valueFont = SmallTable.rowFont(monoDigits: true)
+        let pctFont = SmallTable.rowFont()
         if let summary {
             let showModels = listMode == .models && !summary.models.isEmpty
             // 行随总计周期换数据：All = 全量列表，窗口周期取各窗口聚合，分母同大数字口径
@@ -2122,7 +2128,7 @@ extension BalancePanelView {
     func setupInlineTokens() {
         let view = TokensPanelView()
         view.source = .zcode
-        view.monoFontEnabled = monoFontEnabled
+        view.sharpGroteskFontName = inlineTokensSGFontName
         // 左右缩进 8 = 用量行 / 设置卡片内容边界（usageHorizontalInset），内容撑满版心后
         // 热力图按实际宽等比放大、字号不变（hover 子面板保持默认 16 不受影响）；
         // 顶部缩进 4 = usageRowTopInset，标题→首行间距与用量区块同口径
@@ -2208,7 +2214,7 @@ extension BalancePanelView {
             }
             view.summary = summary
             if switched {
-                // 动效已由 beginSwitchTransition 启动的 60fps timer 驱动，这里只按新内容高度重算面板尺寸
+                // 动效已由 beginSwitchTransition 启动的 DisplayTicker（显示器刷新率出帧）驱动，这里只按新内容高度重算面板尺寸
                 self.onContentChanged?()
             }
         }

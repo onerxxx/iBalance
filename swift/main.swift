@@ -489,7 +489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let c = MenuBarStatusGlowController(stateProvider: { [weak self] in self?.menuBarGlowState(for: $0) })
         // 圆点出现/消失改变标题排版 → 重烘焙标题位图（状态点预留间距随存亡增删）
         c.onDotPresenceChanged = { [weak self] in self?.updateTitle(tag: "dotPresence") }
-        // 小球弹跳参数（设置窗口「动画」pane 落盘的那份）
+        // 小球弹跳参数（设置窗口「菜单栏」pane 落盘的那份）
         c.setBounce(dotBounce)
         return c
     }()
@@ -498,7 +498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 启动时从 UserDefaults 还原，改动即时落盘
     private var dotBounce = MenuBarBounceSettings.load()
 
-    /// 设置窗口「动画」pane 改参：写内存 → 落盘 → 推给光晕控制器（立即重算当前帧，拖动跟手）
+    /// 设置窗口「菜单栏」pane 改参：写内存 → 落盘 → 推给光晕控制器（立即重算当前帧，拖动跟手）
     private func applyDotBounce(_ s: MenuBarBounceSettings) {
         dotBounce = s
         s.save()
@@ -807,8 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 外观统一走 Palette.panelAppearance：浅色主题开=强制浅色（不受系统深色影响）；
         // 渐变开=固定深色（深色玻璃+浅色字）；都关=跟随系统外观，浅色主题下面板即原生
         // 浅色 Liquid Glass，文本走 Palette 动态色自动转黑灰
-        popover.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
-                                                      gradientOn: config.panelGradientEnabled)
+        popover.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled)
         // 满尺寸内容（macOS 14+）：内容视图铺满整个 popover 窗口，顶边伸进系统三角
         // 箭头区，header 的毛玻璃即可一直铺到三角里，箭头与 header 同色（否则箭头是
         // 系统玻璃、header 是自定义玻璃，交界处有色差）。
@@ -1271,7 +1270,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                       percent: Bool, prefix: String = "") -> UsageRowSnapshot? {
             guard let u = UsageStore.usage(platform: platform, accounts: accounts, increasing: increasing) else { return nil }
             let uids = accounts.map(\.uid)
-            let hour = UsageStore.hourlyUsage(platform: platform, accounts: accounts, increasing: increasing)
             // 周历史页：从本周回溯到该平台最早有记录的周（usage.json 保留 60 天 ≈ 最多 8 页）
             var cal = Calendar.current
             cal.firstWeekday = 2
@@ -1303,7 +1301,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             return UsageRowSnapshot(platform: platform, icon: icon, name: name,
-                                    hourText: prefix + fmtUsage(hour, percent: percent, decimals: decimals),
                                     todayText: prefix + fmtUsage(u.today, percent: percent, decimals: decimals),
                                     weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals),
                                     historyWeeks: weeks)
@@ -1402,9 +1399,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             s.lastCheckinTime = text
         }
         s.refreshIntervalSeconds = Int(config.refreshInterval)
-        s.panelGradientEnabled = config.panelGradientEnabled
+        s.panelMaskOpacity = config.panelMaskOpacity
         s.lightThemeEnabled = config.lightThemeEnabled
-        s.monoFontEnabled = config.monoFontEnabled
         s.cardTitleFontSize = config.cardTitleFontSize
         s.cardTitleSharpGrotesk = config.cardTitleSharpGrotesk
         s.cardTitleSGWeight = config.cardTitleSGWeight
@@ -1511,18 +1507,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         actions.addTraeAccount = { [weak self] in self?.onCollectTraeAccount() }
         actions.addZcodeAccount = { [weak self] in self?.onAddZcodeAccount() }
         actions.addCodexAccount = { [weak self] in self?.onAddCodexAccount() }
+        actions.deleteAccount = { [weak self] platform, uid in
+            self?.onDeleteAccount(platform: platform, uid: uid)
+        }
         actions.saveKeyQuota = { [weak self] key, quota, zhipu, qwen in
             self?.applyKeyQuota(apiKey: key, quota: quota, zhipuToken: zhipu, qwenTicket: qwen)
         }
+        actions.deleteAllAccounts = { [weak self] in self?.onDeleteAllAccounts() }
         actions.manualCheckin = { [weak self] in self?.onManualCheckin() }
         actions.showCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
         actions.shareWbHistory = { [weak self] in self?.onShareWbHistory() }
-        // ── 「主题外观」pane：6 个开关 + 2 根滑杆 ──
+        // ── 「主题外观」pane：面板/卡片开关 + 滑杆 ──
         // 开关沿用面板既有的翻转式实现（读 config 取反），传期望值时先比对再翻；
         // 点阵色相/饱和度直接落 Palette（UserDefaults 持久化）并对当前面板就地重绘
-        actions.setPanelGradient = { [weak self] want in
-            guard let self, want != config.panelGradientEnabled else { return }
-            onTogglePanelGradient()
+        actions.setPanelMaskOpacity = { [weak self] opacity in
+            self?.applyPanelMaskOpacity(opacity)
         }
         actions.setLightTheme = { [weak self] want in
             guard let self, want != config.lightThemeEnabled else { return }
@@ -1535,10 +1534,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         actions.setCircularIcon = { [weak self] want in
             guard let self, want != config.circularIcon else { return }
             onToggleCircularIcon()
-        }
-        actions.setMonoFont = { [weak self] want in
-            guard let self, want != config.monoFontEnabled else { return }
-            onToggleMonoFont()
         }
         // ── 卡片主标题字体（字号滑杆 + Sharp Grotesk 字重×宽度）──
         // 直接写 config 即可：syncPanel → panel.update 快照比对到变化后就地重刷标题
@@ -1574,10 +1569,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         actions.setHeatSaturation = { [weak self] in self?.panelView?.applyHeatSaturation(CGFloat($0)) }
         actions.setHeatBrightness = { [weak self] in self?.panelView?.applyHeatBrightness(CGFloat($0)) }
         actions.setBounce = { [weak self] in self?.applyDotBounce($0) }
-        // 侧栏玻璃透明度：落盘 + 立即重灌侧栏那层 NSGlassEffectView 的 tintColor
-        actions.setSidebarGlassTransparency = { [weak self] t in
-            SettingsWindowController.shared.setSidebarGlassTransparency(t)
-        }
         actions.about = { [weak self] in self?.onAbout() }
         // 设置窗口「平台」pane：定高表格，**勾选即生效**（保存链路见 applyPlatformConfig）
         SettingsWindowController.shared.platformConfig = { [weak self] in self?.config }
@@ -1617,22 +1608,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func makeSettingsSnapshot() -> AppSettingsSnapshot {
         let s = makePanelSnapshot()
         let interval = s.refreshIntervalSeconds
+        let savedAccounts = config.workbuddyAccounts.count
+            + config.traeAccounts.count
+            + config.zcodeAccounts.count
+            + config.codexAccounts.count
+        let savedOverrides = [
+            config.deepseekApiKey,
+            config.bigmodelTokenOverride,
+            config.qwenTicketOverride
+        ].filter { !$0.isEmpty }.count
+        // 「已保存账号」逐平台分组（2026-09-13 用户要求）：空平台不出现。
+        // name 取各平台展示名（ZCode 走 displayName = 昵称/uid 尾号，Codex 邮箱优先），
+        // detail 统一给 uid 便于区分同名账号；iconKey 与面板卡片图标名同源
+        let accountGroups = [
+            SavedAccountGroup(id: "workbuddy", platform: "WorkBuddy", iconKey: "workbuddy",
+                              accounts: config.workbuddyAccounts.map {
+                                  .init(id: $0.uid, name: $0.nickname, detail: $0.uid) }),
+            SavedAccountGroup(id: "trae", platform: "TRAE", iconKey: "trae-color",
+                              accounts: config.traeAccounts.map {
+                                  .init(id: $0.uid,
+                                        name: $0.username.isEmpty ? $0.uid : $0.username,
+                                        detail: $0.uid) }),
+            SavedAccountGroup(id: "zcode", platform: "ZCode", iconKey: "zhipu",
+                              accounts: config.zcodeAccounts.map {
+                                  .init(id: $0.uid, name: $0.displayName, detail: $0.uid) }),
+            SavedAccountGroup(id: "codex", platform: "Codex", iconKey: "codex",
+                              accounts: config.codexAccounts.map {
+                                  .init(id: $0.uid,
+                                        name: $0.email.isEmpty ? $0.uid : $0.email,
+                                        detail: $0.email.isEmpty ? "" : $0.uid) }),
+        ].filter { !$0.accounts.isEmpty }
         return AppSettingsSnapshot(
             refreshInterval: [60, 180, 300].contains(interval) ? interval : 300,
             autoCheckin: s.traeAutoCheckin || s.wbAutoCheckin,
             autoCheckinSub: s.lastCheckinTime ?? "",
             autoUpdateCheck: s.updateAutoCheckEnabled,
             bounce: dotBounce,
-            sidebarGlassTransparency: SettingsWindowController.sidebarGlassTransparency,
             apiKey: config.deepseekApiKey,
             commonQuota: config.deepseekCommonQuota,
             zhipuToken: config.bigmodelTokenOverride,
             qwenTicket: config.qwenTicketOverride,
-            panelGradientEnabled: config.panelGradientEnabled,
+            savedAccountCount: savedAccounts,
+            savedOverrideCount: savedOverrides,
+            savedAccountGroups: accountGroups,
+            panelMaskOpacity: config.panelMaskOpacity,
             lightThemeEnabled: config.lightThemeEnabled,
             iconThemeSwap: config.iconThemeSwap,
             circularIcon: config.circularIcon,
-            monoFontEnabled: config.monoFontEnabled,
             longProgressCard: config.longProgressCard,
             cardTitleFontSize: config.cardTitleFontSize,
             cardTitleSharpGrotesk: config.cardTitleSharpGrotesk,
@@ -1643,14 +1665,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             heatBrightness: Double(Palette.heatPeakBrightness))
     }
 
-    /// 面板渐变背景：切换后立即保存并刷新面板（VC 经快照同步后重绘遮罩）
-    @objc private func onTogglePanelGradient() {
-        config.panelGradientEnabled = !config.panelGradientEnabled
+    /// 「高对比背景」强度（0…1，设置窗口滑杆实时拖动）：写配置并经快照同步重绘遮罩
+    private func applyPanelMaskOpacity(_ opacity: Double) {
+        config.panelMaskOpacity = opacity
         ConfigStore.save(config)
-        // popover 窗口外观必须同步重设：容器 appearance=nil（渐变关）时沿继承链取窗口值，
-        // 只在启动时设一次的话，运行中切换后面板会一直停留在启动时的主题
-        popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
-                                                                gradientOn: config.panelGradientEnabled)
         syncPanel()
     }
 
@@ -1663,16 +1681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Palette.lightThemeActive = config.lightThemeEnabled
         updateProgressWinRef?.applyThemeAppearance()
         // popover 窗口外观（含箭头）必须同步重设，否则停留在启动时的主题
-        popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled,
-                                                                gradientOn: config.panelGradientEnabled)
-        syncPanel()
-    }
-
-    /// Mono 字体：余额卡片与用量列表切换 JetBrainsMono（中文回退系统字体），
-    /// 保存后经快照同步，面板对已注册 label 就地换字体（不重建卡片）
-    @objc private func onToggleMonoFont() {
-        config.monoFontEnabled = !config.monoFontEnabled
-        ConfigStore.save(config)
+        popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled)
         syncPanel()
     }
 
@@ -1999,10 +2008,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         runUpdateDemo()
     }
 
-    /// 面板「Key / 额度」磁贴 / 右键「Key / 额度设置…」：打开设置窗口并落到该 pane
-    /// （原独立玻璃弹窗已并入设置窗口表单）
+    /// 面板右键「Key / 额度设置…」：打开设置窗口并落到账号 pane
+    ///（Key/额度 2026-09-13 并入账号 pane，原独立 keyQuota pane 删除）
     @objc func onSetApiKey() {
-        openSettingsWindow(pane: .keyQuota)
+        openSettingsWindow(pane: .accounts)
     }
 
     /// 「Key / 额度」保存（设置窗口表单 → 落盘 → 立即刷新）：
@@ -2014,6 +2023,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         config.bigmodelTokenOverride = zhipuToken
         config.qwenTicketOverride = qwenTicket
         ConfigStore.save(config)
+        onRefresh()
+    }
+
+    /// 「账号」pane 底部「删除账号」：二次确认后清空全部已保存凭据。
+    /// 四平台账号数组 + 三件套手填覆盖一并清零；钥匙串 bundle 由 ConfigStore.save 内部删除（全空时 persist 删条目）。
+    @objc private func onDeleteAllAccounts() {
+        let shell = DialogShell()
+        shell.addTitle("删除账号")
+        shell.addInfo("即将清除 iBalance 中保存的全部凭据：\n\n"
+            + "· WorkBuddy / TRAE / ZCode / Codex 账号\n"
+            + "· DeepSeek Key、ZhiPu Token、Qwen Ticket 手填覆盖\n\n"
+            + "各平台在本机的登录状态不受影响。此操作不可撤销。")
+        _ = shell.addButton("取消", keyEquivalent: "\u{1b}")
+        let idxDelete = shell.addButton("删除", keyEquivalent: "")
+        shell.markDestructive(idxDelete)
+        guard shell.present() == idxDelete else { return }
+
+        config.workbuddyAccounts = []
+        config.traeAccounts = []
+        config.zcodeAccounts = []
+        config.codexAccounts = []
+        config.deepseekApiKey = ""
+        config.bigmodelTokenOverride = ""
+        config.qwenTicketOverride = ""
+        ConfigStore.save(config)
+        syncPanel()
+        onRefresh()
+    }
+
+    /// 设置窗口「已保存账号」行的逐个删除（2026-09-13 用户要求）：
+    /// platform = 平台键（workbuddy / trae / zcode / codex），uid 定位具体账号。
+    /// 二次确认后仅从 iBalance 移除该账号（钥匙串 bundle 由 ConfigStore.save 按新数组重写），
+    /// 平台本机登录态不动；删的是当前登录号时该平台卡片消失，重新导入即可恢复。
+    private func onDeleteAccount(platform: String, uid: String) {
+        // 平台名 / 账号展示名 / 移除动作：一处 switch 集中；uid 找不到（已删或键不符）直接返回
+        let target: (platform: String, account: String, remove: () -> Void)
+        switch platform {
+        case "workbuddy":
+            guard let a = config.workbuddyAccounts.first(where: { $0.uid == uid }) else { return }
+            target = ("WorkBuddy", a.nickname, { self.config.workbuddyAccounts.removeAll { $0.uid == uid } })
+        case "trae":
+            guard let a = config.traeAccounts.first(where: { $0.uid == uid }) else { return }
+            target = ("TRAE", a.username.isEmpty ? a.uid : a.username,
+                      { self.config.traeAccounts.removeAll { $0.uid == uid } })
+        case "zcode":
+            guard let a = config.zcodeAccounts.first(where: { $0.uid == uid }) else { return }
+            target = ("ZCode", a.displayName, { self.config.zcodeAccounts.removeAll { $0.uid == uid } })
+        case "codex":
+            guard let a = config.codexAccounts.first(where: { $0.uid == uid }) else { return }
+            target = ("Codex", a.email.isEmpty ? a.uid : a.email,
+                      { self.config.codexAccounts.removeAll { $0.uid == uid } })
+        default:
+            return
+        }
+
+        let shell = DialogShell()
+        shell.addTitle("删除账号")
+        shell.addInfo("即将删除已保存的 \(target.platform) 账号「\(target.account)」。\n\n"
+            + "只删 iBalance 里保存的这份凭据，平台本机登录状态不受影响。此操作不可撤销。")
+        _ = shell.addButton("取消", keyEquivalent: "\u{1b}")
+        let idxDelete = shell.addButton("删除", keyEquivalent: "")
+        shell.markDestructive(idxDelete)
+        guard shell.present() == idxDelete else { return }
+
+        target.remove()
+        // 菜单栏显隐记录一并清掉（同切号口径：残留记录会压过新会话的默认显隐规则）
+        let prefix: String
+        switch platform {
+        case "workbuddy": prefix = MenuBarPrefix.wb
+        case "trae": prefix = MenuBarPrefix.trae
+        case "zcode": prefix = MenuBarPrefix.zcode
+        default: prefix = MenuBarPrefix.codex
+        }
+        config.menuBarVisible.removeValue(forKey: prefix + uid)
+        ConfigStore.save(config)
+        // 菜单栏立即重排（被删条目即时消失）+ 面板重绘 + 重新拉余额
+        updateTitle(immediate: true, tag: "account-delete")
+        syncPanel()
         onRefresh()
     }
 

@@ -4,7 +4,7 @@
 // 面板配色         enum Palette（本文件）：cardBackground / cardForeground / tooltip* / heat*
 // 卡片字号         主标题 = 设置窗口「主题外观」开放（config.cardTitleFontSize，默认13）
 //                  Palette.cardSubFontSize(9，副标题+积分)；数值固定 13pt
-//                  ⚠️ 改字号改常量，勿在调用点写数字；Mono 开关走 registerFont/applyFontPolicy
+//                  ⚠️ 改字号改常量，勿在调用点写数字
 // 卡片 icon 尺寸    CardStyle.iconSize(25)（本文件，全平台统一）
 // 行高 / 间距       PanelLayout.swift balanceContentRow：row1 16、row2 12、两行 spacing 1
 // 菜单栏指示点      CardMenuBarDotView（PanelLayout.swift，icon 下方 2pt、直径 3.6pt 圆点）；
@@ -54,12 +54,10 @@ struct PanelSnapshot: Equatable {
     /// 今日签到统计文案（如 "8-16 3成功 1失败 2风控"，手动签到计入；空 = 今天尚未产生任何签到结果）
     var lastCheckinTime: String?
     var refreshIntervalSeconds: Int = 300
-    /// 面板背景渐变开关（同步自配置，VC 据此决定遮罩渐变/单色）
-    var panelGradientEnabled = true
+    /// 「高对比背景」强度（0…1，同步自配置；0 = 无遮罩原生玻璃）
+    var panelMaskOpacity: Double = 1
     /// 浅色主题开关（同步自配置；开启时强制浅色外观，优先级高于渐变开关）
     var lightThemeEnabled = false
-    /// Mono 字体开关（同步自配置；余额卡片与用量列表 JetBrainsMono ↔ 系统字体）
-    var monoFontEnabled = false
     /// 卡片主标题字号（pt，同步自配置；设置窗口「主题外观 → 卡片」开放）
     var cardTitleFontSize: Double = 13
     /// 卡片主标题 Sharp Grotesk（本机安装的商业字体；未装该字重回落系统字体）
@@ -276,8 +274,10 @@ enum Palette {
         }
         return (minPt, maxPt)
     }
-    /// 容器玻璃遮罩色（近黑半透明，加深毛玻璃底色；深色主题统一增强）
-    static let containerTint = NSColor(calibratedWhite: 0.02, alpha: 0.55)
+    /// 容器玻璃遮罩色（近黑半透明，加深毛玻璃底色；深色主题统一增强）。
+    /// 2026-09-13 用户要求加深提对比（0.55→0.70）：原值叠在深色玻璃上明度差太小，
+    /// 切换「高对比背景」开关时身体看不出变化、只有 header（双层遮罩）可见
+    static let containerTint = NSColor(calibratedWhite: 0.02, alpha: 0.70)
     /// 容器玻璃渐变底色（中灰半透明）：与 containerTint 组成纵向渐变，顶部近黑 → 底部中灰
     static let containerTintBottom = NSColor(calibratedWhite: 0.25, alpha: 0.55)
 
@@ -290,27 +290,29 @@ enum Palette {
                                                blue: 0xF2 / 255.0, alpha: 0.95)
     static let containerTintLightBottom = NSColor(calibratedRed: 0xF2 / 255.0, green: 0xF2 / 255.0,
                                                   blue: 0xF2 / 255.0, alpha: 0.8)
-    /// 深色遮罩底端：压黑面板底部亮玻璃用（2026-09-07 用户要求，原全透明露出毛玻璃亮色）
-    static let containerTintDarkBottom = NSColor(calibratedWhite: 0.02, alpha: 0.28)
+    /// 深色遮罩底端：压黑面板底部亮玻璃用（2026-09-07 用户要求，原全透明露出毛玻璃亮色）；
+    /// 2026-09-13 随顶档同步加深（0.28→0.45），保持纵向渐变节奏、底部变化同样可辨
+    static let containerTintDarkBottom = NSColor(calibratedWhite: 0.02, alpha: 0.45)
 
     /// 主面板容器背景配色（单一事实源）：applyGradient 与各子弹窗（Token/用量）兜底共用。
-    /// 渐变开：深色遮罩（加深黑）= 顶部近黑 → 底部深灰（containerTint / containerTintDarkBottom）；
+    /// 深色遮罩（加深黑）= 顶部近黑 → 底部深灰（containerTint / containerTintDarkBottom）；
     /// 浅色遮罩（提亮白）= 顶部亮白 → 底部微白（containerTintLight 两端）。
     /// lightTint 由调用方按「浅色主题开关开或生效外观为浅色」传入——遮罩明暗跟随系统深浅色。
-    /// 关 = 无任何遮罩（top/bottom 均 nil，露出原生 Liquid Glass 毛玻璃）。
+    /// opacity = 「高对比背景」强度（0…1）：≤0.01 视为关（top/bottom 均 nil，露出原生
+    /// Liquid Glass 毛玻璃），否则各档 alpha 等比缩放。
     /// top/bottom 分别对应 TintedVisualEffectView 的 tintColor / tintBottomColor
     /// （TintOverlayView 对 nil 不绘制）。
-    static func containerColors(lightTint: Bool, gradientOn: Bool) -> (top: NSColor?, bottom: NSColor?) {
-        guard gradientOn else { return (nil, nil) }
+    static func containerColors(lightTint: Bool, opacity: Double) -> (top: NSColor?, bottom: NSColor?) {
+        guard opacity > 0.01 else { return (nil, nil) }
+        func scaled(_ c: NSColor) -> NSColor { c.withAlphaComponent(c.alphaComponent * opacity) }
         return lightTint
-            ? (containerTintLightTop, containerTintLightBottom)
-            : (containerTint, containerTintDarkBottom)
+            ? (scaled(containerTintLightTop), scaled(containerTintLightBottom))
+            : (scaled(containerTint), scaled(containerTintDarkBottom))
     }
     /// 面板外观统一解析（唯一事实源，所有容器/popover/子面板必须走这里，禁止散落三元式）：
-    /// 浅色主题开 = 强制浅色 aqua（即使系统是深色主题）；其余（含渐变开）= nil 跟随系统
-    /// 深浅色。渐变只控制遮罩配色，遮罩明暗由 containerColors 按生效外观选择。
-    static func panelAppearance(lightTheme: Bool, gradientOn: Bool) -> NSAppearance? {
-        _ = gradientOn
+    /// 浅色主题开 = 强制浅色 aqua（即使系统是深色主题）；其余 = nil 跟随系统深浅色。
+    /// 高对比背景只控制遮罩配色（containerColors），不影响外观。
+    static func panelAppearance(lightTheme: Bool) -> NSAppearance? {
         if lightTheme { return NSAppearance(named: .aqua) }
         return nil
     }
@@ -320,11 +322,11 @@ enum Palette {
     static var lightThemeActive = false
     /// 自建顶层窗口的统一外观（nil = 跟随系统），与 panelAppearance 同口径
     static var topLevelWindowAppearance: NSAppearance? {
-        panelAppearance(lightTheme: lightThemeActive, gradientOn: false)
+        panelAppearance(lightTheme: lightThemeActive)
     }
-    /// 渐变遮罩是否生效：渐变开关开即生效（浅色主题用亮白→透明遮罩，深色用深灰遮罩）
-    static func gradientEffective(lightTheme: Bool, gradientOn: Bool) -> Bool {
-        gradientOn
+    /// 遮罩是否生效（强度 ≤1% 视为关）
+    static func maskEffective(_ opacity: Double) -> Bool {
+        opacity > 0.01
     }
     /// 卡片圆角 10pt（对齐 macOS Big Sur+ NSPopover 窗口系统圆角）
     static let cardCornerRadius: CGFloat = 10
@@ -336,10 +338,6 @@ enum Palette {
     static let panelHeaderContentColor = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor.systemGray : NSColor.black
     }
-    /// header 背景遮罩色（浅色外观）：#F4F4F4 @90%（2026-09-06 用户指定 #f4f4f4，
-    /// 原 #EBEBEB@90%）；深色外观沿用容器顶色
-    static let headerBackdropLightColor = NSColor(calibratedRed: 0xF4 / 255.0, green: 0xF4 / 255.0,
-                                                  blue: 0xF4 / 255.0, alpha: 0.9)
     /// header 下缘分割线色（深色白@10% / 浅色黑@8%），由 PanelSeparatorView 自绘使用。
     static let headerSeparatorColor = NSColor(name: nil) { appearance in
         appearance.isDark
@@ -661,13 +659,12 @@ final class BalancePanelViewController: NSViewController {
         // 外观统一走 Palette.panelAppearance：浅色主题开=强制浅色（即使系统深色）；
         // 渐变开=强制深色（深色玻璃+浅色字）；都关=跟随系统外观（浅色系统即原生
         // 浅色 Liquid Glass，文本走 Palette 动态色自动转黑灰）
-        container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
-                                                       gradientOn: panel.panelGradientEnabled)
-        // 叠加半透明遮罩：生效外观深色=顶部透明→底部深灰；浅色=顶部亮白→底部透明；
-        // 关闭时无遮罩（原生玻璃）
+        container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled)
+        // 叠加半透明遮罩：生效外观深色=顶部透明→底部深灰渐变；浅色=顶部亮白→底部微白；
+        // 强度 0 = 无遮罩（原生玻璃）
         let initialColors = Palette.containerColors(
             lightTint: panel.lightThemeEnabled || !NSApp.effectiveAppearance.isDark,
-            gradientOn: panel.panelGradientEnabled)
+            opacity: panel.panelMaskOpacity)
         container.tintColor = initialColors.top
         container.tintBottomColor = initialColors.bottom
         // 容器圆角与系统 popover 窗口对齐（10pt 连续曲率），裁掉遮罩层直角边缘
@@ -689,6 +686,10 @@ final class BalancePanelViewController: NSViewController {
         // document 因浮窗旧尺寸/布局瞬态宽于视口时，滚轮横移仍能真实滚动——
         // 换上横向原点恒钳 0 的 clip view 根治（documentView 赋值保留现有 contentView）
         scrollView.contentView = NoHorizontalScrollClipView()
+        // ⚠️ 换上的裸 NSClipView 默认 drawsBackground=true、底色 windowBackgroundColor——
+        // 一整块不透明底把容器玻璃与遮罩全部盖住：这是「高对比背景」开关 body 无反应、
+        // 面板看着多一层嵌套的根因（GradProbe 实证遮罩层绘制正常、纯被此层盖住）
+        scrollView.contentView.drawsBackground = false
         container.addSubview(scrollView)
         NSLayoutConstraint.activate([
             // 滚动视口从安全区顶边开始：满尺寸内容（hasFullSizeContent）下容器会铺满
@@ -739,10 +740,9 @@ final class BalancePanelViewController: NSViewController {
             backdrop.state = .active
             backdrop.isEmphasized = false
             backdrop.appearance = container.appearance
-            // 浅色外观 = #EBEBEB @90%（2026-09-06 用户指定），深色沿用容器顶色
-            backdrop.tintColor = container.effectiveAppearance.isDark
-                ? initialColors.top : Palette.headerBackdropLightColor
-            backdrop.tintBottomColor = backdrop.tintColor
+            // 与 applyGradient 同口径：强度 >0 = 沿用容器顶色（亮暗同规则）；0 = 遮罩全移除
+            backdrop.tintColor = initialColors.top
+            backdrop.tintBottomColor = initialColors.top
             container.addSubview(backdrop)
             // 顶边贴窗口绝对顶部（= 伸进三角箭头区），header 的毛玻璃由此一直铺到
             // 三角里，箭头与 header 同色；底边落在 header 下缘（安全区顶 + header 高）。
@@ -1126,28 +1126,34 @@ final class BalancePanelViewController: NSViewController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
     }
 
-    /// 按当前开关与生效外观刷新背景遮罩：浅色主题强制浅色；渐变生效时按生效外观
-    /// 取深灰（深）或亮白（浅）的纵向渐变遮罩；否则无遮罩（原生玻璃）
+    /// [GradProbe] 探针去重：状态串不变不重复记日志（viewDidLayout 每次布局都会调用）
+    private var gradProbeKey = ""
+
+    /// 按当前强度与生效外观刷新背景遮罩：浅色主题强制浅色；强度 >0 时按生效外观
+    /// 取深灰（深）或亮白（浅）的纵向渐变遮罩（alpha 随强度缩放）；0 = 无遮罩（原生玻璃）
     private func applyGradient() {
         guard let container = view as? TintedVisualEffectView else { return }
         // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
-        container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
-                                                       gradientOn: panel.panelGradientEnabled)
+        container.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled)
         let colors = Palette.containerColors(
             lightTint: !container.effectiveAppearance.isDark,
-            gradientOn: panel.panelGradientEnabled)
+            opacity: panel.panelMaskOpacity)
         container.tintColor = colors.top
         container.tintBottomColor = colors.bottom
         container.tintGradientStartY = 0
-        // header 背景层同步同一套外观与遮罩（渐变开关/浅色主题切换即时生效）；
-        // 浅色外观 = #EBEBEB @90%（2026-09-06 用户指定），深色沿用容器顶色
+        // header 背景层同步同一套外观与遮罩（强度/浅色主题变化即时生效）：
+        // 强度 >0 = 沿用容器顶色（亮暗同规则，浅色不再用固定 #F4F4F4，2026-09-13 用户要求）；
+        // 0 = 遮罩全移除，与 body 一致裸露原生玻璃
         if let backdrop = panel.headerBackdropView {
-            backdrop.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled,
-                                                          gradientOn: panel.panelGradientEnabled)
-            let headerTint = container.effectiveAppearance.isDark
-                ? colors.top : Palette.headerBackdropLightColor
-            backdrop.tintColor = headerTint
-            backdrop.tintBottomColor = headerTint
+            backdrop.appearance = Palette.panelAppearance(lightTheme: panel.lightThemeEnabled)
+            backdrop.tintColor = colors.top
+            backdrop.tintBottomColor = colors.top
+        }
+        // [GradProbe] 强度/外观/取色/遮罩几何任一变化才记一条
+        let probe = "[GradProbe] applyGradient vc=\(ObjectIdentifier(self).hashValue) opacity=\(panel.panelMaskOpacity) dark=\(container.effectiveAppearance.isDark) bodyTop=\(colors.top != nil) bodyBottom=\(colors.bottom != nil) headerTintSet=\(panel.headerBackdropView?.tintColor != nil) \(container.tintProbe)"
+        if probe != gradProbeKey {
+            gradProbeKey = probe
+            Logger.log(.layout, probe)
         }
         // 自建顶层窗口不挂在本视图树上、拿不到容器 appearance，翻渐变/浅色开关时按全局
         // 镜像重染：非阻塞弹窗（3D 硬币）+ 设置窗口（「主题外观」pane 就在那，不重染的话
@@ -1242,6 +1248,20 @@ final class BalancePanelView: NSView {
     /// header 独立背景层：固定在滚动内容上方，不承载文字/按钮，只负责
     /// 复刻面板容器的毛玻璃（遮住滚到 header 下方的内容）+ 承载下缘分割线。
     var headerBackdropView: TintedVisualEffectView?
+
+    // MARK: - header 图标拖动换位（逻辑在 PanelDrag.swift）
+
+    /// 参与排序的 header 图标 id 固定清单（= 持久化顺序键；新增 header 按钮须
+    /// 同步此清单与 build() 的注册表字面量）
+    static let headerButtonIdentifiers = ["quit", "settings", "refresh", "github", "cockpit"]
+    /// id → 按钮视图（build() 填充）
+    var headerButtonRegistry: [String: NSView] = [:]
+    /// header 图标当前顺序（id 序；拖动中实时重排，有变化时松手落盘）
+    var headerButtonOrder: [String] = []
+    /// header 图标链式 leading 约束（顺序变化时整体换装，见 PanelDrag.applyHeaderButtonOrder）
+    var headerButtonChainConstraints: [NSLayoutConstraint] = []
+    /// 正在拖动的 header 图标 id（nil = 无拖拽会话）
+    var draggingHeaderButtonID: String?
 
     // MARK: - 对外回调（由 AppDelegate 接线到现有处理逻辑）
     // ⚠️ 2026-09-12 移除面板「设置」板块、2026-09-13 移除「操作」板块后，两批专属回调
@@ -1540,43 +1560,39 @@ final class BalancePanelView: NSView {
     /// 总和超出实际行宽，Auto Layout 被迫破坏约束（卡片宽随数据漂移），hover 渐变层
     /// （frame 首次 hover 定格）随之与卡片错位——预算改按实际宽度现算后自然宽 ≤ document。
     private var usageRowWidth: CGFloat { bounds.width - 14 }
-    /// 当前自动分配的三列宽（每次行重建前按内容重算；此为初值兜底）
-    var usageColWidths = (week: CGFloat(50), today: CGFloat(44), hour: CGFloat(40))
+    /// 当前自动分配的两列宽（每次行重建前按内容重算；此为初值兜底）
+    var usageColWidths = (week: CGFloat(50), today: CGFloat(44))
 
-    /// 按实际内容自动分配三列宽度：每列 = max(表头, 全部行文本) 宽 + 6pt 呼吸；
+    /// 按实际内容自动分配两列宽度：每列 = max(表头, 全部行文本) 宽 + 6pt 呼吸；
     /// 名称列与固定开销先扣，剩余预算不够时按比例收窄（列宽下限保 5 字符值，
-    /// 名称列再不够由自身截断兜底）。字体度量取当前 uiFont——字体开关切换后
-    /// applyFontPolicy 强制清空 renderedUsageRows 触发重建重算。
+    /// 名称列再不够由自身截断兜底）。字体度量取当前 uiFont。
     private func computeUsageColumnLayout(_ rows: [UsageRowSnapshot]) {
         // 度量字体与行渲染同源（小表格口径），避免测量/渲染字重不一致
-        let valueFont = SmallTable.rowFont(mono: monoFontEnabled, monoDigits: true)
-        let headerFont = SmallTable.titleFont(mono: monoFontEnabled)
+        let valueFont = SmallTable.rowFont(monoDigits: true)
+        let headerFont = SmallTable.titleFont()
         func w(_ s: String, _ f: NSFont) -> CGFloat {
             s.size(withAttributes: [.font: f]).width
         }
-        var hour = w("1H", headerFont)
         var today = w("1D", headerFont)
         var week = w("1W", headerFont)
         for r in rows {
-            hour = max(hour, w(r.hourText, valueFont))
             today = max(today, w(r.todayText, valueFont))
             week = max(week, w(r.weekText, valueFont))
         }
-        hour += 6; today += 6; week += 6
-        let nameFont = SmallTable.rowFont(mono: monoFontEnabled)
+        today += 6; week += 6
+        let nameFont = SmallTable.rowFont()
         let nameW = rows.map { w($0.name, nameFont) }.max() ?? 40
-        // 固定开销：左右 inset 16 + icon 14 + icon↔名 4 + 名↔数值区 6 + 三个列间隙 24
+        // 固定开销：左右 inset 16 + icon 14 + icon↔名 4 + 名↔数值区 6 + 两个列间隙 16
         let budget = usageRowWidth - SmallTable.horizontalInset * 2 - 14 - 4 - 6
-            - 3 * SmallTable.columnSpacing - nameW
-        let total = hour + today + week
+            - 2 * SmallTable.columnSpacing - nameW
+        let total = today + week
         if total > budget, total > 0 {
             let scale = budget / total
-            // 列宽下限 34/38/40：按实际行宽保住 5 字符值不截断
-            hour = max(34, hour * scale)
+            // 列宽下限 38/40：按实际行宽保住 5 字符值不截断
             today = max(38, today * scale)
             week = max(40, week * scale)
         }
-        usageColWidths = (week: week, today: today, hour: hour)
+        usageColWidths = (week: week, today: today)
     }
 
     // 用量表样式口径统一走 SmallTable（小表格，与 Token 面板共用）
@@ -1586,12 +1602,10 @@ final class BalancePanelView: NSView {
     var usageRowTopInset: CGFloat { SmallTable.rowInset }
     var usageRowBottomInset: CGFloat { SmallTable.rowInset }
 
-    /// 面板渐变背景开关状态（update 同步；VC 读取决定遮罩渐变/单色）
-    private(set) var panelGradientEnabled = true
+    /// 「高对比背景」强度状态（update 同步；VC 读取决定遮罩缩放）
+    private(set) var panelMaskOpacity: Double = 1
     /// 浅色主题开关状态（update 同步；优先级高于渐变——开启即强制浅色外观）
     private(set) var lightThemeEnabled = false
-    /// Mono 字体开关状态（update 同步；变化时对已注册 label 就地切换字体，不重建卡片）
-    private(set) var monoFontEnabled = false
     /// 卡片主标题字号（pt）与 Sharp Grotesk 档位（update 同步；变化时就地重刷标题字体）
     private(set) var cardTitleFontSize: CGFloat = 13
     private(set) var cardTitleSharpGrotesk = false
@@ -1605,24 +1619,11 @@ final class BalancePanelView: NSView {
     private(set) var iconThemeSwapEnabled = false
     /// 圆形图标开关状态（update 同步；品牌 icon 裁圆 + 状态光环圆形）
     private(set) var circularIconEnabled = false
-    // MARK: - 字体策略（Mono 开关：余额卡片 + 用量列表）
+    // MARK: - 字体（余额卡片 + 用量列表；等宽数字列用系统等宽数字变体）
 
-    /// 需跟随 Mono 开关切换字体的 label 注册项（weak：卡片重建后旧 label 释放自动失效）
-    private struct FontTarget {
-        weak var label: NSTextField?
-        let size: CGFloat
-        let weight: NSFont.Weight
-        /// 关闭 Mono 时是否用等宽数字系统字体（余额数值等右对齐数字列）
-        let monoDigits: Bool
-    }
-    private var fontTargets: [FontTarget] = []
-
-    /// 按当前字体开关状态取字体（优先级：Mono 风格 > 系统字体）。
-    /// Mono = JetBrainsMono（中文级联回退系统字体），
-    /// 关 = 系统字体（等宽数字列可选，余额数值右对齐用）。
+    /// 取字体：系统字体，monoDigits = 等宽数字变体（余额数值等右对齐数字列用）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
-        if monoFontEnabled { return MonoFontProvider.font(size: size, weight: weight) }
-        return monoDigits
+        monoDigits
             ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
             : .systemFont(ofSize: size, weight: weight)
     }
@@ -1641,17 +1642,14 @@ final class BalancePanelView: NSView {
         return v
     }()
 
-    /// 注册 label 并立即应用当前字体策略（开关切换时 applyFontPolicy() 就地更新，不重建视图）
+    /// 注册 label 并设置字体（字号/字重固定档；Sharp Grotesk 主标题走 registerCardTitle）
     func registerFont(_ label: NSTextField, size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) {
         label.font = uiFont(size: size, weight: weight, monoDigits: monoDigits)
-        fontTargets.append(FontTarget(label: label, size: size, weight: weight, monoDigits: monoDigits))
-        if fontTargets.count % 32 == 0 { fontTargets.removeAll { $0.label == nil } }
     }
 
     // MARK: 卡片主标题字体（字号滑杆 + Sharp Grotesk 字重×宽度，设置窗口「主题外观」开放）
 
-    /// 主标题注册表：不走 fontTargets（那里的 size/weight 注册即冻结，改档会被旧值覆盖）；
-    /// weight 记注册时的调用方字重（Sharp Grotesk 关闭时的回落字体用）。
+    /// 主标题注册表：size/weight 记注册时的调用方字重（Sharp Grotesk 关闭时的回落字体用）；
     /// rolling/valueWidth 同卡捆注册：数值（积分/金额）与标题同字号联动、列宽等比缩放
     private struct CardTitleTarget {
         weak var label: FadeableTextField?
@@ -1684,6 +1682,12 @@ final class BalancePanelView: NSView {
         return "SharpGrotesk-\(weight)\(String(format: "%02d", width))"
     }
 
+    /// Token 面板大数字共用的 Sharp Grotesk 字体名（未开启 = nil）；与卡片标题同档同源，
+    /// 供跨文件宿主（setupInlineTokens / update）注入 TokensPanelView
+    var inlineTokensSGFontName: String? {
+        cardTitleSharpGrotesk ? cardTitleSGPostScriptName : nil
+    }
+
     private func applyCardTitleFont(to label: FadeableTextField, weight: NSFont.Weight,
                                     rolling: RollingNumberView?, valueWidth: NSLayoutConstraint?,
                                     valueBaseline: NSLayoutConstraint? = nil) {
@@ -1691,7 +1695,7 @@ final class BalancePanelView: NSView {
            let sg = NSFont(name: cardTitleSGPostScriptName, size: cardTitleFontSize) {
             label.font = sg
         } else {
-            // 未启用 / 本机未装该字重 → 回落系统字体策略（Mono 开关口径）
+            // 未启用 / 本机未装该字重 → 回落系统字体
             label.font = uiFont(size: cardTitleFontSize, weight: weight)
         }
         // 行框 = 字号 + 3（见 balanceContentRow 注释），字号变化时同步放行高
@@ -1702,13 +1706,14 @@ final class BalancePanelView: NSView {
         rolling?.setSize(cardTitleFontSize)
         rolling?.refreshFont()
         valueWidth?.constant = cardTitleFontSize * 5
-        // 基线锚定（2026-09-13 用户定稿）：探针基线钉 row1 中心下方系统字体
-        // capHeight/2 处——constant 只由字号决定，与当前字体无关（同字号切字体
-        // 基线恒等不跳行；各字体墨迹中心与行中心相差 ≤0.17pt，近似居中）
-        valueBaseline?.constant = NSFont.systemFont(ofSize: cardTitleFontSize).capHeight / 2
+        // 基线锚定（2026-09-13 用户定稿）：探针基线钉 row1 中心下方「系统字体数字
+        // 墨迹半高」处——constant 只由字号决定，与当前字体无关（同字号切字体基线恒等
+        // 不跳行）。与 balanceContentRow 的 build 路径同公式（systemDigitInkHeight）：
+        // 旧 capHeight/2 近似使墨迹中心偏高 (墨迹高−cap)/2，就地联动与重建成两张皮
+        valueBaseline?.constant = Self.systemDigitInkHeight(cardTitleFontSize) / 2
     }
 
-    /// 字号/字体档变化（或 Mono 开关切换）时：对所有存活主标题就地重刷
+    /// 字号/字体档变化时：对所有存活主标题就地重刷
     private func applyCardTitleFont() {
         for t in cardTitleTargets {
             guard let label = t.label else { continue }
@@ -1718,13 +1723,7 @@ final class BalancePanelView: NSView {
         cardTitleTargets.removeAll { $0.label == nil }
     }
 
-    /// 余额滚动数值视图注册表（weak：卡片重建后自动失效）。
-    /// RollingNumberView 非 NSTextField、不进 fontTargets，Mono 开关切换时单独就地刷字体
-    private let rollingTargets = NSHashTable<RollingNumberView>()
-    /// 子账号 chip 注册表（weak：卡片重建后自动失效）——字体策略切换时按新字体重算右内缩进
-    private let chipItems = NSHashTable<SubAccountItemView>.weakObjects()
-
-    /// 注册余额滚动数值视图并注入字体策略（uiFont：Mono/系统 + 等宽数字）
+    /// 注册余额滚动数值视图并注入字体策略（uiFont：系统字体 + 等宽数字）
     func registerRollingNumber(_ v: RollingNumberView, size: CGFloat, weight: NSFont.Weight) {
         v.configure(size: size, weight: weight, fontProvider: { [weak self] s, w, mono in
             guard let self else { return .monospacedDigitSystemFont(ofSize: s, weight: w) }
@@ -1735,26 +1734,6 @@ final class BalancePanelView: NSView {
             }
             return self.uiFont(size: s, weight: w, monoDigits: mono)
         })
-        rollingTargets.add(v)
-    }
-
-    /// Mono 开关变化：对所有存活 label 就地切换字体（保留点阵脉冲等动画状态）
-    private func applyFontPolicy() {
-        for t in fontTargets {
-            guard let label = t.label else { continue }
-            label.font = uiFont(size: t.size, weight: t.weight, monoDigits: t.monoDigits)
-        }
-        fontTargets.removeAll { $0.label == nil }
-        // 余额滚动数值（非 NSTextField）：单独就地刷新字体，滚动状态保留
-        for v in rollingTargets.allObjects {
-            v.refreshFont()
-        }
-        // chip 右内缩进按末字符墨迹回补：字体换了 rsb 也变，按新字体重算
-        for item in chipItems.allObjects { item.refreshOpticalPadding() }
-        // 主标题走独立注册表（字号/Sharp Grotesk 动态档），Mono 换字体后一并重刷
-        applyCardTitleFont()
-        // 用量列宽按字体度量自动分配：清空行缓存，本次 update 随即按新字体重建重算
-        renderedUsageRows = []
     }
 
     override init(frame frameRect: NSRect) {
@@ -1780,25 +1759,16 @@ final class BalancePanelView: NSView {
             || previousSnapshot?.offline != s.offline
             || previousSnapshot?.lastCheckinTime != s.lastCheckinTime
 
-        // 渐变/浅色主题开关状态同步（VC 通过 onPanelGradientChanged 即时刷新遮罩与外观绘制）
-        let gradientChanged = s.panelGradientEnabled != panelGradientEnabled
-        panelGradientEnabled = s.panelGradientEnabled
+        // 「高对比背景」强度/浅色主题开关状态同步（VC 通过 onPanelGradientChanged 即时刷新遮罩与外观绘制）
+        let maskChanged = s.panelMaskOpacity != panelMaskOpacity
+        panelMaskOpacity = s.panelMaskOpacity
         let lightChanged = s.lightThemeEnabled != lightThemeEnabled
         lightThemeEnabled = s.lightThemeEnabled
-        if gradientChanged || lightChanged {
-            usageHistoryController?.panelGradientEnabled = panelGradientEnabled
+        if maskChanged || lightChanged {
+            Logger.log(.layout, "[GradProbe] panel.update id=\(ObjectIdentifier(self).hashValue) opacity \(panelMaskOpacity)→\(s.panelMaskOpacity) light \(lightThemeEnabled)→\(s.lightThemeEnabled)")
+            usageHistoryController?.panelMaskOpacity = panelMaskOpacity
             usageHistoryController?.lightThemeEnabled = lightThemeEnabled
             onPanelGradientChanged?()
-        }
-        // Mono 字体开关状态同步：变化时对已注册 label 就地切换字体（不重建卡片）
-        let monoChanged = s.monoFontEnabled != monoFontEnabled
-        monoFontEnabled = s.monoFontEnabled
-        if monoChanged {
-            applyFontPolicy()
-            // 用量子弹窗（图表）跟随同一开关：文本和数值切换 Mono 风格
-            usageHistoryController?.monoFontEnabled = monoFontEnabled
-            // 主面板内嵌 Token 板块跟随同一开关（就地刷字体）
-            inlineTokenView?.monoFontEnabled = monoFontEnabled
         }
         // 卡片主标题字号/字体档同步：变化时就地重刷已注册标题（不重建卡片）
         let titleFontChanged = s.cardTitleFontSize != cardTitleFontSize
@@ -1809,7 +1779,11 @@ final class BalancePanelView: NSView {
         cardTitleSharpGrotesk = s.cardTitleSharpGrotesk
         cardTitleSGWeight = s.cardTitleSGWeight
         cardTitleSGWidth = s.cardTitleSGWidth
-        if titleFontChanged { applyCardTitleFont() }
+        if titleFontChanged {
+            applyCardTitleFont()
+            // 主面板内嵌 Token 板块大数字跟随同一 Sharp Grotesk 档（就地刷字体，未装回落）
+            inlineTokenView?.sharpGroteskFontName = inlineTokensSGFontName
+        }
         valueScrollPreviewEnabled = s.valueScrollPreviewEnabled
         // 预览定时器状态与配置保持一致（幂等：无变化不动）
         setValueScrollPreview(s.valueScrollPreviewEnabled)
@@ -2155,7 +2129,6 @@ final class BalancePanelView: NSView {
                     // 右内缩进按末字符墨迹回补（背景贴 ink 而非 advance，左右视觉等距）
                     item.valueLabel = lbl
                     item.refreshOpticalPadding()
-                    chipItems.add(item)
                     item.addArrangedSubview(iv)
                     item.addArrangedSubview(lbl)
                     strip.addArrangedSubview(item)
@@ -2280,8 +2253,8 @@ final class BalancePanelView: NSView {
                 self?.endPlatformDrag()
             }, topPadding: cardPadTop, bottomPadding: cardPadBottom,
                // 卡片左缩进 7pt（2026-09-13 用户「左缩进-1pt」，历史：09-06「+1pt」由 7 改 8，今改回 7）；
-               // 右缩进独立档 9（2026-09-06 用户「减少1pt」，原 10）
-               horizontalPadding: 7, trailingPadding: 9,
+               // 右缩进独立档 8（2026-09-13 用户「右间距缩小1pt」，调参史 10→9→8）
+               horizontalPadding: 7, trailingPadding: 8,
                cardBackground: nil)
             cardRef = card
             // 当前账号积分 chip 气泡数据盒（hc 块内挂接闭包捕获，append 后存入 entry 供 apply 更新）
@@ -2829,7 +2802,7 @@ final class BalancePanelView: NSView {
         // 两行统一：小字（cardSubFontSize）+ 亮色前景 cardForeground
         registerFont(nick, size: Palette.cardSubFontSize, weight: .medium)
         nick.textColor = Palette.cardForeground
-        // 徽章挂昵称后（字体取 nick 实际字体：Mono 开关等字体策略经 registerFont 已生效）
+        // 徽章挂昵称后（字体取 nick 实际字体，经 registerFont 已生效）
         let line = NSMutableAttributedString(
             string: "昵称: \(nickname)",
             attributes: [.font: nick.font ?? .systemFont(ofSize: Palette.cardSubFontSize),
@@ -2842,8 +2815,7 @@ final class BalancePanelView: NSView {
             // 颜色按生效外观分档（2026-09-06 用户指定「浅色主题下加深确保对比度」）：
             // 深色 = 原 #FFC700；浅色 = 加深琥珀 #B87800（原黄在亮玻璃底上对比不足）。
             // 解算口径与品牌图标同源（panelAppearance 强制档优先，浅色主题开关下不漂）
-            let tipAppearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                        gradientOn: panelGradientEnabled)
+            let tipAppearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
                 ?? NSApp.effectiveAppearance
             let tint = tipAppearance.isDark
                 ? NSColor(calibratedRed: 1, green: 0.78, blue: 0, alpha: 1)
@@ -2940,7 +2912,7 @@ final class BalancePanelView: NSView {
         } else {
             let colors = Palette.containerColors(
                 lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
-                gradientOn: panelGradientEnabled)
+                opacity: panelMaskOpacity)
             glass.tintColor = colors.top
             glass.tintBottomColor = colors.bottom
         }
@@ -2978,8 +2950,7 @@ final class BalancePanelView: NSView {
         win.ignoresMouseEvents = true   // 纯提示,不拦截鼠标（避免盖住卡片引发 hover 抖动）
         win.level = NSWindow.Level(rawValue: anchorWindow.level.rawValue + 1)
         win.collectionBehavior = [.transient, .ignoresCycle]
-        win.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
-                                                 gradientOn: panelGradientEnabled)
+        win.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
         win.contentView = container
         // 箭头顶点对准卡片侧边中点（贴边 2pt,与原 popover 锚点口径一致）
         let cardRect = anchorWindow.convertToScreen(anchorCard.convert(anchorCard.bounds, to: nil))
@@ -3196,9 +3167,9 @@ final class BalancePanelView: NSView {
     /// root 底部上限约束（≤ panel.bottom-11）：仅为 fittingSize 预留底边距
     /// （原贴底 footer 2026-09-13 移除后从 41 收窄）；日常高度求解不应依赖它
     var rootBottomCap: NSLayoutConstraint?
-    /// 字符化开关（MonoCharSwitch）切换模糊→清晰过渡的计时器
-    var charBlurTimer: Timer?
-    /// 进行中模糊过渡的目标图层（timer 为多调用方共享：新调用接管时旧图层集
+    /// 字符化开关（MonoCharSwitch）切换模糊→清晰过渡的出帧源（显示器刷新率）
+    var charBlurTicker: DisplayTicker?
+    /// 进行中模糊过渡的目标图层（ticker 为多调用方共享：新调用接管时旧图层集
     /// 中断在中间模糊半径——不清滤镜会永久停在模糊状态，见 playCharBlurTransition）
     var charBlurLayers: [CALayer] = []
 
