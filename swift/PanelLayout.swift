@@ -1,19 +1,20 @@
 // PanelLayout.swift — iBalance
-// 面板布局构建:build() 主装配 + 卡片/设置行/操作磁贴等行构建器
+// 面板布局构建:build() 主装配 + 卡片/操作磁贴等行构建器
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 //
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
 // 主装配      build()（面板所有区段的组装入口；改整体结构先读它）
-// header 右侧  NSSegmentedControl（0=主题调教弹调色气泡 / 1=平台开关），见 panel.headerSegmentControl
+// header      左上角 power + gearshape 两个图标按钮（右侧 2026-09-12 起无控件）
 // 卡片容器     addCard(rows:to:...)（圆角背景 + hover + 点击/右键/拖拽回调都在这挂）
 // 卡片内容     balanceContentRow(...)（两行：标题+数值 / 副标题+点阵）
 //              ⚠️ **卡片字号·行高·icon 列宽的数值权威就在这一个方法里**（字号走 Palette 常量）
-// 设置行      switchRow(title:sub:sw:)（原生 NSSwitch 与 Mono 字符开关同框切换）
 // 行包裹      wrapHoverRow（给任意行加 hover 背景 + pointingHand 光标）
-// 动效        playCharBlurTransition / crossfade / staggerRiseIn / applySwitchVisuals
+// 动效        playCharBlurTransition / crossfade / staggerRiseIn
 // 指示点      CardMenuBarDotView（菜单栏显隐圆点，按生效外观解算 cardForeground）
 // 工具        symbolImage / makeFailureBadge / stretchSpacer
 //            （原 refreshAnchors/syncLayout 属已删的 MenuBarFadeMask，勿再找）
+//            ⚠️ 原「设置行 switchRow / 设置行图标 settingsRowIcon / applySwitchVisuals」随
+//              面板「设置」板块 2026-09-12 移除 —— 设置项已全部在设置窗口；要加回面板先想清楚归属。
 //
 // ⚠️ 本文件是 extension BalancePanelView = Panel.swift 同一类型拆出的「布局部分」。
 //    状态与数据在 Panel.swift，行的数值在这里——改数值来这里，改状态机去 Panel.swift。
@@ -163,55 +164,21 @@ extension BalancePanelView {
         usageHistoryPositionAnchor.alphaValue = 0
         addSubview(usageHistoryPositionAnchor)
 
-        // ── 顶部 header：更新时间严格居中，和 footer 使用同一高度 ──
+        // ── 顶部 header：左侧按钮组（退出/设置/刷新周期饼图/GitHub/Cockpit）──
         let header = NSView()
         header.translatesAutoresizingMaskIntoConstraints = false
         // header 背景层：与面板容器同款毛玻璃（material/遮罩配色由 VC 同步），
         // 视觉上就是面板背景本身、没有独立色块，但仍是实心的——滚动时内容
-        // 从 header 下方穿过也不会透到「更新于」和按钮背后。
+        // 从 header 下方穿过也不会透到按钮背后。
         headerBackdropView = TintedVisualEffectView()
+        // header 中间的「更新于 / 刷新中…」文字 2026-09-13 按用户要求移除：刷新节奏
+        // 由饼图按钮表达。label 对象与全部写入点（setRefreshing 脉冲、footer 收尾
+        // 回写等）保留不动，继续安全写这个隐藏视图。
         updatedLabel.translatesAutoresizingMaskIntoConstraints = false
+        updatedLabel.isHidden = true
         header.addSubview(updatedLabel)
-        // 右上角按钮组（2026-09-10 用户指定）：「主题调教」+「平台开关」合为一个
-        // NSSegmentedControl，两段等宽同款，替代原独立调色图标按钮；
-        // trackingMode = .momentary（纯动作按钮，无常驻选中态）。
-        // 点击 0 段弹悬浮气泡=色相/饱和度两行滑杆 + 主题/样式开关组（子账号气泡同款载体）；
-        // 图标为模板图，不着色，由控件按内容色渲染（与 header 其它按钮同调）。
-        // 背景 = 系统 Liquid Glass：segmentStyle = .automatic 由系统按窗口语境解算
-        // （26 起即 Liquid Glass 材质），随系统「外观 → Liquid Glass」Clear/Tinted
-        // 与「降低透明度」设置走；不再自垫 NSGlassEffectView（双层玻璃发闷）。
-        let themeTuneImage = symbolImage("paintbrush", size: 11)
-        themeTuneImage?.isTemplate = true
-        let platformTogglesImage = symbolImage("circle.grid.2x2.topleft.checkmark.filled", size: 11)
-        platformTogglesImage?.isTemplate = true
-        // 背景/边框光影全由系统 .automatic 样式负责（Liquid Glass 材质自带
-        // 镜面边缘高光，随「外观 → Liquid Glass」与「降低透明度」设置解算），
-        // 不再叠自绘描边/圆角裁切——那会盖住或切掉系统玻璃的光影。
-        // borderShape = .capsule（26+ 官方 API）：胶囊圆角边框由系统按控件尺寸
-        // 与语境解析绘制（上版删子类时把它一起删了，圆角因此消失）。
-        let headerSeg = NSSegmentedControl(frame: .zero)
-        headerSeg.borderShape = .capsule
-        headerSeg.segmentCount = 2
-        headerSeg.setImage(themeTuneImage, forSegment: 0)
-        headerSeg.setImage(platformTogglesImage, forSegment: 1)
-        headerSeg.trackingMode = .momentary
-        headerSeg.target = self
-        headerSeg.action = #selector(headerSegmentTapped(_:))
-        headerSeg.controlSize = .small
-        headerSeg.setImageScaling(.scaleProportionallyDown, forSegment: 0)
-        headerSeg.setImageScaling(.scaleProportionallyDown, forSegment: 1)
-        headerSeg.setWidth(28, forSegment: 0)
-        headerSeg.setWidth(28, forSegment: 1)
-        headerSeg.setToolTip("主题调教", forSegment: 0)
-        headerSeg.setToolTip("平台开关", forSegment: 1)
-        headerSeg.translatesAutoresizingMaskIntoConstraints = false
-        self.headerSegmentControl = headerSeg
-        header.addSubview(headerSeg)
-        // hover 高光层：系统分段控件没有 hover 反馈（AppKit 无公开 API，26+ 内部
-        // SwiftUI 托管绘制），叠一层与控件同尺寸的鼠标穿透视图自绘「悬停段」高光。
-        // 必须在 headerSeg 之后添加（z 序在上），点击/tooltip 由穿透 hitTest 保证照常。
-        let segHover = SegmentedHoverOverlay(control: headerSeg)
-        segHover.attach(to: header)
+        // 右上角按钮组 2026-09-12 整组移除（原「主题调教 + 平台开关」NSSegmentedControl）：
+        // 两个入口迁进设置窗口（「主题外观」「平台」pane），header 右侧因此不再挂任何控件。
         let quitBtn = HoverIconButton()
         quitBtn.image = symbolImage("power", size: 11)
         quitBtn.normalTintColor = Palette.panelHeaderContentColor
@@ -221,31 +188,83 @@ extension BalancePanelView {
         quitBtn.toolTip = "退出 iBalance"
         quitBtn.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(quitBtn)
+        // 设置窗口入口：header 左上角、退出按钮右侧（SwiftUI 设置窗口，系统设置式侧栏+表单）
+        let settingsBtn = HoverIconButton()
+        settingsBtn.image = symbolImage("gearshape", size: 11)
+        settingsBtn.normalTintColor = Palette.panelHeaderContentColor
+        settingsBtn.target = self
+        settingsBtn.action = #selector(settingsTapped)
+        settingsBtn.toolTip = "打开设置窗口"
+        settingsBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(settingsBtn)
+        // header 左侧按钮组第三颗（退出/设置右侧 +2pt）：刷新周期饼图按钮（圆形饼图
+        // 走满一圈 = 一个自动刷新周期，每秒推进；左键立即刷新，右键弹间隔单选菜单）。
+        // 大小/配色对齐同组 HoverIconButton
+        let refreshPieBtn = RefreshPieButton(frame: .zero)
+        refreshPieBtn.onSelectInterval = { [weak self] seconds in
+            self?.onChangeRefreshInterval?(seconds)
+        }
+        refreshPieBtn.onSelectRefresh = { [weak self] in
+            self?.onManualRefresh?()
+        }
+        refreshPieBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(refreshPieBtn)
+        refreshPieButton = refreshPieBtn
+        // 第四颗：GitHub 项目页（原贴底 footer 按钮 2026-09-13 迁入 header）
+        let githubBtn = HoverIconButton()
+        if let githubImage = bundleIcon("github", size: 11) {
+            githubImage.isTemplate = true
+            githubBtn.image = githubImage
+        } else {
+            githubBtn.image = symbolImage("globe", size: 11)
+        }
+        githubBtn.normalTintColor = Palette.panelHeaderContentColor
+        githubBtn.target = self
+        githubBtn.action = #selector(openGitHubTapped)
+        githubBtn.toolTip = "打开 iBalance GitHub 项目"
+        githubBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(githubBtn)
+        // 第五颗：打开 Cockpit（原操作板块首磁贴 2026-09-13 迁入 header，板块整体移除）
+        let cockpitBtn = HoverIconButton()
+        cockpitBtn.image = symbolImage("list.bullet.rectangle.portrait", size: 11)
+        cockpitBtn.normalTintColor = Palette.panelHeaderContentColor
+        cockpitBtn.target = self
+        cockpitBtn.action = #selector(openCockpitTapped)
+        cockpitBtn.toolTip = "打开 Cockpit"
+        cockpitBtn.translatesAutoresizingMaskIntoConstraints = false
+        header.addSubview(cockpitBtn)
         let headerSeparator = PanelSeparatorView()
         headerSeparator.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(headerSeparator)
         let panelBarHeight: CGFloat = 20
         let panelTopPadding: CGFloat = 6
         headerView = header
+        let headerRowCenterY = panelTopPadding + panelBarHeight / 2
         NSLayoutConstraint.activate([
-            updatedLabel.centerXAnchor.constraint(equalTo: header.centerXAnchor),
-            updatedLabel.centerYAnchor.constraint(equalTo: header.topAnchor,
-                                                  constant: panelTopPadding + panelBarHeight / 2),
-            updatedLabel.heightAnchor.constraint(lessThanOrEqualToConstant: panelBarHeight),
             // 距容器缘 = 容器缩进 + 正文缩进 7 + 2.6（2026-09-06 用户「header 左右缩进增加2pt」
-            // 后再「再增加0.6pt」，原 +7 与 root 内容左右缘对齐）——原 themeBtn 右缘位由分段控件接管
-            headerSeg.trailingAnchor.constraint(
-                equalTo: header.trailingAnchor,
-                constant: -(BalancePanelViewController.contentHorizontalInset + 9.6)),
-            headerSeg.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
-            // 高度上限 = 栏高 +4（24pt）：系统分段控件自然高随外观浮动，卡上限避免顶到分割线
-            headerSeg.heightAnchor.constraint(lessThanOrEqualToConstant: panelBarHeight + 4),
+            // 后再「再增加0.6pt」，原 +7 与 root 内容左右缘对齐）
             quitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             quitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             quitBtn.leadingAnchor.constraint(
                 equalTo: header.leadingAnchor,
                 constant: BalancePanelViewController.contentHorizontalInset + 9.6),
-            quitBtn.centerYAnchor.constraint(equalTo: updatedLabel.centerYAnchor),
+            quitBtn.centerYAnchor.constraint(equalTo: header.topAnchor, constant: headerRowCenterY),
+            settingsBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            settingsBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            settingsBtn.leadingAnchor.constraint(equalTo: quitBtn.trailingAnchor, constant: 2),
+            settingsBtn.centerYAnchor.constraint(equalTo: header.topAnchor, constant: headerRowCenterY),
+            refreshPieBtn.widthAnchor.constraint(equalToConstant: RefreshPieButton.buttonSize),
+            refreshPieBtn.heightAnchor.constraint(equalToConstant: RefreshPieButton.buttonSize),
+            refreshPieBtn.leadingAnchor.constraint(equalTo: settingsBtn.trailingAnchor, constant: 2),
+            refreshPieBtn.centerYAnchor.constraint(equalTo: header.topAnchor, constant: headerRowCenterY),
+            githubBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            githubBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            githubBtn.leadingAnchor.constraint(equalTo: refreshPieBtn.trailingAnchor, constant: 2),
+            githubBtn.centerYAnchor.constraint(equalTo: header.topAnchor, constant: headerRowCenterY),
+            cockpitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            cockpitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            cockpitBtn.leadingAnchor.constraint(equalTo: githubBtn.trailingAnchor, constant: 2),
+            cockpitBtn.centerYAnchor.constraint(equalTo: header.topAnchor, constant: headerRowCenterY),
             // ── header 下缘分割线：贴 header 底边，通栏 ──
             headerSeparator.leadingAnchor.constraint(equalTo: header.leadingAnchor),
             headerSeparator.trailingAnchor.constraint(equalTo: header.trailingAnchor),
@@ -261,14 +280,14 @@ extension BalancePanelView {
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             // header 总高度吃 BalancePanelView.headerHeight（2026-09-10 由用户指定 30→33）；
-            // header 内部上边距不变，API 标题上方间距单独收紧 4pt。
+            // header 内部上边距不变，API 标题上方间距单独收紧（2026-09-13 用户「统一-1pt」4→3）。
             root.topAnchor.constraint(equalTo: topAnchor,
-                                      constant: BalancePanelView.headerHeight + 4),
-        // 底部用 ≤：root 顶锚、保持内容自然高度（永不被拉伸）。footer 已移出 root、
-        // 单独贴 panel 底部，故 root 底部预留 footer(20)+底边距(11)+最小间隙(10)=41pt，
-        // 避免与贴底 footer 重叠；浮窗拖高时多出的高度自然成为 root 与 footer 间的空白
+                                      constant: BalancePanelView.headerHeight + 3),
+        // 底部用 ≤：root 顶锚、保持内容自然高度（永不被拉伸）。原贴底 footer
+        // 2026-09-13 已整体移除（GitHub 按钮迁入 header），root 底部只留 11pt 底边距；
+        // 浮窗拖高时多出的高度自然成为底部空白
         ])
-        rootBottomCap = root.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -41)
+        rootBottomCap = root.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -11)
         rootBottomCap?.isActive = true
         rootViewRef = root
         // 共享 hover 材质的统一宿主：材质（渐变背景块 + 发丝描边框）挂在滚动内容根上
@@ -358,8 +377,8 @@ extension BalancePanelView {
         platformCards[BalancePlatform.qwen.rawValue] = qwenCardsContainer
         apiGroupContainer.setCustomSpacing(platformCardGap, after: qwenCardsContainer)
 
-        // API 区块 → Agent 区块（分割线已移除，用区块间距分隔）
-        root.setCustomSpacing(10, after: apiGroupContainer)
+        // API 区块 → Agent 区块（分割线已移除，用区块间距分隔；09-13 统一-1pt）
+        root.setCustomSpacing(9, after: apiGroupContainer)
 
         // ── Agent 分组标题（原「余额」板块改名；ZCode/Codex/TRAE/WB 等 Agent 平台）──
         // HoverCard 驻留：hover 背景常规淡入，驻留 Motion.hoverDwell 与平台卡同触发
@@ -367,8 +386,8 @@ extension BalancePanelView {
         // 确认后不回落（同平台卡口径）
         let balanceTitle = HoverCard()
         balanceTitle.wantsLayer = true
-        // 圆角与余额卡片统一（Palette.cardCornerRadius = 10pt）
-        balanceTitle.layer?.cornerRadius = Palette.cardCornerRadius
+        // 圆角与余额卡片统一（hoverCardCornerRadius = 9pt，2026-09-13 由 10 改）
+        balanceTitle.layer?.cornerRadius = Palette.hoverCardCornerRadius
         balanceTitle.layer?.cornerCurve = .continuous
         balanceTitle.layer?.masksToBounds = true
         // hover 材质（背景 + 框）由容器共享（HoverMaterialHost），卡片自身恒无边框
@@ -466,8 +485,8 @@ extension BalancePanelView {
         // 须在两组容器都建好后调用：重排按组内过滤进行
         applyPlatformOrder(animated: false)
 
-        // Agent 区块 → Token 板块（分割线已移除，用区块间距分隔）
-        root.setCustomSpacing(10, after: balanceGroupContainer)
+        // Agent 区块 → Token 板块（分割线已移除，用区块间距分隔；09-13 统一-1pt）
+        root.setCustomSpacing(9, after: balanceGroupContainer)
 
         // ── Token 板块（内嵌 ZCode / WorkBuddy 卡片 hover 子面板同款内容，单实例，
         // 只显示 Agent 组最顶上平台的 Token；不可折叠。顶部平台无 Token 数据源或无数据时整块隐藏）──
@@ -489,8 +508,8 @@ extension BalancePanelView {
         // 初始隐藏：数据异步到达后由 applyInlineTokensVisibility 统一裁决显隐
         tokenCard.isHidden = true
         tokenTitle.isHidden = true
-        // Token 板块 → 用量区块
-        root.setCustomSpacing(10, after: tokenCard)
+        // Token 板块 → 用量区块（09-13 统一-1pt）
+        root.setCustomSpacing(9, after: tokenCard)
         // 填充内嵌内容并启动低频刷新（数据源 60s 后台缓存，fetch 只回缓存零读取）
         setupInlineTokens()
 
@@ -508,244 +527,19 @@ extension BalancePanelView {
         usageContentStack.distribution = .fill
         usageContentStack.spacing = 0
         usageContentStack.translatesAutoresizingMaskIntoConstraints = false
+        // 列表行共享 hover 材质宿主（渐变背景+描边行间整块滑动，与卡片同款；
+        // 装在稳定容器上——行随数据刷新重建，宿主不跟着重建）
+        usageContentStack.installHoverMaterialHost()
         let usageCard = addCard(rows: [usageContentStack], to: root, spacing: 6, topPadding: 2, horizontalPadding: 0)
         usageCardRef = usageCard
         usageCollapseTargets = [usageCard]
         let usageCollapsed = UserDefaults.standard.bool(forKey: UDKey.usageSectionCollapsed)
         usageCard.isHidden = usageCollapsed
         root.setCustomSpacing(usageCollapsed ? 6 : 0, after: usageTitle)
-        // 用量区块 → 设置区块
-        root.setCustomSpacing(10, after: usageCard)
-
-        // ── 设置卡片 ──
-        autoCheckinSwitch.target = self
-        autoCheckinSwitch.action = #selector(autoCheckinToggled)
-        gradientSwitch.target = self
-        gradientSwitch.action = #selector(panelGradientToggled)
-        lightThemeSwitch.target = self
-        lightThemeSwitch.action = #selector(lightThemeToggled)
-        monoSwitch.target = self
-        monoSwitch.action = #selector(monoFontToggled)
-        valuePreviewSwitch.target = self
-        valuePreviewSwitch.action = #selector(valueScrollPreviewToggled)
-        longProgressCardSwitch.target = self
-        longProgressCardSwitch.action = #selector(longProgressCardToggled)
-        iconThemeSwapSwitch.target = self
-        iconThemeSwapSwitch.action = #selector(iconThemeSwapToggled)
-        verticalLineProgressSwitch.target = self
-        verticalLineProgressSwitch.action = #selector(verticalLineProgressToggled)
-        updateAutoSwitch.target = self
-        updateAutoSwitch.action = #selector(updateAutoCheckToggled)
-        // 「自动检查更新」行尾手动检查按钮：与「刷新时间」行尾 manualRefreshBtn 同口径
-        // （RefreshIconButton，点击图标转一圈，自身 hover 提亮），触发现有手动更新流程。
-        let manualCheckUpdateBtn = RefreshIconButton()
-        manualCheckUpdateBtn.image = symbolImage("arrow.down.circle", size: 10)
-        manualCheckUpdateBtn.target = self
-        manualCheckUpdateBtn.action = #selector(checkUpdateTapped)
-        manualCheckUpdateBtn.toolTip = "立即检查 GitHub Releases 新版本"
-        manualCheckUpdateBtn.widthAnchor.constraint(equalToConstant: 16).isActive = true
-        manualCheckUpdateBtn.heightAnchor.constraint(equalToConstant: 16).isActive = true
-        manualCheckUpdateBtn.setContentHuggingPriority(.required, for: .horizontal)
-        manualCheckUpdateBtn.setContentHuggingPriority(.defaultLow, for: .vertical)
-        manualCheckUpdateBtn.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        // 刷新间隔行：标题 + 手动刷新按钮 + spacer + 原生下拉菜单
-        intervalPopup.target = self
-        intervalPopup.action = #selector(intervalChanged)
-        intervalPopup.setContentHuggingPriority(.required, for: .horizontal)
-        intervalPopup.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let intervalLabel = NSTextField(labelWithString: "刷新时间")
-        intervalLabel.font = .systemFont(ofSize: 12)
-        intervalLabel.textColor = Palette.cardForeground
-        // label 压缩阻力提到 required：行空间不足时优先让其它视图让步，label 永远不被压窄
-        intervalLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        // 手动刷新按钮：arrow.clockwise 图标，石墨灰（systemGray），size 10（小于选项文本 12pt，更紧凑）。
-        // 点击时图标顺时针旋转一圈（RefreshIconButton 内部 sendAction 触发）。
-        // hover 时按钮自绘圆形白@8% 背景 + 图标 tint 提亮（16×16 容器），
-        // 仅自身 hover 生效；行 hover 不驱动任何提亮（见下方 enablesTextBrightening = false）。
-        // 视觉整体向左下偏移 1pt（与设置行文字基线对齐微调），容器/命中区不动。
-        let manualRefreshBtn = RefreshIconButton()
-        manualRefreshBtn.image = symbolImage("arrow.clockwise", size: 10)
-        manualRefreshBtn.target = self
-        manualRefreshBtn.action = #selector(manualRefreshTapped)
-        // 固定 16×16 方形容器（与设置行高一致）：撑起圆形 hover 背景的绘制区域
-        manualRefreshBtn.widthAnchor.constraint(equalToConstant: 16).isActive = true
-        manualRefreshBtn.heightAnchor.constraint(equalToConstant: 16).isActive = true
-        manualRefreshBtn.setContentHuggingPriority(.required, for: .horizontal)
-        manualRefreshBtn.setContentHuggingPriority(.defaultLow, for: .vertical)
-        manualRefreshBtn.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        // 行首图标与开关行同口径（settingsRowIcon）
-        let intervalIcon = settingsRowIcon("timer")
-        let intervalRow = NSStackView()
-        intervalRow.orientation = .horizontal
-        intervalRow.distribution = .fill
-        intervalRow.alignment = .centerY
-        intervalRow.spacing = 6
-        // spacer 吃掉按钮后的剩余空白，下拉菜单贴行尾（原生控件自身命中区即可）
-        intervalRow.setViews([intervalIcon, intervalLabel, manualRefreshBtn, stretchSpacer(), intervalPopup], in: .leading)
-
-        // 主题/样式开关组（2026-09-07 用户指定移出设置卡、迁入 header 调色气泡）：
-        // 照常创建并注册进 switchRows（快照状态同步 / Mono 字符开关外观切换管线不变），
-        // 行视图由 showHeatWindow 挂到气泡内容尾部；顺序沿用原设置卡排列
-        themeSwitchRows = [
-            switchRow(title: "高对比背景", sub: nil, sw: gradientSwitch, trailingComp: 3,
-                      icon: "circle.lefthalf.filled"),
-            switchRow(title: "浅色主题", sub: nil, sw: lightThemeSwitch, trailingComp: 3,
-                      icon: "sun.max"),
-            switchRow(title: "图标深浅互换", sub: nil, sw: iconThemeSwapSwitch, trailingComp: 3,
-                      icon: "arrow.left.arrow.right"),
-            switchRow(title: "Mono 风格", sub: nil, sw: monoSwitch, trailingComp: 3,
-                      icon: "textformat"),
-            switchRow(title: "长进度卡片", sub: nil, sw: longProgressCardSwitch, trailingComp: 3,
-                      icon: "line.3.horizontal"),
-            switchRow(title: "竖线进度条", sub: nil, sw: verticalLineProgressSwitch, trailingComp: 3,
-                      icon: "lines.measurement.horizontal.aligned.bottom"),
-        ]
-        // 更新窗口演示行：整行可点，以演示数据打开更新窗口（发现新版→下载→校验→
-        // 安装全流程循环，不出网不真替换），用于调试窗口各状态设计；
-        // 与 --update-demo 启动参数走同一入口（AppDelegate.runUpdateDemo）。
-        let updateDemoRow = NSStackView()
-        updateDemoRow.orientation = .horizontal
-        updateDemoRow.distribution = .fill
-        updateDemoRow.alignment = .centerY
-        updateDemoRow.spacing = 6
-        let updateDemoLabel = NSTextField(labelWithString: "更新窗口演示")
-        updateDemoLabel.font = .systemFont(ofSize: 12)
-        updateDemoLabel.textColor = Palette.cardForeground
-        updateDemoRow.setViews([settingsRowIcon("hammer"), updateDemoLabel, stretchSpacer()], in: .leading)
-        updateDemoRow.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(updateDemoTapped)))
-
-        let settingRows = [
-            intervalRow,
-            switchRow(title: "自动签到", sub: autoCheckinSub, sw: autoCheckinSwitch, icon: "checkmark.seal"),
-            // 「滚动预览」暂时隐藏（2026-08-28）：恢复时把 switchRow 加回此处，
-            // 并同步恢复下方 valuePreviewSub.isHidden = false
-            // switchRow(title: "滚动预览", sub: valuePreviewSub, sw: valuePreviewSwitch),
-            switchRow(title: "自动检查更新", sub: nil, sw: updateAutoSwitch, icon: "arrow.triangle.2.circlepath",
-                      accessory: manualCheckUpdateBtn),
-            updateDemoRow,
-        ].map {
-            let hover = wrapHoverRow($0)
-            // 行 hover 不提亮小字与图标 tint：小字保持常态颜色，
-            // 刷新按钮仅自身 hover 时提亮（RefreshIconButton 内部处理）
-            hover.enablesTextBrightening = false
-            return hover
-        }
-        // 副标题默认隐藏（switchRow 内统一设置），静态文案行直接显示
-        // valuePreviewSub.isHidden = false
-        // 「设置」标题：可折叠标题条（hover 余额卡片样式，点击折叠整个设置卡片）
-        var settingCollapseTargets: [NSView] = []
-        let settingTitle = collapsibleSectionTitle(name: "设置", key: UDKey.settingsSectionCollapsed,
-                                                    targets: { settingCollapseTargets })
-        root.addArrangedSubview(settingTitle)
-        pinFullWidth(settingTitle, in: root)
-        root.setCustomSpacing(0, after: settingTitle)
-        sectionTitleViews["settings"] = settingTitle
-        let settingCard = addCard(rows: settingRows, to: root, spacing: 8)
-        // 折叠目标接线 + 初始态（内容隐藏与标题下间距，展开时间距 0 贴卡片）
-        settingCollapseTargets = [settingCard]
-        let settingsCollapsed = UserDefaults.standard.bool(forKey: UDKey.settingsSectionCollapsed)
-        settingCard.isHidden = settingsCollapsed
-        root.setCustomSpacing(settingsCollapsed ? 6 : 0, after: settingTitle)
-        // 设置卡片初始开关外观（Mono 开启时直接以字符开关呈现，避免启动瞬间闪原生开关）
-        applySwitchVisuals(animated: false)
-
-        // ── 操作卡片：磁贴按钮（每行 4 个，超出换行）──
-        wbAddBtn.target = self
-        wbAddBtn.action = #selector(addWbAccountTapped)
-        traeAddBtn.target = self
-        traeAddBtn.action = #selector(addTraeAccountTapped)
-        zcodeAddBtn.target = self
-        zcodeAddBtn.action = #selector(addZcodeAccountTapped)
-        // Codex 操作按钮图标与余额卡片保持同样的 5% 缩放口径。
-        let codexAddBtn = ActionTileButton(bundleIcon: "codex", title: "添加账号", target: self, action: #selector(addCodexAccountTapped), svgIconSize: 16.05)
-        checkinBtn.target = self
-        checkinBtn.action = #selector(manualCheckinTapped)
-        wbShareBtn.target = self
-        wbShareBtn.action = #selector(shareWbHistoryTapped)
-
-        let cockpitBtn = ActionTileButton(symbol: "gauge.with.needle", title: "Cockpit", target: self, action: #selector(openCockpitTapped))
-        // Key/额度磁贴：DeepSeek + ZhiPu 设置弹窗统一入口，icon 用 SF Symbol 钥匙
-        let deepSeekSettingsBtn = ActionTileButton(symbol: "key.fill", title: "Key / 额度", target: self, action: #selector(setApiKeyTapped))
-        let aboutBtn = ActionTileButton(symbol: "info.circle", title: "关于", target: self, action: #selector(aboutTapped))
-        // 3D 硬币演示：复刻 mintform-react 的 CSS 3D token（点按自旋 / 拖动翻转）；
-        // symbol 与弹窗 header 共用 CoinDemoDialog.tileSymbol（两处永远是同一个 icon）
-        let coinDemoBtn = ActionTileButton(symbol: CoinDemoDialog.tileSymbol, title: "3D 硬币", target: self, action: #selector(coinDemoTapped))
-        // 「平台开关」入口 2026-09-10 迁入 header 分段控件段 1，磁贴不再重复占位；
-        // 「检查更新」磁贴同日移除（设置卡「自动检查更新」行尾图标按钮 + 菜单栏「检查更新…」保留）
-        let actionTiles = [
-            cockpitBtn,
-            wbAddBtn,
-            traeAddBtn,
-            zcodeAddBtn,
-            codexAddBtn,
-            deepSeekSettingsBtn,
-            checkinBtn,
-            ActionTileButton(symbol: "list.bullet.rectangle", title: "签到历史", target: self, action: #selector(checkinHistoryTapped)),
-            wbShareBtn,
-            coinDemoBtn,
-            aboutBtn,
-        ]
-        // 各按钮悬停提示（HIG：图标类控件应有 tooltip）
-        cockpitBtn.toolTip = "打开 Cockpit"
-        wbAddBtn.toolTip = "添加 WorkBuddy 账号"
-        traeAddBtn.toolTip = "添加 TRAE 账号"
-        zcodeAddBtn.toolTip = "添加 ZCode 账号（JSON 导入）"
-        codexAddBtn.toolTip = "添加 Codex 账号（JSON 导入 ~/.codex/auth.json）"
-        deepSeekSettingsBtn.toolTip = "配置 DeepSeek API Key、日常额度与 ZhiPu Token"
-        wbShareBtn.toolTip = "将全部历史会话与记忆同步给当前登录的 WorkBuddy 账号（切换账号后可再次执行）"
-        coinDemoBtn.toolTip = "3D 硬币旋转演示（复刻 mintform：点击自旋、拖动翻转）"
-        let buildVer = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
-        aboutBtn.toolTip = "关于 iBalance（v\(buildVer)）"
-        // 按钮间水平间距 4pt（4×52 + 3×4 = 220 ≤ 内容宽 236，整体靠左）
-        let tileSpacing: CGFloat = 4
-        for tile in actionTiles {
-            tile.widthAnchor.constraint(equalToConstant: 52).isActive = true
-            tile.heightAnchor.constraint(equalToConstant: 44).isActive = true
-            tile.setContentHuggingPriority(.required, for: .horizontal)
-            tile.setContentCompressionResistancePriority(.required, for: .horizontal)
-        }
-        // 按每行 4 个切分；.fill + 固定间距：不满一行的行也按同样间距从左到右排列（不居中/不撑开）
-        let maxPerRow = 4
-        let rows: [[ActionTileButton]] = stride(from: 0, to: actionTiles.count, by: maxPerRow).map {
-            Array(actionTiles[$0..<min($0 + maxPerRow, actionTiles.count)])
-        }
-        let tileRows: [NSStackView] = rows.map { rowTiles in
-            let row = NSStackView(views: rowTiles)
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.distribution = .fill
-            row.spacing = tileSpacing
-            row.translatesAutoresizingMaskIntoConstraints = false
-            row.heightAnchor.constraint(equalToConstant: 44).isActive = true
-            return row
-        }
-        // 设置区块 → 操作区块（分割线已移除，用区块间距分隔）
-        root.setCustomSpacing(10, after: settingCard)
-        // 「操作」标题：可折叠标题条（折叠时内容整体隐藏）
-        var actionCollapseTargets: [NSView] = []
-        let actionTitle = collapsibleSectionTitle(name: "操作", key: UDKey.actionsSectionCollapsed,
-                                                  targets: { actionCollapseTargets })
-        root.addArrangedSubview(actionTitle)
-        pinFullWidth(actionTitle, in: root)
-        root.setCustomSpacing(0, after: actionTitle)
-        sectionTitleViews["actions"] = actionTitle
-        // App 宫格样式：行内容器内靠左（不满一行的末行也靠左），整个容器在卡片内水平居中；
-        // 左右内边距 0（容器宽 220 ≤ 内容宽 236），行间垂直间距 4pt
-        let tilesContainer = NSStackView(views: tileRows)
-        tilesContainer.orientation = .vertical
-        tilesContainer.alignment = .leading
-        tilesContainer.distribution = .fill
-        tilesContainer.spacing = 4
-        tilesContainer.translatesAutoresizingMaskIntoConstraints = false
-        let actionCard = addCard(rows: [tilesContainer], to: root, bottomPadding: 3, horizontalPadding: 0, stretchRows: false, centerRows: true)
-
-        // 操作区块 → footer（分割线已移除，用区块间距分隔）
-        root.setCustomSpacing(10, after: actionCard)
-        // 折叠目标接线 + 初始态
-        actionCollapseTargets = [actionCard]
-        let actionsCollapsed = UserDefaults.standard.bool(forKey: UDKey.actionsSectionCollapsed)
-        actionCard.isHidden = actionsCollapsed
-        root.setCustomSpacing(actionsCollapsed ? 6 : 0, after: actionTitle)
+        // 操作区块 2026-09-13 整体移除（磁贴功能各奔前程：Cockpit → header 第五颗，
+        // 添加账号/Key额度/签到历史/同步共享/关于 → 设置窗口与状态栏菜单；3D 硬币演示、
+        // 手动签到随板块退场）：用量为面板最后一个区块，其下 9pt 即收尾间距
+        root.setCustomSpacing(9, after: usageCard)
 
         // ── 底部：退出按钮（贴右）──
         // pin 按钮（挂 API 标题行尾，面板首行标题）：属性在此配置，布局见 apiTitle 段
@@ -765,39 +559,8 @@ extension BalancePanelView {
 
         updatedLabel.font = .systemFont(ofSize: 9, weight: .regular)
         updatedLabel.textColor = Palette.panelHeaderContentColor
-        let githubBtn = HoverIconButton()
-        if let githubImage = bundleIcon("github", size: 11) {
-            githubImage.isTemplate = true
-            githubBtn.image = githubImage
-        } else {
-            githubBtn.image = symbolImage("globe", size: 11)
-        }
-        githubBtn.normalTintColor = Palette.panelHeaderContentColor
-        githubBtn.target = self
-        githubBtn.action = #selector(openGitHubTapped)
-        githubBtn.toolTip = "打开 iBalance GitHub 项目"
-        let footer = NSView()
-        footer.translatesAutoresizingMaskIntoConstraints = false
-        githubBtn.translatesAutoresizingMaskIntoConstraints = false
-        footer.addSubview(githubBtn)
-        // footer 移出 root、直接挂 panel 并贴底：root 用 ≤ 底约束保持内容自然高度
-        // （永不被拉伸），浮窗拖高时多出的高度成为 root 与 footer 间的空白，footer 始终贴底。
-        // 宽度与 root 对齐（左右各内缩 7pt 正文缩进；容器层缩进由 VC scrollView
-        // 统一表达，不在此重复），底部留 11pt 边距
-        addSubview(footer)
-        // 固定 footer 高度，避免子控件 intrinsicContentSize 变化时重新布局导致错位
-        NSLayoutConstraint.activate([
-            footer.heightAnchor.constraint(equalToConstant: panelBarHeight),
-            footer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
-            footer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
-            footer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
-            githubBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
-            githubBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
-            // 容器固定 22×22（HoverIconButton.buttonSize）；无边框按钮，
-            // hover 时自绘大圆角淡白背景（圆角与卡片统一）
-            githubBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
-            githubBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
-        ])
+        // 原贴底 footer（GitHub 按钮）2026-09-13 整体移除：按钮迁入 header 左侧按钮组，
+        // 底部不再有固定区，root 底部 cap 同步收窄到底边距 11pt（见上方 rootBottomCap）
     }
 
     /// 卡片容器：NSVisualEffectView（自动适配深浅色）+ 圆角 + 内边距，宽度撑满 root。
@@ -838,7 +601,7 @@ extension BalancePanelView {
             card = NSView()
         }
         card.wantsLayer = true
-        card.layer?.cornerRadius = Palette.cardCornerRadius
+        card.layer?.cornerRadius = Palette.hoverCardCornerRadius
         card.layer?.cornerCurve = .continuous
         card.layer?.masksToBounds = true
         // 卡片自身恒无边框：HoverCard 的 hover 材质由容器共享（HoverMaterialHost），
@@ -929,8 +692,8 @@ extension BalancePanelView {
             apply(collapsed)
         }
         hc.wantsLayer = true
-        // 圆角与余额卡片统一（Palette.cardCornerRadius = 10pt）
-        hc.layer?.cornerRadius = Palette.cardCornerRadius
+        // 圆角与余额卡片统一（hoverCardCornerRadius = 9pt，2026-09-13 由 10 改）
+        hc.layer?.cornerRadius = Palette.hoverCardCornerRadius
         hc.layer?.cornerCurve = .continuous
         hc.layer?.masksToBounds = true
         // hover 材质（背景 + 框）由容器共享（HoverMaterialHost），卡片自身恒无边框
@@ -994,6 +757,24 @@ extension BalancePanelView {
         return preferred[iconName] ?? fallback[iconName]
     }
 
+    /// 卡片品牌 icon 取图（含「圆形图标」开关）：circular = 画布内切圆 alpha 蒙版裁圆
+    /// （品牌图为满幅 squircle，宽高不变仅四角裁切）。静态缓存（键名 × 深浅）。
+    private static var circularBrandImages: [String: NSImage] = [:]
+    static func cardBrandImage(_ iconName: String, dark: Bool, circular: Bool) -> NSImage? {
+        guard let base = brandIconImage(iconName, dark: dark) else { return nil }
+        guard circular else { return base }
+        let key = "\(iconName)|\(dark)"
+        if let hit = circularBrandImages[key] { return hit }
+        let size = base.size
+        let masked = NSImage(size: size)
+        masked.lockFocus()
+        NSBezierPath(ovalIn: NSRect(origin: .zero, size: size)).addClip()
+        base.draw(in: NSRect(origin: .zero, size: size))
+        masked.unlockFocus()
+        circularBrandImages[key] = masked
+        return masked
+    }
+
     /// 余额卡片内容行：左大 icon + 中间纵向（标题/签到信息）+ 右纵向（额度值/点阵）
     /// 三列撑满整行：icon 与图标列宽同宽（27.75pt，2026-09-05 由 25pt +15%） / middle ≥ 70% / right 40pt
     /// 中间内容垂直居中；点阵进度放右侧额度值下方（DeepSeek 无点阵）
@@ -1012,11 +793,12 @@ extension BalancePanelView {
         for c in agentCards { agent.setCustomSpacing(platformCardGap, after: c) }
     }
 
-    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 24, imageSize: CGFloat? = nil, iconTint: NSColor = Palette.cardForeground, nickLabel: NSTextField? = nil, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .medium, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, subtitleMeta: NSView? = nil, valuePrefixIcon: String? = nil, longProgressCard: Bool = false, titleLabelRef: ((FadeableTextField) -> Void)? = nil, menuBarDotRef: ((NSView) -> Void)? = nil, statusRingRef: ((CardTaskStatusRingView) -> Void)? = nil) -> NSView {
+    func balanceContentRow(icon iconName: String, name: String, valueView: RollingNumberView, info: NSStackView?, dots: UsageDots?, iconSize: CGFloat = 24, imageSize: CGFloat? = nil, iconTint: NSColor = Palette.cardForeground, titleWeight: NSFont.Weight = .semibold, valueWeight: NSFont.Weight = .medium, textColor: NSColor = Palette.cardForeground, failureBadge: NSView? = nil, premadeIconView: NSImageView? = nil, hoverSubStrip: NSView? = nil, subtitleMeta: NSView? = nil, valuePrefixIcon: String? = nil, longProgressCard: Bool = false, titleLabelRef: ((FadeableTextField) -> Void)? = nil, menuBarDotRef: ((NSView) -> Void)? = nil, statusRingRef: ((CardTaskStatusRingView) -> Void)? = nil) -> NSView {
         var imgSize = imageSize ?? iconSize
-        // 长进度卡片：icon 缩小 40% 与主标题同行（2026-09-06 用户指定）；
+        // 长进度卡片：icon 缩小 40% 与主标题同行（2026-09-06 用户指定），
+        // 2026-09-13 再「缩小2pt」→ 27.75×0.6−2 = 14.65；图标列（长进度 = icon 见方）随之；
         // 普通样式：icon 缩 2pt（2026-09-06 用户指定，列宽不变由图标列留白承接）
-        if longProgressCard { imgSize *= 0.6 } else { imgSize -= 2 }
+        if longProgressCard { imgSize = imgSize * 0.6 - 2 } else { imgSize -= 2 }
         // 左：大 icon（统一图标列宽 = 27.75pt，2026-09-05 由 25pt +15%，与 icon 等宽；
         // 约束写死不随 iconSize 变；image 在列内居中显示，imageSize 可独立缩小）；
         // premadeIconView 由外部传入（多号卡片预建 icon 视图，普通 NSImageView 即可）
@@ -1030,8 +812,10 @@ extension BalancePanelView {
         let brandAppearance = Palette.panelAppearance(lightTheme: lightThemeEnabled,
                                                       gradientOn: panelGradientEnabled)
             ?? NSApp.effectiveAppearance
-        // brandIconDark：生效外观 ⊕ 图标深浅互换开关（开关开启时深浅版互换）
-        if let brand = Self.brandIconImage(iconName, dark: brandIconDark(for: brandAppearance)) {
+        // brandIconDark：生效外观 ⊕ 图标深浅互换开关（开关开启时深浅版互换）；
+        // 「圆形图标」开关开 = 裁圆版（宽高不变）
+        if let brand = Self.cardBrandImage(iconName, dark: brandIconDark(for: brandAppearance),
+                                           circular: circularIconEnabled) {
             iconView.identifier = NSUserInterfaceItemIdentifier("brandIcon:" + iconName)
             let scaled = brand.copy() as! NSImage
             scaled.size = NSSize(width: imgSize, height: imgSize)
@@ -1057,6 +841,7 @@ extension BalancePanelView {
             // 任务状态发光底层（WB / ZCode 当前账号卡）：撑满 iconContainer（尽可能大），
             // icon 叠加其上居中；menuBarDot / 失败角标仍锚定 iconView，位置不变
             let ring = CardTaskStatusRingView()
+            ring.isCircular = circularIconEnabled   // 「圆形图标」开关：光环随图标翻圆形
             ring.translatesAutoresizingMaskIntoConstraints = false
             iconContainer.addSubview(ring)
             iconContainer.addSubview(iconView)
@@ -1135,43 +920,31 @@ extension BalancePanelView {
             ])
         }
 
-        // 标题行：nameLabel（平台名，Palette.cardForeground）+ 可选 nickLabel（昵称，systemGray 石墨灰）
+        // 标题行：nameLabel（平台名，Palette.cardForeground）单 label（昵称展示 2026-09-02
+        // 移除、透明占位 2026-09-13 一并删除，昵称/徽章由积分按钮悬浮气泡承载）
         // FadeableTextField：wantsLayer 承载 hover 字重动画
         let nameLabel = FadeableTextField(labelWithString: name)
-        registerFont(nameLabel, size: Palette.cardTitleFontSize, weight: titleWeight)
         nameLabel.textColor = textColor
         // 暴露 nameLabel 给调用方（如 hover 字重动画驱动）
         titleLabelRef?(nameLabel)
         nameLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        // 平台标题优先保持完整，昵称在有限空间内使用省略号
-        nameLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
-        // 13pt 字体需要略高于字号本身的行框（+3），避免字形下沿被裁切。
-        nameLabel.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        // 平台标题优先保持完整；压缩阻力 998（标题右缘让位约束 999 最后兜底）：
+        // 字号/Sharp Grotesk 放大后横向放不下时标题尾部省略，且明确禁折行
+        // —— 标题与积分/金额恒在同一行
+        nameLabel.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(998), for: .horizontal)
+        nameLabel.cell?.wraps = false
+        nameLabel.lineBreakMode = .byTruncatingTail
+        // 行框 = 字号 + 3（13pt 需要略高于字号本身的行框，避免字形下沿被裁切）；
+        // 字号设置变化时就地调 constant（引用存进 label，applyCardTitleFont 统一驱动）
+        let titleHeight = nameLabel.heightAnchor.constraint(equalToConstant: cardTitleFontSize + 3)
+        titleHeight.isActive = true
+        nameLabel.titleHeightConstraint = titleHeight
 
-        let titleRow: NSView
-        if let nick = nickLabel {
-            // 昵称放标题后：使用标题行剩余空间，单行尾部省略。
-            registerFont(nick, size: 10)
-            nick.maximumNumberOfLines = 1
-            nick.lineBreakMode = .byTruncatingTail
-            nick.cell?.truncatesLastVisibleLine = true
-            nick.cell?.wraps = false
-            nick.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            nick.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            // 用 firstBaseline 对齐：10pt 与 12pt 文字基线对齐，视觉居中
-            let row = NSStackView(views: [nameLabel, nick])
-            row.orientation = .horizontal
-            row.alignment = .firstBaseline
-            row.spacing = 4
-            titleRow = row
-        } else {
-            // 与多账号卡同构：空 stack 包裹（裸 nameLabel 直接挂行实测起点偏 -2pt，
-            // stack 包裹后与 WB/TRAE 等卡起点一致）
-            let row = NSStackView(views: [nameLabel])
-            row.orientation = .horizontal
-            row.alignment = .firstBaseline
-            titleRow = row
-        }
+        // 与多账号卡同构：空 stack 包裹（裸 nameLabel 直接挂行实测起点偏 -2pt，
+        // stack 包裹后与其他卡起点一致）
+        let titleRow = NSStackView(views: [nameLabel])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .firstBaseline
         titleRow.translatesAutoresizingMaskIntoConstraints = false
         titleRow.setContentHuggingPriority(.defaultLow, for: .horizontal)
         titleRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1179,8 +952,9 @@ extension BalancePanelView {
         // 额度值（右对齐；逐位数字垂直滚动 RollingNumberView），
         // 与标题冲突时数值优先（required），标题尾部省略；
         // 基线对齐用视图内置探针（同字体隐藏 label 的 firstBaselineAnchor）。
-        // 字号与主标题同档（2026-09-06 用户指定「余额跟主标题同一行, 字号一样」，撤销当日 15pt 改版）
-        registerRollingNumber(valueView, size: 13, weight: valueWeight)
+        // 字号与主标题同档（2026-09-06 用户指定「余额跟主标题同一行, 字号一样」；
+        // 2026-09-13 起随主标题字号设置联动，积分/金额 + ¥$ 前缀一并缩放）
+        registerRollingNumber(valueView, size: cardTitleFontSize, weight: valueWeight)
         valueView.setTextColor(textColor)
         // 数值前缀图标（Agent 卡积分前的 coin）：贴数字左侧、随槽位右对齐成组。
         // 按常规态边长烘焙（2× 光栅），chip 态由视图缩小绘制，离开 hover 无损复原
@@ -1190,8 +964,10 @@ extension BalancePanelView {
         valueView.setContentHuggingPriority(.required, for: .horizontal)
         valueView.setContentCompressionResistancePriority(.required, for: .horizontal)
         valueView.translatesAutoresizingMaskIntoConstraints = false
-        // 数值列宽 65（13pt 定稿口径，2026-09-06 随字号回 13pt 一并撤销 80 临时档）
-        valueView.widthAnchor.constraint(equalToConstant: 65).isActive = true
+        // 数值列宽随字号等比缩放（65 = 13pt × 5 的定稿比例，2026-09-06 定稿口径）；
+        // 约束引用交 registerCardTitle，字号设置变化时就地调
+        let valueWidth = valueView.widthAnchor.constraint(equalToConstant: cardTitleFontSize * 5)
+        valueWidth.isActive = true
 
         // 第一行：标题（左）+ 数值（右）同一行（两种卡型同构，2026-09-06 默认卡片改版回位）
         // 用普通 NSView + 显式约束，避免 NSStackView gravity 分布歧义
@@ -1206,22 +982,41 @@ extension BalancePanelView {
             ])
         }
         row1.addSubview(valueView)
+        // 标题右缘 ≤ 数值**内容前缘**（999，全场唯一可让位约束）：空间不足时标题先截断，
+        // 数值列宽/行高（required）永不让位 —— 标题与积分/金额恒在同一行。
+        // 钉 contentLeadingGuide（数字墨迹组最左缘，随 setText/字号/位数实时更新）而非
+        // 数值列前缘：列宽为最宽数字组合预留，短数值右锚后列内留白大——标题可借用
+        // 留白尽量完整显示（2026-09-13 用户「大字号下 WorkBuddy 显示不完整」；此前
+        // 恒挡列前缘，间隙档 −4/0/+8/4 历史均废）。guide 未布局时回退列前缘（保守）
+        let titleTrailingLimit = titleRow.trailingAnchor.constraint(
+            lessThanOrEqualTo: valueView.contentLeadingGuide.leadingAnchor, constant: -3)
+        titleTrailingLimit.priority = NSLayoutConstraint.Priority(999)
+        // 数值垂直锚 = 基线（2026-09-13 用户定稿：不用按各字体度量反推的补偿）：
+        // 探针基线钉 row1 中心下方「系统字体 capHeight/2」处——offset 只由字号决定，
+        // 同字号下任何字体（SF / Sharp Grotesk / Mono）基线位置恒等，切字体整行不跳；
+        // 墨迹中心≈行中心（各字体 cap 与系统字相差 ≤0.17pt）且随字号缩放无累积漂移。
+        // 字号变化时由 applyCardTitleFont 就地更新 constant
+        let valueBaseline = valueView.baselineAnchor.constraint(
+            equalTo: row1.centerYAnchor,
+            constant: NSFont.systemFont(ofSize: cardTitleFontSize).capHeight / 2)
+        // 主标题注册（label + 数值视图 + 列宽/基线约束捆成一组，字号设置变化时就地联动重刷）
+        registerCardTitle(nameLabel, weight: titleWeight, rolling: valueView,
+                          valueWidth: valueWidth, valueBaseline: valueBaseline)
         NSLayoutConstraint.activate([
             // 长进度卡片：标题起于 icon 右 4pt（2026-09-06 用户指定 -2pt，原 6）；列表态：标题起于行前缘
             longProgressCard
                 ? titleRow.leadingAnchor.constraint(equalTo: iconContainer.trailingAnchor, constant: 4)
                 : titleRow.leadingAnchor.constraint(equalTo: row1.leadingAnchor),
-            // 昵称行允许向数值区多占 12pt（-4 → +8）：为昵称尾部签到徽章
-            //（10pt 图标 + 薄空格）预留显示空间；数值右对齐（右锚 bounds-2.5），
-            // 常规数值宽度下左侧有富余，不会与数字字形重叠
-            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: valueView.leadingAnchor,
-                                               constant: nickLabel != nil ? 8 : -4),
-            row1.heightAnchor.constraint(equalToConstant: 16),
+            titleTrailingLimit,
+            // 行高跟随数值视图固有高（max(行高, 基线探针行高)，随主标题字号设置缩放，
+            // 卡片高度随之变化；13pt 时即原固定 16pt 口径）
+            row1.heightAnchor.constraint(equalTo: valueView.heightAnchor),
             titleRow.firstBaselineAnchor.constraint(equalTo: valueView.baselineAnchor),
             // 数值右锚 +2.5pt 光学偏移（2026-09-07 用户由 0.7 逐步调大；进度条在右侧独立容器，
             // 见 row 组装处，标题/副标题行右缘对齐后不与条同区）
             valueView.trailingAnchor.constraint(equalTo: row1.trailingAnchor, constant: 2.5),
-            valueView.centerYAnchor.constraint(equalTo: row1.centerYAnchor),
+            // 垂直位置由基线锚定（valueBaseline 创建处见上，随字号设置联动）
+            valueBaseline,
         ])
 
         // 第二行：列表态 = 副标题（左）+ 点阵/账号条（右）同行；
@@ -1237,12 +1032,9 @@ extension BalancePanelView {
                     // 全宽进度条：两端钉死行宽（列表态为右锚定固有宽 50.09pt，2026-09-06 加长 10%）；
                     // 高 6（2026-09-07 用户由 4 调高——9-06 口径为连续两轮 -1.5pt：7 → 5.5 → 4；
                     // 行槽 14 容 chip 互换不变）。视图高仅约束容器：横态轨道在 barFrame 内
-                    // 仍按 UsageDots.barHeight 4.06 居中不随此高变；竖线模式线高取 bounds 跟满 6
+                    // 仍按 UsageDots.barHeight 4.06 居中不随此高变
                     dots.setContentHuggingPriority(.defaultLow, for: .horizontal)
                     dots.heightAnchor.constraint(equalToConstant: 6.0).isActive = true
-                    // 竖线进度条开关（2026-09-07 用户新增，仅长进度卡片）：开启后本条
-                    // 改为竖线形态（条数/线宽见 UsageDots.lineCount/lineWidth），行几何不变
-                    dots.lineBarMode = verticalLineProgressEnabled
                     barRow.addSubview(dots)
                     NSLayoutConstraint.activate([
                         dots.leadingAnchor.constraint(equalTo: barRow.leadingAnchor),
@@ -1398,7 +1190,10 @@ extension BalancePanelView {
         // 默认卡片改版（2026-09-06 用户定稿）：进度条独立成容器（barHolder）排在内容区
         // 右侧——主/副标题行右缘先对齐（两行同宽），右边才是撑满整行高的进度条容器。
         // 2026-09-07 用户改版：竖向形态 = 4 个圆角正方点竖排点阵（边长 = verticalThickness
-        // = holder 宽，间隔随 holder 高伸缩）；额度值已回标题行（见 row1 组装处）
+        // = holder 宽）；2026-09-13 用户要求点阵列**固定高度**（不再随字号/卡片高伸缩，
+        // 原「上下缩进 2pt 随 holder 撑满」改恒定高 + 容器内居中）：
+        // 恒 25.5 = 默认 13pt 下原高（row1 16 + 行距 1.5 + row2 12 − 上下缩进 2×2），
+        // 默认字号外观零变化
         var barHolder: NSView?
         if !longProgressCard, let dots = dots {
             dots.isVertical = true
@@ -1408,10 +1203,9 @@ extension BalancePanelView {
             holder.addSubview(dots)
             NSLayoutConstraint.activate([
                 holder.widthAnchor.constraint(equalToConstant: UsageDots.verticalThickness),
-                // 容器上下缩进 2pt（2026-09-06 用户指定，由 1 加深）：条不顶满 holder 上下缘
-                dots.topAnchor.constraint(equalTo: holder.topAnchor, constant: 2),
-                dots.bottomAnchor.constraint(equalTo: holder.bottomAnchor, constant: -2),
+                dots.heightAnchor.constraint(equalToConstant: 25.5),
                 dots.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
+                dots.centerYAnchor.constraint(equalTo: holder.centerYAnchor),
             ])
             barHolder = holder
         }
@@ -1455,102 +1249,6 @@ extension BalancePanelView {
             row.bottomAnchor.constraint(equalTo: hover.bottomAnchor, constant: -bottomInset),
         ])
         return hover
-    }
-
-    /// 开关行：标题（可选副标题）+ 右侧开关。
-    /// 默认用原生 NSSwitch（.mini 尺寸，紧凑）；Mono 模式开启时切换为字符开关 [×]/[▪]。
-    /// 两个控件装入同一容器同框显隐切换（不重建行）；容器和可见控件右缘均贴行尾，
-    /// 点击整行任意位置都能切换开关状态。
-    /// trailingComp：原生开关视觉右缘补偿。MiniSwitch 整体 0.81 缩放（锚点在中心）会把
-    /// 视觉右缘向内拖 intrinsicWidth×(1−0.81)/2 ≈ 3pt；调色气泡行距边本就只有 10pt，
-    /// 不补偿看起来不贴右缘。设置卡维持 0（历史观感未要求动）。
-    /// 设置行前置图标：SF Symbol 裁边后固定 10×10 显示框、systemGray 着色
-    /// （与用量行 icon 同口径，保证浮窗内各项目图标风格统一）。
-    /// imageScaling 按比例缩放填满框（长边=10）：裁边后各 symbol 长宽比不同，
-    /// 默认 scaleNone 按原图尺寸居中会导致墨迹视觉大小不一 + 到右侧标题的
-    /// 留白不齐（2026-09-10 用户指定调色气泡内统一）。
-    private func settingsRowIcon(_ name: String) -> NSImageView {
-        let iv = NSImageView()
-        iv.image = Self.trimmedSymbolImage(name, size: 10)
-        iv.image?.isTemplate = true
-        iv.contentTintColor = .systemGray
-        iv.imageScaling = .scaleProportionallyUpOrDown
-        iv.translatesAutoresizingMaskIntoConstraints = false
-        iv.widthAnchor.constraint(equalToConstant: 10).isActive = true
-        iv.heightAnchor.constraint(equalToConstant: 10).isActive = true
-        return iv
-    }
-
-    private func switchRow(title: String, sub: NSTextField?, sw: MiniSwitch,
-                           trailingComp: CGFloat = 0, icon: String? = nil,
-                           accessory: NSView? = nil) -> NSView {
-        sw.controlSize = .mini
-        let label = NSTextField(labelWithString: title)
-        label.font = .systemFont(ofSize: 12)
-        label.textColor = Palette.cardForeground
-        sw.setContentHuggingPriority(.required, for: .horizontal)
-        // 降低垂直拥抱/压缩阻力：让外部固定行高约束能压住开关高度
-        sw.setContentHuggingPriority(.defaultLow, for: .vertical)
-        sw.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        let charSw = MonoCharSwitch()
-        charSw.state = sw.state
-        // 复用原生开关的 target/action，保证字符开关翻转后能触发同样的业务回调
-        charSw.target = sw.target
-        charSw.action = sw.action
-        // 字符开关保持固有尺寸，不被外部约束压扁/拉伸
-        charSw.setContentHuggingPriority(.required, for: .horizontal)
-        charSw.setContentHuggingPriority(.required, for: .vertical)
-        charSw.setContentCompressionResistancePriority(.required, for: .horizontal)
-        charSw.setContentCompressionResistancePriority(.required, for: .vertical)
-        // 同框容器：装载原生开关 + 字符开关（Mono 模式显隐切换）。
-        // 容器右缘贴行尾。MonoCharSwitch 是全自绘控件，
-        // 把控件 trailing 直接约束到容器 trailing，即可让两者的 `]` 视觉右缘一致。
-        // box 宽度固定容纳原生开关（NSSwitch .mini frame 宽约 32pt，留余量到 40）；不跟 charSw
-        // intrinsic（自绘后仅 ~25pt，放不下原生开关）。
-        let box = NSView()
-        box.translatesAutoresizingMaskIntoConstraints = false
-        box.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        box.heightAnchor.constraint(equalToConstant: 16).isActive = true
-        box.setContentHuggingPriority(.required, for: .horizontal)
-        charSw.translatesAutoresizingMaskIntoConstraints = false
-        sw.translatesAutoresizingMaskIntoConstraints = false
-        box.addSubview(charSw)
-        box.addSubview(sw)
-        NSLayoutConstraint.activate([
-            charSw.trailingAnchor.constraint(equalTo: box.trailingAnchor),
-            charSw.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            sw.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: trailingComp),
-            sw.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-        ])
-        var views: [NSView] = []
-        if let iconName = icon { views.append(settingsRowIcon(iconName)) }
-        views.append(label)
-        if let s = sub {
-            // 字号/颜色对齐余额卡片签到信息（10pt + systemGray 石墨灰）
-            s.font = .systemFont(ofSize: 10, weight: .regular)
-            s.textColor = .systemGray
-            s.isHidden = true
-            views.append(s)
-        }
-        // 行内 accessory（如手动检查按钮）插在 spacer 之前、紧跟标题（2026-09-10
-        // 用户指定靠左摆放，不再贴行尾）；整行点击手势对按钮命中已做排除
-        // （SwitchRowTapHandler.toggle），不会连坐翻转开关
-        if let accessory { views.append(accessory) }
-        views.append(stretchSpacer())
-        views.append(box)
-        let row = NSStackView(views: views)
-        row.orientation = .horizontal
-        row.distribution = .fill
-        row.alignment = .centerY
-        row.spacing = 6
-        // 点击整行任意位置触发开关切换：手势加到行容器上，覆盖 label/spacer/switch 全区域。
-        // ⚠️ handler 必须被 switchRows 强持有：gesture 的 target 是弱引用，
-        //    若仅作局部变量会立即释放，导致整行点击完全失效。
-        let handler = SwitchRowTapHandler(sw: sw, char: charSw)
-        let tap = NSClickGestureRecognizer(target: handler, action: #selector(SwitchRowTapHandler.toggle(_:)))
-        row.addGestureRecognizer(tap)
-        switchRows.append((row: row, sw: sw, char: charSw, handler: handler))
-        return row
     }
 
     /// 字符化开关（MonoCharSwitch）切换时的模糊→清晰过渡，
@@ -1753,28 +1451,6 @@ extension BalancePanelView {
         }
     }
 
-    /// 按 Mono 模式切换设置开关控件外观：Mono 开 = 字符开关 [×]/[▪]，关 = 原生 NSSwitch。
-    /// 调用时机：build() 初始布局后、update() 每次快照同步后（monoFontEnabled 已更新）。
-    func applySwitchVisuals(animated: Bool) {
-        let useChar = monoFontEnabled
-        for entry in switchRows {
-            entry.char.state = entry.sw.state
-            if !useChar {
-                // 原生开关从隐藏恢复显示：NSStackView detach/reattach 会重置 layer transform，
-                // 尺寸未变 layout() 不触发，需手动补 0.81 缩放
-                entry.sw.applyVisualScale()
-            }
-            crossfade(useChar ? entry.sw : entry.char,
-                      to: useChar ? entry.char : entry.sw,
-                      animated: animated)
-        }
-        // 切换的两组开关（原生 ↔ 字符化）都叠加模糊→清晰过渡（CSS blur 式）
-        if animated {
-            playCharBlurTransition(on: switchRows.map { $0.char })
-            playCharBlurTransition(on: switchRows.map { $0.sw })
-        }
-    }
-
     /// 可拉伸占位（把右侧元素推到行尾）
     func stretchSpacer() -> NSView {
         let v = NSView()
@@ -1906,8 +1582,11 @@ extension BalancePanelView {
     }
 
     /// 余额卡片主标题 label：wantsLayer 承载 hover 字重动画（只改字形宽度不改行框）。
-    /// 行框高 16pt 由外部约束固定；原菜单栏渐变蒙版已随小白点指示替代而移除（2026-08-31）。
+    /// 行框高由外部约束固定（原 16pt；字号开放后 = 字号 + 3，约束引用存本属性就地调）；
+    /// 原菜单栏渐变蒙版已随小白点指示替代而移除（2026-08-31）。
     final class FadeableTextField: NSTextField {
+        /// 行框高度约束（build 时由 balanceContentRow 注入；字号设置变化时就地调 constant）
+        var titleHeightConstraint: NSLayoutConstraint?
         override init(frame frameRect: NSRect) {
             super.init(frame: frameRect)
             wantsLayer = true
@@ -1960,6 +1639,13 @@ extension BalancePanelView {
                 if taskState != .interrupted || oldValue != .interrupted {
                     resetGlitchTransform()
                 }
+                needsLayout = true
+            }
+        }
+        /// 「圆形图标」开关：true = 光环各层（柔光/涟漪/扫描裁切框）随卡片 icon 翻圆形
+        var isCircular = false {
+            didSet {
+                guard oldValue != isCircular else { return }
                 needsLayout = true
             }
         }
@@ -2056,14 +1742,22 @@ extension BalancePanelView {
                                  width: boxSide, height: boxSide)
             glow.frame = boxRect
             // 圆角：进行中 7pt / 完成 7pt（各自独立常量）；中断态 boxSide×0.22
-            //（随放大底数走，形状比例与未放大时一致）
-            let corner = taskState == .running ? Self.runningCornerRadius
-                        : taskState == .completed ? Self.completedCornerRadius
-                        : boxSide * 0.22
-            glow.cornerRadius = corner
+            //（随放大底数走，形状比例与未放大时一致）。
+            // 「圆形图标」开：光环翻圆形（整圆必须 .circular 曲线——.continuous 在
+            // 半径=边长/2 时是超椭圆 squircle，不是圆）；涟漪圈用自身边长出圆
+            let curve: CALayerCornerCurve = isCircular ? .circular : .continuous
+            glow.cornerCurve = curve
+            glow.cornerRadius = isCircular ? boxSide / 2
+                : taskState == .running ? Self.runningCornerRadius
+                : taskState == .completed ? Self.completedCornerRadius
+                : boxSide * 0.22
             for layer in [ring1, ring2] {
                 layer.frame = rect
-                layer.cornerRadius = corner
+                layer.cornerCurve = curve
+                layer.cornerRadius = isCircular ? rect.width / 2
+                    : taskState == .running ? Self.runningCornerRadius
+                    : taskState == .completed ? Self.completedCornerRadius
+                    : boxSide * 0.22
             }
             CATransaction.commit()
             // 中断态 icon 光晕增加 2pt 模糊（1pt → 3pt）；无状态/其它状态恢复基础值。
@@ -2078,7 +1772,8 @@ extension BalancePanelView {
                 // 光束圆盘按对角线放大 √2，自转扫到四角不留空洞
                 sweepBlur.frame = boxRect.insetBy(dx: -6, dy: -6)
                 sweepClip.frame = CGRect(x: 6, y: 6, width: boxSide, height: boxSide)
-                sweepClip.cornerRadius = Self.runningCornerRadius
+                sweepClip.cornerCurve = isCircular ? .circular : .continuous
+                sweepClip.cornerRadius = isCircular ? boxSide / 2 : Self.runningCornerRadius
                 let discSide = boxSide * 1.4142
                 sweepDisc.frame = CGRect(x: (boxSide - discSide) / 2, y: (boxSide - discSide) / 2,
                                          width: discSide, height: discSide)

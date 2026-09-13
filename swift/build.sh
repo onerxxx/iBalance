@@ -194,17 +194,23 @@ for bundled in "$RESOURCES_DIR"/*; do
     fi
 done
 
-# 代码签名（保持固定签名身份）：
-# ad-hoc 签名每次编译都会生成新哈希，macOS TCC 按签名识别应用，
-# 导致"完全磁盘访问"等授权每次重建都被重置；
-# 用固定自签证书签名后，重建不再要求重新授权。
-SIGN_IDENTITY="iBalance Local Sign"
+# 代码签名（身份优先级，自动探测）：
+# 1) Apple Development（证书 OU = team ID）——macOS 钥匙串按 teamid 分区记录授权，
+#    重编译跨构建静默；自签无 team 证书只能按二进制哈希记录信任，每次构建必弹
+#    一次钥匙串密码（2026-09-12 实测定案，v4 默认 ACL 亦然）。TCC 同样按 DR 稳定。
+# 2) iBalance Local Sign（历史自签）——TCC 稳定，但钥匙串每构建弹一次。
+# 3) ad-hoc 兜底——TCC/钥匙串授权每构建重置。
+# 用 SHA-1 指定身份（防重名），高一档存在即用，没有自动落回下一档。
 BUNDLE_ID="com.local.ibalance"
-if security find-identity -v -p codesigning | grep -q "$SIGN_IDENTITY"; then
-    echo "==> 代码签名（${SIGN_IDENTITY}，identifier=${BUNDLE_ID}）"
-    codesign --force --identifier "$BUNDLE_ID" --sign "$SIGN_IDENTITY" "$APP_DIR"
+APPLE_DEV_ID="$(security find-identity -v -p codesigning | awk '/"Apple Development/ {print $2; exit}')"
+if [[ -n "$APPLE_DEV_ID" ]]; then
+    echo "==> 代码签名（Apple Development ${APPLE_DEV_ID}，identifier=${BUNDLE_ID}）"
+    codesign --force --identifier "$BUNDLE_ID" --sign "$APPLE_DEV_ID" "$APP_DIR"
+elif security find-identity -v -p codesigning | grep -q "iBalance Local Sign"; then
+    echo "==> 代码签名（iBalance Local Sign，identifier=${BUNDLE_ID}）"
+    codesign --force --identifier "$BUNDLE_ID" --sign "iBalance Local Sign" "$APP_DIR"
 else
-    echo "!! 未找到签名证书 '$SIGN_IDENTITY'，回退 ad-hoc 签名（identifier 仍固定）"
+    echo "!! 未找到签名证书，回退 ad-hoc 签名（identifier 仍固定）"
     codesign --force --identifier "$BUNDLE_ID" --sign - "$APP_DIR" || \
         echo "!! ad-hoc 签名失败，保留 linker 签名"
 fi

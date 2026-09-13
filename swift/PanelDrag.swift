@@ -121,7 +121,8 @@ extension BalancePanelView {
             let ghost = NSView(frame: ghostFrame)
             ghost.wantsLayer = true
             if let l = ghost.layer {
-                l.cornerRadius = Palette.cardCornerRadius
+                // 幽灵圆角跟随卡片层圆角（2026-09-13 起 9pt，与 hover 描边同源）
+                l.cornerRadius = Palette.hoverCardCornerRadius
                 l.cornerCurve = .continuous
                 if let blur = CIFilter(name: "CIGaussianBlur") {
                     blur.setValue(6, forKey: kCIInputRadiusKey)

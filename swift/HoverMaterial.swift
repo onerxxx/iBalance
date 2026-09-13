@@ -33,18 +33,22 @@ final class HoverMaterialHost {
     let materialLayer = CAGradientLayer()
     /// 描边层（zPosition 恒定压在背景块与卡片子层之上）
     let outlineLayer = CAShapeLayer()
+    /// 背景块是否参与显示（false = 仅描边；Token 行 2026-08-31 口径「无渐变底」）
+    private let showsBackground: Bool
     /// 坐标基准 / 动态色解析基准
     private weak var hostView: NSView?
-    /// 当前被指示的卡片（弱引用：卡片会被重建）
-    private(set) weak var currentCard: HoverCard?
+    /// 当前目标（弱引用视图 + 该视图坐标系里的 rect；卡片与行矩形统一表达）
+    private weak var currentOwner: NSView?
+    private var currentRectInOwner: NSRect = .zero
     /// 材质是否在场（false = 尚未出现或已淡出）
     private(set) var isShown = false
     /// 离开卡片后的宽限：hover 跨过卡片间隙时材质不该闪一下，留给下一张卡接管
     private static let exitGrace: CFTimeInterval = 0.12
     private var hideWork: DispatchWorkItem?
 
-    init(hostView: NSView) {
+    init(hostView: NSView, showsBackground: Bool = true) {
         self.hostView = hostView
+        self.showsBackground = showsBackground
         // 背景块：圆角与卡片统一；masksToBounds 让它自己裁出圆角
         materialLayer.cornerCurve = .continuous
         materialLayer.masksToBounds = true
@@ -66,25 +70,42 @@ final class HoverMaterialHost {
 
     /// 把材质移到这张卡上。immediate：拖拽截图等场景直接落位（不淡入、不走缓冲）。
     func show(for card: HoverCard, immediate: Bool = false) {
+        guard let geo = geometry(for: card) else { return }
+        show(geometry: geo, owner: card, rectInOwner: card.bounds, immediate: immediate)
+    }
+
+    /// 行级矩形目标（2026-09-13 行列表「沿用连续效果」）：rect 为 view 坐标系里的
+    /// 行框——行不必是独立视图（Token 行是绘制矩形），同宿主内矩形间转移 = 整块滑动，
+    /// 首次出现淡入，离开走与卡片相同的宽限。
+    func show(rect: NSRect, in view: NSView, cornerRadius: CGFloat, immediate: Bool = false) {
+        guard let hostView, let win = view.window, win === hostView.window,
+              rect.width > 0, rect.height > 0 else { return }
+        let r = view.convert(rect, to: hostView)
+        guard r.width > 0, r.height > 0 else { return }
+        show(geometry: Geometry(center: CGPoint(x: r.midX, y: r.midY), size: r.size, radius: cornerRadius),
+             owner: view, rectInOwner: rect, immediate: immediate)
+    }
+
+    /// 统一落位入口：卡片与行矩形都归到这里（滑动/淡入/宽限取消共用原逻辑）
+    private func show(geometry geo: Geometry, owner: NSView, rectInOwner: NSRect, immediate: Bool) {
         hideWork?.cancel()
         hideWork = nil
-        guard let geo = geometry(for: card) else { return }
         let wasShown = isShown
-        let fromCard = currentCard
-        let sameCard = fromCard === card
-        currentCard = card
+        let sameTarget = currentOwner === owner && currentRectInOwner == rectInOwner
+        currentOwner = owner
+        currentRectInOwner = rectInOwner
         if immediate {
             apply(geo, animated: false)
             setOpacity(1, animated: false)
             isShown = true
             return
         }
-        if isShown && !sameCard && fromCard != nil {
-            // 跨卡：整块滑过去并停住
+        if isShown && !sameTarget {
+            // 跨目标：整块滑过去并停住
             apply(geo, animated: true)
         } else {
-            // 同卡只跟几何（驻留切换高度 / 内容变化）；首次出现（含上一张卡已被重建）
-            // 直接落位再淡入——没有上一张卡可参照，滑入方向无从判定
+            // 同目标只跟几何（驻留切换高度 / 内容变化）；首次出现（含上一目标已被重建）
+            // 直接落位再淡入——没有上一目标可参照，滑入方向无从判定
             apply(geo, animated: false)
             if !wasShown { setOpacity(1, animated: true) }
             isShown = true
@@ -93,12 +114,19 @@ final class HoverMaterialHost {
 
     /// 卡片离开：延迟隐藏（相邻卡片紧接着接管时材质不停顿）
     func cardDidExit(_ card: HoverCard) {
-        guard currentCard === card else { return }
+        hideIfCurrent(rect: card.bounds, in: card)
+    }
+
+    /// 行/矩形目标离开：owner 与 rect 都一致才收——行间转移时旧行的 exit 不打断
+    /// 新行已发起的接管（新 show 先到会取消本宽限；宽限先跑完说明光标真离开了）
+    func hideIfCurrent(rect: NSRect, in view: NSView) {
+        guard currentOwner === view, currentRectInOwner == rect else { return }
         hideWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.currentCard === card else { return }
+            guard let self, self.currentOwner === view, self.currentRectInOwner == rect else { return }
             self.hideWork = nil
-            self.currentCard = nil
+            self.currentOwner = nil
+            self.currentRectInOwner = .zero
             self.isShown = false
             self.setOpacity(0, animated: true)
         }
@@ -109,15 +137,25 @@ final class HoverMaterialHost {
     /// 几何跟随：卡片 layout 后调用（尺寸变化时材质贴回卡片轮廓）。
     /// 跨卡移动动画进行中继续走动画（驻留切换高度会边动边改），静止时直接落位
     func updateGeometry(for card: HoverCard) {
-        guard currentCard === card, isShown, hideWork == nil, let geo = geometry(for: card) else { return }
+        guard currentOwner === card, isShown, hideWork == nil, let geo = geometry(for: card) else { return }
         apply(geo, animated: materialLayer.animation(forKey: "position") != nil)
+    }
+
+    /// 行级几何跟随：行框变化（列宽重算/布局位移）时贴回行轮廓
+    func updateGeometry(rect: NSRect, in view: NSView, cornerRadius: CGFloat) {
+        guard currentOwner === view, currentRectInOwner == rect, isShown, hideWork == nil,
+              let hostView, let win = view.window, win === hostView.window else { return }
+        let r = view.convert(rect, to: hostView)
+        apply(Geometry(center: CGPoint(x: r.midX, y: r.midY), size: r.size, radius: cornerRadius),
+              animated: materialLayer.animation(forKey: "position") != nil)
     }
 
     /// 立即收起（拖拽锁定：材质不该跟着幽灵卡片跑）
     func hideNow() {
         hideWork?.cancel()
         hideWork = nil
-        currentCard = nil
+        currentOwner = nil
+        currentRectInOwner = .zero
         isShown = false
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -223,7 +261,8 @@ final class HoverMaterialHost {
     private func setOpacity(_ value: Float, animated: Bool) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for layer in [materialLayer, outlineLayer] {
+        // 仅描边模式（showsBackground=false）：背景块常驻隐藏，显隐只动描边层
+        for layer in showsBackground ? [materialLayer, outlineLayer] : [outlineLayer] {
             if animated {
                 let a = CABasicAnimation(keyPath: "opacity")
                 a.fromValue = layer.opacity
@@ -267,11 +306,11 @@ extension NSView {
     /// 在内容容器上安装共享 hover 材质宿主（重复调用无副作用）。
     /// 卡片向上查找宿主，所以容器要覆盖目标卡片的全部范围——
     /// 面板里装在滚动内容根上，材质随内容一起滚动
-    func installHoverMaterialHost() {
+    func installHoverMaterialHost(showsBackground: Bool = true) {
         guard objc_getAssociatedObject(self, &HoverMaterialAssociate.host) == nil else { return }
         wantsLayer = true
         objc_setAssociatedObject(self, &HoverMaterialAssociate.host,
-                                 HoverMaterialHost(hostView: self),
+                                 HoverMaterialHost(hostView: self, showsBackground: showsBackground),
                                  .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
     }
 
@@ -285,5 +324,12 @@ extension NSView {
             view = cur.superview
         }
         return nil
+    }
+
+    /// 自身安装的宿主（不做向上查找）：applyHeatHueInPlace 逐宿主重染描边用——
+    /// 根宿主 / 用量行宿主 / Token 行宿主是三个独立实例，各自的描边色都定格在
+    /// 创建时，主题色（峰值色）变化后须逐一重解算
+    var installedHoverMaterialHost: HoverMaterialHost? {
+        objc_getAssociatedObject(self, &HoverMaterialAssociate.host) as? HoverMaterialHost
     }
 }

@@ -1,45 +1,15 @@
 // AccountSwitcher.swift — iBalance
-// 多账号采集与切换:WB OAuth 采集、TRAE/Codex/ZCode 导入、performAccountSwitch 统一切号编排
+// 多账号采集与切换:WB 当前账号 JSON 导入、TRAE/Codex/ZCode 导入、performAccountSwitch 统一切号编排
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 
 import Cocoa
-import UserNotifications
 
 extension AppDelegate {
 
-    // MARK: - WorkBuddy 添加账号（OAuth 采集 / 当前账号 JSON 导入）
+    // MARK: - WorkBuddy 添加账号（读取本机已登录账号）
 
     @objc func onAddWbAccount() {
-        // OAuth 采集进行中 → 再点一次 = 取消采集
-        guard !wbOauthInProgress else {
-            wbOauthCancelled = true
-            return
-        }
-        // 选择导入方式（同步模态，keepPanelAliveDuring 保持面板不关闭）
-        let shell = DialogShell()
-        shell.addIcon(makeWbBrandIcon())
-        shell.addTitle("添加 WorkBuddy 账号")
-        // 收窄一档：长文规格 width+8（240+8=248，与关于弹窗基准一致），替代 inputWidth(280)
-        shell.contentWidth = DialogMetrics.width + 8
-        shell.addInfo("OAuth 导入：打开浏览器登录新账号，登录成功后自动采集凭据。\n\nJSON 导入：直接读取你在 WorkBuddy App 中登录的账号。已经登录 App 的话，选择这个即可。")
-        let oauth = shell.addButton("OAuth 导入", keyEquivalent: "\r")
-        let json = shell.addButton("JSON 导入 (推荐)", tintColor: .systemBlue)
-        shell.addButton("取消", keyEquivalent: "\u{1b}")
-        let clicked = keepPanelAliveDuring { shell.present() }
-        if clicked == oauth {
-            startWbOauth()
-        } else if clicked == json {
-            importWbFromAuthFile()
-        }
-    }
-
-    /// 启动 OAuth 采集（浏览器登录 → 轮询 token → 写入 config）
-    private func startWbOauth() {
-        wbOauthInProgress = true
-        wbOauthCancelled = false
-        wbOauthMenuItem.title = "取消添加 WorkBuddy 账号…"
-        syncPanel()
-        Task { await runOauth() }
+        importWbFromAuthFile()
     }
 
     /// 从 WorkBuddy Desktop 当前登录账号导入：读取 auth 文件（workbuddy-desktop.info，JSON 格式），
@@ -63,10 +33,10 @@ extension AppDelegate {
         }
         ConfigStore.save(config)
         syncPanel()
-        // 导入后立即拉取余额刷新卡片；自动签到开启时补一次签到（与 OAuth 导入对齐）
+        // 导入后立即拉取余额刷新卡片；自动签到开启时补一次签到
         refreshSeq &+= 1
         let importSeq = refreshSeq
-        Logger.log(.refresh, "[\(importSeq)] onImportWbAuthFile triggering ad-hoc WB refresh")
+        Logger.log(.refresh, "[\(importSeq)] importWbFromAuthFile triggering ad-hoc WB refresh")
         Task { await refreshOneWorkBuddy(config, seq: importSeq) }
         if config.workbuddyAutoCheckin {
             Task { await wbAutoCheckinIfNeeded() }
@@ -78,44 +48,6 @@ extension AppDelegate {
             : "已导入账号「\(account.nickname)」（共 \(config.workbuddyAccounts.count) 个账号）")
         shell.addButton("好的", keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }
-    }
-
-    private func runOauth() async {
-        // 启动时发引导通知
-        let guide = UNMutableNotificationContent()
-        guide.title = "请在浏览器中登录 WorkBuddy 账号"
-        guide.body = "登录成功后自动采集，无需其他操作（10 分钟内有效）"
-        try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_oauth_guide", content: guide, trigger: nil))
-
-        let result = await WorkBuddyService.collectAccount(isCancelled: { [weak self] in self?.wbOauthCancelled ?? true })
-
-        var msg: String
-        var success = false
-        switch result {
-        case .success(let account):
-            if let idx = config.workbuddyAccounts.firstIndex(where: { $0.uid == account.uid }) {
-                config.workbuddyAccounts[idx] = account
-            } else {
-                config.workbuddyAccounts.append(account)
-            }
-            ConfigStore.save(config)
-            msg = "已添加账号「\(account.nickname)」（共 \(config.workbuddyAccounts.count) 个其他账号）"
-            success = true
-        case .failure(let err):
-            msg = err
-        }
-        wbOauthInProgress = false
-        wbOauthMenuItem.title = "添加 WorkBuddy 账号…"
-        syncPanel()
-
-        let content = UNMutableNotificationContent()
-        content.title = success ? "WorkBuddy 账号采集成功" : "WorkBuddy 账号采集失败"
-        content.body = msg
-        try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "wb_oauth_result", content: content, trigger: nil))
-
-        if success, config.workbuddyAutoCheckin {
-            Task { await wbAutoCheckinIfNeeded() }
-        }
     }
 
     // MARK: - TRAE 多账号采集 / 切换

@@ -3,7 +3,7 @@ import Foundation
 
 // MARK: - WorkBuddy 多号签到账号
 
-/// OAuth 采集得到的 token/refreshToken/uid/domain/nickname。
+/// 导入得到的 token/refreshToken/uid/domain/nickname（来源：本机 WorkBuddy Desktop 登录信息）。
 /// refreshToken 用于在 access_token 过期前自动刷新，token 永不过期。
 /// 同一时刻 WorkBuddy Desktop 只能登录一个账号，多号签到需预存各账号凭据（钥匙串）。
 struct WBAccount: Codable, Equatable {
@@ -11,7 +11,7 @@ struct WBAccount: Codable, Equatable {
     var uid: String
     var domain: String = "www.codebuddy.cn"
     var nickname: String = ""
-    var refreshToken: String = ""   // OAuth refresh_token
+    var refreshToken: String = ""   // refresh_token
     var expiresAt: TimeInterval = 0 // access_token 过期时间戳（秒），0 表示未知
 
     enum CodingKeys: String, CodingKey {
@@ -173,9 +173,18 @@ struct AppConfig: Codable {
     ///（深色外观取浅色版、浅色外观取深色版；仅影响卡片 icon，面板外观不动）。
     /// 2026-09-07 用户定稿默认开启（旧配置无此键时解码兜底同为 true）
     var iconThemeSwap: Bool = true
-    /// 竖线进度条开关：true = 长进度卡片的整行进度条替换为等宽竖线（条数/线宽见 UsageDots.lineCount/lineWidth）
-    ///（间隔自适应容器宽，无轨道背景无边框）；仅影响长进度卡片模式，默认关
-    var verticalLineProgress: Bool = false
+    /// 圆形图标开关：true = 余额卡片品牌 icon 裁成圆形（画布内切圆 alpha 蒙版，
+    /// 宽高不变仅四角裁切），任务状态光环同步翻圆形
+    var circularIcon: Bool = false
+    /// 卡片主标题字号（pt，10…18）：设置窗口「主题外观 → 卡片」开放（2026-09-13）
+    var cardTitleFontSize: Double = 13
+    /// 卡片主标题启用 Sharp Grotesk（用户本机 ~/Library/Fonts 安装的商业字体；
+    /// 未装对应字重时 NSFont(name:) 落空，自动回落系统字体）
+    var cardTitleSharpGrotesk: Bool = false
+    /// Sharp Grotesk 字重档（0=Thin 1=Book 2=Light 3=Medium 4=SemiBold 5=Bold 6=Black）
+    var cardTitleSGWeight: Int = 3
+    /// Sharp Grotesk 宽度档（0=05 1=10 2=15 3=20 4=25）
+    var cardTitleSGWidth: Int = 3
     /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
     var fadeHintBandHeight: Double = 54
     var fadeHintHighlightAlpha: Double = -0.6
@@ -228,7 +237,11 @@ struct AppConfig: Codable {
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case longProgressCard = "long_progress_card"
         case iconThemeSwap = "icon_theme_swap"
-        case verticalLineProgress = "vertical_line_progress"
+        case circularIcon = "circular_icon"
+        case cardTitleFontSize = "card_title_font_size"
+        case cardTitleSharpGrotesk = "card_title_sharp_grotesk"
+        case cardTitleSGWeight = "card_title_sg_weight"
+        case cardTitleSGWidth = "card_title_sg_width"
         case updateAutoCheck = "update_auto_check"
         case fadeHintBandHeight = "fade_hint_band_height"
         case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
@@ -288,7 +301,11 @@ struct AppConfig: Codable {
                 .decodeIfPresent(Bool.self, forKey: .balanceCardNewMode)
             ?? false
         iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? true
-        verticalLineProgress = try c.decodeIfPresent(Bool.self, forKey: .verticalLineProgress) ?? false
+        // 主标题字号/字体档：夹回取值域，旧值/越界值不会顶歪滑杆或组出非法 PS 名
+        cardTitleFontSize = min(max(try c.decodeIfPresent(Double.self, forKey: .cardTitleFontSize) ?? 13, 10), 18)
+        cardTitleSharpGrotesk = try c.decodeIfPresent(Bool.self, forKey: .cardTitleSharpGrotesk) ?? false
+        cardTitleSGWeight = min(max(try c.decodeIfPresent(Int.self, forKey: .cardTitleSGWeight) ?? 3, 0), 6)
+        cardTitleSGWidth = min(max(try c.decodeIfPresent(Int.self, forKey: .cardTitleSGWidth) ?? 3, 0), 4)
         fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
         fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
         fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55
@@ -349,7 +366,10 @@ struct AppConfig: Codable {
         try c.encode(updateAutoCheck, forKey: .updateAutoCheck)
         try c.encode(longProgressCard, forKey: .longProgressCard)
         try c.encode(iconThemeSwap, forKey: .iconThemeSwap)
-        try c.encode(verticalLineProgress, forKey: .verticalLineProgress)
+        try c.encode(cardTitleFontSize, forKey: .cardTitleFontSize)
+        try c.encode(cardTitleSharpGrotesk, forKey: .cardTitleSharpGrotesk)
+        try c.encode(cardTitleSGWeight, forKey: .cardTitleSGWeight)
+        try c.encode(cardTitleSGWidth, forKey: .cardTitleSGWidth)
         try c.encode(fadeHintBandHeight, forKey: .fadeHintBandHeight)
         try c.encode(fadeHintHighlightAlpha, forKey: .fadeHintHighlightAlpha)
         try c.encode(fadeHintMaskMidAlpha, forKey: .fadeHintMaskMidAlpha)
@@ -543,21 +563,31 @@ enum UDKey {
     static func traeStatusRetry(_ uid: String) -> String { "trae_status_retry_\(uid)" }
     static var traeStatusFillDate: String { "trae_status_fill_date" }
 
-    // 面板区块折叠状态（Bool，设置/操作标题胶囊点击切换）
-    static var settingsSectionCollapsed: String { "panel_settings_section_collapsed" }
+    // 面板区块折叠状态（Bool，操作/用量标题胶囊点击切换）
+    // ⚠️ 原 settingsSectionCollapsed 随面板「设置」板块 2026-09-12 移除（设置项都在设置窗口）
     static var actionsSectionCollapsed: String { "panel_actions_section_collapsed" }
     static var usageSectionCollapsed: String { "panel_usage_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
-    /// 热力点阵峰值色相/饱和（Double 0..1，header 调色弹层滑杆写入，Palette 读写）
+    /// 热力点阵峰值色相/饱和/明度（Double 0..1，设置窗口「主题外观」滑杆写入，Palette 读写）
     static var heatDotHue: String { "heat_dot_hue" }
     static var heatDotSaturation: String { "heat_dot_saturation" }
+    static var heatDotBrightness: String { "heat_dot_brightness" }
 
     // 3D 硬币弹窗（CoinDemo）：整页参数自动保存，下次打开还原（读写见 CoinSettings）
+    /// Preset（Int = CoinPreset.rawValue：0 = GHO 无色场 / 1 = sGHO 启用色场）
+    static var coinPreset: String { "coin_preset" }
+    /// Appearance（Int = CoinAppearance.rawValue：0 = Default 材质渲染 / 1 = Outline 线稿）
+    static var coinAppearance: String { "coin_appearance" }
     /// Coin color（"#RRGGBB"）
     static var coinMaterialColor: String { "coin_material_color" }
+    /// lowerField 色场颜色（"#RRGGBB"）：硬币盖面下方那层渐变色场（sgho 默认紫）
+    static var coinFieldColor: String { "coin_field_color" }
     /// Coin size（Double，px，CoinMetrics.sizeRange）
     static var coinSize: String { "coin_size" }
+    /// Panel coin size（Double，pt，CoinMetrics.panelSizeRange）——主面板 Token 板块里
+    /// 那枚内嵌硬币的直径，与弹窗的 Coin size 相互独立
+    static var coinPanelSize: String { "coin_panel_size" }
     /// Thickness（Double，px，CoinMetrics.thicknessRange）
     static var coinThickness: String { "coin_thickness" }
     /// Logo size（Double，**百分数** 50…125）。键名带 percent 是刻意的：早期版本把
@@ -568,6 +598,20 @@ enum UDKey {
     static var coinMarkDepth: String { "coin_mark_depth" }
     /// Edge finish（Int = CoinEdgeFinish.rawValue）
     static var coinEdgeFinish: String { "coin_edge_finish" }
+    /// 静止俯仰（Double，度，-180…180）
+    static var coinRestingTilt: String { "coin_resting_tilt" }
+    /// 静止朝向（Double，度，-180…180）
+    static var coinRestingRotation: String { "coin_resting_rotation" }
+    /// 点按自旋圈数（Double，1…5）
+    static var coinTurns: String { "coin_turns" }
+    /// Outline 线稿内部结构层级（Double，1…5）
+    static var coinOutlineLevel: String { "coin_outline_level" }
+    /// Outline 线稿基准线宽（Double，1…10 px）
+    static var coinOutlineWidth: String { "coin_outline_width" }
+    /// Logo 反色（Bool）：把 logo 与硬币面互为负形显示（原为 false，未写过即关闭）
+    static var coinLogoInverted: String { "coin_logo_inverted" }
+    /// SwiftUI 设置窗口左侧栏玻璃透明度（Double，0…1，1 = 最透；见 `SidebarGlass`）
+    static var settingsSidebarGlassTransparency: String { "settings_sidebar_glass_transparency" }
     /// 上传的 logo SVG 原文（空 = 内置 GHO 预设）
     static var coinLogoSVG: String { "coin_logo_svg" }
     /// 上传的 logo 文件名（行内展示用，空 = 内置 GHO 预设）
@@ -576,6 +620,19 @@ enum UDKey {
     // App 自更新（GitHub Releases）：静默检查节流与「暂不」提醒抑制
     static var updateLastCheckDate: String { "update_last_check_date" }
     static var updateSnoozeDate: String { "update_snooze_date" }
+
+    // 菜单栏状态点「小球弹跳」（设置窗口「动画」pane）：
+    // 逐项独立落盘，读写与取值域见 MenuBarBounceSettings.load()/save()
+    /// 弹跳高度（Double，pt，MenuBarBounceSettings.amplitudeRange）
+    static var menuBarBounceAmplitude: String { "menubar_bounce_amplitude" }
+    /// 弹跳周期（Double，秒，periodRange）
+    static var menuBarBouncePeriod: String { "menubar_bounce_period" }
+    /// 腾空占比（Double，airRatioRange）
+    static var menuBarBounceAirRatio: String { "menubar_bounce_air_ratio" }
+    /// 触地压扁（Double，squashRange）
+    static var menuBarBounceSquashMin: String { "menubar_bounce_squash_min" }
+    /// 顶点拉伸（Double，stretchRange）
+    static var menuBarBounceStretchMax: String { "menubar_bounce_stretch_max" }
 }
 
 /// 余额数值快照的磁盘缓存（cache-then-refresh）：启动时先显示上次数值再等网络刷新。
@@ -672,9 +729,13 @@ struct UsageBaselines: Codable {
         var dailyUsage: [String: Double]
         /// 近 1 小时观测点（滚动裁剪：窗口内全保留 + 窗口外留 1 个锚点）
         var samples: [Sample] = []
+        /// 余额 24h 采样历史（副标题右侧 24h 变化用）：与 samples 同构但窗口 24h，
+        /// **跨空窗不清空**——App 休眠后变化量跨越空窗仍是真实余额变化。
+        /// 裁剪保留窗口内全部点 + 窗口外最近 1 个锚点（供查询取 ≤24h 前的基准值）
+        var balanceHistory: [Sample] = []
 
         private enum CodingKeys: String, CodingKey {
-            case dayKey, dayBase, weekKey, weekBase, dailyUsage, samples
+            case dayKey, dayBase, weekKey, weekBase, dailyUsage, samples, balanceHistory
         }
 
         init(dayKey: String, dayBase: Double, weekKey: String, weekBase: Double) {
@@ -694,6 +755,7 @@ struct UsageBaselines: Codable {
             weekBase = try c.decode(Double.self, forKey: .weekBase)
             dailyUsage = try c.decodeIfPresent([String: Double].self, forKey: .dailyUsage) ?? [:]
             samples = try c.decodeIfPresent([Sample].self, forKey: .samples) ?? []
+            balanceHistory = try c.decodeIfPresent([Sample].self, forKey: .balanceHistory) ?? []
         }
     }
     var entries: [String: Entry] = [:]
@@ -793,6 +855,15 @@ enum UsageStore {
         if let firstIn = e.samples.firstIndex(where: { $0.ts >= nowTs - 3600 }) {
             let keepFrom = max(0, firstIn - 1)
             if keepFrom > 0 { e.samples.removeFirst(keepFrom) }
+        }
+        // 余额 24h 采样历史（副标题 24h 变化用）：同构裁剪但跨空窗不清空——
+        // 变化量跨空窗仍真实；全部点超窗时只留最后一个锚点
+        e.balanceHistory.append(UsageBaselines.Entry.Sample(ts: nowTs, value: value))
+        if let firstIn = e.balanceHistory.firstIndex(where: { $0.ts >= nowTs - 86400 }) {
+            let keepFrom = max(0, firstIn - 1)
+            if keepFrom > 0 { e.balanceHistory.removeFirst(keepFrom) }
+        } else if e.balanceHistory.count > 1 {
+            e.balanceHistory.removeFirst(e.balanceHistory.count - 1)
         }
         changed = true
         // 控制 usage.json 体积；保留最近 60 天的各平台/账号用量历史。
@@ -910,6 +981,42 @@ enum UsageStore {
         let cutoff = Date().timeIntervalSince1970 - 3600
         guard let anchor = e.samples.last(where: { $0.ts <= cutoff }) ?? e.samples.first else { return nil }
         return increasing ? max(0, current - anchor.value) : max(0, anchor.value - current)
+    }
+
+    /// 过去 24h 余额/积分**变化量**（观察值口径带符号：余额型负 = 消耗、已用型正 =
+    /// 消耗；方向箭头由调用方按 increasing 翻成卡片显示值口径）。
+    /// 锚点 = 时间上 ≤24h 前最近的余额采样（balanceHistory，真实值含充值/签到跳变）。
+    /// 采样不足 24h（2026-09-13 启用首日）时用每日消耗快照推导（用户指路用量板块
+    /// 的既有数据）：今日实时消耗 + 昨日全天消耗 ×(24−已过小时)/24（假设昨日速率均匀）。
+    /// ⚠️ 快照是「仅消耗」口径（observe 反向跳变平移基线），充值/签到得分不在内——
+    /// 此类账号在采样积累满 24h 前方向可能失真，满 24h 后自动切回真实采样锚点。
+    /// 无任何记录/零消耗恒返回 0（2026-09-13 用户指定：无数据或无变化显示右箭头 + 0，
+    /// 不再隐藏——nil 通道已删）
+    static func balanceChange24h(platform: String, uid: String, current: Double,
+                                 increasing: Bool) -> Double {
+        guard let e = memory.entries["\(platform):\(uid)"] else { return 0 }
+        let now = Date()
+        let cutoff = now.timeIntervalSince1970 - 86400
+        if let anchor = e.balanceHistory.last(where: { $0.ts <= cutoff }) {
+            return current - anchor.value
+        }
+        guard let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now) else { return 0 }
+        let todayPart = e.dailyUsage[dayFormatter.string(from: now)] ?? 0
+        let yesterPart = e.dailyUsage[dayFormatter.string(from: yesterday)] ?? 0
+        let dayFraction = now.timeIntervalSince1970.truncatingRemainder(dividingBy: 86400) / 86400
+        let consumed = todayPart + yesterPart * (1 - dayFraction)
+        return increasing ? consumed : -consumed
+    }
+
+    /// 平台级过去 24h 变化加总（无记录账号贡献 0，恒有值）
+    static func balanceChange24h(platform: String, accounts: [(uid: String, current: Double)],
+                                 increasing: Bool) -> Double {
+        var sum: Double = 0
+        for a in accounts where !a.uid.isEmpty {
+            sum += balanceChange24h(platform: platform, uid: a.uid,
+                                    current: a.current, increasing: increasing)
+        }
+        return sum
     }
 
     /// 平台级汇总：全部账号近 1 小时用量相加（无观测记录的账号贡献 0，升级后首小时从此起算）

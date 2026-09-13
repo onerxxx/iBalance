@@ -662,25 +662,7 @@ final class UsageDots: NSView {
     /// 未点亮 = 热力图底点色 heatDotEmpty；无背景无边框（draw 直绘，隐藏轨道/填充层）。
     /// 历史口径：09-06 为连续竖条（1pt 边框+内缩填充），已被本点阵替换。须在进视图层级前置位
     var isVertical = false { didSet { needsLayout = true } }
-    /// 竖线模式（2026-09-07 用户指定，仅长进度卡片整行条替换形态）：等宽竖线横向排列，条数与线宽见下方常量，
-    /// 间隔自适应容器宽；已填充=轨道同款绿渐变按横向位置采样、未填充=浅灰线；
-    /// 无轨道背景无边框（隐藏 track/progress 层，draw 直绘）。与 isVertical 互斥，勿同开
-    var lineBarMode = false {
-        didSet {
-            guard oldValue != lineBarMode else { return }
-            trackLayer.isHidden = lineBarMode
-            progressLayer.isHidden = lineBarMode
-            needsLayout = true
-            needsDisplay = true
-        }
-    }
-    // ══ 竖线模式几何：**唯一改参入口**（其他任何文件的注释一律不写数值，避免与实现漂移）══
-    /// 间隔 = (容器宽 − 条数×线宽) ÷ (条数−1)，自适应且 clamp ≥ 0；总占宽 = 条数 × 线宽。
-    /// 历史调参：30×1 → 60×1 → 50×1.5 → 40×5.5 → 32×4 → 30×3 → 33×3 → 36×3 → 40×3
-    private static let lineCount = 40
-    private static let lineWidth: CGFloat = 3
-    /// 未填充线透明度（dotsDim 再乘此系数；比轨道 0.45 更浅，避免整排灰线读作背景）
-    private static let emptyLineAlpha: CGFloat = 0.35
+    // （竖线模式 lineBarMode 及其几何常量已于 2026-09-13 随开关整体移除，git 可查）
     /// 竖排点阵：点数与圆角比例（圆角 = 边长 × 0.2，2026-09-07 用户「减小圆角」，原 0.3 同热力图口径）
     private static let verticalDotCount = 4
     private static let dotCornerRadiusFactor: CGFloat = 0.2
@@ -745,13 +727,13 @@ final class UsageDots: NSView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyColors()
-        // 竖线/点阵形态的配色在 draw 里按生效外观直解，主题切换须重绘
-        if lineBarMode || isVertical { needsDisplay = true }
+        // 竖点阵形态的配色在 draw 里按生效外观直解，主题切换须重绘
+        if isVertical { needsDisplay = true }
     }
     override func layout() {
         super.layout()
-        if lineBarMode || isVertical {
-            // 线位/点位随 bounds 重排：标脏走 draw 直绘（track/progress 层隐藏）
+        if isVertical {
+            // 点位随 bounds 重排：标脏走 draw 直绘（track/progress 层隐藏）
             trackLayer.isHidden = true
             progressLayer.isHidden = true
             needsDisplay = true
@@ -766,7 +748,6 @@ final class UsageDots: NSView {
             super.draw(dirtyRect)
             return
         }
-        if lineBarMode { drawLineBar(); return }
         if isVertical { drawVerticalDots(); return }
         super.draw(dirtyRect)
     }
@@ -809,33 +790,8 @@ final class UsageDots: NSView {
             NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
         }
     }
-    /// 竖线模式直绘：条数与线宽见上方常量，间隔 = (宽 − 条数×线宽) ÷ (条数−1) 自适应；线位按
-    /// backing 像素取整防亚像素发糊（coin 图标同款教训）；无轨道背景无边框
-    private func drawLineBar() {
-        let count = Self.lineCount
-        let gap = max(0, (bounds.width - CGFloat(count) * Self.lineWidth) / CGFloat(count - 1))
-        let filled = min(count, max(0, Int((ratio * CGFloat(count)).rounded())))
-        let scale = window?.backingScaleFactor ?? 2
-        let stops = Self.progressStops(dark: effectiveAppearance.isDark)
-        for i in 0..<count {
-            let x = (CGFloat(i) * (Self.lineWidth + gap) * scale).rounded() / scale
-            let color: NSColor
-            if i < filled {
-                // 热力渐变按整条横向位置采样（左深右亮，与横态轨道渐变同构）
-                let t = CGFloat(i) / CGFloat(count - 1)
-                let mix = { (a: CGFloat, b: CGFloat) in a + (b - a) * t }
-                color = NSColor(srgbRed: mix(stops[0].r, stops[1].r) / 255.0,
-                                green: mix(stops[0].g, stops[1].g) / 255.0,
-                                blue: mix(stops[0].b, stops[1].b) / 255.0, alpha: 1)
-            } else {
-                color = Palette.dotsDim.withAlphaComponent(Self.emptyLineAlpha)
-            }
-            color.setFill()
-            NSBezierPath(rect: NSRect(x: x, y: 0, width: Self.lineWidth, height: bounds.height)).fill()
-        }
-    }
     /// 首次布局前 bounds 为零：跳过（intrinsicContentSize 驱动 Auto Layout 随后到位）。
-    /// 仅横态（长进度卡片胶囊轨道）走层路径；竖态点阵与竖线模式在 layout 早退走 draw 直绘
+    /// 仅横态（长进度卡片胶囊轨道）走层路径；竖态点阵在 layout 早退走 draw 直绘
     private func layoutBar() {
         guard bounds.width > 0, bounds.height > 0 else { return }
         let barRect = barFrame()
@@ -863,7 +819,7 @@ final class UsageDots: NSView {
     /// 原硬编码绿档废弃，改由 heatLevelColor 推导，header 调色气泡调色相/饱和度即时跟随）。
     /// 深色 = L1→L4（45% 压暗端→峰值）；浅色 = 两端均峰值色（2026-09-08 用户
     /// 「卡片进度条只用最亮的颜色」，单色条）。返回 sRGB 0–255 元组：
-    /// 横态层渐变与竖线逐条采样共用。
+    /// 横态层渐变共用（竖线模式已随 09-13 开关移除）。
     private static func progressStops(dark: Bool) -> [(r: CGFloat, g: CGFloat, b: CGFloat)] {
         (dark ? [1, 4] : [4, 4]).map { level in
             let c = Palette.heatLevelColor(level, dark: dark).usingColorSpace(.sRGB) ?? .black
@@ -871,7 +827,7 @@ final class UsageDots: NSView {
         }
     }
     /// 调色气泡改了色相/饱和度后的整体重取色：横态走层 applyColors，
-    /// 竖线/竖点阵 draw 直绘现算，needsDisplay 兜住两种形态
+    /// 竖点阵 draw 直绘现算，needsDisplay 兜住
     func refreshHeatColors() {
         applyColors()
         needsDisplay = true
@@ -896,8 +852,8 @@ final class UsageDots: NSView {
             updatePulse()
         }
         guard bounds.width > 0, bounds.height > 0 else { return }
-        // 竖线/点阵形态无在途层动画：整列重绘即可
-        if lineBarMode || isVertical { needsDisplay = true; return }
+        // 竖点阵形态无在途层动画：整列重绘即可
+        if isVertical { needsDisplay = true; return }
         let barRect = barFrame()
         let newFrame = progressFrame(in: barRect)
 
@@ -909,7 +865,7 @@ final class UsageDots: NSView {
 
         // 首帧（无 presentation）从模型值出发无可见跳变，直接返回
         guard progressLayer.presentation() != nil else { return }
-        // 当前显示中的宽度（横态；竖态点阵/竖线在上方早退，无层动画）
+        // 当前显示中的宽度（横态；竖态点阵在上方早退，无层动画）
         let current = progressLayer.presentation()?.frame ?? newFrame
         let currentLength = current.width
         let targetLength = newFrame.width
@@ -1011,15 +967,20 @@ extension BalancePanelView {
         // 位移动画需要 layer-backed
         rowStack.wantsLayer = true
         // 用量条目 hover：整行渐变背景 + 发丝边框（与余额卡片/磁贴/折叠标题条同一套 Palette）；
-        // 行内容常态系统灰，hover 时文字/icon 提亮（HoverRowView 内建：文字→hoverTextColor、
-        // 灰 tint 图标→labelColor；退出回落 systemGray；hover 锁定期间保持提亮）
-        let hoverRow = wrapHoverRow(rowStack, hoverTextColor: Palette.cardForeground,
+        // 行内容常态系统灰，hover 时文字/icon 一起提亮到 Palette.hoverForeground（不透明纯白）。
+        // ⚠️ 别改成系统 labelColor：vibrant 外观下它是白 @85%，叠在深色玻璃上偏灰，
+        // 观感即「先亮后有变暗」（2026-09-12 实测 txt alpha=0.85）；两个色路同源这一个值，
+        // 退出回落 systemGray；hover 锁定期间保持提亮
+        let hoverRow = wrapHoverRow(rowStack, hoverTextColor: Palette.hoverForeground,
                                     horizontalPadding: usageHorizontalInset,
                                     topInset: usageRowTopInset,
                                     bottomInset: usageRowBottomInset)
         hoverRow.hoverGradientColors = Palette.hoverGradient
         // 发丝边框：与余额卡片 HoverCard 同款（hoverBorderNormal 18% ↔ Bright，1.2pt，0.22s）
         hoverRow.enablesHoverBorder = true
+        // 行 hover 交给列表共享材质宿主（usageContentStack 上安装）：渐变背景+描边
+        // 行间整块滑动，与卡片连续效果同源；上两行自带视觉随之停用（保留以便回退）
+        hoverRow.usesSharedHoverMaterial = true
         hoverRow.wantsLayer = true
         hoverRow.onHoverChanged = { [weak self, weak hoverRow] inside in
             guard let self else { return }

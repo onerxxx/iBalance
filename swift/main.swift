@@ -16,6 +16,7 @@
 //    面板视图在 Panel.swift / PanelLayout.swift，控件在 Controls.swift，弹窗在 Dialogs.swift。
 
 import Cocoa
+import SettingsUI
 import UserNotifications
 
 // MARK: - 辅助工具
@@ -70,14 +71,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let statusBar = NSStatusBar.system
     private var statusItem: NSStatusItem!
     var autoCheckinMenuItem: NSMenuItem!
-    private var refreshIntervalMenuItem: NSMenuItem!
-    private var refreshIntervalOptions: [NSMenuItem] = []
 
     private var timer: Timer?
     var checkinTimer: Timer?
-    var wbOauthMenuItem: NSMenuItem!
-    var wbOauthInProgress = false
-    var wbOauthCancelled = false
     var traeCollectMenuItem: NSMenuItem!
     var traeCollectInProgress = false
     // 手动签到进行中标记：防重复触发
@@ -155,7 +151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var cacheWbAccounts: [String: (remain: Double, total: Double)] = [:]
     /// WB 裂变包重置日（uid → 周期结束时间，副标题显示用）；拉取按小时节流
     private var cacheWbFission: [String: Date] = [:]
-    private var wbFissionFetchedAt: Date?
+    /// 裂变包最近拉取时刻（uid → 时间）：节流用（≥1h 拉一次）。
+    /// ⚠️ 必须按 uid 记（同 TRAE 的 traeResetAtAdoptedAt）：单一全局时间戳会让「切号后的新
+    /// 主账号」被上一个账号的节流挡住 —— 新账号 cacheWbFission 无值，副标题最长空 1 小时。
+    private var wbFissionFetchedAt: [String: Date] = [:]
     var cacheTrae: (limit: Double, used: Double, resetAt: Double)?
     /// TRAE 多账号额度缓存：uid → (limit, used, resetAt)，resetAt 为订阅包重置戳（0=无订阅包）
     var cacheTraeAccounts: [String: (limit: Double, used: Double, resetAt: Double)] = [:]
@@ -262,12 +261,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 fp.setFrame(f, display: true)
             }
             step(8.2, "T2 window tall") { self.floatingPanelVC?.layoutProbe("T2-window-tall", force: true) }
-            step(8.8, "collapse settings") { self.panelView?.toggleSectionForAutoTest("settings") }
-            step(10.4, "T3 after collapse") { self.floatingPanelVC?.layoutProbe("T3-after-collapse", force: true) }
-            step(11.0, "expand settings") { self.panelView?.toggleSectionForAutoTest("settings") }
-            step(12.6, "T4 after expand") { self.floatingPanelVC?.layoutProbe("T4-after-expand", force: true) }
-            step(13.2, "collapse actions") { self.panelView?.toggleSectionForAutoTest("actions") }
-            step(14.8, "T5 after collapse actions") { self.floatingPanelVC?.layoutProbe("T5-after-collapse-actions", force: true) }
+            step(9.2, "collapse usage") { self.panelView?.toggleSectionForAutoTest("usage") }
+            step(10.8, "T3 after collapse") { self.floatingPanelVC?.layoutProbe("T3-after-collapse", force: true) }
+            step(11.4, "expand usage") { self.panelView?.toggleSectionForAutoTest("usage") }
+            step(13.0, "T4 after expand") { self.floatingPanelVC?.layoutProbe("T4-after-expand", force: true) }
         }
 
         config = ConfigStore.load()
@@ -309,9 +306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         menu.addItem(autoCheckinMenuItem)
         updateAutoCheckinMenuTitle()
 
-        wbOauthMenuItem = NSMenuItem(title: "添加 WorkBuddy 账号…", action: #selector(onAddWbAccount), keyEquivalent: "")
-        wbOauthMenuItem.target = self
-        menu.addItem(wbOauthMenuItem)
+        let addWbMenuItem = NSMenuItem(title: "添加 WorkBuddy 账号（读取本机登录）…", action: #selector(onAddWbAccount), keyEquivalent: "")
+        addWbMenuItem.target = self
+        menu.addItem(addWbMenuItem)
 
         traeCollectMenuItem = NSMenuItem(title: "采集 TRAE 当前账号…", action: #selector(onCollectTraeAccount), keyEquivalent: "")
         traeCollectMenuItem.target = self
@@ -319,24 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // 刷新时间子菜单：1 / 3 / 5 分钟单选
-        let intervalSubmenu = NSMenu()
-        for minutes in [1, 3, 5] {
-            let item = NSMenuItem(title: "\(minutes)分钟", action: #selector(onToggleRefreshInterval(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = minutes * 60
-            item.state = (config.refreshInterval == TimeInterval(minutes * 60)) ? .on : .off
-            intervalSubmenu.addItem(item)
-            refreshIntervalOptions.append(item)
-        }
-        refreshIntervalMenuItem = NSMenuItem(title: "刷新时间", action: nil, keyEquivalent: "")
-        refreshIntervalMenuItem.submenu = intervalSubmenu
-        menu.addItem(refreshIntervalMenuItem)
-        updateRefreshIntervalMenuTitle()
-
-        menu.addItem(NSMenuItem.separator())
-
-        let apiKeyMenuItem = NSMenuItem(title: "DeepSeek / ZhiPu / Qwen 设置…", action: #selector(onSetApiKey), keyEquivalent: "")
+        let apiKeyMenuItem = NSMenuItem(title: "Key / 额度设置…", action: #selector(onSetApiKey), keyEquivalent: "")
         apiKeyMenuItem.target = self
         menu.addItem(apiKeyMenuItem)
 
@@ -509,8 +489,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let c = MenuBarStatusGlowController(stateProvider: { [weak self] in self?.menuBarGlowState(for: $0) })
         // 圆点出现/消失改变标题排版 → 重烘焙标题位图（状态点预留间距随存亡增删）
         c.onDotPresenceChanged = { [weak self] in self?.updateTitle(tag: "dotPresence") }
+        // 小球弹跳参数（设置窗口「动画」pane 落盘的那份）
+        c.setBounce(dotBounce)
         return c
     }()
+
+    /// 菜单栏状态点小球弹跳参数：唯一事实源（设置窗口滑杆写它、快照读它、光晕控制器按它算帧）。
+    /// 启动时从 UserDefaults 还原，改动即时落盘
+    private var dotBounce = MenuBarBounceSettings.load()
+
+    /// 设置窗口「动画」pane 改参：写内存 → 落盘 → 推给光晕控制器（立即重算当前帧，拖动跟手）
+    private func applyDotBounce(_ s: MenuBarBounceSettings) {
+        dotBounce = s
+        s.save()
+        menuBarGlow.setBounce(s)
+    }
 
     /// 获取菜单栏图标形状（惰性加载并缓存）：
     /// PDF/SVG 栅格化为黑形位图（矢量直接设 isTemplate 不生效，会渲染成黑色）；PNG 品牌色原样（烘焙进 template 后只取其 alpha 形状）
@@ -729,47 +722,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard statusItem?.button != nil else { return }
         let panel = BalancePanelView()
         panel.onOpenCockpit = { [weak self] in self?.onOpenCockpit() }
-        panel.onToggleAutoCheckin = { [weak self] in self?.onToggleAutoCheckin() }
-        panel.onAddWbAccount = { [weak self] in self?.onAddWbAccount() }
-        panel.onAddZcodeAccount = { [weak self] in self?.onAddZcodeAccount() }
-        panel.onAddCodexAccount = { [weak self] in self?.onAddCodexAccount() }
-        panel.onSetInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
-        panel.onManualRefresh = { [weak self] in self?.onRefresh() }
-        panel.onSetApiKey = { [weak self] in self?.onSetApiKey() }
-        panel.onTogglePanelGradient = { [weak self] in self?.onTogglePanelGradient() }
-        panel.onToggleLightTheme = { [weak self] in self?.onToggleLightTheme() }
-        panel.onToggleMonoFont = { [weak self] in self?.onToggleMonoFont() }
-        panel.onToggleValueScrollPreview = { [weak self] in self?.onToggleValueScrollPreview() }
-        panel.onToggleLongProgressCard = { [weak self] in self?.onToggleLongProgressCard() }
-        panel.onToggleIconThemeSwap = { [weak self] in self?.onToggleIconThemeSwap() }
-        panel.onToggleVerticalLineProgress = { [weak self] in self?.onToggleVerticalLineProgress() }
-        panel.onAbout = { [weak self] in self?.onAbout() }
-        panel.onShowCoinDemo = { [weak self] in self?.onShowCoinDemo() }
-        panel.onCheckForUpdate = { [weak self] in self?.onCheckForUpdate() }
-        panel.onRunUpdateDemo = { [weak self] in self?.runUpdateDemo() }
-        panel.onToggleUpdateAutoCheck = { [weak self] in self?.onToggleUpdateAutoCheck() }
-        panel.onManagePlatformToggles = { [weak self] in self?.onManagePlatformToggles() }
-        panel.onManualCheckin = { [weak self] in self?.onManualCheckin() }
-        panel.onShowCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
-        panel.onShareWbHistory = { [weak self] in self?.onShareWbHistory() }
         panel.onQuit = { [weak self] in self?.onQuit() }
         panel.onOpenGitHub = {
             NSWorkspace.shared.open(URL(string: "https://github.com/onerxxx/iBalance")!)
         }
+        // header 左上角设置按钮：打开 SwiftUI 设置窗口（侧栏 + 表单，系统设置式）
+        panel.onOpenSettings = { [weak self] in self?.openSettingsWindow() }
         // 右上角 pin：置顶常驻——内容转移至无边框 NSPanel 浮动窗口（无箭头、
         // 浮层层级、背景原生拖动）；取消置顶时浮窗直接关闭
         panel.onTogglePin = { [weak self] in self?.togglePanelPin() }
-        // header 调色气泡存续期间挂起主面板 transient（点自绘气泡窗会被误判「面板外
-        // 点击」先关主面板）；气泡关闭按 pin 态恢复——与 keepPanelAliveDuring 同一口径
-        panel.onHeatWindowActive = { [weak self] active in
-            guard let self, let popover = self.popoverController, popover.isShown else { return }
-            if active {
-                popover.behavior = .applicationDefined
-            } else {
-                popover.behavior = popover.contentViewController?.view.window?.level == .floating
-                    ? .applicationDefined : .transient
-            }
-        }
         // 余额卡片点击：DeepSeek 打开浏览器，TRAE / WorkBuddy / ZCode 启动应用
         panel.onClickDeepSeek = {
             NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3080/")!)
@@ -803,7 +764,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.onSwitchWbAccount = { [weak self] uid in
             self?.switchWbAccount(uid: uid)
         }
-        panel.onCollectTraeAccount = { [weak self] in self?.onCollectTraeAccount() }
         panel.onSwitchTraeAccount = { [weak self] uid in
             self?.switchTraeAccount(uid: uid)
         }
@@ -872,6 +832,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                      height: panel.fittingSize.height)
         popoverController = popover
         panelView = panel
+        // header 右上角刷新周期饼图：数据源直读自动刷新定时器（repeating Timer 的
+        // fireDate 恒为下次触发时刻，本轮起点 = fireDate − 间隔）。手动刷新不重建
+        // 定时器、饼图不跳变；applyRefreshInterval 重建定时器后自动跟随，无需另行推送。
+        // （contentViewController 赋值已同步触发 loadView → build()，饼图按钮此时已就位）
+        panel.onChangeRefreshInterval = { [weak self] seconds in
+            self?.applyRefreshInterval(seconds)
+        }
+        panel.onManualRefresh = { [weak self] in self?.onRefresh() }
+        panel.refreshPieButton?.cycleProvider = { [weak self] in
+            let interval = self?.config.refreshInterval ?? 60
+            guard let fireDate = self?.timer?.fireDate else { return (Date(), interval) }
+            return (fireDate.addingTimeInterval(-interval), interval)
+        }
     }
 
     /// 复用已构建的 popover/panel 展示，不再重建视图层级（消除高频点击延迟）。
@@ -884,6 +857,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         if popoverController == nil { buildPanelOnce() }   // 兜底：未预构建时按需构建一次
         guard let popover = popoverController, let panel = panelView else { return }
+        // 面板行为按当前态归位：3D 硬币非阻塞弹窗 / SwiftUI 设置窗口在屏期间保持
+        // applicationDefined（点弹窗不算「面板外」，面板保持可交互）；平时恢复 transient。
+        // 覆盖「弹窗开着时面板曾被关掉再重开」的窗口期——弹窗关闭回调里的
+        // endKeepPanelAlive 只对在屏面板生效。
+        popover.behavior = (GlassModalShell.hasActiveNonModalSession
+                            || SettingsWindowController.shared.isSessionActive)
+            ? .applicationDefined : .transient
         // 先展示缓存数据（即时响应），再触发自动刷新拿最新
         panel.update(makePanelSnapshot())
         // Token 板块跟随缓存即时上屏：缓存命中同步落位（打开即在）；
@@ -964,25 +944,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - NSPopoverDelegate
 
-    /// 模态弹窗（NSAlert 等）运行期间临时把 popover 行为切为 applicationDefined：
-    /// .transient 会把「与弹窗交互」误判为「点击面板外」而关闭面板，
-    /// 导致点「操作」区的 API Key / 关于 等选项时面板先消失。
-    /// block 结束后恢复 .transient（恢复「点击面板外自动关闭」）。
-    /// 注意：仅包裹同步模态；异步长流程（如 OAuth 打开浏览器）不要用，否则面板会一直浮在最前。
-    func keepPanelAliveDuring<T>(_ block: () -> T) -> T {
-        guard let popover = popoverController, popover.isShown else { return block() }
+    /// 面板保活（begin）：临时把 popover 行为切为 applicationDefined，防 .transient 把
+    /// 「与弹窗交互」误判为「点击面板外」而关闭面板，导致点「操作」区的 API Key /
+    /// 关于 等选项时面板先消失。
+    /// 同步模态用 keepPanelAliveDuring 包裹；跨异步的生命周期（3D 硬币非阻塞弹窗）
+    /// 用 begin/end 手动配对——begin 后必须在弹窗关闭回调里 end。
+    func beginKeepPanelAlive() {
+        guard let popover = popoverController, popover.isShown else { return }
         popover.behavior = .applicationDefined
-        // 恢复时尊重 pin 置顶态（置顶期间本就是 applicationDefined，不能被重置回 transient）
-        defer { popover.behavior = popover.contentViewController?.view.window?.level == .floating
-                ? .applicationDefined : .transient }
+    }
+
+    /// 面板保活收口（end）：恢复「点击面板外自动关闭」。尊重 pin 置顶态（置顶期间本就
+    /// 是 applicationDefined，不能被重置回 transient）；3D 硬币非阻塞弹窗、SwiftUI 设置
+    /// 窗口在屏期间同样保持 applicationDefined——其他模态（调色气泡、系统弹窗）的收口
+    /// 不得提前解除其保活。
+    func endKeepPanelAlive() {
+        guard let popover = popoverController, popover.isShown else { return }
+        popover.behavior = (popover.contentViewController?.view.window?.level == .floating
+                            || GlassModalShell.hasActiveNonModalSession
+                            || SettingsWindowController.shared.isSessionActive)
+            ? .applicationDefined : .transient
+    }
+
+    /// 同步模态版保活：begin + block + end 三明治。
+    /// 注意仅包裹同步模态；异步长流程不要用（如切号重启、浏览器交互），
+    /// 否则面板会一直浮在最前。
+    func keepPanelAliveDuring<T>(_ block: () -> T) -> T {
+        beginKeepPanelAlive()
+        defer { endKeepPanelAlive() }
         return block()
+    }
+
+    /// 调色盘可见时拒绝 popover 自动关闭：点击 NSColorWell 弹系统调色盘后，
+    /// NSColorPanel 抢 key 会让 AppKit 询问 popover 是否关闭，默认返回 true
+    /// 会关掉主面板，用户在调色盘里调色时无法看到主面板 hover 实时重染。
+    /// 仅在调色盘（NSColorPanel.shared）可见时拒绝；调色盘关掉后即使气泡
+    /// 还在也放行——避免用户主动关面板（点图标/切账号/弹 Alert）时被卡住。
+    func popoverShouldClose(_ popover: NSPopover) -> Bool {
+        if NSColorPanel.shared.isVisible { return false }
+        return true
     }
 
     /// popover 关闭后归还焦点（隐藏 App），让之前活跃的应用恢复前台，
     /// 避免菜单栏小工具霸占焦点。
     func popoverDidClose(_ notification: Notification) {
-        // 主面板收起（点外/pin 转移等）联动收起 header 调色气泡，防孤儿浮层
-        panelView?.dismissHeatWindow()
         // 移除面板位置锁定：停用 KVO + 清空顶边锚点
         panelFrameObserver?.invalidate()
         panelFrameObserver = nil
@@ -999,6 +1004,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // popover 收起走到这里）：hide 会连它一起藏掉（同一「一闪即逝」根因），
         // 焦点已由该窗口接管，跳过归还
         if updateProgressWinRef?.isVisible ?? false { return }
+        // SwiftUI 设置窗口开着（用户点菜单栏图标显式关面板等路径）：hide 会把设置
+        // 窗口连坐藏掉（「窗口没消失，重开面板又出现」的根因），焦点由它接管，跳过
+        if SettingsWindowController.shared.isSessionActive { return }
         NSApp.hide(nil)
     }
 
@@ -1044,8 +1052,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 日常额度不再显示，恒为引导文案
         dsSnap.expireSegments = ["打开Harness"]
         if let ds = cacheDs {
-            dsSnap.weekDailyText = weekDailyText(platform: "ds", accounts: [(uid: "main", current: ds.total)],
-                                                 increasing: false, percent: false, decimals: 2, prefix: ds.symbol)
+            let d = dayDeltaText(platform: "ds", accounts: [(uid: "main", current: ds.total)],
+                                 increasing: false, percent: false, decimals: 2, prefix: ds.symbol)
+            dsSnap.dayDeltaText = d.text
+            dsSnap.dayDeltaDirection = d.direction
         }
         s.dsAccounts = [dsSnap]
         // ZhiPu 卡片：智谱 BigModel 可用余额（同多号管线单元素，uid 恒 "zhipu"，
@@ -1063,8 +1073,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         zpSnap.expireSegments = ["打开财务中心"]
         if let bal = cacheBigModelBalance {
-            zpSnap.weekDailyText = weekDailyText(platform: "zhipu", accounts: [(uid: "zhipu", current: bal)],
-                                                 increasing: false, percent: false, decimals: 2, prefix: "¥")
+            let d = dayDeltaText(platform: "zhipu", accounts: [(uid: "zhipu", current: bal)],
+                                 increasing: false, percent: false, decimals: 2, prefix: "¥")
+            zpSnap.dayDeltaText = d.text
+            zpSnap.dayDeltaDirection = d.direction
         }
         s.zhipuAccounts = [zpSnap]
         // Qwen 卡片：千问 Token Plan 周剩余百分比（同多号管线单元素，uid 恒 "qwen"，
@@ -1092,9 +1104,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Qwen 点阵恒显示：usedRatio=0 表示「本周一点没用」（满格全绿），有展示意义——
         // 与 DS 的「0=没配置额度」语义不同，不套用 DS 的未消耗隐藏口径
         if let q = cacheQwen, q.weekLimit > 0 {
-            qwSnap.weekDailyText = weekDailyText(platform: "qwen",
-                                                 accounts: [(uid: "qwen", current: q.weekRem / q.weekLimit * 100)],
-                                                 increasing: false, percent: true, decimals: 1)
+            let d = dayDeltaText(platform: "qwen",
+                                 accounts: [(uid: "qwen", current: q.weekRem / q.weekLimit * 100)],
+                                 increasing: false, percent: true, decimals: 1)
+            qwSnap.dayDeltaText = d.text
+            qwSnap.dayDeltaDirection = d.direction
         }
         s.qwenAccounts = [qwSnap]
         let today = Self.todayString()
@@ -1105,9 +1119,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == traeMainUid { return false }
             return false
         }
-        let traeWeekDaily = weekDailyText(platform: "trae",
-                                          accounts: cacheTraeAccounts.map { (uid: $0.key, current: $0.value.used) },
-                                          increasing: true, percent: false, decimals: config.traeDecimals)
+        let traeDelta = dayDeltaText(platform: "trae",
+                                     accounts: cacheTraeAccounts.map { (uid: $0.key, current: $0.value.used) },
+                                     increasing: true, percent: false, decimals: config.traeDecimals)
         for ac in traeAccountsList {
             let isCurrent = ac.uid == traeMainUid
             let cached = cacheTraeAccounts[ac.uid]
@@ -1131,7 +1145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
             snap.pulsing = traePulsingTracker.isPulsing(ac.uid)
-            snap.weekDailyText = traeWeekDaily
+            snap.dayDeltaText = traeDelta.text
+            snap.dayDeltaDirection = traeDelta.direction
             s.traeAccounts.append(snap)
         }
         // WorkBuddy 多账号余额卡片：当前账号排最上
@@ -1141,9 +1156,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == mainUid { return false }
             return false
         }
-        let wbWeekDaily = weekDailyText(platform: "wb",
-                                        accounts: cacheWbAccounts.map { (uid: $0.key, current: $0.value.remain) },
-                                        increasing: false, percent: false, decimals: config.workbuddyDecimals)
+        let wbDelta = dayDeltaText(platform: "wb",
+                                   accounts: cacheWbAccounts.map { (uid: $0.key, current: $0.value.remain) },
+                                   increasing: false, percent: false, decimals: config.workbuddyDecimals)
         for ac in accounts {
             let isCurrent = ac.uid == mainUid
             let cached = cacheWbAccounts[ac.uid]
@@ -1162,7 +1177,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
             snap.pulsing = wbPulsingTracker.isPulsing(ac.uid)
-            snap.weekDailyText = wbWeekDaily
+            snap.dayDeltaText = wbDelta.text
+            snap.dayDeltaDirection = wbDelta.direction
             // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 5 分钟）
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.workbuddyVisible
@@ -1180,11 +1196,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == zcodeMainUid { return false }
             return false
         }
-        let zcodeWeekDaily = weekDailyText(platform: "zcode",
-                                           accounts: cacheZcodeAccounts.compactMap {
-                                               $0.value.total > 0 ? (uid: $0.key, current: $0.value.remain / $0.value.total * 100) : nil
-                                           },
-                                           increasing: false, percent: true, decimals: 1)
+        let zcodeDelta = dayDeltaText(platform: "zcode",
+                                      accounts: cacheZcodeAccounts.compactMap {
+                                          $0.value.total > 0 ? (uid: $0.key, current: $0.value.remain / $0.value.total * 100) : nil
+                                      },
+                                      increasing: false, percent: true, decimals: 1)
         for ac in zcodeAccountsList {
             let isCurrent = ac.uid == zcodeMainUid
             let cached = cacheZcodeAccounts[ac.uid]
@@ -1210,7 +1226,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 snap.taskState = AgentTaskStatusStore.zcodeVisible
             }
             snap.tokenInvalid = zcodeInvalidUids.contains(ac.uid)
-            snap.weekDailyText = zcodeWeekDaily
+            snap.dayDeltaText = zcodeDelta.text
+            snap.dayDeltaDirection = zcodeDelta.direction
             s.zcodeAccounts.append(snap)
         }
         // Codex 多账号 usage 卡片：当前 auth.json 对应账号排首位，昵称固定显示邮箱。
@@ -1220,9 +1237,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == codexMainUid { return false }
             return false
         }
-        let codexWeekDaily = weekDailyText(platform: "codex",
-                                           accounts: cacheCodexAccounts.map { (uid: $0.key, current: $0.value.usedPercent) },
-                                           increasing: true, percent: true, decimals: 1)
+        let codexDelta = dayDeltaText(platform: "codex",
+                                      accounts: cacheCodexAccounts.map { (uid: $0.key, current: $0.value.usedPercent) },
+                                      increasing: true, percent: true, decimals: 1)
         for ac in codexAccountsList {
             let isCurrent = ac.uid == codexMainUid
             let cached = cacheCodexAccounts[ac.uid]
@@ -1237,7 +1254,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.pulsing = codexPulsingTracker.isPulsing(ac.uid)
-            snap.weekDailyText = codexWeekDaily
+            snap.dayDeltaText = codexDelta.text
+            snap.dayDeltaDirection = codexDelta.direction
             // Codex Desktop/CLI 的 rollout 事件流：仅当前账号挂接 Agent 三态光环。
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.codexVisible
@@ -1290,14 +1308,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                     weekText: prefix + fmtUsage(u.week, percent: percent, decimals: decimals),
                                     historyWeeks: weeks)
         }
-        // 卡片副标题右侧 meta（2026-09-06 用户指定）：过去 7 天总消耗 ÷ 7 的日均数值。
-        // 2026-09-07 用户定案窗口口径 = 真·过去 7 日（今日实时差值 + 前 6 自然日快照，
-        // UsageStore.last7Days），不再用自然周 ÷7（旧实现）；全账号加总同用量行；
-        // 无观测记录 = nil 不显示。「/ 日 (7日)」后缀与 2pt 固定间隔由 Panel 侧 stack 布局提供
-        func weekDailyText(platform: String, accounts: [(uid: String, current: Double)],
-                           increasing: Bool, percent: Bool, decimals: Int, prefix: String = "") -> String? {
-            guard let sum7 = UsageStore.last7Days(platform: platform, accounts: accounts, increasing: increasing) else { return nil }
-            return prefix + fmtUsage(sum7 / 7, percent: percent, decimals: decimals)
+        // 卡片副标题右侧 meta（2026-09-13 用户改版）：过去 24h 的积分/余额**变化量**
+        //（UsageStore.balanceChange24h，恒有值：无数据/无变化 = 0 → 右箭头 + 0，
+        // 用户指定不再隐藏）。箭头方向 = 卡片显示值的变化：变多 up / 变少 down /
+        // 平 flat——已用型平台（TRAE used/Codex usedPercent，increasing=true，
+        // observe 的值随消耗上升）按取反翻成剩余口径。数值 = 变化量绝对值（方向由
+        // 箭头表达），前缀/小数/百分比口径同用量行；flat 阈值 = 格式化后读作 0 的
+        // 界限（百分比一位小数 0.05 / 两位小数 0.005），箭头图标与 2pt 固定间隔由
+        // Panel 侧 stack 布局提供
+        func dayDeltaText(platform: String, accounts: [(uid: String, current: Double)],
+                          increasing: Bool, percent: Bool, decimals: Int, prefix: String = "") -> (text: String, direction: DayDeltaDirection) {
+            let delta = UsageStore.balanceChange24h(platform: platform, accounts: accounts,
+                                                    increasing: increasing)
+            let cardDelta = increasing ? -delta : delta
+            let direction: DayDeltaDirection
+            if abs(cardDelta) < (percent ? 0.05 : 0.005) {
+                direction = .flat
+            } else {
+                direction = cardDelta > 0 ? .up : .down
+            }
+            return (prefix + fmtUsage(abs(cardDelta), percent: percent, decimals: decimals), direction)
         }
         if let ds = cacheDs,
            let row = usageRow(icon: "deepseek", name: "DeepSeek", platform: "ds",
@@ -1371,16 +1401,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if riskCount > 0 { text += " \(riskCount)风控" }
             s.lastCheckinTime = text
         }
-        s.wbOauthInProgress = wbOauthInProgress
-        s.traeCollectInProgress = traeCollectInProgress
-        s.checkinInProgress = manualCheckinInProgress
         s.refreshIntervalSeconds = Int(config.refreshInterval)
         s.panelGradientEnabled = config.panelGradientEnabled
         s.lightThemeEnabled = config.lightThemeEnabled
         s.monoFontEnabled = config.monoFontEnabled
+        s.cardTitleFontSize = config.cardTitleFontSize
+        s.cardTitleSharpGrotesk = config.cardTitleSharpGrotesk
+        s.cardTitleSGWeight = config.cardTitleSGWeight
+        s.cardTitleSGWidth = config.cardTitleSGWidth
         s.longProgressCard = config.longProgressCard
         s.iconThemeSwap = config.iconThemeSwap
-        s.verticalLineProgress = config.verticalLineProgress
+        s.circularIcon = config.circularIcon
         return s
     }
 
@@ -1417,6 +1448,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - 菜单回调
 
     @objc func onRefresh() {
+        // 任一来源的刷新（定时/手动/网络恢复/开面板）都把自动周期重置为
+        // 「现在起再等一个间隔」：饼图锚定 timer.fireDate，重建定时器后走满
+        // 一圈才到下次刷新，与「本轮已刷新」的直觉一致
+        restartRefreshTimer()
         refreshSeq &+= 1
         let seq = refreshSeq
         let cancelledOld = refreshTask != nil
@@ -1435,31 +1470,177 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    /// 子菜单单选切换刷新间隔（tag = 秒数：60 / 180 / 300）
-    @objc private func onToggleRefreshInterval(_ sender: NSMenuItem) {
-        applyRefreshInterval(TimeInterval(sender.tag))
-    }
-
-    /// 应用刷新间隔（菜单与面板共用）：写配置、同步菜单勾选、重启 Timer
+    /// 应用刷新间隔（面板饼图按钮右键菜单）：写配置、重启 Timer
     private func applyRefreshInterval(_ interval: TimeInterval) {
         guard interval > 0 else { return }
         config.refreshInterval = interval
-        refreshIntervalOptions.forEach { $0.state = (TimeInterval($0.tag) == interval) ? .on : .off }
-        updateRefreshIntervalMenuTitle()
+        restartRefreshTimer()
+        ConfigStore.save(config)
+        syncPanel()
+    }
+
+    /// 重建自动刷新定时器（启动 / applyRefreshInterval 改档 / onRefresh 重置周期共用）
+    private func restartRefreshTimer() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(timeInterval: config.refreshInterval,
                                      target: self,
                                      selector: #selector(onRefresh),
                                      userInfo: nil,
                                      repeats: true)
-        ConfigStore.save(config)
-        syncPanel()
     }
 
-    /// 主菜单项标题显示当前选中的刷新间隔
-    private func updateRefreshIntervalMenuTitle() {
-        let minutes = Int(config.refreshInterval) / 60
-        refreshIntervalMenuItem.title = "刷新时间（\(minutes)分钟）"
+    // MARK: - SwiftUI 设置窗口（header 设置按钮）
+
+    /// 装配设置窗口模型：动作全部转发既有 AppDelegate 回调（与面板磁贴/设置行同一条链路），
+    /// 状态快照复用面板快照的设置段（单一事实源），然后打开窗口。
+    /// `pane` 指定落点：面板「Key / 额度」磁贴、右键「Key / 额度设置…」直接定位到该 pane。
+    private func openSettingsWindow(pane: SettingsSidebarItem = .appearance) {
+        var actions = AppSettingsActions()
+        actions.setRefreshInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
+        actions.toggleAutoCheckin = { [weak self] want in
+            guard let self, want != (config.traeAutoCheckin || config.workbuddyAutoCheckin) else { return }
+            onToggleAutoCheckin()
+        }
+        actions.toggleAutoUpdateCheck = { [weak self] want in
+            guard let self, want != config.updateAutoCheck else { return }
+            onToggleUpdateAutoCheck()
+        }
+        actions.checkForUpdate = { [weak self] in self?.onCheckForUpdate() }
+        actions.runUpdateDemo = { [weak self] in self?.runUpdateDemo() }
+        actions.addWbAccount = { [weak self] in self?.onAddWbAccount() }
+        actions.addTraeAccount = { [weak self] in self?.onCollectTraeAccount() }
+        actions.addZcodeAccount = { [weak self] in self?.onAddZcodeAccount() }
+        actions.addCodexAccount = { [weak self] in self?.onAddCodexAccount() }
+        actions.saveKeyQuota = { [weak self] key, quota, zhipu, qwen in
+            self?.applyKeyQuota(apiKey: key, quota: quota, zhipuToken: zhipu, qwenTicket: qwen)
+        }
+        actions.manualCheckin = { [weak self] in self?.onManualCheckin() }
+        actions.showCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
+        actions.shareWbHistory = { [weak self] in self?.onShareWbHistory() }
+        // ── 「主题外观」pane：6 个开关 + 2 根滑杆 ──
+        // 开关沿用面板既有的翻转式实现（读 config 取反），传期望值时先比对再翻；
+        // 点阵色相/饱和度直接落 Palette（UserDefaults 持久化）并对当前面板就地重绘
+        actions.setPanelGradient = { [weak self] want in
+            guard let self, want != config.panelGradientEnabled else { return }
+            onTogglePanelGradient()
+        }
+        actions.setLightTheme = { [weak self] want in
+            guard let self, want != config.lightThemeEnabled else { return }
+            onToggleLightTheme()
+        }
+        actions.setIconThemeSwap = { [weak self] want in
+            guard let self, want != config.iconThemeSwap else { return }
+            onToggleIconThemeSwap()
+        }
+        actions.setCircularIcon = { [weak self] want in
+            guard let self, want != config.circularIcon else { return }
+            onToggleCircularIcon()
+        }
+        actions.setMonoFont = { [weak self] want in
+            guard let self, want != config.monoFontEnabled else { return }
+            onToggleMonoFont()
+        }
+        // ── 卡片主标题字体（字号滑杆 + Sharp Grotesk 字重×宽度）──
+        // 直接写 config 即可：syncPanel → panel.update 快照比对到变化后就地重刷标题
+        actions.setCardTitleFontSize = { [weak self] size in
+            guard let self, size != config.cardTitleFontSize else { return }
+            config.cardTitleFontSize = size
+            ConfigStore.save(config)
+            syncPanel()
+        }
+        actions.setCardTitleSharpGrotesk = { [weak self] on in
+            guard let self, on != config.cardTitleSharpGrotesk else { return }
+            config.cardTitleSharpGrotesk = on
+            ConfigStore.save(config)
+            syncPanel()
+        }
+        actions.setCardTitleSGWeight = { [weak self] idx in
+            guard let self, idx != config.cardTitleSGWeight else { return }
+            config.cardTitleSGWeight = idx
+            ConfigStore.save(config)
+            syncPanel()
+        }
+        actions.setCardTitleSGWidth = { [weak self] idx in
+            guard let self, idx != config.cardTitleSGWidth else { return }
+            config.cardTitleSGWidth = idx
+            ConfigStore.save(config)
+            syncPanel()
+        }
+        actions.setLongProgressCard = { [weak self] want in
+            guard let self, want != config.longProgressCard else { return }
+            onToggleLongProgressCard()
+        }
+        actions.setHeatHue = { [weak self] in self?.panelView?.applyHeatHue(CGFloat($0)) }
+        actions.setHeatSaturation = { [weak self] in self?.panelView?.applyHeatSaturation(CGFloat($0)) }
+        actions.setHeatBrightness = { [weak self] in self?.panelView?.applyHeatBrightness(CGFloat($0)) }
+        actions.setBounce = { [weak self] in self?.applyDotBounce($0) }
+        // 侧栏玻璃透明度：落盘 + 立即重灌侧栏那层 NSGlassEffectView 的 tintColor
+        actions.setSidebarGlassTransparency = { [weak self] t in
+            SettingsWindowController.shared.setSidebarGlassTransparency(t)
+        }
+        actions.about = { [weak self] in self?.onAbout() }
+        // 设置窗口「平台」pane：定高表格，**勾选即生效**（保存链路见 applyPlatformConfig）
+        SettingsWindowController.shared.platformConfig = { [weak self] in self?.config }
+        SettingsWindowController.shared.applyPlatformConfig = { [weak self] in
+            self?.applyPlatformConfig($0)
+        }
+        SettingsWindowController.shared.configure(
+            actions: actions,
+            snapshot: { [weak self] in self?.makeSettingsSnapshot() ?? AppSettingsSnapshot() },
+            // 平台品牌图标：复用面板查表（<平台>.png = macOS27 ClearDark），固定 dark 版
+            iconProvider: { BalancePanelView.brandIconImage($0, dark: true) })
+        // 2026-09-12 用户要求：关设置窗口时，主面板一并收起 —— 免得「面板 → 设置」这条路径
+        // 走完留下一块只在保活态下才活着、又没人负责关的面板。
+        // 顺序：先 endKeepPanelAlive（把 behavior 从 .applicationDefined 恢复），再 performClose；
+        // 反过来会让 popoverDidClose 先跑完，endKeepPanelAlive 里的 `guard popover.isShown` 直接 return
+        // （虽然下次 showPanel 会重设 behavior，但保持既有语义更稳）。
+        SettingsWindowController.shared.onClose = { [weak self] in
+            guard let self else { return }
+            self.endKeepPanelAlive()
+            if self.popoverController?.isShown == true {
+                self.popoverController?.performClose(nil)
+            }
+        }
+        // 保活先于上屏：设置窗口抢 key 瞬间若 popover 还是 .transient，会被判「面板外
+        // 点击」关闭 → popoverDidClose 的 NSApp.hide 连坐藏掉设置窗口（「一开就没」根因）
+        beginKeepPanelAlive()
+        SettingsWindowController.shared.open(pane: pane)
+    }
+
+    /// 主菜单「文件 → 关闭窗口」（⌘W）落到这里：只关设置窗口，不碰当时的 key window。
+    /// 真正关窗在 `SettingsWindowController.close()`（走标准 performClose 流程）。
+    @objc private func onCloseSettingsWindow() {
+        SettingsWindowController.shared.close()
+    }
+
+    /// 设置窗口状态快照：取自面板快照的设置段（与面板设置行同口径，含异常间隔归一 300）
+    private func makeSettingsSnapshot() -> AppSettingsSnapshot {
+        let s = makePanelSnapshot()
+        let interval = s.refreshIntervalSeconds
+        return AppSettingsSnapshot(
+            refreshInterval: [60, 180, 300].contains(interval) ? interval : 300,
+            autoCheckin: s.traeAutoCheckin || s.wbAutoCheckin,
+            autoCheckinSub: s.lastCheckinTime ?? "",
+            autoUpdateCheck: s.updateAutoCheckEnabled,
+            bounce: dotBounce,
+            sidebarGlassTransparency: SettingsWindowController.sidebarGlassTransparency,
+            apiKey: config.deepseekApiKey,
+            commonQuota: config.deepseekCommonQuota,
+            zhipuToken: config.bigmodelTokenOverride,
+            qwenTicket: config.qwenTicketOverride,
+            panelGradientEnabled: config.panelGradientEnabled,
+            lightThemeEnabled: config.lightThemeEnabled,
+            iconThemeSwap: config.iconThemeSwap,
+            circularIcon: config.circularIcon,
+            monoFontEnabled: config.monoFontEnabled,
+            longProgressCard: config.longProgressCard,
+            cardTitleFontSize: config.cardTitleFontSize,
+            cardTitleSharpGrotesk: config.cardTitleSharpGrotesk,
+            cardTitleSGWeight: config.cardTitleSGWeight,
+            cardTitleSGWidth: config.cardTitleSGWidth,
+            heatHue: Double(Palette.heatPeakHue),
+            heatSaturation: Double(Palette.heatPeakSaturation),
+            heatBrightness: Double(Palette.heatPeakBrightness))
     }
 
     /// 面板渐变背景：切换后立即保存并刷新面板（VC 经快照同步后重绘遮罩）
@@ -1517,19 +1698,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// 竖线进度条：切换开关（长进度卡片整行条替换为等宽竖线，条数/线宽见 UsageDots.lineCount/lineWidth）
-    @objc private func onToggleVerticalLineProgress() {
-        config.verticalLineProgress.toggle()
+    /// 圆形图标：切换开关（余额卡片品牌 icon 裁圆 + 任务状态光环翻圆形，宽高不变）
+    private func onToggleCircularIcon() {
+        config.circularIcon.toggle()
         ConfigStore.save(config)
         syncPanel()
     }
 
-    /// 打开平台开关弹窗：保存后同步右键菜单、自动签到定时器和面板状态。
-    @objc private func onManagePlatformToggles() {
+    /// 平台开关落盘（设置窗口「平台」pane 每次勾选变化即调，已无「保存」按钮）：落盘后同步右键菜单、
+    /// 自动签到定时器和面板状态。2026-09-12 由玻璃弹窗迁入设置窗口，先「保存按钮」后改「勾选即生效」。
+    private func applyPlatformConfig(_ updated: AppConfig) {
         let oldConfig = config
-        let dialog = PlatformAutomationSettingsDialog(config: oldConfig)
-        guard let updated = keepPanelAliveDuring({ dialog.present() }) else { return }
-
         config = updated
         ConfigStore.save(config)
         autoCheckinMenuItem.state = (config.traeAutoCheckin || config.workbuddyAutoCheckin) ? .on : .off
@@ -1573,7 +1752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 长文阅读类弹窗：内容宽 +8 抵消 sidePadding 增量，再 +20 加宽正文行宽
         shell.contentWidth = DialogMetrics.width + 8 + 20
         shell.addInfo("菜单栏常驻小工具，实时聚合多个 AI 服务的余额与额度。\n\n"
-            + "• DeepSeek 余额（官方 API 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• Qwen Token Plan 周额度（浏览器登录态自动采集）\n• WorkBuddy 积分（多号 OAuth，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（本机 JWT + JSON 导入，一键切号）\n• Codex 额度（auth.json 导入，一键切号）\n\n"
+            + "• DeepSeek 余额（官方 API 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• Qwen Token Plan 周额度（浏览器登录态自动采集）\n• WorkBuddy 积分（导入本机登录账号，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（本机 JWT + JSON 导入，一键切号）\n• Codex 额度（auth.json 导入，一键切号）\n\n"
             + "多账号管理 · 自动签到 · 日/周用量统计 · 应用内自更新\n\n"
             + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
@@ -1582,14 +1761,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - 3D 硬币演示
 
-    /// 操作磁贴「3D 硬币」：玻璃模态里放一版 native 复刻的 mintform CSS 3D token。
-    /// 弹窗内容是自绘实时动画，必须包在 keepPanelAliveDuring 内（否则 .transient popover
-    /// 会把与弹窗的交互当成「点击面板外」先关面板）。
+    /// 操作磁贴「3D 硬币」：玻璃壳里放一版 native 复刻的 mintform CSS 3D token。
+    /// 非阻塞呈现（用户 2026-09-11 指定弹窗与主面板两边都可操作）：弹窗可见期间手动
+    /// 保活面板（begin/end 跨异步配对），关闭回调里解除保活并复位内嵌小硬币。
     @objc private func onShowCoinDemo() {
-        keepPanelAliveDuring { CoinDemoDialog.present() }
-        // 弹窗里改的参数刚落盘：Token 板块大数字左边那枚小硬币按同一份 CoinSettings 重灌，
-        // 保证「同一个币、两种尺寸」始终一致
-        panelView?.reloadInlineCoinSettings()
+        beginKeepPanelAlive()
+        CoinDemoDialog.present { [weak self] in
+            self?.endKeepPanelAlive()
+            // 弹窗调参中的实时同步走 .coinSettingsDidChange（通知带内存快照）；落盘只由弹窗
+            // 「保存」按钮负责。弹窗关闭后按磁盘值再灌一次：保存过 = 无害复位，
+            // 没保存 = 撤掉本次未保存的实时同步（主面板回到已存默认）。
+            self?.panelView?.reloadInlineCoinSettings()
+        }
     }
 
     // MARK: - App 自更新（GitHub Releases）
@@ -1661,8 +1844,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if autoCheck,
                UserDefaults.standard.string(forKey: UDKey.updateSnoozeDate) == today { return }
 
+            // ⚠️ split 按 Character 匹配，而 GitHub 正文是 CRLF——"\r\n" 在 Swift 里是
+            // 单个字素簇 Character，既 ≠ "\n" 也 ≠ "\r"，按 \n 切会整段不分 → 全文因
+            // 含 SHA256 行被整条滤掉 →「发布说明为空」。必须按换行语义 isNewline 切。
             var notes = rel.notes
-                .split(separator: "\n")
+                .split(whereSeparator: \.isNewline)
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty && !$0.lowercased().contains("sha256") }
                 .joined(separator: "\n")
@@ -1760,7 +1946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             var notes = "（获取 Release 文本失败，检查网络后重试）"
             if let rel = try? await UpdateService.fetchLatestRelease() {
                 let trimmed = rel.notes
-                    .split(separator: "\n")
+                    .split(whereSeparator: \.isNewline)   // 同 runUpdateFlow：CRLF 是单字素簇，按 \n 切不开
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty && !$0.lowercased().contains("sha256") }
                     .joined(separator: "\n")
@@ -1813,17 +1999,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         runUpdateDemo()
     }
 
-    @objc private func onSetApiKey() {
-        guard let result = keepPanelAliveDuring({
-            DeepSeekSettingsDialog(apiKey: config.deepseekApiKey,
-                                   quota: config.deepseekCommonQuota,
-                                   zhipuToken: config.bigmodelTokenOverride,
-                                   qwenTicket: config.qwenTicketOverride).present()
-        }) else { return }
-        if let apiKey = result.apiKey { config.deepseekApiKey = apiKey }
-        config.deepseekCommonQuota = max(0, result.quota)
-        if let zpToken = result.zhipuToken { config.bigmodelTokenOverride = zpToken }
-        if let qwenTicket = result.qwenTicket { config.qwenTicketOverride = qwenTicket }
+    /// 面板「Key / 额度」磁贴 / 右键「Key / 额度设置…」：打开设置窗口并落到该 pane
+    /// （原独立玻璃弹窗已并入设置窗口表单）
+    @objc func onSetApiKey() {
+        openSettingsWindow(pane: .keyQuota)
+    }
+
+    /// 「Key / 额度」保存（设置窗口表单 → 落盘 → 立即刷新）：
+    /// 凭据三件套走钥匙串（ConfigStore.save 内部转发 CredentialVault），额度进 config.json。
+    /// 表单语义 = 所见即所存：空串即清除该覆盖（ZhiPu / Qwen 回到浏览器登录态）。
+    private func applyKeyQuota(apiKey: String, quota: Double, zhipuToken: String, qwenTicket: String) {
+        config.deepseekApiKey = apiKey
+        config.deepseekCommonQuota = max(0, quota)
+        config.bigmodelTokenOverride = zhipuToken
+        config.qwenTicketOverride = qwenTicket
         ConfigStore.save(config)
         onRefresh()
     }
@@ -2095,9 +2284,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             default: iconScale = 1.0
             }
             // DeepSeek 图标后用细空格（后面紧跟 ¥ 符号），其余平台保持普通空格
-            // 状态点平台：图标前插入预留空隙（圆点左侧间距），点消失时重烘焙自动回收
+            // 状态点平台：图标前插入预留空隙（圆点左侧间距），点消失时重烘焙自动回收；
+            // 末字符 kern −2.2（普通 −0.2 + 额外 −2.0）：点→图标间距缩 2pt（2026-09-13，
+            // 空格字形组合凑不出精确 2pt，直接在 advance 上扣）。
+            // 首位条目只补一个细空格：点槽够容纳 [点][图标间距] 即可（中段条目的槽
+            // 含条目分隔，首位没有前一内容，点将贴位图左缘——见 GlowController 定位处；
+            // 补整段分隔会让点位右移、左缘视觉空隙过大，2026-09-13 用户打回）
             if menuBarGlowState(for: entry.id) != nil {
-                append(MenuBarStatusGlowController.dotReserve)
+                if !hasContent { append("\u{2009}") }
+                let reserve = MenuBarStatusGlowController.dotReserve
+                attr.append(NSAttributedString(
+                    string: String(reserve.dropLast()),
+                    attributes: [.font: boldFont, .kern: -0.2]))
+                attr.append(NSAttributedString(
+                    string: String(reserve.suffix(1)),
+                    attributes: [.font: boldFont, .kern: MenuBarStatusGlowController.dotReserveTailKern]))
             }
             attachIcon(named: entry.icon, size: iconSize * iconScale, spacing: entry.symbol.isEmpty ? " " : "\u{2009}")
 
@@ -2461,14 +2662,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 UsageStore.observe(platform: "wb", uid: uid, value: wb.remain, increasing: false)
                 updatePulsingForWb(uid: uid, remain: wb.remain, total: wb.total)
             }
-            // 裂变包重置日（副标题）：仅主账号、≥1h 拉一次（get-user-resource 全量包列表）
+            // 裂变包重置日（副标题）：仅主账号、按 uid 各自 ≥1h 拉一次（get-user-resource 全量包列表）。
+            // 按 uid 而非全局节流：切号后新主账号需立刻补一次，否则副标题空窗到上次的 1h 期满。
             if let auth = WorkBuddyService.authInfo(),
-               wbFissionFetchedAt.map({ Date().timeIntervalSince($0) > 3600 }) ?? true {
-                wbFissionFetchedAt = Date()
-                if let resetAt = await WorkBuddyService.fetchFissionReset(
-                    token: auth.token, uid: auth.uid, domain: auth.domain), ownsRefresh(seq) {
+               wbFissionFetchedAt[auth.uid].map({ Date().timeIntervalSince($0) > 3600 }) ?? true {
+                // 时间戳在请求返回后才写：请求失败时下一轮（~2.5min）重试，不空等 1 小时
+                let resetAt = await WorkBuddyService.fetchFissionReset(
+                    token: auth.token, uid: auth.uid, domain: auth.domain)
+                wbFissionFetchedAt[auth.uid] = Date()
+                if let resetAt, ownsRefresh(seq) {
                     cacheWbFission[auth.uid] = resetAt
-                    Logger.log(.refresh, "[\(seq)] WB.fission: resetAt=\(resetAt)")
+                    Logger.log(.refresh, "[\(seq)] WB.fission: uid=\(auth.uid) resetAt=\(resetAt)")
                 }
             }
             Logger.log(.refresh, "[\(seq)] WB.main: OK remain=\(wb.remain) total=\(wb.total) (\(Int(Date().timeIntervalSince(mainStart)*1000))ms)")
@@ -2863,6 +3067,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "退出 iBalance", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
+
+        // 文件菜单：⌘W 关设置窗口（accessory App 没有可见菜单条，但 keyEquivalent 照常分发）。
+        // ⚠️ 不用系统约定的 `performClose:`：它作用在「当时的 key window」上，更新窗口等模态
+        //    开着时会把无关窗口一起牵连；这里只认设置窗口（见 onCloseSettingsWindow）。
+        let fileMenuItem = NSMenuItem()
+        mainMenu.addItem(fileMenuItem)
+        let fileMenu = NSMenu(title: "文件")
+        let closeItem = fileMenu.addItem(withTitle: "关闭窗口",
+                                         action: #selector(onCloseSettingsWindow),
+                                         keyEquivalent: "w")
+        closeItem.target = self
+        fileMenuItem.submenu = fileMenu
 
         // Edit 菜单：标准文本编辑命令
         let editMenuItem = NSMenuItem()

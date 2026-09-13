@@ -126,7 +126,7 @@ open iBalance.app             # 运行（或双击）
   | `<源包>.icon`（位置参数） | ✔ | Icon Composer 源包目录路径 |
   | `--export-image` | ✔ | 导出子命令（当前唯一，仍须显式给） |
   | `--output-file` | ✔ | 输出 PNG 完整路径，文件名完全自定。项目命名规范 `<icon>-macOS26-ClearDark-256@1x.png` = 平台+设计代际 / rendition / 逻辑边长 / 像素倍率，见下「现有应用」 |
-  | `--platform` | ✔ | 按目标平台构图（外形遮罩/形状不同）：`iOS` / `macOS` / `watchOS`（watchOS 需源包声明 circles 组，本项目不用） |
+  | `--platform` | ✔ | 按目标平台构图（外形遮罩/形状不同）：`iOS` / `macOS` / `watchOS` 三选一（枚举经非法值报错实测）。**watchOS = 圆形构图**，现有源包直接可导（2026-09-12 实测 qwen.icon 成功，旧「需源包声明 circles 组」说法过时） |
   | `--rendition` | ✔ | 样式变体，六选一：`Default` / `Dark` / `TintedLight` / `TintedDark` / `ClearLight` / `ClearDark`。面板品牌卡特例恒取 `ClearDark` |
   | `--width` / `--height` | ✔ | 输出逻辑边长（pt），与 `--scale` 相乘得像素尺寸：实测 `--width 256 --height 256 --scale 2` 出 **512×512 px**（@2x）。面板资产口径 = 256×256 @1x |
   | `--scale` | ✔ | 像素倍率（1 或 2），对应文件名 `@1x` / `@2x` 后缀 |

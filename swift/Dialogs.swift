@@ -1,15 +1,16 @@
 // Dialogs.swift — iBalance
-// 弹窗统一封装:DialogShell 布局系统 + 各业务弹窗(InputDialog / DeepSeek 设置 / 平台自动化)
+// 弹窗统一封装:DialogShell 布局系统 + 各业务弹窗(InputDialog / 平台自动化)
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 //
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
 // 布局常量    DialogMetrics（内容宽 240 / 输入类 280 / 边距 8 / 图标 66，集中处）
 // NSAlert 壳  DialogShell（原生 NSAlert 薄封装；轻量确认/输入类弹窗走它，别另起 NSAlert）
 // 玻璃模态壳  GlassModalShell（另一个文件：整窗 Liquid Glass 模态窗口，App 图标 header +
-//            内容块 + 保存/取消；更新窗口同配方。DeepSeek 设置 / 平台开关走它）
-// 业务弹窗    InputDialog / DeepSeekSettingsDialog / PlatformAutomationSettingsDialog
+//            内容块 + 保存/取消；更新窗口同配方）
+// 业务弹窗    InputDialog（NSAlert 类）
+// 设置窗内容   PlatformTogglesPanelView（平台开关表格；2026-09-12 由玻璃弹窗迁入设置窗口）
 //
-// ⚠️ 两个壳怎么选：要「和更新窗口 / 平台开关一样的玻璃浮窗」= GlassModalShell；
+// ⚠️ 两个壳怎么选：要「和更新窗口一样的玻璃浮窗」= GlassModalShell；
 //    只要一个系统小弹窗（如单行输入）= DialogShell。
 // ⚠️ DialogShell 三件套（血泪坑，详见 AGENT.md 陷阱 #6）：
 //    1) 标题/说明走 messageText + informativeText（系统排版），别自己堆 label；
@@ -224,160 +225,6 @@ final class DarkInputField: NSTextField {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// DeepSeek 设置弹窗（面板「Key / 额度」磁贴入口）：配置 DeepSeek API Key / 日常充值额度
-/// + ZhiPu Token / Qwen Ticket 覆盖。窗口走 `GlassModalShell`（与更新窗口、平台开关弹窗同款
-/// 玻璃模态浮窗），内容为四行「label 在上、控件在下」表单；回车 = 保存、Esc = 取消。
-@MainActor
-final class DeepSeekSettingsDialog: NSObject {
-    private let apiKeyField: DarkInputField
-    private let popup = NSPopUpButton()
-    private let customField: DarkInputField
-    private let zhipuTokenField: DarkInputField
-    private let qwenTicketField: DarkInputField
-    private let presets: [(label: String, value: Double)] = [
-        ("未设置", 0),
-        ("¥10", 10),
-        ("¥20", 20),
-        ("¥50", 50),
-        ("¥100", 100),
-    ]
-
-    /// - Parameters:
-    ///   - apiKey: 当前 DeepSeek API Key
-    ///   - quota: 当前已设置的日常充值额度（0 = 未设置）
-    ///   - zhipuToken: 当前 ZhiPu Token 覆盖（空 = 自动从浏览器登录态读取）
-    ///   - qwenTicket: 当前 Qwen Ticket 覆盖（空 = 自动从浏览器登录态读取）
-    init(apiKey: String, quota: Double, zhipuToken: String = "", qwenTicket: String = "") {
-        // 四个输入框一套口径（DarkInputField：系统默认外观 + 单行），不再各写一遍控件样式
-        apiKeyField = DarkInputField(value: apiKey)
-        zhipuTokenField = DarkInputField(value: zhipuToken)
-        qwenTicketField = DarkInputField(value: qwenTicket)
-        customField = DarkInputField(placeholder: "自定义额度")
-        super.init()
-
-        for opt in presets { popup.addItem(withTitle: opt.label) }
-        popup.menu?.addItem(withTitle: "自定义", action: nil, keyEquivalent: "")
-
-        if quota > 0 {
-            if let idx = presets.firstIndex(where: { $0.value == quota }) {
-                popup.selectItem(at: idx)
-            } else {
-                popup.selectItem(at: presets.count) // 自定义
-            }
-            customField.stringValue = "\(Int(quota))"
-        } else {
-            popup.selectItem(at: 0)
-        }
-        popup.target = self
-        popup.action = #selector(popupChanged(_:))
-    }
-
-    @objc private func popupChanged(_ sender: NSPopUpButton) {
-        let idx = sender.indexOfSelectedItem
-        if idx < presets.count {
-            let v = presets[idx].value
-            customField.stringValue = v > 0 ? "\(Int(v))" : ""
-        }
-    }
-
-    func present() -> (apiKey: String?, quota: Double, zhipuToken: String?, qwenTicket: String?)? {
-        // 窗口配方与平台开关弹窗 / 更新窗口同源（GlassModalShell：整窗玻璃 + 无红绿灯 +
-        // 系统 16pt 连续曲率圆角 + 同步模态）；宽度也吃壳的默认值，三个玻璃弹窗等宽
-        let shell = GlassModalShell()
-        shell.setWindowTitle("iBalance DeepSeek / ZhiPu / Qwen 设置")
-        let infoAttr = NSMutableAttributedString(
-            string: "配置 API Key 和日常充值额度。获取 API Key：",
-            attributes: [.font: NSFont.systemFont(ofSize: 12),
-                         .foregroundColor: NSColor.secondaryLabelColor])
-        infoAttr.append(NSAttributedString(
-            string: "platform.deepseek.com/api_keys",
-            attributes: [.link: URL(string: "https://platform.deepseek.com/api_keys")!,
-                         .foregroundColor: NSColor.linkColor,
-                         .underlineStyle: NSUnderlineStyle.single.rawValue,
-                         .font: NSFont.systemFont(ofSize: 12)]))
-        shell.addHeader(title: "DeepSeek / ZhiPu / Qwen 设置", info: infoAttr)
-
-        // 四行设置共用一个内容容器：文本在上、控件在下，统一左对齐。
-        let rowWidth = shell.contentWidth
-        let labelHeight: CGFloat = 18
-        // 控件行高 = 输入框统一高（下拉也吃这个值，保证同行等高）
-        let controlHeight: CGFloat = DarkInputField.defaultHeight
-        let labelControlGap: CGFloat = 4
-        let rowHeight = labelHeight + labelControlGap + controlHeight
-        let rowGap: CGFloat = 10
-        let content = NSView(frame: NSRect(x: 0, y: 0,
-                                           width: rowWidth,
-                                           height: rowHeight * 4 + rowGap * 3))
-        // 每行结构同构（label 在上偏 +32，控件在下），自底向上逐行叠放：
-        // Qwen Ticket（底）→ ZhiPu Token → 日常额度 → API Key（顶）
-        let keyLabel = NSTextField(labelWithString: "API Key")
-        keyLabel.font = NSFont.systemFont(ofSize: 12)
-        keyLabel.textColor = NSColor.labelColor
-        keyLabel.alignment = .left
-        keyLabel.frame = NSRect(x: 0, y: rowHeight * 3 + rowGap * 3 + controlHeight + labelControlGap,
-                                width: rowWidth, height: labelHeight)
-        apiKeyField.frame = NSRect(x: 0, y: rowHeight * 3 + rowGap * 3,
-                                   width: rowWidth, height: controlHeight)
-        content.addSubview(keyLabel)
-        content.addSubview(apiKeyField)
-
-        let quotaLabel = NSTextField(labelWithString: "日常额度")
-        quotaLabel.font = NSFont.systemFont(ofSize: 12)
-        quotaLabel.textColor = NSColor.labelColor
-        quotaLabel.alignment = .left
-        quotaLabel.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2 + controlHeight + labelControlGap,
-                                  width: rowWidth, height: labelHeight)
-        let popupWidth: CGFloat = 110
-        popup.frame = NSRect(x: 0, y: rowHeight * 2 + rowGap * 2, width: popupWidth, height: controlHeight)
-        // 与同行下拉等高同基线（旧版这里是 24 高 + 下移 2 的例外，已统一）
-        customField.frame = NSRect(x: popupWidth + 8, y: rowHeight * 2 + rowGap * 2,
-                                   width: rowWidth - popupWidth - 8, height: controlHeight)
-        content.addSubview(quotaLabel)
-        content.addSubview(popup)
-        content.addSubview(customField)
-
-        let zpLabel = NSTextField(labelWithString: "ZhiPu Token（空 = 自动读取浏览器登录态）")
-        zpLabel.font = NSFont.systemFont(ofSize: 12)
-        zpLabel.textColor = NSColor.labelColor
-        zpLabel.alignment = .left
-        zpLabel.frame = NSRect(x: 0, y: rowHeight + rowGap + controlHeight + labelControlGap,
-                               width: rowWidth, height: labelHeight)
-        zhipuTokenField.frame = NSRect(x: 0, y: rowHeight + rowGap,
-                                       width: rowWidth, height: controlHeight)
-        content.addSubview(zpLabel)
-        content.addSubview(zhipuTokenField)
-
-        let qwLabel = NSTextField(labelWithString: "Qwen Ticket（空 = 自动读取浏览器登录态）")
-        qwLabel.font = NSFont.systemFont(ofSize: 12)
-        qwLabel.textColor = NSColor.labelColor
-        qwLabel.alignment = .left
-        qwLabel.frame = NSRect(x: 0, y: controlHeight + labelControlGap,
-                               width: rowWidth, height: labelHeight)
-        qwenTicketField.frame = NSRect(x: 0, y: 0,
-                                       width: rowWidth, height: controlHeight)
-        content.addSubview(qwLabel)
-        content.addSubview(qwenTicketField)
-        shell.addContent(content, height: content.frame.height)
-        // 初始焦点落在内部真实输入控件上（容器本身不是响应者）
-        shell.firstResponder = apiKeyField
-
-        // 按钮：第一个添加的在最右 = 主操作（保存，回车）；取消绑 Esc
-        let save = shell.addButton("保存", keyEquivalent: "\r", primary: true)
-        shell.addButton("取消", keyEquivalent: "\u{1b}")
-        guard shell.present() == save else { return nil }
-
-        let apiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let zpRaw = zhipuTokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let qwRaw = qwenTicketField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let customVal = Double(customField.stringValue.trimmingCharacters(in: .whitespaces)), customVal > 0 {
-            return (apiKey.isEmpty ? nil : apiKey, customVal, zpRaw.isEmpty ? nil : zpRaw, qwRaw.isEmpty ? nil : qwRaw)
-        }
-        let idx = popup.indexOfSelectedItem
-        let quota = idx < presets.count ? presets[idx].value : 0
-        return (apiKey.isEmpty ? nil : apiKey, quota, zpRaw.isEmpty ? nil : zpRaw, qwRaw.isEmpty ? nil : qwRaw)
-    }
-}
-
 /// 弹窗内小号 checkbox：空标题、居中，辅助功能名用于旁白等读屏
 private func makeCheckbox(label: String, isOn: Bool) -> NSButton {
     let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
@@ -388,41 +235,309 @@ private func makeCheckbox(label: String, isOn: Bool) -> NSButton {
     return checkbox
 }
 
-/// 各平台刷新 / 自动签到 / 卡片显示开关弹窗：窗口配方走 `GlassModalShell`
-/// （titled + fullSizeContentView + NSGlassEffectView 整窗一块玻璃；窗口层参数、系统
-/// 16pt 连续曲率圆角与模态收口都在壳里，详见 docs/glass-modal-window-guide.md）。
-/// 内容为 NSGridView 开关表；回车 = 保存、Esc = 取消。
+/// 平台开关表格（设置窗口「平台」pane 内嵌，2026-09-12 由 `GlassModalShell` 玻璃弹窗迁入）。
+///
+/// 每个平台一行，四列开关：刷新 / 签到（不支持的平台显「—」占位）/ 卡片显示 / 用量显示；
+/// 行首「全选」是三态混合框 —— 该行全开=勾选、全关=空白、部分开启=「−」。
+///
+/// 迁入设置窗口后的口径变化：
+/// - 不再自己开窗，改为**定高内容视图**（`contentHeight`）由宿主内嵌；
+/// - **勾选即生效**（2026-09-12 用户去掉页脚「保存」按钮）：任一处勾选变化 → `onCommit` →
+///   宿主 `makeConfig()` 合并落盘 + 同步菜单 / 签到定时器 / 面板。所以没有「未保存改动」，
+///   也没有「取消」语义 —— `reload(config:)` 退化成「每次开窗回读真实配置、归一勾选态」。
+///
+/// 2026-09-12 排版整备（对齐设置窗口其余 pane 的 macOS 口径）：
+/// - 名字 12→13pt（= Form 行正文），品牌图标 12→16pt，行高 27→**36**（用户两次各要 +4pt 行距）、
+///   行间留距改**行底分隔线**；
+/// - 卡片内留白 12pt（原来 0，内容贴卡缘）+ 表头下一条分隔线；
+/// - 名字列由 `layout()` 吸收余量 → 四个开关列恒贴卡片右缘，窗口变宽不再在右侧留空档。
 @MainActor
-final class PlatformAutomationSettingsDialog: NSObject {
-    private struct Row {
+final class PlatformTogglesPanelView: NSView {
+    override var isFlipped: Bool { true }
+
+    // MARK: - 平台表
+
+    /// 一个平台行：除图标与名字外只描述「哪个配置位对应哪一列」——
+    /// 建表、回读、保存三处都按这一张表走，不再各写一遍 7 行字面量。
+    private struct Platform {
         let name: String
-        let platformID: String
+        /// 面板卡片 / 用量可见性字典的键
+        let id: String
         /// 平台名列前置图标：bundle SVG 资源名（与面板品牌卡同图，ZCode 用 "zhipu"）
         let icon: String
+        /// 参与刷新的配置位
+        let refresh: WritableKeyPath<AppConfig, Bool>
+        /// 自动签到配置位（nil = 该平台不支持签到，「签到」列显「—」）
+        let checkin: WritableKeyPath<AppConfig, Bool>?
+    }
+
+    private static let platforms: [Platform] = [
+        Platform(name: "DeepSeek", id: "ds", icon: "deepseek",
+                 refresh: \.deepseekRefreshEnabled, checkin: nil),
+        Platform(name: "ZhiPu", id: "zhipu", icon: "zhipu",
+                 refresh: \.bigmodelRefreshEnabled, checkin: nil),
+        Platform(name: "Qwen", id: "qwen", icon: "qwen",
+                 refresh: \.qwenRefreshEnabled, checkin: nil),
+        Platform(name: "WorkBuddy", id: "wb", icon: "workbuddy",
+                 refresh: \.workbuddyEnabled, checkin: \.workbuddyAutoCheckin),
+        Platform(name: "TRAE", id: "trae", icon: "trae-color",
+                 refresh: \.traeRefreshEnabled, checkin: \.traeAutoCheckin),
+        Platform(name: "ZCode", id: "zcode", icon: "zhipu",
+                 refresh: \.zcodeRefreshEnabled, checkin: nil),
+        Platform(name: "Codex", id: "codex", icon: "codex",
+                 refresh: \.codexRefreshEnabled, checkin: nil),
+    ]
+
+    /// 每行的四个勾选框（与 `platforms` 同序；`checkin` nil = 该平台无签到列控件）
+    private struct RowControls {
         let refresh: NSButton
         let checkin: NSButton?
         let card: NSButton
-        let usage: NSButton?    // nil = 该平台无用量行，「用量」列显「—」占位
+        let usage: NSButton
     }
+
+    private enum Metrics {
+        // ── 卡片内留白（对齐 macOS 设置分区卡：内容不贴卡缘）──
+        static let horizontalInset: CGFloat = 12
+        static let topInset: CGFloat = 6
+        static let bottomInset: CGFloat = 6
+        // ── 表格节奏（对齐 macOS 表格：行高 36 + 行间细分隔线，不留行距）──
+        static let headerHeight: CGFloat = 24
+        static let rowHeight: CGFloat = 36
+        static let columnSpacing: CGFloat = 4
+        /// 列宽：行首全选 / 平台名（最小宽，实际由 layout 吸收余量）/ 四个开关列
+        /// 名字列下限 108 = 最长平台名（WorkBuddy，13pt ≈ 74pt）+ 图标 16 + 间距 6 再留余量；
+        /// 取值要保证「侧栏拉到 240 上限 + 窗口收到 640」的极限卡片宽 380 也放得下
+        static let allColumnWidth: CGFloat = 24
+        static let nameColumnMinWidth: CGFloat = 108
+        static let toggleColumnWidth: CGFloat = 50
+        /// 除名字列外的固定占宽：左右留白 + 全选列 + 四个开关列 + 5 条列间距
+        static var fixedColumnsWidth: CGFloat {
+            horizontalInset * 2 + allColumnWidth
+                + toggleColumnWidth * 4 + columnSpacing * 5
+        }
+    }
+
+    /// 内容定高（设置窗口内嵌用；手工 frame 布局的视图不参与 SwiftUI 自适应）。
+    /// = 上留白 + 表头 + 行数 × 行高 + 下留白（行间不留距，分隔线画在行底）
+    static var contentHeight: CGFloat {
+        Metrics.topInset + Metrics.headerHeight
+            + CGFloat(platforms.count) * Metrics.rowHeight + Metrics.bottomInset
+    }
+
+    private var controls: [RowControls] = []
+    /// 行首「全选」checkbox 的控制器；action 目标需存活至视图销毁，由本视图持有
+    private var rowAllHandlers: [RowAllHandler] = []
+    /// 上一次回读的配置：保存时以它为基，未在表里的平台 / 字段原样保留
+    private var originalConfig: AppConfig
+    /// 表格本体（`layout()` 里按卡片可用宽度重算名字列宽）
+    private var gridView: NSGridView?
+    /// 上一次布局时的卡宽（分隔线重绘的去重依据，见 `layout()`）
+    private var lastLaidOutWidth: CGFloat = 0
+    /// 任一处勾选变化后的落盘回调（宿主编排：`makeConfig()` → 落盘 + 同步菜单 / 定时器 / 面板）
+    var onCommit: (() -> Void)?
+
+    // MARK: - 构建
+
+    init(config: AppConfig) {
+        originalConfig = config
+        super.init(frame: .zero)
+        let grid = buildGrid()
+        gridView = grid
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.leadingAnchor.constraint(equalTo: leadingAnchor,
+                                          constant: Metrics.horizontalInset),
+            grid.topAnchor.constraint(equalTo: topAnchor, constant: Metrics.topInset),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 名字列吸收余量：四个开关列恒贴卡片右缘（macOS 表格口径）。
+    /// 原来名字列写死 130 → 窗口一宽，右侧就空出一条与内容无关的空白；
+    /// 现在固定列以外的宽度全给名字列；只在变宽时写回（幂等，不会来回抖）。
+    override func layout() {
+        super.layout()
+        guard let grid = gridView else { return }
+        let width = max(Metrics.nameColumnMinWidth,
+                        bounds.width - Metrics.fixedColumnsWidth)
+        if abs(grid.column(at: 1).width - width) > 0.5 {
+            grid.column(at: 1).width = width
+        }
+        // 分隔线长度跟卡宽走：非 layer-backed 视图不会因 resize 自动重画，
+        // 但也不能每轮 layout 都置位（拖动窗口时会白重绘），只在宽度真变了才重画
+        if abs(lastLaidOutWidth - bounds.width) > 0.5 {
+            lastLaidOutWidth = bounds.width
+            needsDisplay = true
+        }
+    }
+
+    /// 行分隔线：表头下一条 + 每行底部各一条（末行不画）——
+    /// macOS 表格靠它把一行的四个开关串成一条，1 物理像素。
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let lineWidth = 1 / (window?.backingScaleFactor ?? 2)
+        NSColor.separatorColor.setStroke()
+        let x0 = Metrics.horizontalInset
+        let x1 = bounds.maxX - Metrics.horizontalInset
+        for index in 0..<Self.platforms.count {
+            let y = Metrics.topInset + Metrics.headerHeight
+                + CGFloat(index) * Metrics.rowHeight + lineWidth / 2
+            let line = NSBezierPath()
+            line.move(to: NSPoint(x: x0, y: y))
+            line.line(to: NSPoint(x: x1, y: y))
+            line.lineWidth = lineWidth
+            line.stroke()
+        }
+    }
+
+    private func buildGrid() -> NSGridView {
+        func headerLabel(_ text: String, alignment: NSTextAlignment) -> NSTextField {
+            let label = NSTextField(labelWithString: text)
+            label.font = .systemFont(ofSize: 11, weight: .semibold)
+            label.textColor = .secondaryLabelColor
+            label.alignment = alignment
+            return label
+        }
+        /// 「—」占位（该平台无此项能力）：与行内文字同号的次级灰
+        func unavailablePlaceholder(_ label: String) -> NSView {
+            let unavailable = NSTextField(labelWithString: "—")
+            unavailable.alignment = .center
+            unavailable.font = .systemFont(ofSize: 13)
+            unavailable.textColor = .tertiaryLabelColor
+            unavailable.setAccessibilityLabel(label)
+            return unavailable
+        }
+
+        var gridRows: [[NSView]] = [[
+            headerLabel("", alignment: .center),
+            headerLabel("平台", alignment: .natural),
+            headerLabel("刷新", alignment: .center),
+            headerLabel("签到", alignment: .center),
+            headerLabel("卡片", alignment: .center),
+            headerLabel("用量", alignment: .center),
+        ]]
+
+        for platform in Self.platforms {
+            let name = NSTextField(labelWithString: platform.name)
+            // 13pt = 设置窗口 Form 行正文口径（表内文字不再比其它 pane 小一档）
+            name.font = .systemFont(ofSize: 13)
+            name.textColor = .labelColor   // 图标 tint 同此色号（见 brandIconView）
+            // 平台名列：前置 bundle SVG 品牌图标（裁边模板图，16pt 显示框），
+            // 与面板品牌卡同图；取不到资源（表外平台）则只留文字
+            let nameCell = NSStackView(views: [Self.brandIconView(platform.icon), name])
+            nameCell.orientation = .horizontal
+            nameCell.alignment = .centerY
+            nameCell.spacing = 6
+            let rowAll = makeCheckbox(label: "\(platform.name) 全选", isOn: false)
+            let row = RowControls(
+                refresh: makeCheckbox(label: "\(platform.name) 刷新",
+                                      isOn: originalConfig[keyPath: platform.refresh]),
+                checkin: platform.checkin.map {
+                    makeCheckbox(label: "\(platform.name) 自动签到", isOn: originalConfig[keyPath: $0])
+                },
+                card: makeCheckbox(label: "\(platform.name) 卡片显示",
+                                   isOn: originalConfig.panelCardVisible[platform.id] ?? true),
+                usage: makeCheckbox(label: "\(platform.name) 用量显示",
+                                    isOn: originalConfig.panelUsageVisible[platform.id] ?? true))
+            controls.append(row)
+            let handler = RowAllHandler(
+                all: rowAll,
+                options: [row.refresh, row.checkin, row.card, row.usage].compactMap { $0 })
+            // 勾选即落盘：行首全选与行内单个开关共用一个回调（弱引用视图，避免循环持有）
+            handler.onChange = { [weak self] in self?.onCommit?() }
+            rowAllHandlers.append(handler)
+            gridRows.append([
+                rowAll, nameCell, row.refresh,
+                row.checkin ?? unavailablePlaceholder("该平台不支持签到"),
+                row.card, row.usage,
+            ])
+        }
+
+        let grid = NSGridView(views: gridRows)
+        grid.rowSpacing = 0            // 行高即节奏，行间靠分隔线（macOS 表格口径）
+        grid.columnSpacing = Metrics.columnSpacing
+        grid.xPlacement = .fill
+        grid.yPlacement = .center
+        grid.column(at: 0).width = Metrics.allColumnWidth
+        grid.column(at: 0).xPlacement = .center
+        // 名字列起步宽 = 最小宽，实际宽度由 layout() 按卡片可用宽度吸收余量
+        grid.column(at: 1).width = Metrics.nameColumnMinWidth
+        grid.column(at: 1).xPlacement = .leading
+        for column in 2...5 {
+            grid.column(at: column).width = Metrics.toggleColumnWidth
+            grid.column(at: column).xPlacement = .center
+        }
+        grid.row(at: 0).height = Metrics.headerHeight
+        for index in 1...Self.platforms.count {
+            grid.row(at: index).height = Metrics.rowHeight
+        }
+        return grid
+    }
+
+    // MARK: - 回读 / 保存
+
+    /// 回读真实配置：按配置重置全部勾选（含行首全选框）。
+    /// 勾选即生效，本视图不会有「未保存编辑」，所以这里只是每次开窗的归一（幂等）。
+    func reload(config: AppConfig) {
+        originalConfig = config
+        for (index, platform) in Self.platforms.enumerated() {
+            let row = controls[index]
+            row.refresh.state = config[keyPath: platform.refresh] ? .on : .off
+            if let keyPath = platform.checkin {
+                row.checkin?.state = config[keyPath: keyPath] ? .on : .off
+            }
+            row.card.state = (config.panelCardVisible[platform.id] ?? true) ? .on : .off
+            row.usage.state = (config.panelUsageVisible[platform.id] ?? true) ? .on : .off
+        }
+        rowAllHandlers.forEach { $0.sync() }
+    }
+
+    /// 勾选结果合并回配置：以 `reload` 时的配置为基，未出现在表里的平台 / 字段原样保留
+    func makeConfig() -> AppConfig {
+        var updated = originalConfig
+        for (index, platform) in Self.platforms.enumerated() {
+            let row = controls[index]
+            updated[keyPath: platform.refresh] = (row.refresh.state == .on)
+            if let keyPath = platform.checkin {
+                updated[keyPath: keyPath] = (row.checkin?.state == .on)
+            }
+            updated.panelCardVisible[platform.id] = (row.card.state == .on)
+            updated.panelUsageVisible[platform.id] = (row.usage.state == .on)
+        }
+        return updated
+    }
+
+    // MARK: - 部件
 
     /// 行首「全选」控制器：勾选全开该行所有开关、取消全关；
     /// 行内任一开关变化时反向同步——全开=勾选、全关=空白、部分开启=混合态「−」。
+    /// 每次状态变化后回调 `onChange`（宿主据此即时落盘，见 `PlatformTogglesPanelView.onCommit`）。
     private final class RowAllHandler: NSObject {
         private let all: NSButton
         private let options: [NSButton]
+        /// 任一处变化后的通知（行首全选 / 行内单个开关都算）
+        var onChange: (() -> Void)?
 
         init(all: NSButton, options: [NSButton]) {
             self.all = all
             self.options = options
             super.init()
             all.allowsMixedState = true
-            all.state = Self.syncedState(of: options)
             all.target = self
             all.action = #selector(toggleAll(_:))
             for option in options {
                 option.target = self
                 option.action = #selector(syncAllState(_:))
             }
+            sync()
+        }
+
+        /// 全选框按选项重算（构建时与 `reload` 后都要调）
+        func sync() {
+            all.state = Self.syncedState(of: options)
         }
 
         /// 全选框应显示的状态：全开=勾选、全关=空白、部分=「−」
@@ -437,198 +552,32 @@ final class PlatformAutomationSettingsDialog: NSObject {
             let state: NSControl.StateValue = sender.state == .off ? .off : .on
             for option in options { option.state = state }
             sender.state = state    // 归一「−」中间值：选项全开时全选框不能停在混合态
+            onChange?()
         }
 
         @objc private func syncAllState(_ sender: NSButton) {
-            all.state = Self.syncedState(of: options)
+            sync()
+            onChange?()
         }
     }
 
     /// 平台名列前置品牌图标：bundle SVG 裁边模板图（与面板品牌卡同名资源），
-    /// 固定 12×12 显示框 + 按比例填满，各 SVG 墨迹视觉大小统一（2026-09-10 用户指定）
+    /// 固定 16×16 显示框 + 按比例填满，各 SVG 墨迹视觉大小统一（2026-09-12 随行高一起放大，
+    /// 原来 12pt 相对 13pt 文字偏小；平台名行与 macOS 表单行的图标口径一致）
     ///
     /// contentTintColor 必须显式设成 labelColor：模板图在 NSImageView 里的默认着色是
     /// **secondaryLabelColor**（实测 α=0.549），比同一行的平台名 label（.labelColor，
     /// α=0.847）淡一档，看起来像两个色号；显式指定后两者同色。
     private static func brandIconView(_ resource: String) -> NSImageView {
+        let size: CGFloat = 16
         let iv = NSImageView()
-        iv.image = BalancePanelView.trimmedBundleSvgIcon(resource, size: 12)
+        iv.image = BalancePanelView.trimmedBundleSvgIcon(resource, size: size)
         iv.imageScaling = .scaleProportionallyUpOrDown
         iv.contentTintColor = .labelColor
         iv.translatesAutoresizingMaskIntoConstraints = false
-        iv.widthAnchor.constraint(equalToConstant: 12).isActive = true
-        iv.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        iv.widthAnchor.constraint(equalToConstant: size).isActive = true
+        iv.heightAnchor.constraint(equalToConstant: size).isActive = true
         return iv
-    }
-
-    private let rows: [Row]
-    private let initialConfig: AppConfig
-    /// 行首「全选」checkbox 的控制器；action 目标需存活至弹窗关闭，由本类持有
-    private var rowAllHandlers: [RowAllHandler] = []
-
-    init(config: AppConfig) {
-        initialConfig = config
-        rows = [
-            Row(name: "DeepSeek", platformID: "ds",
-                icon: "deepseek",
-                refresh: makeCheckbox(label: "DeepSeek 刷新", isOn: config.deepseekRefreshEnabled),
-                checkin: nil,
-                card: makeCheckbox(label: "DeepSeek 卡片显示",
-                                   isOn: config.panelCardVisible["ds"] ?? true),
-                usage: makeCheckbox(label: "DeepSeek 用量显示",
-                                    isOn: config.panelUsageVisible["ds"] ?? true)),
-            Row(name: "ZhiPu", platformID: "zhipu",
-                icon: "zhipu",
-                refresh: makeCheckbox(label: "ZhiPu 刷新", isOn: config.bigmodelRefreshEnabled),
-                checkin: nil,
-                card: makeCheckbox(label: "ZhiPu 卡片显示",
-                                   isOn: config.panelCardVisible["zhipu"] ?? true),
-                usage: makeCheckbox(label: "ZhiPu 用量显示",
-                                    isOn: config.panelUsageVisible["zhipu"] ?? true)),
-            Row(name: "Qwen", platformID: "qwen",
-                icon: "qwen",
-                refresh: makeCheckbox(label: "Qwen 刷新", isOn: config.qwenRefreshEnabled),
-                checkin: nil,
-                card: makeCheckbox(label: "Qwen 卡片显示",
-                                   isOn: config.panelCardVisible["qwen"] ?? true),
-                usage: makeCheckbox(label: "Qwen 用量显示",
-                                    isOn: config.panelUsageVisible["qwen"] ?? true)),
-            Row(name: "WorkBuddy", platformID: "wb",
-                icon: "workbuddy",
-                refresh: makeCheckbox(label: "WorkBuddy 刷新", isOn: config.workbuddyEnabled),
-                checkin: makeCheckbox(label: "WorkBuddy 自动签到", isOn: config.workbuddyAutoCheckin),
-                card: makeCheckbox(label: "WorkBuddy 卡片显示",
-                                   isOn: config.panelCardVisible["wb"] ?? true),
-                usage: makeCheckbox(label: "WorkBuddy 用量显示",
-                                    isOn: config.panelUsageVisible["wb"] ?? true)),
-            Row(name: "TRAE", platformID: "trae",
-                icon: "trae-color",
-                refresh: makeCheckbox(label: "TRAE 刷新", isOn: config.traeRefreshEnabled),
-                checkin: makeCheckbox(label: "TRAE 自动签到", isOn: config.traeAutoCheckin),
-                card: makeCheckbox(label: "TRAE 卡片显示",
-                                   isOn: config.panelCardVisible["trae"] ?? true),
-                usage: makeCheckbox(label: "TRAE 用量显示",
-                                    isOn: config.panelUsageVisible["trae"] ?? true)),
-            Row(name: "ZCode", platformID: "zcode",
-                icon: "zhipu",
-                refresh: makeCheckbox(label: "ZCode 刷新", isOn: config.zcodeRefreshEnabled),
-                checkin: nil,
-                card: makeCheckbox(label: "ZCode 卡片显示",
-                                   isOn: config.panelCardVisible["zcode"] ?? true),
-                usage: makeCheckbox(label: "ZCode 用量显示",
-                                    isOn: config.panelUsageVisible["zcode"] ?? true)),
-            Row(name: "Codex", platformID: "codex",
-                icon: "codex",
-                refresh: makeCheckbox(label: "Codex 刷新", isOn: config.codexRefreshEnabled),
-                checkin: nil,
-                card: makeCheckbox(label: "Codex 卡片显示",
-                                   isOn: config.panelCardVisible["codex"] ?? true),
-                usage: makeCheckbox(label: "Codex 用量显示",
-                                    isOn: config.panelUsageVisible["codex"] ?? true)),
-        ]
-        super.init()
-    }
-
-    /// 同步模态运行：保存回车 / 取消 Esc 结束模态；仅保存返回新配置。
-    func present() -> AppConfig? {
-        let shell = GlassModalShell()
-        shell.setWindowTitle("iBalance 平台开关")
-        shell.addHeader(title: "平台开关",
-                        info: NSAttributedString(
-                            string: "选择各平台是否参与刷新、自动签到（支持签到的平台）、在面板显示余额卡片，以及是否显示该平台的用量行。",
-                            attributes: [.font: NSFont.systemFont(ofSize: 11),
-                                         .foregroundColor: NSColor.secondaryLabelColor]))
-
-        // ── 开关表格（NSGridView 列轨道对齐，口径同旧版）──
-        let headerAll = NSTextField(labelWithString: "")
-        let headerName = NSTextField(labelWithString: "平台")
-        let headerRefresh = NSTextField(labelWithString: "刷新")
-        let headerCheckin = NSTextField(labelWithString: "签到")
-        let headerCard = NSTextField(labelWithString: "卡片")
-        let headerUsage = NSTextField(labelWithString: "用量")
-        for label in [headerAll, headerName, headerRefresh, headerCheckin, headerCard, headerUsage] {
-            label.font = .systemFont(ofSize: 11, weight: .semibold)
-            label.textColor = .secondaryLabelColor
-        }
-        headerAll.alignment = .center
-        headerRefresh.alignment = .center
-        headerCheckin.alignment = .center
-        headerCard.alignment = .center
-        headerUsage.alignment = .center
-
-        /// 「—」占位（该平台无此项能力）
-        func unavailablePlaceholder(_ label: String) -> NSView {
-            let unavailable = NSTextField(labelWithString: "—")
-            unavailable.alignment = .center
-            unavailable.font = .systemFont(ofSize: 12)
-            unavailable.textColor = .tertiaryLabelColor
-            unavailable.setAccessibilityLabel(label)
-            return unavailable
-        }
-        var gridRows: [[NSView]] = [[headerAll, headerName, headerRefresh, headerCheckin, headerCard, headerUsage]]
-        for row in rows {
-            let name = NSTextField(labelWithString: row.name)
-            name.font = .systemFont(ofSize: 12)
-            name.textColor = .labelColor   // 图标 tint 同此色号（见 brandIconView）
-            // 平台名列：前置 bundle SVG 品牌图标（裁边模板图，12pt 显示框），
-            // 与面板品牌卡同图；取不到资源（表外平台）则只留文字
-            let nameCell = NSStackView(views: [Self.brandIconView(row.icon), name])
-            nameCell.orientation = .horizontal
-            nameCell.alignment = .centerY
-            nameCell.spacing = 5
-            let rowAll = makeCheckbox(label: "\(row.name) 全选", isOn: false)
-            rowAllHandlers.append(RowAllHandler(all: rowAll,
-                                                options: [row.refresh, row.checkin, row.card, row.usage].compactMap { $0 }))
-            let checkinView = row.checkin ?? unavailablePlaceholder("该平台不支持签到")
-            let usageView = row.usage ?? unavailablePlaceholder("该平台不支持用量显示")
-            gridRows.append([rowAll, nameCell, row.refresh, checkinView, row.card, usageView])
-        }
-        let grid = NSGridView(views: gridRows)
-        let headerHeight: CGFloat = 22
-        let rowHeight: CGFloat = 27
-        grid.rowSpacing = 4
-        grid.columnSpacing = 4
-        grid.xPlacement = .fill
-        grid.yPlacement = .center
-        grid.column(at: 0).width = 26
-        grid.column(at: 0).xPlacement = .center
-        // 平台列吃掉余量：26 + 130 + 54×4 + 间距 4×5 = 392 = 壳内容宽（旧 240 宽壳为 116）
-        grid.column(at: 1).width = 130
-        grid.column(at: 1).xPlacement = .leading
-        for col in 2...5 {
-            grid.column(at: col).width = 54
-            grid.column(at: col).xPlacement = .center
-        }
-        grid.row(at: 0).height = headerHeight
-        for index in 1...rows.count {
-            grid.row(at: index).height = rowHeight
-        }
-        let gridH = headerHeight + CGFloat(rows.count) * rowHeight
-            + CGFloat(rows.count) * 4
-        shell.addContent(grid, height: gridH)
-
-        // 按钮：第一个添加的在最右 = 主操作（保存，回车）；取消绑 Esc
-        let save = shell.addButton("保存", keyEquivalent: "\r", primary: true)
-        shell.addButton("取消", keyEquivalent: "\u{1b}")
-        guard shell.present() == save else { return nil }
-
-        var updatedConfig = initialConfig
-        updatedConfig.deepseekRefreshEnabled = rows[0].refresh.state == .on
-        updatedConfig.bigmodelRefreshEnabled = rows[1].refresh.state == .on
-        updatedConfig.qwenRefreshEnabled = rows[2].refresh.state == .on
-        updatedConfig.workbuddyEnabled = rows[3].refresh.state == .on
-        updatedConfig.workbuddyAutoCheckin = rows[3].checkin?.state == .on
-        updatedConfig.traeRefreshEnabled = rows[4].refresh.state == .on
-        updatedConfig.traeAutoCheckin = rows[4].checkin?.state == .on
-        updatedConfig.zcodeRefreshEnabled = rows[5].refresh.state == .on
-        updatedConfig.codexRefreshEnabled = rows[6].refresh.state == .on
-        for row in rows {
-            updatedConfig.panelCardVisible[row.platformID] = (row.card.state == .on)
-            if let usage = row.usage {
-                updatedConfig.panelUsageVisible[row.platformID] = (usage.state == .on)
-            }
-        }
-        return updatedConfig
     }
 }
 

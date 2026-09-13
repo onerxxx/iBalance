@@ -12,14 +12,13 @@
 // 为什么单条目：2026-09-08 首版逐键 7 条目，钥匙串锁定时每次 SecItem 操作各弹一次
 // 解锁密码，首次迁移连续弹 6-7 次。打包成 1 条后迁移/保存各 1 次操作，至多弹 1 次；
 // 条目创建后日常保存走 update（创建者 App 静默），正常情况零弹窗。
-// 为什么路径 ACL：App 用本地自签证书「iBalance Local Sign」签名，rebuild 后二进制
-// 哈希变化，签名 ACL 会视新二进制为陌生 App（每次构建弹 1 次）。条目以
-// SecTrustedApplicationCreateFromPath 的路径信任创建（dict 内嵌 acl_v 标记），
-// ACL 与签名解耦。2026-09-10 探针实测：同路径 + 同证书 rebuild 后新二进制静默读写
-// （裸二进制 / .app bundle / 外置盘三种配置全通过），机制健康；坏 ACL 只出现在
-// 历史 ad-hoc 签名时代创建的条目上，靠版本标记（v3）删除重建自愈。
-// ⚠️ build.sh 若某次构建落到 ad-hoc 兜底分支（找不到签名身份），该次二进制会弹
-// 一次授权，属预期行为。
+// 为什么默认签名 ACL（v4）：App 用本地自签证书「iBalance Local Sign」签名，DR 锚定
+// 证书指纹而非二进制哈希，rebuild 后 DR 不变 → 默认签名 ACL 跨构建静默读写。
+// v2-v3 的路径 ACL（SecTrustedApplicationCreateFromPath）是 ad-hoc 签名时代的方案；
+// 2026-09-12 起 macOS 27 beta 上旧式路径信任评估失效（每次重建读条目必弹一次
+// 钥匙串密码），弃用并靠版本标记 v3→v4 删除重建为默认 ACL 自愈。
+// ⚠️ build.sh 若某次构建落到 ad-hoc 兜底分支（找不到签名身份），该次二进制的 DR
+// 退化为二进制哈希，会弹一次授权，属预期行为。
 //
 // 数据形态：account = "credentials_bundle" 的 generic password，value = JSON dict
 // {legacy键名: 字符串值}；空值键不入 dict，全空 = 删除条目。
@@ -36,10 +35,10 @@ enum CredentialVault {
     static let bundleAccount = "credentials_bundle"
 
     /// bundle dict 内嵌版本标记（非 Key 枚举键位，merge 时被自然跳过）。
-    /// 缺失或非当前值 = 条目 ACL 已过期（v51 签名 ACL / v2 可能为 ad-hoc 时代坏 ACL），
-    /// 启动时删除重建为当前二进制的路径 ACL。
+    /// 缺失或非当前值 = 条目 ACL 已过期（v3 路径 ACL 在 macOS 27 beta 上评估失效，
+    /// 每次重建弹授权），启动时删除重建为默认签名 ACL（DR 锚定固定证书，跨构建静默）。
     private static let versionKey = "acl_v"
-    private static let versionValue = "3"
+    private static let versionValue = "4"
 
     /// 7 个敏感字段的键位（rawValue 与 config.json legacy 键名一致，即 bundle dict 的键名）
     enum Key: String, CaseIterable {
@@ -61,33 +60,6 @@ enum CredentialVault {
     /// load() 遇到 keychain 读失败后置 true：本会话 save() 跳过 keychain 写入。
     /// 防的是「钥匙串暂时读不出 → 内存里凭据为空 → save 把空值写回钥匙串」的真值覆盖。
     static var writeSuspended = false
-
-    // MARK: - 路径 ACL（根治 rebuild 后授权弹窗）
-
-    /// App 是 ad-hoc 签名，每次 rebuild CDHash 都变，签名 ACL 对新二进制一律视为
-    /// 陌生 App → 每次构建重启读条目都弹一次授权。把条目 ACL 绑定到「可执行文件
-    /// 路径」（SecTrustedApplicationCreateFromPath）后与签名无关，同路径重建即静默。
-    /// 旧式 SecAccess API 虽已废弃，但对 login 钥匙串 legacy 条目仍有效，且无现代替代。
-    private static func selfTrustedAccess() -> SecAccess? {
-        guard let exeURL = Bundle.main.executableURL else {
-            Logger.log(.refresh, "[Keychain] 取不到可执行文件路径，条目退回默认 ACL")
-            return nil
-        }
-        let path = exeURL.resolvingSymlinksInPath().path
-        var trusted: SecTrustedApplication?
-        guard SecTrustedApplicationCreateFromPath(path, &trusted) == errSecSuccess,
-              let t = trusted else {
-            Logger.log(.refresh, "[Keychain] SecTrustedApplicationCreateFromPath 失败（\(path)），条目退回默认 ACL")
-            return nil
-        }
-        var access: SecAccess?
-        guard SecAccessCreate("iBalance credentials" as CFString, [t] as CFArray, &access) == errSecSuccess,
-              let a = access else {
-            Logger.log(.refresh, "[Keychain] SecAccessCreate 失败，条目退回默认 ACL")
-            return nil
-        }
-        return a
-    }
 
     // MARK: - SecItem 原语（account 粒度）
 
@@ -120,7 +92,9 @@ enum CredentialVault {
         }
     }
 
-    /// 写入单条目（update 优先，不存在则 add；add 时挂路径 ACL；ThisDeviceOnly 不随 iCloud 同步）
+    /// 写入单条目（update 优先，不存在则 add）。add 不传 kSecAttrAccess = 默认签名
+    /// ACL：信任按 DR（固定证书「iBalance Local Sign」）判定，rebuild 跨构建静默；
+    /// ThisDeviceOnly 不随 iCloud 同步
     private static func writeItem(_ data: Data, _ account: String) -> OSStatus {
         let st = SecItemUpdate(baseQuery(account) as CFDictionary,
                                [kSecValueData as String: data] as CFDictionary)
@@ -129,7 +103,6 @@ enum CredentialVault {
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         add[kSecAttrDescription as String] = "iBalance 凭据（config.json 明文迁移）"
-        if let access = selfTrustedAccess() { add[kSecAttrAccess as String] = access }
         return SecItemAdd(add as CFDictionary, nil)
     }
 
@@ -240,9 +213,9 @@ enum CredentialVault {
         }
     }
 
-    /// bundle 已存在：ACL 版本不匹配时一次性删除重建（路径 ACL 与签名解耦，实测 2026-09-10：
-    /// 同路径同证书 rebuild 后新二进制静默读写，机制健康；坏 ACL 只会出现在旧版本标记的
-    /// 条目上，靠版本标记迁移自愈）。无论重建成败都返回 true 触发 save——
+    /// bundle 已存在：ACL 版本不匹配时一次性删除重建（v3 路径 ACL 在 macOS 27 beta
+    /// 上评估失效 → 重建为默认签名 ACL，DR 锚定固定证书跨构建静默；坏 ACL 只会出现在
+    /// 旧版本标记的条目上，靠版本标记迁移自愈）。无论重建成败都返回 true 触发 save——
     /// 成功时 dict 已含版本标记，失败时由 persist 用 config 内存值重试写入，数据不丢。
     private static func mergeExisting(_ dict: [String: String], into config: inout AppConfig) -> Bool {
         var needsSave = false

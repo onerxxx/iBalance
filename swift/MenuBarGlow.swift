@@ -1,12 +1,13 @@
 // MenuBarGlow.swift — 菜单栏平台图标「任务状态指示」
 // WB / ZCode / Codex 任一平台有可见任务态时，图标前方出现状态色圆点：
-//   - 圆点本体常亮（直径 = 图标 × dotScale，不闪烁）
+//   - 圆点本体常亮（直径 = 图标 × dotScale，不闪烁）；进行中（蓝）额外做小球弹跳
+//     （抛物线上下位移 + 触地压扁/顶点拉伸，光晕同幅跟随，见 updateBounce）
 //   - 圆点外沿呼吸光晕（同色模糊晕，余弦淡入淡出，周期与面板光环一致）
 // 实现：光晕位图预烘焙 + 60Hz Timer 逐帧写模型 opacity——多屏菜单栏镜像已提交的
 // 图层内容、不传播 CA presentation 动画，只有模型值逐帧提交才能让所有屏同步呼吸
 // （见 breathStep 注释）；图标本体（template 位图）与点击链路不接触。
 import AppKit
-import CoreImage
+import SettingsUI
 
 final class MenuBarStatusGlowController {
 
@@ -23,31 +24,41 @@ final class MenuBarStatusGlowController {
     private static let dotScale: CGFloat = 0.35  // 圆点直径 = 图标宽 × 0.35
     private static let dotSizeAdjust: CGFloat = -0.5  // 圆点直径固定修正（2026-09-08 缩小 0.5pt）
     private static let dotGap: CGFloat = 2       // 圆点与图标左缘的最小间距（定位收敛下限）
-    private static let dotOpacity: Float = 0.9   // 常亮透明度
+    private static let dotOpacity = Float(MenuBarStatusDotStyle.dotOpacity) // 常亮透明度（规格共享源）
     private static let minIconGap: CGFloat = 1   // 空间不足时间距压缩下限（与图标）
     private static let prevContentGap: CGFloat = 2 // 与左侧内容的压缩下限（空隙不够时收敛到此）
-    private static let dotLeftGap: CGFloat = 8   // 左侧有其他平台内容时，圆点与左侧内容的目标间隔
-    // 光晕（呼吸，仅作用于圆点）
-    private static let glowPadding: CGFloat = 5.1  // 光晕画布外扩（点），须容纳模糊扩散；每侧+0.1 = 光晕整体+0.2pt（2026-09-08）
-    private static let blurSigmaPx: CGFloat = 5  // 高斯模糊 σ（3x 位图像素 ≈ 1.7pt 视觉扩散）
-    private static let alphaBoost: CGFloat = 2.0 // 模糊后 alpha 增益（小面积光晕需更高增益）
-    private static let glowPeakOpacity: Float = 0.7 // 呼吸峰值透明度
-    private static let period: CFTimeInterval = 2.8 // 呼吸周期（与面板光环 2.8s 同口径）
+    private static let dotLeftGap: CGFloat = 6   // 左侧有其他平台内容时，圆点与左侧内容的目标间隔（2026-09-13 用户要求由 8 缩 2pt）
+    // 光晕（呼吸，仅作用于圆点）：透明度 / 模糊 / 烘焙规格统一在 MenuBarStatusDotStyle
+    // （SettingsUI，设置窗口预览共用同一份），这里只按用途起别名
+    private static let glowPadding = MenuBarStatusDotStyle.glowPadding // 光晕画布外扩（点），须容纳模糊扩散
+    // 小球弹跳（仅「进行中」蓝点；光晕亮度仍走上面的呼吸，只跟随位移）
+    // 参数改由设置窗口「动画」pane 开放（落盘 + 实时生效），取值域/默认值/解算
+    // 统一在 MenuBarBounceSettings（SettingsUI），本文件只负责把帧画出来
 
     /// 状态点平台在标题烘焙时插入的预留空隙（点左侧间距）。点出现才插入、消失即随
     /// 重烘焙回收——标题排版由 updateTitleImpl 的指纹（含点存亡）驱动增删。
-    /// 宽度算式：dotLeftGap(8) + 圆点(≈4.7) + 右距目标(≈4.4) ≈ 17pt，叠加条目分隔(≈9pt)；
-    /// 右距由「左缘+dotLeftGap 定位 + 本空隙宽度」共同决定，只调图层不调空隙不会变（空隙是硬上限）
+    /// 宽度算式：dotLeftGap(6) + 圆点(≈4.7) + 右距目标(≈2.4) ≈ 13pt，叠加条目分隔(≈9pt)；
+    /// 右距由「左缘+dotLeftGap 定位 + 本空隙宽度」共同决定，只调图层不调空隙不会变（空隙是硬上限）。
+    /// 2026-09-13 点→图标间距 −2pt：宿主烘焙时对本空隙末字符施加 dotReserveTailKern。
     static let dotReserve = "  \u{2009}"
+    /// dotReserve 末字符的 kern：普通字符默认 −0.2，此处 −2.2 = 净缩 2pt（空格字形
+    /// 组合凑不出精确 2pt，直接在末字符 advance 上扣；attachmentRects 经 NSLayoutManager
+    /// 解算，leftFreeSpace 与点定位口径自动一致）
+    static let dotReserveTailKern: CGFloat = -2.2
 
     private let stateProvider: (String) -> AgentTaskState?
-    private static let ciContext = CIContext()
+
+    /// 小球弹跳参数（设置窗口「动画」pane 写入；见 `setBounce`）
+    private var bounce = MenuBarBounceSettings.initial
 
     private weak var button: NSStatusBarButton?
     private var entries: [EntryIcon] = []
     /// 光晕层（呼吸，垫在圆点下）/ 圆点层（常亮本体），按条目 id 索引
     private var glowLayers: [String: CALayer] = [:]
     private var dotLayers: [String: CALayer] = [:]
+    /// 弹跳基准：进行中圆点的静止帧（不含弹跳位移）+ 各自弹跳相位起点（按 id）
+    private var dotBaseFrames: [String: CGRect] = [:]
+    private var bounceStart: [String: CFTimeInterval] = [:]
     private var glowCache: [String: CGImage] = [:]
     /// 圆点存亡变化回调（出现/消失改变标题排版，由宿主触发标题重烘焙）
     var onDotPresenceChanged: (() -> Void)?
@@ -61,6 +72,13 @@ final class MenuBarStatusGlowController {
 
     func attach(button: NSStatusBarButton) {
         self.button = button
+    }
+
+    /// 设置窗口「动画」pane 改参后调用：立刻按新参数重算当前帧（不必等下一拍 60Hz），
+    /// 拖动滑杆时菜单栏是跟手的。无进行中圆点时是空操作。
+    func setBounce(_ s: MenuBarBounceSettings) {
+        bounce = s
+        updateBounce(at: CACurrentMediaTime())
     }
 
     /// 标题位图重烘焙后调用；异步延迟到下一 runloop——status item 尺寸重排
@@ -280,6 +298,8 @@ final class MenuBarStatusGlowController {
         for (id, l) in dotLayers where !wantedIDs.contains(id) {
             l.removeFromSuperlayer()
             dotLayers[id] = nil
+            dotBaseFrames[id] = nil
+            bounceStart[id] = nil
         }
         // 圆点存亡变化 → 标题排版需增删 dotReserve 预留空隙：回调宿主重烘焙标题位图
         // （先更新记录再回调，宿主重烘焙触发 setEntries→sync 时不会二次触发成环）
@@ -311,16 +331,21 @@ final class MenuBarStatusGlowController {
                                   width: e.rect.width,
                                   height: e.rect.height)
             // 圆点本体：图标左侧，垂直居中。位置收敛：
-            //   左侧有内容（leftFreeSpace 非nil）：按「左缘 + dotLeftGap」定位（与左侧数字
-            //   保持目标间隔），右距不足 dotGap 时向图标方向收敛，再不够压到 prevContentGap；
-            //   左侧无内容（首条目）：期望位 = 图标左缘 - dotGap - 直径。
+            //   最左条目（无前一内容）：点贴位图左缘（want = leftEdge + 0）——leading
+            //   视觉空隙只剩按钮内边距，点→图标间距与中段一致（2026-09-13 用户定稿；
+            //   按中段 dotLeftGap 落位会让左缘空隙多出 6pt，用户打回）；
+            //   左侧有内容：按「左缘 + dotLeftGap」定位（与左侧数字保持目标间隔），
+            //   右距不足 dotGap 时向图标方向收敛，再不够压到 prevContentGap
             let d = iconRect.width * Self.dotScale + Self.dotSizeAdjust
             var dotX = iconRect.minX - Self.dotGap - d
+            let isLeftmost = (e.id == entries.first?.id)
             if let leftFree = e.leftFreeSpace {
                 let leftEdge = iconRect.minX - leftFree
-                let want = leftEdge + Self.dotLeftGap
+                let want = leftEdge + (isLeftmost ? 0 : Self.dotLeftGap)
                 let maxForIconGap = iconRect.minX - Self.dotGap - d
-                dotX = min(max(want, leftEdge + Self.prevContentGap), maxForIconGap)
+                dotX = isLeftmost
+                    ? min(want, maxForIconGap)
+                    : min(max(want, leftEdge + Self.prevContentGap), maxForIconGap)
             }
             dotX = min(dotX, iconRect.minX - Self.minIconGap - d)
             let dotFrame = NSRect(x: dotX,
@@ -350,10 +375,20 @@ final class MenuBarStatusGlowController {
             dot.frame = dotFrame
             dot.cornerRadius = d / 2
             dot.backgroundColor = Self.color(for: state).cgColor
+            // 进行中（蓝）：登记弹跳基准帧，相位起点取首次出现时刻（新球从触地起跳）
+            if state == .running {
+                if dotBaseFrames[e.id] == nil { bounceStart[e.id] = CACurrentMediaTime() }
+                dotBaseFrames[e.id] = dotFrame
+            } else {
+                dotBaseFrames[e.id] = nil
+                bounceStart[e.id] = nil
+            }
             // 保证光晕恒在圆点下方
             dot.zPosition = 1
             glow.zPosition = 0
         }
+        // 立即落到当前弹跳帧：排序动画的终态帧即此刻真实帧，收尾无跳变
+        updateBounce(at: CACurrentMediaTime())
         ensureBreathing()
     }
 
@@ -380,21 +415,55 @@ final class MenuBarStatusGlowController {
         breathTimer = nil
     }
 
-    /// 余弦呼吸当前 alpha（breathStep 与排序画布共用，保证光晕亮度跨动画连续）
+    /// 余弦呼吸当前 alpha（breathStep 与排序画布共用，保证光晕亮度跨动画连续）；
+    /// 公式与参数 = MenuBarStatusDotStyle.breathOpacity（设置窗口预览同源）
     private func currentBreathAlpha() -> Float {
-        let t = CACurrentMediaTime() - breathStart
-        let phase = CGFloat(t.truncatingRemainder(dividingBy: Self.period)) / Self.period
-        let breath = CGFloat(0.5) * (CGFloat(1) - cos(CGFloat(2) * CGFloat.pi * phase))
-        return Self.glowPeakOpacity * Float(breath)
+        Float(MenuBarStatusDotStyle.breathOpacity(at: CACurrentMediaTime() - breathStart))
     }
 
-    /// 余弦呼吸：0 → 峰值（半周期处）→ 0；圆点本体不参与（常亮）
+    /// 余弦呼吸：0 → 峰值（半周期处）→ 0；圆点本体不参与（常亮），仅进行中圆点走弹跳
     @objc private func breathStep() {
         guard !glowLayers.isEmpty else { stopBreathing(); return }
+        let now = CACurrentMediaTime()
         let opacity = currentBreathAlpha()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for (_, l) in glowLayers { l.opacity = opacity }
+        CATransaction.commit()
+        updateBounce(at: now)
+    }
+
+    // MARK: - 小球弹跳（仅「进行中」蓝点，60Hz 模型值驱动，多屏同步）
+
+    /// 进行中蓝点＝弹跳小球：在静止基准帧上叠加抛物线弹跳（上下位移 + 触地压扁/顶点拉伸），
+    /// 光晕同幅上下跟随（亮度仍由呼吸驱动，观感不变）。与呼吸同理走模型值逐帧提交——
+    /// CA 动画属 presentation 瞬态，不随菜单栏多屏镜像传播（见 breathStep 注释）。
+    /// 排序滑动期间跳过：帧由 reorderStep 独占插值，收尾 sync 后再交还本函数。
+    /// 形变解算在 `MenuBarBounceSettings.solve(at:)`（设置窗口预览共用同一函数，两边不会漂）。
+    private func updateBounce(at now: CFTimeInterval) {
+        guard !isReordering, !dotBaseFrames.isEmpty else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (id, base) in dotBaseFrames {
+            guard let dot = dotLayers[id] else { continue }
+            let b = bounce.solve(at: now - (bounceStart[id] ?? now))
+            let w = base.width * CGFloat(b.sx)
+            let h = base.height * CGFloat(b.sy)
+            // 以底缘为支点形变：压扁时贴地、拉伸时向上长。
+            // ⚠️ 状态栏按钮的层坐标实测 top-down（+y 向下）：dy 正值按 y-up 应用时真机
+            // 弹跳整体上下镜像（2026-09-13 用户报告，静置位/图标居中因上下对称不露馅）。
+            // solve() 的 dy 语义（视觉向上）不变——设置预览宿主是翻转视图、+dy 即向上；
+            // 这里取负应用，支点 = base.maxY（视觉底缘）：dy=0 底缘贴地压扁，
+            // dy=amplitude 整球上浮顶点拉伸。
+            dot.frame = NSRect(x: base.midX - w / 2,
+                               y: base.maxY - CGFloat(b.dy) - h,
+                               width: w, height: h)
+            dot.cornerRadius = h / 2
+            if let glow = glowLayers[id] {
+                glow.frame = base.insetBy(dx: -Self.glowPadding, dy: -Self.glowPadding)
+                    .offsetBy(dx: 0, dy: -CGFloat(b.dy))
+            }
+        }
         CATransaction.commit()
     }
 
@@ -404,7 +473,7 @@ final class MenuBarStatusGlowController {
     /// （2026-09-08 三态饱和度统一 +10%，与卡片光环同批调整）
     private static func color(for state: AgentTaskState) -> NSColor {
         switch state {
-        case .running:    NSColor(calibratedRed: 0.505, green: 0.824, blue: 1.0, alpha: 1)
+        case .running:    MenuBarStatusDotStyle.runningColor
         case .completed:  NSColor(calibratedRed: 0.51, green: 0.95, blue: 0.40, alpha: 1)
         case .interrupted: NSColor(calibratedRed: 1, green: 0.20, blue: 0, alpha: 1)
         }
@@ -413,37 +482,9 @@ final class MenuBarStatusGlowController {
     private func glowImage(state: AgentTaskState, diameter: CGFloat) -> CGImage? {
         let key = "dot|\(state)|\(Int(diameter * 10))"
         if let c = glowCache[key] { return c }
-        let scale: CGFloat = 3
-        let side = diameter + Self.glowPadding * 2
-        let px = max(1, Int(side * scale))
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
-                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-                                         isPlanar: false, colorSpaceName: .deviceRGB,
-                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
-        rep.size = NSSize(width: side, height: side)
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        // 圆点剪影（实心圆）直接矢量绘制，无需图标形状
-        Self.color(for: state).setFill()
-        NSBezierPath(ovalIn: NSRect(x: Self.glowPadding, y: Self.glowPadding,
-                                    width: diameter, height: diameter)).fill()
-        NSGraphicsContext.restoreGraphicsState()
-        guard let base = rep.cgImage else { return nil }
-
-        // 高斯模糊 + alpha 增益（模糊拉低峰值）+ 裁回画布（模糊 extent 外扩，不裁会破坏 frame 对位）
-        var ci = CIImage(cgImage: base)
-        if let blur = CIFilter(name: "CIGaussianBlur") {
-            blur.setValue(ci, forKey: kCIInputImageKey)
-            blur.setValue(Self.blurSigmaPx, forKey: kCIInputRadiusKey)
-            ci = blur.outputImage ?? ci
-        }
-        if let boost = CIFilter(name: "CIColorMatrix") {
-            boost.setValue(ci, forKey: kCIInputImageKey)
-            boost.setValue(CIVector(x: 0, y: 0, z: 0, w: Self.alphaBoost), forKey: "inputAVector")
-            ci = boost.outputImage ?? ci
-        }
-        ci = ci.cropped(to: CGRect(x: 0, y: 0, width: px, height: px))
-        guard let out = Self.ciContext.createCGImage(ci, from: ci.extent) else { return nil }
+        // 烘焙管线在 MenuBarStatusDotStyle（设置预览同源）；菜单栏 1:1，visualScale 缺省 1
+        guard let out = MenuBarStatusDotStyle.glowBitmap(color: Self.color(for: state),
+                                                         dotDiameter: diameter) else { return nil }
         glowCache[key] = out
         return out
     }
@@ -454,5 +495,38 @@ final class MenuBarStatusGlowController {
         glowLayers.removeAll()
         for (_, l) in dotLayers { l.removeFromSuperlayer() }
         dotLayers.removeAll()
+        dotBaseFrames.removeAll()
+        bounceStart.removeAll()
+    }
+}
+
+// MARK: - 小球弹跳参数的落盘（设置窗口「动画」pane）
+
+/// 取值域/默认值/解算都在 `MenuBarBounceSettings`（SettingsUI），这里只补 UserDefaults 读写。
+/// 逐项独立落盘、逐次改动即写（滑杆拖动过程中也在写）—— 用户调完即是最终值，
+/// 不设「保存」按钮，与「设置」pane 的刷新间隔同口径。
+/// 读回一律夹回取值域：将来收窄范围时老值不会把滑杆顶歪。
+extension MenuBarBounceSettings {
+    static func load() -> MenuBarBounceSettings {
+        let defaults = UserDefaults.standard
+        func value(_ key: String, _ fallback: Double) -> Double {
+            defaults.object(forKey: key) == nil ? fallback : defaults.double(forKey: key)
+        }
+        return MenuBarBounceSettings(
+            amplitude: value(UDKey.menuBarBounceAmplitude, initial.amplitude),
+            period: value(UDKey.menuBarBouncePeriod, initial.period),
+            airRatio: value(UDKey.menuBarBounceAirRatio, initial.airRatio),
+            squashMin: value(UDKey.menuBarBounceSquashMin, initial.squashMin),
+            stretchMax: value(UDKey.menuBarBounceStretchMax, initial.stretchMax)
+        ).clamped()
+    }
+
+    func save() {
+        let defaults = UserDefaults.standard
+        defaults.set(amplitude, forKey: UDKey.menuBarBounceAmplitude)
+        defaults.set(period, forKey: UDKey.menuBarBouncePeriod)
+        defaults.set(airRatio, forKey: UDKey.menuBarBounceAirRatio)
+        defaults.set(squashMin, forKey: UDKey.menuBarBounceSquashMin)
+        defaults.set(stretchMax, forKey: UDKey.menuBarBounceStretchMax)
     }
 }

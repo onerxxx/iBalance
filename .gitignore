@@ -65,3 +65,6 @@ Inter-4.1/
 
 # .icon / actool 构建中间产物（可由 swift/icons 源包重新生成）
 /swift/.icon_build/
+
+# WorkBuddy AI 运行时产物（本地记忆文件，非项目代码）
+.workbuddy-ai/

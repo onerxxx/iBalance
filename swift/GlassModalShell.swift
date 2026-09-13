@@ -1,7 +1,9 @@
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
 // 窗口壳      GlassModalShell：titled + fullSizeContentView + NSGlassEffectView 整窗一块玻璃
-//             （无标题栏 / 无红绿灯、系统 16pt 连续曲率圆角），runModal 同步模态
-// 用法        addHeader(标题 + 说明[ + symbol]) → addContent(主内容) → addButton(主 / 次) → present()
+//             （无标题栏 / 无红绿灯、系统 16pt 连续曲率圆角）
+// 用法        addHeader(标题 + 说明[ + symbol]) → addContent(主内容) → addButton(主 / 次) →
+//             present()（runModal 同步模态：更新 / 平台开关 / Key 弹窗）或
+//             presentNonModal(onDismiss:)（非阻塞：3D 硬币，主面板同时可操作）
 //             symbol 缺省 = 应用图标；给了就画该 SF Symbol（与入口磁贴同款着色），
 //             用于「入口是什么 icon，弹窗 header 就是什么 icon」的弹窗（如 3D 硬币）
 // 常量口径    Metrics（宽 440 / 边距 24 / top 34 / footer 26…全弹窗唯一出处）
@@ -19,7 +21,9 @@ import Cocoa
 /// 圆角由系统 NSThemeFrame 层给出 16pt 连续曲率（与主面板 popover 同源）。
 /// 内容层：contentView = NSGlassEffectView(.regular)，内嵌翻转容器，子视图按
 /// 「y 自窗口顶向下」直接铺 frame（与 UpdateProgressWindow.relayoutAndResize 同法）。
-/// 交互：NSApp.runModal 同步模态；保存按钮绑回车、取消按钮绑 Esc。
+/// 交互：`present()` = NSApp.runModal 同步模态（保存按钮绑回车、取消按钮绑 Esc）；
+/// 3D 硬币走 `presentNonModal(onDismiss:)` 非阻塞呈现——不进模态循环，
+/// 主面板等其余窗口照常收事件，任一按钮 / Esc 收口到 onDismiss 回调。
 @MainActor
 final class GlassModalShell: NSObject {
 
@@ -120,7 +124,7 @@ final class GlassModalShell: NSObject {
     /// header：图标 + 主标题 + 说明（图标贴 header 顶，文字列起点 = 图标右缘 + 间距）
     ///
     /// `symbol` 缺省（nil）= 应用图标（`UpdateProgressWindowController.trimmedAppIcon`）；
-    /// 给 SF Symbol 名时改画该符号，点径 / 粗细 / 着色与入口磁贴（`ActionTileButton`）同款
+    /// 给 SF Symbol 名时改画该符号，点径 / 粗细 / 着色与原面板入口磁贴同款口径
     /// —— 入口磁贴是什么 icon，弹窗 header 就画同一个。
     func addHeader(title: String, info: NSAttributedString, symbol: String? = nil) {
         let iv = NSImageView()
@@ -205,11 +209,25 @@ final class GlassModalShell: NSObject {
 
     @objc private func onButtonClicked(_ sender: NSButton) {
         clickedIndex = buttons.firstIndex(of: sender) ?? -1
-        NSApp.stopModal(withCode: .OK)
+        if nonModalDismiss != nil {
+            finishNonModal()
+        } else {
+            NSApp.stopModal(withCode: .OK)
+        }
     }
+
+    // MARK: 同步模态（更新窗口 / 平台开关 / Key 弹窗）
 
     /// 同步模态运行，返回被点击按钮的索引（Esc / 取消返回其索引；异常收口 -1）
     func present() -> Int {
+        layoutAndShow()
+        NSApp.runModal(for: win)
+        win.orderOut(nil)
+        return clickedIndex
+    }
+
+    /// 上屏前的窗口准备：主题 / 尺寸 / frame 直铺 / 居中激活（模态与非阻塞共用一段）
+    private func layoutAndShow() {
         // 应用内主题：模态壳是自建顶层窗口、不在面板视图树上，取不到容器 appearance，
         // 只能按全局镜像显式设（浅色主题开=aqua，否则 nil 跟随系统）
         win.appearance = Palette.topLevelWindowAppearance
@@ -240,7 +258,6 @@ final class GlassModalShell: NSObject {
             bx -= Metrics.buttonHGap
         }
 
-        // ── 模态运行：回车 / Esc 两路都收口到 stopModal ──
         win.center()
         clickedIndex = -1
         // ⚠️ 先激活 App 再上屏：本 App 是 LSUIElement（默认不活跃），不激活时窗口拿不到
@@ -253,8 +270,59 @@ final class GlassModalShell: NSObject {
         win.makeKeyAndOrderFront(nil)
         win.orderFrontRegardless()
         if let firstResponder { win.makeFirstResponder(firstResponder) }
-        NSApp.runModal(for: win)
+    }
+
+    // MARK: 非阻塞会话（3D 硬币弹窗专用）
+
+    /// 在屏的非阻塞会话：静态强持有（窗口在屏期间 shell 与回调闭包都得活着，
+    /// finish 时清空即全部释放）。同刻至多一个非阻塞玻璃弹窗。
+    private static var activeSession: (shell: GlassModalShell, onDismiss: (Int) -> Void)?
+
+    /// 是否有非阻塞玻璃弹窗在屏（主面板展示 / 保活收口据此决定是否挂起 transient）
+    static var hasActiveNonModalSession: Bool { activeSession != nil }
+
+    /// 已有非阻塞弹窗在屏时把焦点交回给它（重复点入口磁贴不叠第二个窗口）
+    static func focusActiveNonModal() {
+        activeSession?.shell.win.makeKeyAndOrderFront(nil)
+    }
+
+    /// 非阻塞关闭回调（nil = 当前 shell 不在非阻塞会话里，按钮点击走 stopModal）
+    private var nonModalDismiss: ((Int) -> Void)?
+
+    /// 非阻塞呈现：不开 NSApp.runModal，主面板等其余窗口照常收事件（用户 2026-09-11
+    /// 指定 3D 硬币弹窗与主面板两边都可操作）。任一按钮 / Esc 关闭后窗口收起，
+    /// `onDismiss(被点按钮索引)` 在收起之后回调一次。
+    func presentNonModal(onDismiss: @escaping (Int) -> Void) {
+        // 保险：已有会话在屏 → 焦点还给它，本窗口不叠上来（入口侧已用
+        // hasActiveNonModalSession 拦截，正常到不了这）
+        if GlassModalShell.activeSession != nil {
+            GlassModalShell.focusActiveNonModal()
+            return
+        }
+        nonModalDismiss = onDismiss
+        GlassModalShell.activeSession = (self, onDismiss)
+        layoutAndShow()
+    }
+
+    /// 非阻塞会话收口：清静态（shell / 回调从此无人持有）→ 窗口收起 → 回调。
+    /// 回调刻意放在 orderOut 之后，调用侧可安全做面板复位。
+    private func finishNonModal() {
+        GlassModalShell.activeSession = nil
+        let dismiss = nonModalDismiss
+        nonModalDismiss = nil
         win.orderOut(nil)
-        return clickedIndex
+        dismiss?(clickedIndex)
+    }
+
+    /// 窗口 appearance 按全局镜像重设（Palette.topLevelWindowAppearance）。
+    /// 浅色主题开关（设置窗口「主题外观」pane）翻转时，在屏的非阻塞弹窗（3D 硬币）外观
+    /// 要跟着变；设置窗口自身按同一口径在自己的 refreshAppearance() 里重染。
+    func refreshWindowAppearance() {
+        win.appearance = Palette.topLevelWindowAppearance
+    }
+
+    /// 静态入口：活动中的非阻塞弹窗重染窗口外观（无会话 = 无操作）
+    static func refreshActiveNonModalAppearance() {
+        activeSession?.shell.refreshWindowAppearance()
     }
 }

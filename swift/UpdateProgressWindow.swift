@@ -833,8 +833,8 @@ final class UpdateProgressWindowController: NSObject, NSWindowDelegate {
         notesScroll.hasHorizontalScroller = false
         notesScroll.autohidesScrollers = true
         notesScroll.wantsLayer = true
-        // hover 卡片同款皮肤（动态色，随窗口外观深浅切换）：深色 白@30% 描边 +
-        // 黑@85% 底 / 浅色 黑@30% 描边 + 黑@6% 底（Palette.hoverBorderBright /
+        // hover 卡片同款皮肤（动态色，随窗口外观深浅切换）：点阵主题色@30% 描边 +
+        // 深色 黑@50% 底 / 浅色 白@90% 底（Palette.hoverBorderBright /
         // hoverGradient 取值，与面板 hover 卡片同源）；圆角由
         // ConcentricScrollView.cornerConfiguration（containerConcentric）驱动。
         // 帧/端点/颜色统一由 applyNotesBoxSkin() 上（布局后调用，见 relayoutAndResize）
@@ -1225,22 +1225,19 @@ final class UpdateProgressWindowController: NSObject, NSWindowDelegate {
         win.appearance = Palette.topLevelWindowAppearance
     }
 
-    /// 更新描述框皮肤：hover 卡片同款斜向渐变底 + 描边，帧/端点/颜色一并上。
+    /// 更新描述框皮肤：纯色底（按主题：浅色白 / 深色黑）+ 描边。
     /// 动态色按视图生效外观解算（notesScroll 在窗口层级里，取它即窗口外观）。
     /// ⚠️ CGColor 落盘就定格当时外观——外观切换时由 notesScroll.onEffectiveAppearanceChange
     /// 再调一次，别改成只在 buildUI 里设一遍
     private func applyNotesBoxSkin() {
         notesBackdrop.frame = notesScroll.bounds
-        // 渐变端点与 hover 卡片同源（60° 视觉角、任意宽高比不失真）
-        let (start, end) = Palette.gradientEndpoints(angleDeg: Palette.hoverGradientAngleDeg,
-                                                     in: notesScroll.bounds)
-        notesBackdrop.startPoint = start
-        notesBackdrop.endPoint = end
+        // 背景不再引用卡片渐变，纯色带统一 50% 不透明度：浅色白 / 深色黑（两端同色，layer 结构不动）
+        let solid = (notesScroll.effectiveAppearance.isDark ? NSColor.black : NSColor.white)
+            .withAlphaComponent(0.50)
+        let cg = Palette.borderCGColor(solid, in: notesScroll)
+        notesBackdrop.colors = [cg, cg]
         notesScroll.layer?.borderColor =
             Palette.borderCGColor(Palette.hoverBorderBright, in: notesScroll)
-        notesBackdrop.colors = Palette.hoverGradient.map {
-            Palette.borderCGColor($0, in: notesScroll)
-        }
     }
 
     /// 已可见时直接返回：状态在窗口打开期间切换绝不重新 center / orderFront（防闪烁）
