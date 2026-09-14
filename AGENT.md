@@ -155,8 +155,8 @@ open iBalance.app             # 运行（或双击）
 | 主标题 / 数值字号 | `Palette.cardTitleFontSize`（Panel.swift） | 13 |
 | 副标题（到期/剩余分段）/ 其余账号积分 chip / 气泡积分行 | `Palette.cardSubFontSize`（Panel.swift） | 9 |
 | 卡片 icon 尺寸（全部平台统一） | `CardStyle.iconSize` / `monoIconSize` | 24 / 20.47 |
-| row1 / row2 行高、两行 spacing | `PanelLayout.balanceContentRow` | 16 / 12 / 2 |
-| 卡片上下内边距 | `rebuildAccountCards` 的 cardPadTop/Bottom | 6 / 6（2026-09-01：5.5 → 6） |
+| row1 / row2 行高、两行 spacing | `PanelLayout.balanceContentRow` | row1 = 数值视图固有高（随字体）、row2 = `subRowHeight` 12、spacing = `titleRowBaseGap` 1.5 × 字体系数（2026-09-14 主标题行框定义已删） |
+| 卡片上下内边距 | `rebuildAccountCards` 的 cardPadTop/Bottom | 7 / 7（2026-09-14：6 → 7） |
 | 图标列容器宽 | `PanelLayout.balanceContentRow` 的 iconContainer.widthAnchor | 25pt（2026-09-01：24.47 → 25，写死不随 iconSize 变） |
 | 昵称（副标题右侧）字号 | `PanelLayout.balanceContentRow` | 10 |
 | 昵称（含签到徽章）最大宽 | `NickBadgeTextField` 构建处（Panel.swift） | ≤ 90 |

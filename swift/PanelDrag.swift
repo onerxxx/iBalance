@@ -359,13 +359,13 @@ extension BalancePanelView {
         refreshInlineTokens()
     }
 
-    // MARK: - header 图标拖动换位
+    // MARK: - header 图标拖动换槽（槽位模型，2026-09-14）
 
-    /// 起手阈值（pt）：按下后移动超过它才认定换位手势，手抖点击不误入拖拽
+    /// 起手阈值（pt）：按下后移动超过它才认定拖拽手势，手抖点击不误入拖拽
     private static let headerDragStartThreshold: CGFloat = 4
 
     /// header 图标按下起手（2026-09-13 起无需按住 Cmd）：第一段做点击/拖拽阈值判断——
-    /// 位移超过阈值进入换位循环；未超阈值松手 = 普通点击，由按钮回放自己的点击链路
+    /// 位移超过阈值进入换槽循环；未超阈值松手 = 普通点击，由按钮回放自己的点击链路
     /// （协议 performClickAction，与各按钮原点击行为一致）。
     func beginHeaderIconDrag(for id: String, event: NSEvent) {
         guard draggingHeaderButtonID == nil,
@@ -373,6 +373,8 @@ extension BalancePanelView {
               let header = headerView,
               let panelWindow = header.window else { return }
         let start = header.convert(event.locationInWindow, from: nil)
+        // 记下「指针抓在按钮内哪个位置」：换槽时保持这个偏移，手感是抓住而不是跳变
+        headerDragGrabOffsetX = start.x - view.frame.minX
         while let next = panelWindow.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             guard next.type == .leftMouseDragged else {
                 // 阈值内松手 = 普通点击
@@ -386,71 +388,153 @@ extension BalancePanelView {
         }
     }
 
-    /// 换位主循环（已过阈值）：按指针 x 实时重排，松手落盘（有变化时）。
+    /// 换槽主循环（已过阈值）：按指针 x 实时把按钮落到最近槽位，松手落盘（有变化时）。
     /// 同步事件循环会吞掉 tracking area 的 entered/exited 派发，被拖按钮的 hover
     /// 须按光标是否在其框内手动同步（离框即灭、回框复亮，松手后归正常事件接管）。
+    /// 会话期间显示槽位指引层（空位虚线圆 + 落点亮环），结束收起。
     private func runHeaderIconReorder(for id: String, firstPointerX: CGFloat) {
         guard let header = headerView, let panelWindow = header.window,
               let view = headerButtonRegistry[id] else { return }
         draggingHeaderButtonID = id
-        let orderAtStart = headerButtonOrder
-        reorderHeaderButtons(pointerX: firstPointerX)
+        let slotsAtStart = headerButtonSlots
+        headerDragOriginSlots = slotsAtStart
+        headerSlotGuidesView?.isHidden = false
+        updateHeaderDropSlot(pointerX: firstPointerX)
         while let next = panelWindow.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             let inside = view.bounds.contains(view.convert(next.locationInWindow, from: nil))
             (view as? PanelScrollHoverSync)?.syncHoverState(inside)
             guard next.type == .leftMouseDragged else { break }
-            reorderHeaderButtons(pointerX: header.convert(next.locationInWindow, from: nil).x)
+            updateHeaderDropSlot(pointerX: header.convert(next.locationInWindow, from: nil).x)
         }
         draggingHeaderButtonID = nil
-        if headerButtonOrder != orderAtStart {
-            UserDefaults.standard.set(headerButtonOrder, forKey: UDKey.headerButtonOrder)
+        headerButtonDropSlot = nil
+        headerDragGrabOffsetX = 0
+        headerDragOriginSlots = []
+        headerSlotGuidesView?.dropSlot = nil
+        headerSlotGuidesView?.isHidden = true
+        if headerButtonSlots != slotsAtStart {
+            // 空位以 "" 落盘（stringArray 装不下 nil），读回时按空串跳过
+            UserDefaults.standard.set(headerButtonSlots.map { $0 ?? "" },
+                                      forKey: UDKey.headerButtonOrder)
         }
     }
 
-    /// 指针 x 决定插入位：统计位于其左侧（midX < pointerX）的其他图标数。
-    /// 换位边界是相邻按钮中点、按钮等宽，来回过界自带一整个按钮宽的迟滞，不抖动。
-    private func reorderHeaderButtons(pointerX: CGFloat) {
-        guard let id = draggingHeaderButtonID, let header = headerView else { return }
-        let others = headerButtonOrder.filter { $0 != id }
-        let insertIndex = others.filter { otherID in
-            guard let view = headerButtonRegistry[otherID] else { return false }
-            return view.convert(view.bounds, to: header).midX < pointerX
-        }.count
-        var next = others
-        next.insert(id, at: min(insertIndex, next.count))
-        guard next != headerButtonOrder else { return }
-        headerButtonOrder = next
-        applyHeaderButtonOrder(animated: true)
+    /// 指针 x → 目标槽位并落位（**反向退位模型**，2026-09-14 用户定稿）：
+    /// 先把指针位置按起手抓握偏移换算成按钮左缘，再按槽位节距取最近槽
+    /// （round = 过半个槽距才换，自带迟滞不抖）。
+    ///
+    /// 落位规则（每次都从**起手快照**重算，不在实时槽位表上连锁改）：
+    /// 1. 拖动按钮搬到 target，origin…target 之间的整段（含被占位者）向**拖动方向的反方向**
+    ///    各挪**一位**，由拖动按钮腾出的起手槽吸收；
+    /// 2. 再做一遍**自动归位**：任何被迫让位的按钮，只要它的**原位空着**就搬回去 ——
+    ///    反复扫到稳定（一颗归位会腾出下一颗的位置，所以要迭代）。
+    ///    于是「左键还没松开时」只要拖动按钮离开某颗原位，那颗就立刻弹回原位；
+    ///    拖动按钮落到空槽时第 1 步不动任何人，第 2 步也无事可做 → 只有它自己移动。
+    /// 不做「落点是空位」的特判 —— 那会让去程/回程走两条不同路径，破坏可逆性。
+    private func updateHeaderDropSlot(pointerX: CGFloat) {
+        guard let id = draggingHeaderButtonID,
+              let origin = headerDragOriginSlots.firstIndex(where: { $0 == id }) else { return }
+        let pitch = BalancePanelView.headerButtonSlotPitch
+        let wouldBeLeading = pointerX - headerDragGrabOffsetX
+        let raw = (wouldBeLeading - BalancePanelView.headerSlotStripLeading) / pitch
+        let target = min(max(Int(raw.rounded()), 0),
+                         BalancePanelView.headerButtonSlotCount - 1)
+        if headerButtonDropSlot != target {
+            headerButtonDropSlot = target
+            headerSlotGuidesView?.dropSlot = target
+            headerSlotGuidesView?.needsDisplay = true
+        }
+        let next = reverseShiftedSlots(origin: origin, target: target)
+        guard next != headerButtonSlots else { return }
+        headerButtonSlots = next
+        applyHeaderButtonSlots(animated: true)
     }
 
-    /// 按当前顺序重建 header 图标链式 leading 约束：首颗钉 header 左缘（距容器缘 =
-    /// 容器缩进 + 正文缩进 7 + 2.6，2026-09-06 用户「header 左右缩进增加2pt」后再
-    /// 「再增加0.6pt」，原 +7 与 root 内容左右缘对齐），其余依次 +2pt。
-    /// animated 时给让位按钮加 X 轴位移动画（口径同 applyPlatformOrder）。
-    func applyHeaderButtonOrder(animated: Bool) {
+    /// 反向退位 + 自动归位：
+    /// 1. origin…target 整段（含 target 上那颗）沿**拖动方向的反方向**各退一位，
+    ///    腾出的起手槽由紧邻的那颗补上；拖动按钮落到 target；
+    /// 2. 任何被迫让位的按钮，只要它的**原位空着**就搬回原位，反复扫到稳定。
+    ///    于是「左键还没松开」时，拖动按钮一离开某颗的原位，那颗就立刻弹回；
+    ///    落到空槽时第 1 步的退位会被第 2 步全部弹回 → 净效果只有拖动按钮自己移动。
+    ///
+    /// ⚠️ **不给「落点是空位」加特判**（2026-09-14 用户明确要求去掉）：
+    /// 特判会让去程（落点空 → 纯搬）与回程（落点已被邻位补上 → 退位）走两条不对称路径，
+    /// 实测 9 槽下 72 组 origin/target 里有 12 组拖回原位不能复原。
+    ///
+    /// ⚠️ **第 2 步的代价：不再完全可逆。** 自动归位本质是「向 origin 压实」，会把盘面上
+    /// **原有的空档**吃掉，所以「拖出去再拖回」不保证复原 —— 实测真实拖拽路径
+    /// 470/2119 次不能精确复原（例：`A B C · D E` 把 B 拖到槽 4 再拖回槽 1，
+    /// 空档会从槽 3 挪到槽 4）。这是用户要求的固有副作用，不是 bug；已如实告知。
+    private func reverseShiftedSlots(origin: Int, target: Int) -> [String?] {
+        var next = headerDragOriginSlots
+        guard origin != target else { return next }
+        let id = next[origin]
+        let step = target > origin ? 1 : -1          // 拖动方向
+        var index = target
+        while index != origin {                      // ① 整段沿 -step（反方向）各退一位
+            next[index - step] = headerDragOriginSlots[index]
+            index -= step
+        }
+        next[target] = id
+        // ② 自动归位：原位空着就搬回去，扫到稳定为止。
+        //    每次只往**空**的原位搬，所以「到原位的距离和」严格下降 → 一定收敛。
+        let lo = min(origin, target), hi = max(origin, target)
+        var moved = true
+        while moved {
+            moved = false
+            for slot in lo...hi {
+                guard let item = next[slot], item != id,
+                      let home = headerDragOriginSlots.firstIndex(where: { $0 == item }),
+                      home != slot, next[home] == nil else { continue }
+                next[home] = item
+                next[slot] = nil
+                moved = true
+            }
+        }
+        return next
+    }
+
+    /// 按槽位表重装 header 图标 leading 约束：第 i 槽的按钮钉在
+    /// header.leading + headerSlotStripLeading + i × headerButtonSlotPitch。
+    /// 槽位是**绝对位置**、不是链式相邻 —— 空位因此天然保留，不需要占位视图；
+    /// 也因为没有链式依赖，任何一颗都能独立落到任意槽（含最右的 9 号空槽）。
+    /// animated 时给位置变化的按钮加 X 轴位移动画（口径同 applyPlatformOrder）。
+    func applyHeaderButtonSlots(animated: Bool) {
         guard let header = headerView else { return }
-        let orderedViews = headerButtonOrder.compactMap { headerButtonRegistry[$0] }
-        guard orderedViews.count == BalancePanelView.headerButtonIdentifiers.count else { return }
-        let oldFrames = Dictionary(uniqueKeysWithValues: orderedViews.map {
-            (ObjectIdentifier($0), $0.frame)
+        let placed = headerButtonSlots.enumerated().compactMap { slot, id -> (Int, NSView)? in
+            guard let id, let view = headerButtonRegistry[id] else { return nil }
+            return (slot, view)
+        }
+        guard placed.count == BalancePanelView.headerButtonIdentifiers.count else { return }
+        let oldFrames = Dictionary(uniqueKeysWithValues: placed.map {
+            (ObjectIdentifier($0.1), $0.1.frame)
         })
         NSLayoutConstraint.deactivate(headerButtonChainConstraints)
         headerButtonChainConstraints.removeAll()
-        let leadInset = BalancePanelViewController.contentHorizontalInset + 9.6
-        for (index, view) in orderedViews.enumerated() {
-            let leading: NSLayoutConstraint
-            if index == 0 {
-                leading = view.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: leadInset)
-            } else {
-                leading = view.leadingAnchor.constraint(
-                    equalTo: orderedViews[index - 1].trailingAnchor, constant: 2)
-            }
-            headerButtonChainConstraints.append(leading)
+        let pitch = BalancePanelView.headerButtonSlotPitch
+        let stripLeading = BalancePanelView.headerSlotStripLeading
+        for (slot, view) in placed {
+            headerButtonChainConstraints.append(
+                view.leadingAnchor.constraint(equalTo: header.leadingAnchor,
+                                              constant: stripLeading + CGFloat(slot) * pitch))
         }
         NSLayoutConstraint.activate(headerButtonChainConstraints)
         header.layoutSubtreeIfNeeded()
+        // 前景色按落点分档（唯一落点，重排/换槽都走这里）：
+        //  · **正中间那一格** → 卡片主标题色（Palette.cardForeground）；
+        //  · 其余 → **面板底色上端色降亮度**（Palette.panelTintDimmed：同色相压深一档）
+        //（2026-09-14 用户要求）。9 槽时的中间格 = 下标 4；槽数为偶数时取靠左的中格
+        let centerSlot = BalancePanelView.headerButtonSlotCount / 2
+        for (slot, view) in placed {
+            (view as? HeaderTintAdjustable)?.normalTintColor = (slot == centerSlot)
+                ? Palette.cardForeground
+                : Palette.panelTintDimmed
+        }
+        // 指引层占用表跟随槽位表（唯一同步点，避免两处各算一份）
+        headerSlotGuidesView?.occupied = headerButtonSlots.map { $0 != nil }
+        headerSlotGuidesView?.needsDisplay = true
         guard animated, !shouldReduceMotion else { return }
-        for view in orderedViews {
+        for (_, view) in placed {
             guard let oldFrame = oldFrames[ObjectIdentifier(view)],
                   oldFrame != view.frame,
                   let layer = view.layer else { continue }
@@ -463,12 +547,28 @@ extension BalancePanelView {
         }
     }
 
-    /// 还原落盘的 header 图标顺序：未知 id 丢弃、缺失 id 按固定清单补尾（新增按钮向前兼容）
-    func savedHeaderButtonOrder() -> [String] {
+    /// 还原落盘的槽位表：未知 id 丢弃、重复 id 只留首次、长度对齐槽位数；
+    /// 缺失 id（新增按钮 / 旧格式迁移）依次补进空槽。
+    /// 兼容旧的「紧凑 id 序」格式：旧值 5 项正好落进槽位 0…4，而旧链式布局
+    /// （首颗 stripLeading、其后每颗 +2pt）与槽位布局逐点相同 → 老用户升级观感零变化。
+    func savedHeaderButtonSlots() -> [String?] {
+        let count = BalancePanelView.headerButtonSlotCount
         let saved = UserDefaults.standard.stringArray(forKey: UDKey.headerButtonOrder) ?? []
-        var order = saved.filter { BalancePanelView.headerButtonIdentifiers.contains($0) }
-        for id in BalancePanelView.headerButtonIdentifiers where !order.contains(id) { order.append(id) }
-        return order
+        var slots: [String?] = Array(repeating: nil, count: count)
+        var used = Set<String>()
+        for (index, id) in saved.enumerated() where index < count {
+            guard !id.isEmpty,
+                  BalancePanelView.headerButtonIdentifiers.contains(id),
+                  !used.contains(id) else { continue }
+            slots[index] = id
+            used.insert(id)
+        }
+        for id in BalancePanelView.headerButtonIdentifiers where !used.contains(id) {
+            guard let free = slots.firstIndex(where: { $0 == nil }) else { break }
+            slots[free] = id
+            used.insert(id)
+        }
+        return slots
     }
 
 }

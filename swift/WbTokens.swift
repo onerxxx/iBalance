@@ -21,6 +21,7 @@ enum WBTokenStore {
         let model: String    // 首要模型（极少数多模型 trace 归属第一个，无法按模型拆分）
         let sessionId: String
         let tokens: Int64    // input + output
+        let outputTokens: Int64  // 仅 output（卡片副标题 tok/s 用，2026-09-14 用户指定）
         let calls: Int64
         let startedAt: TimeInterval?   // trace 原始起点（秒）；缺失/不可解析为 nil（不计入周期总计）
         let dayStart: TimeInterval?   // 本地时区当日零点；startedAt 缺失/不可解析为 nil
@@ -39,10 +40,10 @@ enum WBTokenStore {
     private static var fileCache: [String: FileContribution] = [:]
     private static var diskCacheLoaded = false
 
-    /// 增量缓存落盘位置（App Support/wb-tokens-filecache-v2.json）；
-    /// v2 = FileContribution 增加 startedAt 字段后换名，旧缓存解码失败自动全量重建一次
+    /// 增量缓存落盘位置（App Support/wb-tokens-filecache-v3.json）；
+    /// v3 = FileContribution 增加 outputTokens 字段后换名，旧缓存解码失败自动全量重建一次
     private static var diskCacheURL: URL {
-        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v2.json")
+        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v3.json")
     }
 
     /// 首次查询前把持久化的单文件贡献装回内存（进程生命周期内只装一次）
@@ -64,6 +65,8 @@ enum WBTokenStore {
     static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
+    /// 已构建缓存的同步只读（nil = 尚未构建过）：卡片副标题 tok/s 用
+    static func cachedSummary() -> TokenSummary? { cache.cachedIfBuilt }
 
     private static func query() -> TokenSummary? {
         loadDiskCacheIfNeeded()
@@ -148,6 +151,25 @@ enum WBTokenStore {
                                                   path: projectPaths[$0.key]) }
             .sorted { $0.tokens > $1.tokens }
         guard !projectRows.isEmpty else { return nil }
+        // 最近 10 次会话均速（tok/s，卡片副标题 meta）：**一次对话 = 同一 sessionId 的全部
+        // trace**（trace 只是一次 agent 运行，一次对话含多次运行；按 trace 切会把分母缩成
+        // 纯运行时间、数值虚高数倍）。tokens 只算 output（2026-09-14 用户指定）；
+        // 时长 = 会话首 trace 起点 → 末 trace mtime（含对话中的空闲，口径对齐 ZCode
+        // session.time_created→time_updated）；sessionId 缺失的 trace 各自成会话，均值口径归 recentSessionSpeed
+        var bySession: [String: (start: TimeInterval, end: TimeInterval, output: Int64)] = [:]
+        for (path, c) in fresh {
+            guard let started = c.startedAt else { continue }
+            let key = c.sessionId.isEmpty ? path : c.sessionId
+            let end = c.mtime.timeIntervalSince1970
+            var s = bySession[key] ?? (started, started, 0)
+            s.start = min(s.start, started)
+            s.end = max(s.end, end)
+            s.output += c.outputTokens
+            bySession[key] = s
+        }
+        let sessions = bySession.values.map {
+            (start: $0.start, tokens: Double($0.output), seconds: $0.end - $0.start)
+        }
         let modelRows = models.values
             .filter { $0.tokens > 0 }
             .map { TokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
@@ -173,9 +195,11 @@ enum WBTokenStore {
         let daily = dailyMap
             .map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
-        return TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
+        var summary = TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
                                  requestCount: requests, daily: daily, periodTotals: periodTotals,
                                  periodProjects: periodProjects, periodModels: periodModels)
+        summary.recentSessionSpeed = recentSessionSpeed(sessions)
+        return summary
     }
 
     /// workbuddy.db sessions 表 sessionId → cwd（含已删除会话，保留历史用量归属）。
@@ -245,7 +269,8 @@ enum WBTokenStore {
         let dayStart = startedAt
             .map { Calendar.current.startOfDay(for: Date(timeIntervalSince1970: $0)).timeIntervalSince1970 }
         return FileContribution(mtime: mtime, size: size, model: model, sessionId: sid,
-                                tokens: tokens, calls: calls, startedAt: startedAt, dayStart: dayStart)
+                                tokens: tokens, outputTokens: output, calls: calls,
+                                startedAt: startedAt, dayStart: dayStart)
     }
 
     /// ISO8601 → 原始时间戳（秒）。容忍毫秒位有无：截前 19 位补 Z 再解析。

@@ -29,7 +29,7 @@
 //           暗带（曾经 0.45→0.85，看起来像「mark 的轮廓随厚度变粗」）。
 //           且 mark 画在盖面 ④ 与「inset 阴影 / lowerField」**之间**，与盖面吃同一遍着色
 //           → 视觉上 mark 就是硬币本体雕出来的浮雕（见 drawMark / paintFaceMaterial）
-// mark 边界阴影 轮廓外一圈**与朝向无关**的接触阴影（`markRimShadow`）：侧壁只在斜看时有，
+// mark 边界阴影 轮廓外一圈**与朝向无关**的接触阴影（Shadow opacity / Shadow spread 两旋钮）：侧壁只在斜看时有，
 //           纯正面立体感全压在它身上；与盖面环遮蔽同源（落影在低的那一侧：币在内侧、
 //           mark 在外侧）。⚠️ 投影**随 Logo depth 变宽变黑**（用户 2026-09-11 指定）：
 //           宽度 ×(1 + markShadowDepthWidthGain·t)、峰值不透明度 ×(1 + markShadowDepthAlphaGain·t)，
@@ -111,7 +111,7 @@ enum CoinMetrics {
     /// 侧壁明暗：沿挤出方向往材质面阴影里压多少 —— **只是一档浅压暗**（把斜面与材质分开），
     /// 顶面边缘取 `markWallShadeTop`，扫掠外缘取 `markWallShadeEdge`，中间线性过渡
     /// （与币面 inset 阴影同口径：越靠边界越深）。
-    /// ⚠️ 这一档**不承担「轮廓」职责**，轮廓见 `markRimShadow`。侧壁的宽度 = 挤出位移（几何，
+    /// ⚠️ 这一档**不承担「轮廓」职责**，轮廓见 `markShadowSpread` 那圈边界阴影。侧壁的宽度 = 挤出位移（几何，
     /// 与 Logo depth 成正比、改不掉），一旦压深（曾用到 0.85，几乎等于影色）它就和那圈影连成
     /// 一条**随厚度变宽的暗带** —— 看起来像「币面上 mark 的轮廓粗了一圈」。压暗量因此按
     /// 「明显弱于影的峰值」取（约 1/4 档）：厚度只表现为身体变宽 / 顶面位移，轮廓宽度恒定。
@@ -123,7 +123,7 @@ enum CoinMetrics {
     static let markExtrudeStep = 0.5
     static let markExtrudeStepLimit = 24
     /// 边界阴影挂靠的**扫掠并集**副本间距（px，见 `sweepOutline`）：`CGPath.union` 不便宜，
-    /// 份数越少越好；而这支并集只喂给 `markRimShadow` 那圈模糊，间距（2）远小于模糊半径（8）时
+    /// 份数越少越好；而这支并集只喂给边界阴影那圈模糊，间距（2）远小于模糊半径（8）时
     /// 包络上的蜂窝起伏（细笔画最明显）在模糊后不可分辨。
     /// ⚠️ 只有 `.sweptBody` 那一档用得到它（`.footprint` 不算并集）。
     static let sweepOutlineGap = 2.0
@@ -132,14 +132,47 @@ enum CoinMetrics {
     /// 币的凸起边缘（抬起的盘缘）落影在凹陷的盘面上 → 边界**内侧**；mark 的凸起边缘（抬起的浮雕）
     /// 落影在它压着的币面上 → 轮廓**外侧**。没有它的话纯正面（挤出位移 = 0、连侧壁都不存在）
     /// 浮雕会彻底平掉，读起来像贴上去的贴纸 —— 币靠环遮蔽立住，mark 靠这一圈。
-    /// `markRimShadow` 是**视觉衰减距离**（160 盒 px）：轮廓处满值、往外这么远衰减到 0。
-    /// ⚠️ `markRimShadowAlpha` 是 depth=0 时的**可见峰值不透明度**（轮廓处实测）：
-    /// 参考实现量到 0.35，用户 2026-09-11 要求「初始阴影再深一些」→ 0.45。
-    /// ⚠️ **单遍阴影的硬上限是 0.5**：CG 的 `setShadow` 在形状边界处只落地一半 alpha
-    /// （高斯台阶半高，见 drawMark 的 ×2 补偿），填充 α 最大 1 → 可见峰值最大 0.5。
-    /// 所以「初始更深」与「随 depth 继续变黑」是在同一个 0.5 里分预算，见底下 gain 的取法。
-    static let markRimShadow = 8.0
-    static let markRimShadowAlpha = 0.45
+    /// 两只旋钮 2026-09-14 起开放到设置 forms（Control 区 **Shadow opacity / Shadow spread**，
+    /// 经 CoinSettings 落盘、内嵌小硬币同步跟随）：
+    /// - **spread** 是**视觉衰减距离**（160 盒 px）：轮廓处满值、往外这么远衰减到 0；0 = 整圈关断。
+    /// - **opacity** 是**轮廓处可见峰值不透明度**（N 遍合成后，百分数）。⚠️ 单遍 setShadow 在形状
+    ///   边界只落地一半 alpha（高斯台阶半高，见 drawMark 的 ×2 补偿）→ 单遍可见峰值封顶 0.5，
+    ///   N 遍 source-over 合成封顶 1−0.5^N；每遍落点 alpha 由峰值反解：b = 1−(1−peak)^(1/N)，见 drawMark。
+    ///   ⚠️ 想往上顶**只能加遍数** —— 所以遍数随滑杆值自适应（`markRimShadowPasses(forPeak:)`）：
+    ///   ≤75% 仍走 N=2（老值视觉一个像素都不动），75% 往上自动升到 3…6 遍。
+    static let markShadowSpreadRange: ClosedRange<Double> = 0...16
+    /// Shadow opacity 滑杆量程（百分数）。⚠️ 100 是**滑杆刻度**、不是渲染封顶：真正能落到的合成峰值
+    /// 见 `markShadowOpacityCeiling`（100% 时 N=6 → 98.4375%，顶端那 1.6% 肉眼不可分辨）。
+    /// 2026-09-14 用户「改为最高 100%」由 0...75 放宽到此；放宽只动上限，老值（≤75）读回来一字不改。
+    static let markShadowOpacityRange: ClosedRange<Double> = 0...100
+    /// 出厂默认：spread 8（参考实现量级）；opacity 70 = 旧定值 markRimShadowAlpha 0.45
+    /// （2026-09-11 用户「初始阴影再深一些」）× N=2 遍合成 ≈ 0.6975 取整 —— 2026-09-14
+    /// 「加深 svg 带来的阴影」后以此为新基线开放调参。
+    static let defaultMarkShadowSpread = 8.0
+    static let defaultMarkShadowOpacity = 70.0
+    /// 边界阴影的**叠画遍数**：同一轮廓把带影填充重复 N 次，影逐遍 source-over 合成
+    /// 1−(1−a)^N，抬起单遍 0.5 的可见峰值上限 —— 只加深，模糊半径与轮廓形态不变。
+    /// ⚠️ 遍数**随滑杆值自适应**（`markRimShadowPasses(forPeak:)`）：合成封顶 1−0.5^N，
+    /// 峰值 ≤ 75% 时 N=2 就够（α≤1 的夹取线还没咬到），再往上必须加遍数才真能变深。
+    /// 代价 = 每多一遍一次模糊（离线探针、160pt/2× 弹窗币 depth 拉满：1.26→2.30 ms/帧，N=6 ≈ 3.9 ms/帧；
+    /// 重画只发生在硬币运动期间，静止有位图缓存不吃）。峰值低时不多花这笔钱。
+    static let markRimShadowMinPasses = 2
+    static let markRimShadowMaxPasses = 6
+    /// 渲染真正能落到的合成峰值上限 = 1 − 0.5^Nmax（Nmax = 6 → 98.4375%）。
+    /// 滑杆给到 100 只是刻度取整，落点一律夹到这里（否则反解出的每遍 alpha 会越过 α≤1 的夹取线，
+    /// 顶端一段滑杆变成「推了没反应」的死区）
+    static var markShadowOpacityCeiling: Double {
+        1 - pow(0.5, Double(markRimShadowMaxPasses))
+    }
+    /// 给定目标峰值（**分数** 0…1，即滑杆百分数 /100）时该叠几遍：每遍可见峰值 ≤ 0.5（色 α≤1 夹取），
+    /// 要 1−(1−b)^N = peak 反解出的 b 不越过 0.5 就得 N ≥ log2(1/(1−peak)) —— 取满足条件的最小遍数
+    /// （夹在 min…max 之间）。于是峰值低时不多花模糊，且 0…75% 这一段恒为 2 遍 = 与旧版逐像素一致。
+    static func markRimShadowPasses(forPeak peak: Double) -> Int {
+        let p = min(max(peak, 0), markShadowOpacityCeiling)
+        guard p > 0 else { return markRimShadowMinPasses }
+        let needed = Int((log(1 - p) / log(0.5)).rounded(.up))
+        return min(max(needed, markRimShadowMinPasses), markRimShadowMaxPasses)
+    }
     /// 接触阴影挂哪种几何（用户 2026-09-11 定：投影要**随 Logo depth 变宽变黑**，见下面两个 gain）。
     /// - `.sweptBody`（默认）：挂在挤出体的扫掠并集上 —— 身体一鼓出去，影跟着身体走，
     ///   扫掠包络上的凹角 / 被挤窄的缝隙还会把模糊影从两侧灌满 → 额外加一层「越深越宽越黑」。
@@ -152,14 +185,14 @@ enum CoinMetrics {
     /// 由下面两个 gain 显式承担（任何朝向下都成立），几何档只决定影贴着谁走。
     static let markRimShadowCaster: CoinMarkShadowCaster = .sweptBody
     /// **关联 ①（宽度）**：投影随 Logo depth 变宽。depth 归一化 t = markDepth / markDepthRange.upperBound，
-    /// 实际模糊半径 = `markRimShadow` × (1 + gain × t) —— 默认 0.5 → depth 拉满时宽 1.5 倍。
+    /// 实际模糊半径 = `markShadowSpread` × (1 + gain × t) —— 默认 0.5 → depth 拉满时宽 1.5 倍。
     static let markShadowDepthWidthGain = 0.5
-    /// **关联 ②（黑度）**：投影随 Logo depth 变黑。可见峰值不透明度 = `markRimShadowAlpha` × (1 + gain × t)。
-    /// ⚠️ 取 0.11 而不是更大：单遍阴影可见峰值封顶 0.5（见 `markRimShadowAlpha` 注释），
-    /// 0.45 × (1 + 0.11) = 0.50 恰好把整条滑杆的「变黑」预算用满且不提前饱和；
-    /// 调大只会让上半段提前顶到 0.5 后失去变化（宽度那条 gain 不受此限）。
-    /// 若要把「初始更深」和「变黑幅度更大」同时做大，得换**两层阴影**（核心 + 外晕）抬掉 0.5 上限，
-    /// ⚠️ 但那是每帧多一遍模糊（mark 的并集算一次约 9ms/帧，见 sweepOutline），需先量帧耗再上。
+    /// **关联 ②（黑度）**：投影随 Logo depth 变黑。每遍落点 b = 1−(1−peak)^(1/N)（peak =
+    /// Shadow opacity，N 见 `markRimShadowPasses(forPeak:)`），实际再乘 (1 + gain × t)。
+    /// ⚠️ 取 0.11 而不是更大：出厂 peak 70%（N=2）的 b = 0.4523，×(1+0.11) 后色值 2b ≈ 1.004
+    /// 恰好顶到 setShadow 色 α≤1 的夹取线 —— 调大只会让「变黑」提前顶死失去变化
+    /// （宽度那条 gain 不受此限）。⚠️ 峰值拉到 ~90% 以上时这条 gain 本就已顶死（每遍落点接近 0.5
+    /// 的可见上限），「越深越黑」不再额外生效 —— 这是既有口径，非本次放宽量程引入。
     static let markShadowDepthAlphaGain = 0.11
     /// 盖面「环形环境遮蔽」：一圈**与朝向无关**的内阴影（宽度 / 峰值不透明度）。
     /// ⚠️ 参考实现没有这个 —— 它的 box-shadow offset 纯 ∝ normal.x，正面（normal.x = 0）时
@@ -508,7 +541,7 @@ enum CoinEdgeFinish: Int, CaseIterable {
 
 // MARK: - mark 接触阴影的投射体
 
-/// `markRimShadow` 那圈接触阴影「挂在哪块几何上」。⚠️ 它只决定**影贴着谁走**；
+/// `markShadowSpread` 那圈接触阴影「挂在哪块几何上」。⚠️ 它只决定**影贴着谁走**；
 /// 「投影随 Logo depth 变宽变黑」那条关联由 `markShadowDepthWidthGain` /
 /// `markShadowDepthAlphaGain` 显式承担（任何档、任何朝向都生效）。
 enum CoinMarkShadowCaster {
@@ -887,6 +920,17 @@ final class Coin3DView: NSView {
     /// 0 = 平贴（= 参考实现原样）；> 0 时 mark 变成硬币实体的一部分，转起来能看见侧壁
     var markDepth: Double = CoinMetrics.defaultMarkDepth {
         didSet { guard markDepth != oldValue else { return }; invalidateRender() }
+    }
+
+    /// mark 边界阴影的**可见峰值不透明度**（轮廓处、N 遍合成后；分数 0…0.984375，设置存百分数）：
+    /// drawMark 里反解出每遍的落点 alpha，见 `CoinMetrics.markShadowOpacityRange`
+    var markShadowOpacity = CoinMetrics.defaultMarkShadowOpacity / 100 {
+        didSet { guard markShadowOpacity != oldValue else { return }; invalidateRender() }
+    }
+
+    /// mark 边界阴影的**视觉衰减距离**（px/160 盒；0 = 整圈阴影关断）
+    var markShadowSpread = CoinMetrics.defaultMarkShadowSpread {
+        didSet { guard markShadowSpread != oldValue else { return }; invalidateRender() }
     }
 
     /// logo 轮廓（GHO 预设或上传的 SVG 解析结果）：丢缓存 + 重算基准缩放
@@ -1640,7 +1684,7 @@ final class Coin3DView: NSView {
     /// ⚠️ 渐变端点跟着 `transform`（盖面）走、**不跟** mark 的位移走：抬起来的那一块取到的
     /// 仍是它落点处的材质，所以顶面与盖面逐像素同色（`shade = 0` 时差 0）。
     ///
-    /// 边界阴影（`markRimShadow`）：侧壁只在**斜看**时存在（正面位移为 0 → 无侧壁），所以纯正面的
+    /// 边界阴影（`markShadowSpread` / `markShadowOpacity`）：侧壁只在**斜看**时存在（正面位移为 0 → 无侧壁），所以纯正面的
     /// 立体感全压在轮廓外那一圈接触阴影上 —— 与币的凸起边缘同口径（落影在低的那一侧，
     /// 币落在凹陷的盘面内侧、mark 落在它压着的币面外侧）。这条阴影**任何朝向都在**，
     /// 挂在**整个身体的扫掠并集**上（`sweepOutline`），与盖面的环形环境遮蔽是同一角色的两个位置。
@@ -1702,7 +1746,7 @@ final class Coin3DView: NSView {
                 pieces.append((path, topPath, solid.evenOdd ? .evenOdd : .winding))
             }
         }
-        // ① 边界阴影（**与朝向无关**，见 `markRimShadow`）：以轮廓为中心画的模糊副本 ——
+        // ① 边界阴影（**与朝向无关**，见 `markShadowSpread`）：以轮廓为中心画的模糊副本 ——
         //    内侧那一半随后被侧壁 / 顶面盖住，留下的正好是轮廓**外侧**那圈接触阴影。
         //    ⚠️ 投射体取哪种几何见 `CoinMetrics.markRimShadowCaster`：默认 **底面轮廓**
         //    （`.footprint`），与 Logo depth 完全无关 —— 投影宽度/黑度恒等于平贴时的样子；
@@ -1711,7 +1755,8 @@ final class Coin3DView: NSView {
         //    ⚠️ 并集必须**一次填充**（一条路径）：逐份填会把模糊影叠 N 次（远端糊成实心黑）。
         //    ⚠️ 顺序不能挪到顶面之后：那样内侧那一半会留在顶面上（浮雕边缘糊一圈黑）。
         //    ⚠️ CG 的 `setShadow` 在形状边界处恰好只落地一半 alpha（高斯台阶的半高），
-        //    所以色值乘 2 才是「轮廓处满值」的峰值（实测峰值 α = markRimShadowAlpha）。
+        //    所以色值乘 2 才是「轮廓处满值」的每遍落点（α 由 Shadow opacity 反解，见下）。
+        //    ⚠️ 单遍峰值封顶 0.5 —— 再往下加深靠同一轮廓叠画多遍（`markRimShadowPasses`）。
         //    ⚠️⚠️ 两个必须照做的细节：
         //      a. 模糊半径**不随 CTM 缩放**（实测：CTM 放大 2 倍，半衰距离纹丝不动），
         //         而本视图是在 `renderCoin` 那个带 backing scale 的 CTM 下画的 —— 必须手动补
@@ -1720,17 +1765,27 @@ final class Coin3DView: NSView {
         //         想让影单独落地就得先填一块不透明的黑 —— 那块黑会顺着轮廓的抗锯齿边带漏出来
         //         （实测沿对角边一圈 0.5×面色的暗边）。放进图层后用 `.clear` 把填充抠掉，
         //         最终只有影参与合成，边带上只剩「影自己的半覆盖」，与自然抗锯齿一致。
-        if CoinMetrics.markRimShadow > 0 {
+        if markShadowSpread > 0, markShadowOpacity > 0 {
             let deviceScale = max(0.01, hypot(ctx.ctm.a, ctx.ctm.b))
             // 「Logo depth → 投影更宽 / 更黑」这条关联（用户 2026-09-11 指定，见 CoinMetrics 两个 gain）：
-            // t = Logo 厚度滑杆的归一化值，宽度与峰值不透明度各乘 (1 + gain·t)。放在**几何之前**算，
+            // t = Logo 厚度滑杆的归一化值，宽度与每遍落点各乘 (1 + gain·t)。放在**几何之前**算，
             // 所以任何朝向（含正面挤出位移 = 0）都成立，不被「影贴谁走」那档影响。
             let depthT = min(max(markDepth / CoinMetrics.markDepthRange.upperBound, 0), 1)
-            let shadowBlur = CoinMetrics.markRimShadow * sizeScale * deviceScale
+            let shadowBlur = markShadowSpread * sizeScale * deviceScale
                 * (1 + CoinMetrics.markShadowDepthWidthGain * depthT)
-            let shadowAlpha = min(1, CoinMetrics.markRimShadowAlpha * 2
+            // 设置的可见峰值（轮廓处、N 遍合成后）反解出每遍的落点 alpha：
+            // N 遍 source-over 合成 1−(1−b)^N = peak → b = 1−(1−peak)^(1/N)；
+            // ×2 是 setShadow 边界半高补偿（色 α≤1 夹取 → 单遍可见峰值封顶 0.5）。
+            // ⚠️ N **随峰值自适应**（滑杆 0…100% → 2…6 遍，见 markRimShadowPasses(forPeak:)）：
+            // 峰值 ≤75% 时 N=2、算式与旧版逐位相同；再往上靠加遍数把 1−0.5^N 的天花板抬起来。
+            // 峰值先夹到 markShadowOpacityCeiling，否则 100% 会反解出 b = 1（色值 ×2 = 2 > 1）
+            // 被夹成 1，顶端一截滑杆推了没反应。
+            let peak = min(markShadowOpacity, CoinMetrics.markShadowOpacityCeiling)
+            let passes = CoinMetrics.markRimShadowPasses(forPeak: peak)
+            let perPass = 1 - pow(1 - peak, 1 / Double(passes))
+            let shadowAlpha = min(1, perPass * 2
                 * (1 + CoinMetrics.markShadowDepthAlphaGain * depthT))
-            // ⚠️ 并集只算一次、两遍共用：`CGPath.union` 不便宜（每帧都跑），算两遍等于白付一倍。
+            // ⚠️ 并集只算一次、各遍共用：`CGPath.union` 不便宜（每帧都跑），算两遍等于白付一倍。
             let outlines = pieces.map { piece -> (path: CGPath, rule: CGPathFillRule) in
                 switch CoinMetrics.markRimShadowCaster {
                 case .footprint:
@@ -1745,9 +1800,13 @@ final class Coin3DView: NSView {
             ctx.setShadow(offset: .zero, blur: shadowBlur,
                           color: CoinRGB.black.cgColor(alpha: shadowAlpha))
             ctx.setFillColor(CoinRGB.black.cgColor())
-            for outline in outlines {
-                ctx.addPath(outline.path)
-                ctx.fillPath(using: outline.rule)
+            // 同一轮廓叠画 `passes` 遍：影逐遍 source-over 合成 1−(1−a)^N，
+            // 突破单遍 0.5 的可见峰值上限 —— 只加深，模糊半径与轮廓形态不变。
+            for _ in 0..<passes {
+                for outline in outlines {
+                    ctx.addPath(outline.path)
+                    ctx.fillPath(using: outline.rule)
+                }
             }
             ctx.restoreGState()
             ctx.setBlendMode(.clear)
@@ -1789,7 +1848,7 @@ final class Coin3DView: NSView {
     }
 
     /// 浮雕在屏幕上的**轮廓** = Minkowski 扫掠的并集（底面 ∪ 沿途副本 ∪ 顶面）。
-    /// 只喂给边界阴影（`markRimShadow`）：那圈影要贴着**整个身体**的边界，逐份填会叠影、逐份
+    /// 只喂给边界阴影（`markShadowSpread`）：那圈影要贴着**整个身体**的边界，逐份填会叠影、逐份
     /// 合并又算不出边界，所以走 `CGPath.union`。侧壁 / 顶面照旧逐份画（那是精确扫掠，份数不够会露棱面）。
     /// 副本份数按「间距 ≤ `sweepOutlineGap`」取，与侧壁的 24 份无关；⚠️ `CGPath.union` 需要
     /// macOS 13+，且 evenodd 的形状（带洞的 logo）必须把 `.evenOdd` 传进去 —— 否则洞会被
@@ -1908,6 +1967,11 @@ struct CoinSettings {
     var logoScalePercent: Double
     /// logo 厚度（px/160 盒，0 = 平贴）—— mark 沿盖面法线挤出的深度
     var markDepth: Double
+    /// mark 边界阴影的可见峰值不透明度（**百分数** 0…100，轮廓处 N 遍合成后；渲染封顶见
+    /// `CoinMetrics.markShadowOpacityCeiling`）
+    var markShadowOpacity: Double
+    /// mark 边界阴影的视觉衰减距离（px/160 盒，0…16；0 = 整圈关断）
+    var markShadowSpread: Double
     var finish: CoinEdgeFinish
     /// 静止俯仰（度，Motion 区 Resting tilt，-180…180，0 = 正立）
     var restingTilt: Double
@@ -1937,6 +2001,8 @@ struct CoinSettings {
                                       thickness: CoinMetrics.defaultThickness,
                                       logoScalePercent: 100,
                                       markDepth: CoinMetrics.defaultMarkDepth,
+                                      markShadowOpacity: CoinMetrics.defaultMarkShadowOpacity,
+                                      markShadowSpread: CoinMetrics.defaultMarkShadowSpread,
                                       finish: .reeded,
                                       restingTilt: 0,
                                       restingRotation: CoinMetrics.defaultRestingRotation,
@@ -2005,6 +2071,12 @@ struct CoinSettings {
                                      initial.logoScalePercent),
             markDepth: double(UDKey.coinMarkDepth, CoinMetrics.markDepthRange,
                               initial.markDepth),
+            markShadowOpacity: double(UDKey.coinMarkShadowOpacity,
+                                      CoinMetrics.markShadowOpacityRange,
+                                      initial.markShadowOpacity),
+            markShadowSpread: double(UDKey.coinMarkShadowSpread,
+                                     CoinMetrics.markShadowSpreadRange,
+                                     initial.markShadowSpread),
             // 缺省 / 越界都落到 initial.finish（= reeded，rawValue 0，正好是「没写过」的取值）
             finish: CoinEdgeFinish(rawValue: defaults.integer(forKey: UDKey.coinEdgeFinish))
                 ?? initial.finish,
@@ -2040,6 +2112,8 @@ struct CoinSettings {
         defaults.set(thickness, forKey: UDKey.coinThickness)
         defaults.set(logoScalePercent, forKey: UDKey.coinLogoScalePercent)
         defaults.set(markDepth, forKey: UDKey.coinMarkDepth)
+        defaults.set(markShadowOpacity, forKey: UDKey.coinMarkShadowOpacity)
+        defaults.set(markShadowSpread, forKey: UDKey.coinMarkShadowSpread)
         defaults.set(finish.rawValue, forKey: UDKey.coinEdgeFinish)
         defaults.set(restingTilt, forKey: UDKey.coinRestingTilt)
         defaults.set(restingRotation, forKey: UDKey.coinRestingRotation)
@@ -2345,6 +2419,10 @@ final class CoinControlSectionView: CoinFormSectionView {
     var onLogoScaleChange: ((Double) -> Void)?
     /// Logo depth：滑杆**px**（0…12），mark 沿盖面法线挤出的深度；0 = 保持平贴
     var onMarkDepthChange: ((Double) -> Void)?
+    /// Shadow opacity：滑杆**百分数**（0…100），mark 边界阴影在轮廓处的可见峰值（N 遍合成后）
+    var onShadowOpacityChange: ((Double) -> Void)?
+    /// Shadow spread：滑杆**px**（0…16），mark 边界阴影的视觉衰减距离；0 = 整圈关断
+    var onShadowSpreadChange: ((Double) -> Void)?
     /// 传入解析成功的 logo：轮廓 + **SVG 原文**（原文随参数一起落盘，下次开弹窗还原）
     /// + **文件名**（行内展示，一并落盘）
     var onLogoChange: ((CoinLogoArt, String, String) -> Void)?
@@ -2386,6 +2464,8 @@ final class CoinControlSectionView: CoinFormSectionView {
     let panelSizeRow: CoinSliderRowView
     let logoSizeRow: CoinSliderRowView
     let logoDepthRow: CoinSliderRowView
+    let shadowOpacityRow: CoinSliderRowView
+    let shadowSpreadRow: CoinSliderRowView
 
     // 行 4：Logo 上传（标签 + 当前文件名 + 上传按钮）
     private let logoRow = CoinFormRowView(frame: .zero)
@@ -2432,11 +2512,20 @@ final class CoinControlSectionView: CoinFormSectionView {
         // Logo 厚度：0 = 平贴（参考实现原样），> 0 时 mark 被挤出成硬币的实体部分
         logoDepthRow = CoinSliderRowView(label: "Logo depth", range: CoinMetrics.markDepthRange,
                                          value: settings.markDepth) { "\(Int($0)) px" }
+        // Shadow opacity：mark 边界阴影的可见峰值（百分数；量程 0…100，遍数随值自适应，
+        // 见 CoinMetrics.markShadowOpacityRange / markRimShadowPasses(forPeak:)）
+        shadowOpacityRow = CoinSliderRowView(label: "Shadow opacity",
+                                             range: CoinMetrics.markShadowOpacityRange,
+                                             value: settings.markShadowOpacity) { "\(Int($0)) %" }
+        // Shadow spread：边界阴影的衰减距离（px/160 盒），0 = 整圈阴影关断
+        shadowSpreadRow = CoinSliderRowView(label: "Shadow spread",
+                                            range: CoinMetrics.markShadowSpreadRange,
+                                            value: settings.markShadowSpread) { "\(Int($0)) px" }
         super.init(title: CoinControlSectionView.sectionTitle, bare: bare)
 
         for row in [appearanceRow, outlineLevelRow, outlineWidthRow, presetRow, coinColorRow,
-                    fieldColorRow, coinSizeRow, panelSizeRow, logoSizeRow, logoDepthRow, logoRow,
-                    logoInvertRow] {
+                    fieldColorRow, coinSizeRow, panelSizeRow, logoSizeRow, logoDepthRow,
+                    shadowOpacityRow, shadowSpreadRow, logoRow, logoInvertRow] {
             addRow(row)
         }
         for label in [appearanceLabel, presetLabel, coinColorLabel, fieldColorLabel, logoLabel,
@@ -2523,6 +2612,8 @@ final class CoinControlSectionView: CoinFormSectionView {
         // 换算（/100）只在 `apply(logoScale:)` 一处做。这里再除一次 = 硬币缩到 1% 且落盘成 0.x
         logoSizeRow.onValueChange = { [weak self] in self?.onLogoScaleChange?($0) }
         logoDepthRow.onValueChange = { [weak self] in self?.onMarkDepthChange?($0) }
+        shadowOpacityRow.onValueChange = { [weak self] in self?.onShadowOpacityChange?($0) }
+        shadowSpreadRow.onValueChange = { [weak self] in self?.onShadowSpreadChange?($0) }
         uploadButton.target = self
         uploadButton.action = #selector(uploadLogo)
     }
@@ -2559,6 +2650,8 @@ final class CoinControlSectionView: CoinFormSectionView {
         panelSizeRow.layout(width: width)
         logoSizeRow.layout(width: width)
         logoDepthRow.layout(width: width)
+        shadowOpacityRow.layout(width: width)
+        shadowSpreadRow.layout(width: width)
         logoLabel.frame = NSRect(x: CoinFormMetrics.padX, y: textY,
                                  width: CoinFormMetrics.labelW, height: 17)
         uploadButton.sizeToFit()
@@ -2900,6 +2993,8 @@ final class CoinDemoPanelView: NSView {
         coin.thickness = settings.thickness
         coin.logoScale = settings.logoScalePercent / 100
         coin.markDepth = settings.markDepth
+        coin.markShadowOpacity = settings.markShadowOpacity / 100
+        coin.markShadowSpread = settings.markShadowSpread
         coin.logoArt = settings.logoArt
         coin.edgeFinish = settings.finish
         coin.style = settings.appearance
@@ -2921,6 +3016,8 @@ final class CoinDemoPanelView: NSView {
         control.onPanelSizeChange = { [weak self] in self?.apply(panelSize: $0) }
         control.onLogoScaleChange = { [weak self] in self?.apply(logoScale: $0) }
         control.onMarkDepthChange = { [weak self] in self?.apply(markDepth: $0) }
+        control.onShadowOpacityChange = { [weak self] in self?.apply(markShadowOpacity: $0) }
+        control.onShadowSpreadChange = { [weak self] in self?.apply(markShadowSpread: $0) }
         control.onLogoChange = { [weak self] art, svg, name in
             self?.apply(logoArt: art, svg: svg, name: name)
         }
@@ -2936,7 +3033,7 @@ final class CoinDemoPanelView: NSView {
 
     // MARK: 单个参数 → 硬币 + 内存快照 + 通知
 
-    /// 参数变更统一出口（17 个 apply 全走这里）：快照即时落盘（2026-09-13 起自动
+    /// 参数变更统一出口（19 个 apply 全走这里）：快照即时落盘（2026-09-13 起自动
     /// 保存，显式「保存为默认」按钮已删）+ 通知实时同步主面板小硬币
     ///（通知带**内存快照**，主面板靠它重灌、不读盘）
     private func notifyLiveChange() {
@@ -3043,6 +3140,20 @@ final class CoinDemoPanelView: NSView {
     private func apply(markDepth: Double) {
         settings.markDepth = markDepth
         coin.markDepth = markDepth
+        notifyLiveChange()
+    }
+
+    /// Shadow opacity：入参是滑杆**百分数**（0…100），硬币吃分数 —— 与 Logo size 同一套换算
+    private func apply(markShadowOpacity percent: Double) {
+        settings.markShadowOpacity = percent
+        coin.markShadowOpacity = percent / 100
+        notifyLiveChange()
+    }
+
+    /// Shadow spread：入参就是 px（0…16），与 `CoinSettings.markShadowSpread` 同域，不做任何换算
+    private func apply(markShadowSpread: Double) {
+        settings.markShadowSpread = markShadowSpread
+        coin.markShadowSpread = markShadowSpread
         notifyLiveChange()
     }
 

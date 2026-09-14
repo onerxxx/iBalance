@@ -148,7 +148,7 @@ private struct AccountsPane: View {
             }
             // 「已保存账号」（2026-09-13 用户要求）：逐平台列出已保存账号，行内「删除」移除单个账号。
             // 删除转交宿主（二次确认 + 落盘 + 面板/菜单栏刷新），model.deleteAccount 里的 sync() 回读刷新本列表；
-            // 空平台不出现，全空时整段不渲染（下方「删除账号」行的副标题会说明当前没有凭据）
+            // 空平台不出现，全空时整段不渲染
             ForEach(model.snapshot.savedAccountGroups) { group in
                 Section {
                     ForEach(group.accounts) { acc in
@@ -200,31 +200,7 @@ private struct AccountsPane: View {
             } footer: {
                 Text("留空则解密浏览器 Cookies 取登录态，填了以手填值为准（浏览器登出后仍可用）。回车 / 换页 / 关窗即保存。")
             }
-            // 2026-09-13 用户要求：底部加「删除账号」——清空已保存的各平台凭据。
-            // 破坏性操作：按钮染红 + 置灰（没东西可删时）；二次确认与结果提示都在宿主（见 onDeleteAllAccounts）
-            Section {
-                OperationRow(model: model, icon: .symbol("trash"), title: "删除账号",
-                             subtitle: savedCredentialSummary,
-                             actionTitle: "删除",
-                             destructive: true,
-                             enabled: model.snapshot.savedAccountCount
-                                 + model.snapshot.savedOverrideCount > 0) {
-                    model.actions.deleteAllAccounts()
-                }
-            } footer: {
-                Text("清除已保存的全部平台凭据：WorkBuddy / TRAE / ZCode / Codex 账号，以及 DeepSeek Key、ZhiPu Token、Qwen Ticket 手填覆盖。\n只删 iBalance 里存的这份，不会退出各平台本机的登录状态。")
-            }
         }
-    }
-
-    /// 「删除账号」行的副标题：已保存的账号数 + 手填凭据数（都没存时说清楚，免得以为按钮坏了）
-    private var savedCredentialSummary: String {
-        let accounts = model.snapshot.savedAccountCount
-        let overrides = model.snapshot.savedOverrideCount
-        var parts: [String] = []
-        if accounts > 0 { parts.append("\(accounts) 个账号") }
-        if overrides > 0 { parts.append("\(overrides) 项 Key / Token") }
-        return parts.isEmpty ? "当前没有已保存的凭据" : "已保存 " + parts.joined(separator: " · ")
     }
 }
 
@@ -293,6 +269,20 @@ private struct AboutPane: View {
                 }
             } footer: {
                 Text("每日静默检查一次 GitHub Releases 新版本；「更新窗口演示」走全流程，但不出网、不真替换。")
+            }
+            Section {
+                OperationRow(model: model, icon: .symbol("square.and.arrow.up"), title: "导出配置",
+                             subtitle: "全部设置与账号凭据打包为 JSON 文件", actionTitle: "导出") {
+                    model.actions.exportBackup()
+                }
+                OperationRow(model: model, icon: .symbol("square.and.arrow.down"), title: "导入配置",
+                             subtitle: "从备份文件恢复，导入后自动重启", actionTitle: "导入") {
+                    model.actions.importBackup()
+                }
+            } header: {
+                Text("备份")
+            } footer: {
+                Text("导出文件含明文凭据，请妥善保管。")
             }
         }
     }
@@ -431,81 +421,138 @@ private struct ThemePane: View {
     var body: some View {
         Form {
             Section {
-                sliderRow("色相", get: { model.snapshot.heatHue }, set: model.setHeatHue)
-                sliderRow("饱和度", get: { model.snapshot.heatSaturation }, set: model.setHeatSaturation)
-                sliderRow("亮度", get: { model.snapshot.heatBrightness }, set: model.setHeatBrightness)
-            } header: {
-                // 标题右侧实时色样（2026-09-13 用户要求）：由三根滑杆当前值合成；
-                // 滑杆写入都经 sync() 回读快照，拖动中色样同步变色。描边兜底近黑/近白主题色在卡底上的可辨性
-                HStack(spacing: 6) {
+                // 主题色（2026-09-14 用户要求：原色相/饱和度/亮度三根滑杆 + 标题色样一起撤掉，
+                // 收成「面板」组里的一行系统色盘）——
+                // 拾色后由模型分解回 HSB 三参落值（下游点阵档位/卡片边框仍读 HSB，口径不变）；
+                // 主题色不含透明语义，故不透出不透明度滑杆
+                LabeledContent {
+                    ColorPicker("主题色", selection: themeColor, supportsOpacity: false)
+                        .labelsHidden()
+                } label: {
                     Text("主题色")
-                    Circle()
-                        .fill(Color(nsColor: NSColor(hue: model.snapshot.heatHue,
-                                                     saturation: model.snapshot.heatSaturation,
-                                                     brightness: model.snapshot.heatBrightness,
-                                                     alpha: 1)))
-                        .frame(width: 10, height: 10)
-                        .overlay(Circle().strokeBorder(.quaternary, lineWidth: 1))
                 }
-            } footer: {
-                Text("点阵峰值配色（卡片边框同源）：色相转一圈，饱和度决定鲜艳程度，亮度决定明暗。")
-            }
-            Section {
-                // 强度滑杆（0…100%，与下方主题色滑杆同款）：拖动实时回读快照即时生效
-                sliderRow("高对比背景",
-                          get: { model.snapshot.panelMaskOpacity },
-                          set: model.setPanelMaskOpacity)
+                // 点阵背景色（2026-09-15 用户要求开放）：无用量底点 / 进度条轨道底 / 骨架行同源，
+                // 带不透明度（轨道与底点都是半透明观感）
+                LabeledContent {
+                    ColorPicker("点阵背景色", selection: heatDotEmptyColor, supportsOpacity: true)
+                        .labelsHidden()
+                } label: {
+                    Text("点阵背景色")
+                }
+                // 面板底色（2026-09-14 用户要求：原「高对比背景」强度滑杆改制）——
+                // 行尾色块即系统色盘入口，点击弹出系统颜色面板（含「不透明度」滑杆，
+                // 即原「强度」语义）；拾色即时落盘重绘，不留「保存」按钮
+                LabeledContent {
+                    ColorPicker("面板背景色", selection: backgroundColor, supportsOpacity: true)
+                        .labelsHidden()
+                } label: {
+                    Text("面板背景色")
+                }
+                // 遮罩上下两端的不透明度（2026-09-14 用户要求：删掉原「底端 = alpha × 0.65」的自动递减，
+                // 两端各给一个滑杆）。顶部滑杆与色盘的不透明度是同一字段的两个入口
+                percentSliderRow("顶部不透明度",
+                                 get: { model.snapshot.panelBackgroundColor.alpha },
+                                 set: { model.setPanelBackgroundColor(
+                                     model.snapshot.panelBackgroundColor.withAlpha($0)) })
+                percentSliderRow("底部不透明度",
+                                 get: { model.snapshot.panelBackgroundBottomAlpha },
+                                 set: model.setPanelBackgroundBottomAlpha)
                 Toggle("浅色主题", isOn: toggle(\.lightThemeEnabled, model.setLightTheme))
             } header: {
                 Text("面板")
             } footer: {
-                Text("「高对比背景」= 底色明暗遮罩强度，0% = 原生玻璃；「浅色主题」= 强制浅色外观（忽略系统深色）。")
+                Text("「主题色」= 点阵峰值配色（卡片边框同源）；「点阵背景色」= 无用量底点 / 进度条轨道底（骨架行同源）；「面板背景色」= 面板底色遮罩（色盘给颜色，其不透明度即顶端值）；「顶部/底部不透明度」= 遮罩纵向两端各管一档，两者相同即纯色、0% 露原生玻璃；「浅色主题」= 强制浅色外观，打开时仅在底色明度 ≤ 50% 时翻转其明度（已是亮底则保持）。")
             }
             Section {
                 Toggle("图标深浅互换", isOn: toggle(\.iconThemeSwap, model.setIconThemeSwap))
-                Toggle("圆形图标", isOn: toggle(\.circularIcon, model.setCircularIcon))
                 Toggle("长进度卡片", isOn: toggle(\.longProgressCard, model.setLongProgressCard))
-                intSliderRow("主标题字号",
-                             get: { model.snapshot.cardTitleFontSize },
-                             set: model.setCardTitleFontSize,
-                             in: 10...18, unit: "pt")
+                // 主标题字号（2026-09-15 用户：区间收到 10…16、步进 0.5 —— 半档用于微调标题墨迹高，
+                // 读数同档显示小数）
+                ptSliderRow("主标题字号",
+                            get: { model.snapshot.cardTitleFontSize },
+                            set: model.setCardTitleFontSize,
+                            in: 10...16, step: 0.5)
                 Toggle("Sharp Grotesk 字体", isOn: toggle(\.cardTitleSharpGrotesk, model.setCardTitleSharpGrotesk))
-                if model.snapshot.cardTitleSharpGrotesk {
-                    Picker("字重", selection: intOption(\.cardTitleSGWeight, model.setCardTitleSGWeight)) {
-                        Text("Thin").tag(0)
-                        Text("Book").tag(1)
-                        Text("Light").tag(2)
-                        Text("Medium").tag(3)
-                        Text("SemiBold").tag(4)
-                        Text("Bold").tag(5)
-                        Text("Black").tag(6)
-                    }
-                    Picker("宽度", selection: intOption(\.cardTitleSGWidth, model.setCardTitleSGWidth)) {
-                        Text("05（窄）").tag(0)
-                        Text("10").tag(1)
-                        Text("15").tag(2)
-                        Text("20").tag(3)
-                        Text("25（宽）").tag(4)
-                    }
+                // 主副标题行距系数（2026-09-14 用户要求）：主标题不再写死行框高度，
+                // 行距 = 基准 1.5pt × 本系数；SG 字面更扁，单独一档（默认较小）
+                floatSliderRow("主副标题间距系数（系统字体）",
+                               get: { model.snapshot.cardTitleGapScaleSF },
+                               set: model.setCardTitleGapScaleSF,
+                               in: 0.2...2.0, step: 0.05)
+                floatSliderRow("主副标题间距系数（SG）",
+                               get: { model.snapshot.cardTitleGapScaleSG },
+                               set: model.setCardTitleGapScaleSG,
+                               in: 0.2...2.0, step: 0.05)
+                // 卡片 hover 背景色（2026-09-15 用户要求开放）：即 hover 时那块材质底（卡片 /
+                // 用量行 / Token 行共用），带不透明度
+                LabeledContent {
+                    ColorPicker("hover 背景色", selection: cardHoverBackgroundColor, supportsOpacity: true)
+                        .labelsHidden()
+                } label: {
+                    Text("hover 背景色")
                 }
             } header: {
                 Text("卡片")
             } footer: {
-                Text("「主标题字号」= 余额卡平台名（数值字号不变）；「Sharp Grotesk 字体」用本机安装的 Sharp Grotesk（字重×宽度任选组合，未装该字重自动回落系统字体）。")
+                Text("「主标题字号」= 余额卡平台名（数值字号不变）；「Sharp Grotesk 字体」用本机安装版本（固定 Book20），未装该字重自动回落系统字体。间距系数 = 主标题行与副标题行之间距（基准 1.5pt）的倍率，按当前字体取对应档。「hover 背景色」= 鼠标悬停时那块底（卡片、用量行、Token 行共用）。")
             }
         }
     }
 
-    /// 滑杆行：标签居左，滑杆 + 百分数读数居右（等宽数字，拖动时不抖）。
-    /// get 直读模型快照（不回传渲染时的常量），拖动中滑杆位置与读数都不滞后。
-    private func sliderRow(_ title: String, get: @escaping () -> Double,
-                           set: @escaping (Double) -> Void) -> some View {
+    /// 主题色绑定：读 = 快照 HSB 三参经 `PanelThemeColor.rgb` 合成（与面板点阵同一解算，
+    /// 色块所见即面板所得；色盘轮盘/明度也随之定位）；
+    /// 写 = 色盘给的颜色分解回 HSB —— 先归一到 sRGB 再读分量，
+    /// ⚠️ `hueComponent` 只对 RGB 空间有效（灰度 / 设备空间直接读会抛异常），
+    /// 归一失败（色盘给了 pattern 类颜色，正常路径不会发生）就丢弃这次写入
+    private var themeColor: Binding<Color> {
+        Binding(get: {
+            let c = PanelThemeColor.rgb(hue: CGFloat(model.snapshot.heatHue),
+                                        saturation: CGFloat(model.snapshot.heatSaturation),
+                                        brightness: CGFloat(model.snapshot.heatBrightness))
+            // 与 Palette 同装法（calibratedRed）：色块与点阵落在同一色彩空间，屏幕呈现一致
+            return Color(nsColor: NSColor(calibratedRed: c.red, green: c.green, blue: c.blue, alpha: 1))
+        }, set: { picked in
+            guard let rgb = NSColor(picked).usingColorSpace(.sRGB) else { return }
+            model.setThemeColor(hue: Double(rgb.hueComponent),
+                                saturation: Double(rgb.saturationComponent),
+                                brightness: Double(rgb.brightnessComponent))
+        })
+    }
+
+    /// 即时生效开关：写入转交宿主动作（落盘 + 重绘 + 快照回读）
+    private func toggle(_ keyPath: KeyPath<AppSettingsSnapshot, Bool>,
+                        _ set: @escaping (Bool) -> Void) -> Binding<Bool> {
+        Binding(get: { model.snapshot[keyPath: keyPath] }, set: set)
+    }
+
+    /// 面板底色绑定：快照（真实配置）读写，写入转交宿主动作后由 `sync()` 回读；
+    /// 色盘给的 alpha 一并带上（`supportsOpacity: true`，即原「高对比背景」强度）
+    private var backgroundColor: Binding<Color> {
+        Binding(get: { model.snapshot.panelBackgroundColor.swiftUIColor },
+                set: { model.setPanelBackgroundColor(PanelBackgroundColor(swiftUIColor: $0)) })
+    }
+
+    /// 点阵背景色绑定（2026-09-15）：同底色口径 —— 快照读写 + 宿主落盘后回读
+    private var heatDotEmptyColor: Binding<Color> {
+        Binding(get: { model.snapshot.heatDotEmptyColor.swiftUIColor },
+                set: { model.setHeatDotEmptyColor(PanelBackgroundColor(swiftUIColor: $0)) })
+    }
+
+    /// 卡片 hover 背景色绑定（2026-09-15）：同底色口径
+    private var cardHoverBackgroundColor: Binding<Color> {
+        Binding(get: { model.snapshot.cardHoverBackgroundColor.swiftUIColor },
+                set: { model.setCardHoverBackgroundColor(PanelBackgroundColor(swiftUIColor: $0)) })
+    }
+
+    /// 系数滑杆行：同款布局，量纲为小数（步进可配，读数按 ×1.00 呈现）
+    private func floatSliderRow(_ title: String, get: @escaping () -> Double,
+                                set: @escaping (Double) -> Void,
+                                in range: ClosedRange<Double>, step: Double) -> some View {
         LabeledContent {
             HStack(spacing: 10) {
-                Slider(value: snapped(Binding(get: get, set: set), in: 0...1, step: 0.01), in: 0...1)
-                    .frame(width: 190)
-                // 读数与滑杆同源、VoiceOver 会重复播报 → 只当视觉辅助
-                Text(get(), format: .percent.precision(.fractionLength(0)))
+                Slider(value: snapped(Binding(get: get, set: set), in: range, step: step), in: range)
+                    .frame(width: 150)
+                Text(String(format: "×%.2f", get()))
                     .font(.footnote)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -517,28 +564,44 @@ private struct ThemePane: View {
         }
     }
 
-    /// 即时生效开关：写入转交宿主动作（落盘 + 重绘 + 快照回读）
-    private func toggle(_ keyPath: KeyPath<AppSettingsSnapshot, Bool>,
-                        _ set: @escaping (Bool) -> Void) -> Binding<Bool> {
-        Binding(get: { model.snapshot[keyPath: keyPath] }, set: set)
-    }
-
-    /// Int 档位选项绑定（Sharp Grotesk 字重/宽度档）：同 toggle 的闭包 Binding 口径
-    private func intOption(_ keyPath: KeyPath<AppSettingsSnapshot, Int>,
-                           _ set: @escaping (Int) -> Void) -> Binding<Int> {
-        Binding(get: { model.snapshot[keyPath: keyPath] }, set: set)
-    }
-
-    /// 数值滑杆行：标签居左，滑杆 + 单位读数居右（等宽数字，拖动时不抖）。
-    /// 与 sliderRow（0…1 百分比）同款布局，量纲开放为任意区间。
-    private func intSliderRow(_ title: String, get: @escaping () -> Double,
-                              set: @escaping (Double) -> Void,
-                              in range: ClosedRange<Double>, unit: String) -> some View {
+    /// 字号滑杆行（pt，步进 0.5）：布局同其他滑杆行，读数为整数不补小数、
+    /// 半档才显示一位（16pt / 13.5pt）—— 2026-09-15 用户要求主标题字号收到 10…16、步进 0.5
+    private func ptSliderRow(_ title: String, get: @escaping () -> Double,
+                             set: @escaping (Double) -> Void,
+                             in range: ClosedRange<Double>, step: Double) -> some View {
         LabeledContent {
             HStack(spacing: 10) {
-                Slider(value: snapped(Binding(get: get, set: set), in: range, step: 1), in: range)
+                Slider(value: snapped(Binding(get: get, set: set), in: range, step: step), in: range)
                     .frame(width: 150)
-                Text("\(Int(get()))\(unit)")
+                Text(Self.ptText(get()))
+                    .font(.footnote)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 56, alignment: .trailing)
+                    .accessibilityHidden(true)
+            }
+        } label: {
+            Text(title)
+        }
+    }
+
+    /// 字号读数：整数省掉小数位（与常见「16pt」写法一致），半档保留一位
+    private static func ptText(_ v: Double) -> String {
+        let rounded = (v * 2).rounded() / 2
+        return abs(rounded - rounded.rounded()) < 0.01
+            ? "\(Int(rounded.rounded()))pt"
+            : String(format: "%.1fpt", rounded)
+    }
+
+    /// 百分比滑杆行（0…1 量纲，读数取整为 "NN%"）：遮罩上下端不透明度等
+    private func percentSliderRow(_ title: String, get: @escaping () -> Double,
+                                  set: @escaping (Double) -> Void,
+                                  step: Double = 0.05) -> some View {
+        LabeledContent {
+            HStack(spacing: 10) {
+                Slider(value: snapped(Binding(get: get, set: set), in: 0...1, step: step), in: 0...1)
+                    .frame(width: 150)
+                Text("\(Int((get() * 100).rounded()))%")
                     .font(.footnote)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -754,10 +817,8 @@ private struct OperationRow: View {
     let title: String
     let subtitle: String?
     let actionTitle: String?
-    /// 破坏性动作（「删除账号」）：按钮走 destructive 语义 + 显式染红
+    /// 破坏性动作（逐账号「删除」）：按钮走 destructive 语义 + 显式染红
     var destructive = false
-    /// 动作按钮是否可用（如「删除账号」在没有任何已保存凭据时置灰）
-    var enabled = true
     let action: () -> Void
 
     var body: some View {
@@ -781,7 +842,6 @@ private struct OperationRow: View {
                         Text(actionTitle)
                     }
                 }
-                .disabled(!enabled)
             }
         }
     }

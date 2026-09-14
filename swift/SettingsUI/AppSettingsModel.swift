@@ -7,6 +7,215 @@ import AppKit
 import CoreImage
 import SwiftUI
 
+/// 点阵主题色的**取值域与解算**（HSB → RGB 的唯一实现）。2026-09-14 由设置窗口三根滑杆
+/// 改制成系统色盘时上提到这里：宿主 `Palette.heatPeakRGB`（点阵档位色 / 卡片边框 / 热力图印章）
+/// 与设置窗口色盘色块共用同一份 —— 与 `MenuBarBounceSettings.solve` 同一条
+/// 「两边各写一份迟早漂移」的共存铁律。
+public enum PanelThemeColor {
+    /// 标准 HSV → RGB（各分量 0…1）。色相/饱和度/明度调整后推导峰值色的唯一实现
+    public static func rgb(hue: CGFloat, saturation: CGFloat, brightness: CGFloat)
+        -> (red: CGFloat, green: CGFloat, blue: CGFloat) {
+        let h = hue * 6, s = saturation, v = brightness
+        let i = Int(floor(h)), f = h - floor(h)
+        let p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f))
+        switch ((i % 6) + 6) % 6 {
+        case 0: return (v, t, p)
+        case 1: return (q, v, p)
+        case 2: return (p, v, t)
+        case 3: return (p, q, v)
+        case 4: return (t, p, v)
+        default: return (v, p, q)
+        }
+    }
+
+    /// 标准 RGB → HSV（各分量 0…1），`rgb` 的反解 —— 只用于「明度取反」这类
+    /// 需要在 HSB 域上做单参运算的场合（`PanelBackgroundColor.brightnessFlipped`）。
+    /// 灰阶（delta = 0）时色相无定义，返回 hue = 0（此时色相对结果无影响）
+    public static func hsb(red: CGFloat, green: CGFloat, blue: CGFloat)
+        -> (hue: CGFloat, saturation: CGFloat, brightness: CGFloat) {
+        let maxV = max(red, green, blue), minV = min(red, green, blue)
+        let delta = maxV - minV
+        let brightness = maxV
+        let saturation = maxV == 0 ? 0 : delta / maxV
+        var hue: CGFloat = 0
+        if delta > 0 {
+            if maxV == red {
+                hue = ((green - blue) / delta).truncatingRemainder(dividingBy: 6)
+            } else if maxV == green {
+                hue = (blue - red) / delta + 2
+            } else {
+                hue = (red - green) / delta + 4
+            }
+            hue /= 6
+            if hue < 0 { hue += 1 }
+        }
+        return (hue, saturation, brightness)
+    }
+}
+
+/// 面板「面板背景色」：主面板底色遮罩的颜色。
+/// 宿主（`Palette.containerColors` / `TintOverlayView`）与设置窗口色盘**共用同一份取值域**
+/// —— 与 `MenuBarBounceSettings` 同一条「两边各写一份迟早漂移」的共存铁律。
+///
+/// 2026-09-14 由「高对比背景」强度滑杆改制：原滑杆只等比缩放固定黑/白遮罩的 alpha，
+/// 现在整条遮罩就是这个颜色本身，alpha 由系统色盘直接给（= 原「强度」语义）。
+///
+/// ⚠️ **存储以 HSB 为准，RGB 只是派生渲染值**（`red/green/blue` 是计算属性）。
+/// 原因见 `brightnessFlipped`：若按 RGB 存储，「浅色主题」开关的明度翻转会在
+/// 翻转结果落到灰阶（V=1 → 纯黑、V=0 → 纯白）时**永久丢掉色相与饱和度**。
+/// 与点阵「主题色」的存储口径一致（那边也是 HSB 三参分开存）。
+/// 落盘格式 `hsv:H,S,V,A`（见 `configValue`，config.json 可手改；旧 `#RRGGBBAA` 仍可读）。
+public struct PanelBackgroundColor: Equatable {
+    /// 色相 / 饱和度 / 明度 / 不透明度（各 0…1）—— 存储真值，渲染用的 RGB 由前三者合成
+    public var hue: Double
+    public var saturation: Double
+    public var brightness: Double
+    public var alpha: Double
+
+    /// 默认 = 原「高对比背景 100%」的顶部色（近黑 @70%）：老配置迁移到新键时观感不变
+    public static let `default` = PanelBackgroundColor(red: 0.02, green: 0.02, blue: 0.02, alpha: 0.70)
+
+    /// 点阵**背景色**默认（= 无用量底点 / 进度条轨道底 / 骨架行；2026-09-15 起设置窗口可改）：
+    /// 深灰 #292929，与旧内置值同源。浅色主题开关会把明度翻转（翻到 ≈ #d6d6d6）
+    public static let heatDotEmptyDefault = PanelBackgroundColor(red: 0x29 / 255.0, green: 0x29 / 255.0,
+                                                                 blue: 0x29 / 255.0, alpha: 1)
+    /// 卡片 **hover 背景色**默认（= `HoverMaterialHost` 材质块底色；2026-09-15 起设置窗口可改）：
+    /// 黑 @30%，与旧内置值同源（浅色主题开关 → 白 @30%）
+    public static let cardHoverDefault = PanelBackgroundColor(red: 0, green: 0, blue: 0, alpha: 0.30)
+
+    /// 遮罩**底端**不透明度的默认值（0…1）：= 默认色自身的 alpha（两端同值 ⇒ 纯色遮罩）。
+    /// 2026-09-14 起上下两端各自独立（`panel_background_bottom_alpha`），此值只作各处属性的初值；
+    /// 旧配置的迁移值见 `Config` 解码（取与顶端同值）
+    public static let defaultBottomAlpha: Double = 0.70
+
+    /// 遮罩是否生效（alpha ≤ 1% 视为关 → 露出容器原生毛玻璃）
+    public var isEffective: Bool { alpha > 0.01 }
+
+    public init(hue: Double, saturation: Double, brightness: Double, alpha: Double) {
+        // 四参一律量化到 1e-6（同时夹进 0…1）：与落盘串（`configValue` 的 `%.6f`）精度一致，
+        // 保证「落盘 → 读回」与「翻转 → 翻回」都是**逐位无损**的 ——
+        // 否则 `1 - (1 - 0.02)` 会得到 0.020000000000000018，来回切换会攒出假不等。
+        // 1e-6 的色相 ≈ 0.00036°，远在肉眼分辨之下
+        self.hue = Self.quantized(hue)
+        self.saturation = Self.quantized(saturation)
+        self.brightness = Self.quantized(brightness)
+        self.alpha = Self.quantized(alpha)
+    }
+
+    /// 量化到 1e-6 并夹进 0…1（落盘/翻转的无损基准）
+    private static func quantized(_ v: Double) -> Double {
+        (min(max(v, 0), 1) * 1_000_000).rounded() / 1_000_000
+    }
+
+    /// RGB 构造（各 0…1）：分解成 HSB 落值 —— 灰阶（delta = 0）时色相无定义，取 0
+    public init(red: Double, green: Double, blue: Double, alpha: Double) {
+        let hsb = PanelThemeColor.hsb(red: CGFloat(red), green: CGFloat(green), blue: CGFloat(blue))
+        self.init(hue: Double(hsb.hue), saturation: Double(hsb.saturation),
+                  brightness: Double(hsb.brightness), alpha: alpha)
+    }
+
+    /// HSB → sRGB 派生渲染值（各 0…1）。只在下游取色/落 hex 时现算，不做缓存
+    private var rgb: (red: Double, green: Double, blue: Double) {
+        let c = PanelThemeColor.rgb(hue: CGFloat(hue), saturation: CGFloat(saturation),
+                                    brightness: CGFloat(brightness))
+        return (Double(c.red), Double(c.green), Double(c.blue))
+    }
+    public var red: Double { rgb.red }
+    public var green: Double { rgb.green }
+    public var blue: Double { rgb.blue }
+
+    /// 从 AppKit 颜色取分量：统一转 sRGB 再读，避免 calibrated / device 空间下
+    /// 分量不可比（同一视觉色在两空间里的数值不同，等值比较会假不等）
+    public init(nsColor: NSColor) {
+        guard let c = nsColor.usingColorSpace(.sRGB) else {
+            self = .default
+            return
+        }
+        self.init(red: Double(c.redComponent), green: Double(c.greenComponent),
+                  blue: Double(c.blueComponent), alpha: Double(c.alphaComponent))
+    }
+
+    public var nsColor: NSColor {
+        NSColor(srgbRed: red, green: green, blue: blue, alpha: alpha)
+    }
+
+    /// SwiftUI 色盘口径（sRGB 直通：走 `Color(nsColor:)` 会按显示 P3 解释，选中值会被挪位）
+    public var swiftUIColor: Color {
+        Color(.sRGB, red: red, green: green, blue: blue, opacity: alpha)
+    }
+
+    public init(swiftUIColor: Color) {
+        self.init(nsColor: NSColor(swiftUIColor))
+    }
+
+    /// 当前渲染色的 `#RRGGBBAA`（仅供日志/GradProbe 探针可读，**不再是落盘格式**）
+    public var hexString: String {
+        func byte(_ v: Double) -> Int { Int((min(max(v, 0), 1) * 255).rounded()) }
+        return String(format: "#%02X%02X%02X%02X", byte(red), byte(green), byte(blue), byte(alpha))
+    }
+
+    /// 亮度翻转（「浅色主题」开关联动用）：**只把明度 V 取反**，色相 / 饱和度 / 不透明度原样保留。
+    ///
+    /// 为什么不直接 RGB 逐通道取反：那会连色相一起翻（深蓝 → 米黄），浅色底会跑成另一种颜色；
+    /// 取明度才是用户说的「翻转亮度」——近黑底（V=0.02）↔ 近白底（V=0.98），
+    /// 自选的深蓝底（V=0.16）↔ 同色相浅蓝底（V=0.84），语义稳定且可逆。
+    /// 灰阶（饱和度 0）下与 RGB 取反等价，所以默认近黑底翻转后就是纯灰白。
+    ///
+    /// 2026-09-14 修（用户报「开关浅色主题时色相和饱和度被重置」）：
+    /// 原实现是 RGB → HSB → 翻 V → RGB 往返，当翻转结果落到灰阶时——
+    /// V=1 的浅色翻成 **V=0 纯黑**、V=0 的黑翻成纯白——`PanelThemeColor.hsb` 对灰阶
+    /// （delta = 0）返回 hue=0 / saturation=0，**色相与饱和度被永久抹掉**，
+    /// 再翻一次就只剩灰白。现在颜色本身就以 HSB 存储，翻转只改 `brightness` 一个字段，
+    /// 色相/饱和度根本不参与运算：既不丢也不漂，来回切换精确可逆。
+    public var brightnessFlipped: PanelBackgroundColor {
+        PanelBackgroundColor(hue: hue, saturation: saturation,
+                             brightness: 1 - brightness, alpha: alpha)
+    }
+
+    /// 换不透明度、保留色相/饱和度/明度：「顶部不透明度」滑杆与系统色盘共用同一落值入口
+    /// （两者都写同一个 `alpha` 字段，滑杆拖动即等价于色盘里改不透明度）
+    public func withAlpha(_ a: Double) -> PanelBackgroundColor {
+        PanelBackgroundColor(hue: hue, saturation: saturation, brightness: brightness, alpha: a)
+    }
+
+    /// config 落盘格式 `hsv:H,S,V,A`（四参各 0…1，6 位小数 = 结构体的量化精度，故逐位无损；
+    /// 人可读、可手改）。存 HSB 而非 `#RRGGBBAA` 的原因见 `brightnessFlipped`
+    public var configValue: String {
+        String(format: "hsv:%.6f,%.6f,%.6f,%.6f", hue, saturation, brightness, alpha)
+    }
+
+    /// 解析 `hsv:H,S,V,A`；兼容旧落盘格式 `#RRGGBBAA`（分解成 HSB，一次性迁移）。非法输入返回 nil
+    public init?(configValue: String) {
+        let s = configValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix("hsv:") else {
+            self.init(hex: s)   // 旧格式兜底
+            return
+        }
+        let parts = s.dropFirst(4).split(separator: ",").map { Double($0) }
+        guard parts.count == 4, parts.allSatisfy({ $0 != nil }) else { return nil }
+        func unit(_ v: Double) -> Double { min(max(v, 0), 1) }
+        self.init(hue: unit(parts[0]!), saturation: unit(parts[1]!),
+                  brightness: unit(parts[2]!), alpha: unit(parts[3]!))
+    }
+
+    /// 解析 `#RRGGBBAA` / `RRGGBBAA`；`#RRGGBB`（6 位）按不透明处理。非法输入返回 nil
+    public init?(hex: String) {
+        var s = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6 || s.count == 8, let v = UInt32(s, radix: 16) else { return nil }
+        if s.count == 6 {
+            self.init(red: Double((v >> 16) & 0xFF) / 255,
+                      green: Double((v >> 8) & 0xFF) / 255,
+                      blue: Double(v & 0xFF) / 255, alpha: 1)
+        } else {
+            self.init(red: Double((v >> 24) & 0xFF) / 255,
+                      green: Double((v >> 16) & 0xFF) / 255,
+                      blue: Double((v >> 8) & 0xFF) / 255,
+                      alpha: Double(v & 0xFF) / 255)
+        }
+    }
+}
+
 /// 菜单栏「进行中」状态点的小球弹跳参数（设置窗口「菜单栏」pane 可调）。
 /// 刻意放在 SettingsUI 里：**宿主与设置界面共用同一份取值域与默认值** ——
 /// 宿主 `MenuBarStatusGlowController` 按这份参数逐帧算小球帧，界面按同一份画实时预览，
@@ -200,30 +409,36 @@ public struct AppSettingsSnapshot: Equatable {
     /// 菜单栏状态点小球弹跳参数（「菜单栏」pane）
     public var bounce: MenuBarBounceSettings = .initial
     /// ── 「主题外观」pane：以下各项（原「主题调教」玻璃弹窗内容）──
-    /// 「高对比背景」强度（0…1，0 = 无遮罩原生玻璃；面板遮罩 alpha 随此值缩放）
-    public var panelMaskOpacity: Double = 1
+    /// 面板底色遮罩色（2026-09-14 由「高对比背景」强度滑杆改制：颜色 + alpha 由色盘给）
+    public var panelBackgroundColor: PanelBackgroundColor = .default
+    /// 遮罩**底端**不透明度（0…1；顶端 = panelBackgroundColor 的 alpha，两端各自独立，
+    /// 取代原「alpha × 0.65」自动递减）
+    public var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
     /// 浅色主题开关（强制浅色外观，即使系统是深色主题）
     public var lightThemeEnabled = false
     /// 品牌 icon 深浅版互换
     public var iconThemeSwap = false
-    /// 品牌 icon 裁圆（宽高不变，仅形状裁切；任务状态光环同步翻圆形）
-    public var circularIcon = false
     /// 长进度卡片（整行进度条 + 副标题下移）
     public var longProgressCard = false
-    /// 卡片主标题字号（pt，10…18）
+    /// 卡片主标题字号（pt，10…16、步进 0.5）
     public var cardTitleFontSize: Double = 13
     /// 卡片主标题 Sharp Grotesk（本机安装的商业字体；未装该字重回落系统字体）
     public var cardTitleSharpGrotesk = false
-    /// Sharp Grotesk 字重档（0=Thin 1=Book 2=Light 3=Medium 4=SemiBold 5=Bold 6=Black）
-    public var cardTitleSGWeight = 3
-    /// Sharp Grotesk 宽度档（0=05 1=10 2=15 3=20 4=25）
-    public var cardTitleSGWidth = 3
-    /// 点阵主题色相（0…1）
+    /// 主标题↔副标题行距的字体系数（× `PanelLayout.titleRowBaseGap`，0.2…2.0）：
+    /// 主标题去掉硬行框后按字体疏密补偿，SG 更扁 → 单独一档
+    public var cardTitleGapScaleSF: Double = 1.0
+    public var cardTitleGapScaleSG: Double = 0.7
+    /// 点阵主题色（HSB 三参 0…1）：设置窗口「面板 → 主题色」系统色盘拾色后分解落值
+    /// （下游点阵档位色与卡片边框仍按 HSB 口径取值）
     public var heatHue: Double = 0
     /// 点阵主题饱和度（0…1）
     public var heatSaturation: Double = 0
     /// 点阵主题峰值明度（0…1）
     public var heatBrightness: Double = 0
+    /// 点阵**背景色**（无用量底点 / 进度条轨道底 / 骨架行；2026-09-15 用户要求开放）
+    public var heatDotEmptyColor: PanelBackgroundColor = .heatDotEmptyDefault
+    /// 卡片 **hover 背景色**（HoverMaterialHost 材质块底色；2026-09-15 用户要求开放）
+    public var cardHoverBackgroundColor: PanelBackgroundColor = .cardHoverDefault
     /// DeepSeek API Key（真实值来自钥匙串；空 = 未配置）
     public var apiKey: String = ""
     /// DeepSeek 常用充值额度（0 = 未设置 → 面板不画点阵；>0 = 点阵分母）
@@ -232,10 +447,6 @@ public struct AppSettingsSnapshot: Equatable {
     public var zhipuToken: String = ""
     /// Qwen Ticket 手填覆盖（空 = 自动读浏览器登录态）
     public var qwenTicket: String = ""
-    /// 「账号」pane 底部「删除账号」用：已保存的**账号数**（WorkBuddy / TRAE / ZCode / Codex 四个数组之和）
-    public var savedAccountCount: Int = 0
-    /// 同上：已保存的**手填凭据数**（DeepSeek Key / ZhiPu Token / Qwen Ticket 里非空的条数）
-    public var savedOverrideCount: Int = 0
     /// 「已保存账号」列表（2026-09-13 用户要求）：逐平台分组，空平台不出现；全空 = 空数组
     public var savedAccountGroups: [SavedAccountGroup] = []
 
@@ -244,14 +455,17 @@ public struct AppSettingsSnapshot: Equatable {
                 bounce: MenuBarBounceSettings = .initial,
                 apiKey: String = "", commonQuota: Double = 0,
                 zhipuToken: String = "", qwenTicket: String = "",
-                savedAccountCount: Int = 0, savedOverrideCount: Int = 0,
                 savedAccountGroups: [SavedAccountGroup] = [],
-                panelMaskOpacity: Double = 1, lightThemeEnabled: Bool = false,
-                iconThemeSwap: Bool = false, circularIcon: Bool = false,
+                panelBackgroundColor: PanelBackgroundColor = .default,
+                panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha,
+                lightThemeEnabled: Bool = false,
+                iconThemeSwap: Bool = false,
                 longProgressCard: Bool = false,
                 cardTitleFontSize: Double = 13, cardTitleSharpGrotesk: Bool = false,
-                cardTitleSGWeight: Int = 3, cardTitleSGWidth: Int = 3,
-                heatHue: Double = 0, heatSaturation: Double = 0, heatBrightness: Double = 0) {
+                cardTitleGapScaleSF: Double = 1.0, cardTitleGapScaleSG: Double = 0.7,
+                heatHue: Double = 0, heatSaturation: Double = 0, heatBrightness: Double = 0,
+                heatDotEmptyColor: PanelBackgroundColor = .heatDotEmptyDefault,
+                cardHoverBackgroundColor: PanelBackgroundColor = .cardHoverDefault) {
         self.refreshInterval = refreshInterval
         self.autoCheckin = autoCheckin
         self.autoCheckinSub = autoCheckinSub
@@ -261,21 +475,21 @@ public struct AppSettingsSnapshot: Equatable {
         self.commonQuota = commonQuota
         self.zhipuToken = zhipuToken
         self.qwenTicket = qwenTicket
-        self.savedAccountCount = savedAccountCount
-        self.savedOverrideCount = savedOverrideCount
         self.savedAccountGroups = savedAccountGroups
-        self.panelMaskOpacity = panelMaskOpacity
+        self.panelBackgroundColor = panelBackgroundColor
+        self.panelBackgroundBottomAlpha = panelBackgroundBottomAlpha
         self.lightThemeEnabled = lightThemeEnabled
         self.iconThemeSwap = iconThemeSwap
-        self.circularIcon = circularIcon
         self.longProgressCard = longProgressCard
         self.cardTitleFontSize = cardTitleFontSize
         self.cardTitleSharpGrotesk = cardTitleSharpGrotesk
-        self.cardTitleSGWeight = cardTitleSGWeight
-        self.cardTitleSGWidth = cardTitleSGWidth
+        self.cardTitleGapScaleSF = cardTitleGapScaleSF
+        self.cardTitleGapScaleSG = cardTitleGapScaleSG
         self.heatHue = heatHue
         self.heatSaturation = heatSaturation
         self.heatBrightness = heatBrightness
+        self.heatDotEmptyColor = heatDotEmptyColor
+        self.cardHoverBackgroundColor = cardHoverBackgroundColor
     }
 }
 
@@ -293,24 +507,24 @@ public struct AppSettingsActions {
     public var addCodexAccount: () -> Void = {}
     /// Key/额度表单保存（2026-09-13 并入账号 pane；apiKey、日常额度、ZhiPu Token、Qwen Ticket；空串 = 清除该项覆盖）
     public var saveKeyQuota: (String, Double, String, String) -> Void = { _, _, _, _ in }
-    /// 「账号」pane 底部「删除账号」（2026-09-13 用户要求）：清空全部已保存的平台凭据 ——
-    /// WorkBuddy / TRAE / ZCode / Codex 的账号数组 + DeepSeek Key / ZhiPu Token / Qwen Ticket 手填覆盖。
-    /// 二次确认与结果提示都由宿主负责（破坏性操作，UI 这边只发一个意图）
-    public var deleteAllAccounts: () -> Void = {}
     /// 「已保存账号」列表的逐个删除（2026-09-13 用户要求）：platform = 平台键
     /// （workbuddy / trae / zcode / codex），uid = 账号 uid。二次确认由宿主负责（破坏性操作）
     public var deleteAccount: (String, String) -> Void = { _, _ in }
-    /// ── 「主题外观」pane：外观开关（传期望值，宿主比对当前配置后再落盘）+ 强度滑杆 ──
-    /// 「高对比背景」强度（0…1，0 = 原生玻璃；宿主：落盘 + 快照同步重绘遮罩）
-    public var setPanelMaskOpacity: (Double) -> Void = { _ in }
+    /// ── 「主题外观」pane：外观开关（传期望值，宿主比对当前配置后再落盘）+ 底色色盘 ──
+    /// 面板「面板背景色」（宿主：落盘 + 快照同步重绘遮罩）
+    public var setPanelBackgroundColor: (PanelBackgroundColor) -> Void = { _ in }
+    /// 面板底色遮罩**底端**不透明度（宿主：落盘 + 同步镜像 + 重绘遮罩）
+    public var setPanelBackgroundBottomAlpha: (Double) -> Void = { _ in }
     public var setLightTheme: (Bool) -> Void = { _ in }
     public var setIconThemeSwap: (Bool) -> Void = { _ in }
-    public var setCircularIcon: (Bool) -> Void = { _ in }
     public var setLongProgressCard: (Bool) -> Void = { _ in }
-    /// 「主题外观」pane 点阵色相 / 饱和度 / 明度（0…1；宿主：落 UserDefaults + 就地重绘点阵与边框）
-    public var setHeatHue: (Double) -> Void = { _ in }
-    public var setHeatSaturation: (Double) -> Void = { _ in }
-    public var setHeatBrightness: (Double) -> Void = { _ in }
+    /// 「主题外观」pane 点阵主题色（HSB 三参 0…1，**一把写**；2026-09-14 由三根滑杆改为
+    /// 系统色盘拾色 —— 色盘给的是一个颜色，分解回 HSB 后一次落值、只重绘一次）。
+    /// 宿主：落 UserDefaults + 就地重绘点阵与卡片边框
+    public var setHeatColor: (Double, Double, Double) -> Void = { _, _, _ in }
+    /// 点阵背景色 / 卡片 hover 背景色（2026-09-15 开放；宿主：写 config + 落盘 + 镜像 + 就地重绘）
+    public var setHeatDotEmptyColor: (PanelBackgroundColor) -> Void = { _ in }
+    public var setCardHoverBackgroundColor: (PanelBackgroundColor) -> Void = { _ in }
     public var manualCheckin: () -> Void = {}
     public var showCheckinHistory: () -> Void = {}
     public var shareWbHistory: () -> Void = {}
@@ -320,9 +534,15 @@ public struct AppSettingsActions {
     /// 宿主：写 config + 落盘 + syncPanel，面板快照比对变化后就地重刷标题）
     public var setCardTitleFontSize: (Double) -> Void = { _ in }
     public var setCardTitleSharpGrotesk: (Bool) -> Void = { _ in }
-    public var setCardTitleSGWeight: (Int) -> Void = { _ in }
-    public var setCardTitleSGWidth: (Int) -> Void = { _ in }
+    /// 主副标题行距系数（系统字体 / SG 两档）：宿主写 config + 落盘 + syncPanel，
+    /// 面板比对到变化后**就地改间距**（不重建卡片）
+    public var setCardTitleGapScaleSF: (Double) -> Void = { _ in }
+    public var setCardTitleGapScaleSG: (Double) -> Void = { _ in }
     public var about: () -> Void = {}
+    /// 「关于」pane 备份（BackupService）：导出 = config 全量（含凭据）+ UserDefaults 域 → JSON；
+    /// 导入 = 覆盖写回并重启（确认弹窗与破坏性提示都在宿主侧）
+    public var exportBackup: () -> Void = {}
+    public var importBackup: () -> Void = {}
 
     public init() {}
 }
@@ -534,11 +754,16 @@ public final class AppSettingsModel {
         sync()
     }
 
-    // ── 「主题外观」pane：开关 + 滑杆，全部即时生效（改完 sync() 回读真实配置）──
+    // ── 「主题外观」pane：开关 + 色盘，全部即时生效（改完 sync() 回读真实配置）──
 
-    /// 「高对比背景」强度（0…1，滑杆实时拖动）：动作转交宿主，随后回读快照
-    public func setPanelMaskOpacity(_ opacity: Double) {
-        actions.setPanelMaskOpacity(opacity)
+    /// 面板「面板背景色」（色盘逐次拾色都会走这里）：动作转交宿主，随后回读快照
+    public func setPanelBackgroundColor(_ color: PanelBackgroundColor) {
+        actions.setPanelBackgroundColor(color)
+        sync()
+    }
+    /// 遮罩底端不透明度滑杆（顶端走上面那个色盘 / 顶部滑杆）
+    public func setPanelBackgroundBottomAlpha(_ v: Double) {
+        actions.setPanelBackgroundBottomAlpha(v)
         sync()
     }
     public func setLightTheme(_ on: Bool) {
@@ -549,10 +774,6 @@ public final class AppSettingsModel {
         actions.setIconThemeSwap(on)
         sync()
     }
-    public func setCircularIcon(_ on: Bool) {
-        actions.setCircularIcon(on)
-        sync()
-    }
     public func setCardTitleFontSize(_ size: Double) {
         actions.setCardTitleFontSize(size)
         sync()
@@ -561,28 +782,31 @@ public final class AppSettingsModel {
         actions.setCardTitleSharpGrotesk(on)
         sync()
     }
-    public func setCardTitleSGWeight(_ idx: Int) {
-        actions.setCardTitleSGWeight(idx)
+    public func setCardTitleGapScaleSF(_ v: Double) {
+        actions.setCardTitleGapScaleSF(v)
         sync()
     }
-    public func setCardTitleSGWidth(_ idx: Int) {
-        actions.setCardTitleSGWidth(idx)
+    public func setCardTitleGapScaleSG(_ v: Double) {
+        actions.setCardTitleGapScaleSG(v)
         sync()
     }
     public func setLongProgressCard(_ on: Bool) {
         actions.setLongProgressCard(on)
         sync()
     }
-    public func setHeatHue(_ hue: Double) {
-        actions.setHeatHue(hue)
+    /// 主题色拾取（色盘）：先交宿主动作（落 UserDefaults + 就地重绘），随后回读快照
+    public func setThemeColor(hue: Double, saturation: Double, brightness: Double) {
+        actions.setHeatColor(hue, saturation, brightness)
         sync()
     }
-    public func setHeatSaturation(_ saturation: Double) {
-        actions.setHeatSaturation(saturation)
+    /// 点阵背景色拾取（色盘，2026-09-15）：宿主落盘 + 镜像 + 清烘焙缓存就地重绘，随后回读快照
+    public func setHeatDotEmptyColor(_ color: PanelBackgroundColor) {
+        actions.setHeatDotEmptyColor(color)
         sync()
     }
-    public func setHeatBrightness(_ brightness: Double) {
-        actions.setHeatBrightness(brightness)
+    /// 卡片 hover 背景色拾取（色盘，2026-09-15）：宿主落盘 + 镜像 + 逐材质宿主重解算，随后回读快照
+    public func setCardHoverBackgroundColor(_ color: PanelBackgroundColor) {
+        actions.setCardHoverBackgroundColor(color)
         sync()
     }
     /// 草稿是否有未落盘的改动（提交点的守卫：脏才写，避免空提交反复刷网络）
@@ -637,7 +861,7 @@ extension AppSettingsModel {
             refreshInterval: 180, autoCheckin: true,
             autoCheckinSub: "9-12 3成功 1失败", autoUpdateCheck: true,
             apiKey: "sk-preview-key", commonQuota: 20,
-            panelMaskOpacity: 1, lightThemeEnabled: false,
+            panelBackgroundColor: .default, lightThemeEnabled: false,
             iconThemeSwap: true,
             longProgressCard: true,
             heatHue: 0.25, heatSaturation: 0.6, heatBrightness: 0.996)

@@ -9,7 +9,6 @@
 // 行容器         HoverRowView（hover 提亮背景+文本）/ SubAccountItemView（其余账号 chip，点击切号）
 // 图标按钮       HoverIconButton / RefreshIconButton（刷新自转，CAAnimationDelegate）
 // 玻璃与遮罩      TintedVisualEffectView（面板玻璃，继承面板遮罩色）/ TintOverlayView
-// 滚动提示层      ScrollFadeHint（顶/底缘渐隐，参数 FadeHintParams，config.json 的 fade_hint_* 可覆盖）
 // pin 浮窗 resize  PanelResizeHandle（浮窗自绘把手；**仅高度可调**，宽度恒等于起拖宽）
 // hover 协议      PanelScrollHoverSync（滚动时同步 hover 状态）/ HoverEnterValidation
 // 签到结果模型     CheckinRowState / CheckinInfoItem / CheckinResultRow（渲染在 Dialogs.swift）
@@ -639,7 +638,8 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
         }
         return false
     }
-    /// 需要 hover 提亮的 tint 控件 setter：contentTintColor 为 systemGray 的 NSImageView / NSButton
+    /// 需要 hover 提亮的 tint 控件 setter：contentTintColor 为**副前景灰**（Palette.secondaryForeground，
+    /// 浅色外观下按面板底色加深过）的 NSImageView / NSButton
     /// 跟随整行 hover 提亮（**与文字同一个 hoverTextColor**，勿再写死 labelColor——
     /// 用量行 hoverTextColor = Palette.cardForeground #EBEBEB，labelColor 是纯白，
     /// 两者并排会让同一行出现「两个前景色」；Token 面板自绘行的 icon/文字同色口径见
@@ -662,11 +662,11 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
         func scan(_ v: NSView) {
             if let tf = v as? NSTextField { labels.append(tf) }
             else if let iv = v as? NSImageView,
-                    iv.contentTintColor == NSColor.systemGray || iv.contentTintColor == NSColor.labelColor {
+                    iv.contentTintColor == Palette.secondaryForeground || iv.contentTintColor == NSColor.labelColor {
                 tintables.append({ [weak iv] c in iv?.contentTintColor = c })
             }
             else if let btn = v as? NSButton,
-                    btn.contentTintColor == NSColor.systemGray || btn.contentTintColor == NSColor.labelColor {
+                    btn.contentTintColor == Palette.secondaryForeground || btn.contentTintColor == NSColor.labelColor {
                 tintables.append({ [weak btn] c in btn?.contentTintColor = c })
             }
             for sub in v.subviews { scan(sub) }
@@ -780,7 +780,7 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
         // model 色已是亮色（animator 动画改的是 model 值），漏收集会导致最终
         // 退出时 highlightedLabels 为空、亮色卡死不回落
         highlightedLabels = labels.filter {
-            $0.textColor == NSColor.systemGray || $0.textColor == NSColor.tertiaryLabelColor
+            $0.textColor == Palette.secondaryForeground || $0.textColor == NSColor.tertiaryLabelColor
                 || $0.textColor == hoverTextColor
         }
         // 文字/图标色**直接落定**，不走 NSAnimationContext + animator（2026-09-12 用户指定
@@ -823,8 +823,8 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
         }
         guard enablesTextBrightening else { return }
         // 与 enter 对称：颜色直接落定（不走 animator，理由见 enterHoverVisual）
-        for l in highlightedLabels { l.textColor = NSColor.systemGray }
-        for setter in tintables { setter(NSColor.systemGray) }
+        for l in highlightedLabels { l.textColor = Palette.secondaryForeground }
+        for setter in tintables { setter(Palette.secondaryForeground) }
         highlightedLabels.removeAll()
     }
 
@@ -855,14 +855,26 @@ protocol HeaderIconDraggable: NSView {
     func performClickAction()
 }
 
-/// 无边框图标按钮：使用 macOS 原生 bezelStyle 实现 hover 时自动显示圆角背景，
-/// 系统自动处理背景绘制，仅用 tracking area 管理图标颜色变化。
-/// hover 时系统渲染浅色圆角背景（略大于图标），图标同步提亮为 labelColor。
-final class HoverIconButton: NSButton, PanelScrollHoverSync, HeaderIconDraggable {
+/// header 按钮的「常态前景色」统一入口（HoverIconButton / RefreshPieButton 都实现）：
+/// 槽位重排后按「落在哪一格」统一切换色调时，不必对两种按钮类型分别判别
+///（当前用途：中间格那颗改成卡片主标题色，见 PanelDrag.applyHeaderButtonSlots）。
+protocol HeaderTintAdjustable: NSView {
+    var normalTintColor: NSColor { get set }
+}
+
+/// 无边框图标按钮（header 图标组共用）：hover 底自绘（hoverBgLayer 正圆 + hoverBackgroundColor），
+/// 系统 bezel 关闭，tracking area 管理「底色淡入 + 图标提亮到 hoverTintColor」。
+/// 默认提亮色 labelColor；header 五颗按钮走 PanelLayout.makeHeaderIconButton 统一构造，
+/// 不单独指定 hoverTintColor，hover 观感与同组一致。
+final class HoverIconButton: NSButton, PanelScrollHoverSync, HeaderIconDraggable, HeaderTintAdjustable {
     /// 按钮容器尺寸（正方形）
     static let buttonSize: CGFloat = 22
-    /// 非 hover 常态 tint；默认保持现有系统灰，header 可按主题指定黑色动态色。
-    var normalTintColor: NSColor = .systemGray {
+    /// hover 底色（极淡白圆底）：header 图标按钮 / 手动刷新按钮 / 刷新周期饼图按钮
+    /// 三处共用同一常量 —— 同组按钮的 hover 底不可能各写一份而走样
+    static let hoverBackgroundColor = NSColor.white.withAlphaComponent(0.12)
+    /// 非 hover 常态 tint；默认 = 副前景色（面板第二层灰，浅色外观下按面板底色加深），
+    /// header 可按主题指定黑色动态色。
+    var normalTintColor: NSColor = Palette.secondaryForeground {
         didSet {
             if !isMouseInside { contentTintColor = normalTintColor }
         }
@@ -936,7 +948,7 @@ final class HoverIconButton: NSButton, PanelScrollHoverSync, HeaderIconDraggable
         updateHoverBgGeometry()
         // hover 背景：极淡白底淡入（0.22s，同全项目过渡节奏）
         animateLayerKey(hoverBgLayer, keyPath: "backgroundColor",
-                        to: NSColor.white.withAlphaComponent(0.12).cgColor)
+                        to: Self.hoverBackgroundColor.cgColor)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -964,6 +976,65 @@ final class HoverIconButton: NSButton, PanelScrollHoverSync, HeaderIconDraggable
     }
 }
 
+/// header 拖动时的**槽位指引层**（2026-09-14 用户「拖动时给我 header 上空位的视觉指引」）：
+/// 拖拽会话期间铺出整条槽位（数量 = BalancePanelView.headerButtonSlotCount）——
+/// 空位画虚线圆（一眼看出「这儿可以放」），
+/// 当前落点画亮环（落点是占用位时只描环、不填充，避免盖住那颗按钮的图标）。
+///
+/// 画在按钮**之上**（由 PanelLayout.build 用 positioned: .above 挂载）：整层以 stroke
+/// 为主，叠在图标上方也不遮字形；非拖拽会话由调用方置 isHidden。
+///
+/// 视图几何由外部钉成「正好一个按钮带」（leading = 槽位条起点、width = 槽位条总宽、
+/// height = 按钮边长、centerY 与按钮同轴），所以内部第 i 槽就是 x = i × pitch 的
+/// 一个边长正方形、y 直接贴 bounds —— 不在这里再算一次垂直居中。
+///
+/// 配色走 `Palette.panelHeaderContentColor`（浅色外观黑 / 深色外观系统灰）而非纯白，
+/// 两种外观下都看得见；落点为空位时的填充沿用 `HoverIconButton.hoverBackgroundColor`，
+/// 与真实 hover 底色同源，给出「落点即悬停」的观感。
+final class HeaderSlotGuidesView: NSView {
+    /// 槽位占用表（下标 = 槽位，true = 该槽有按钮）；由 applyHeaderButtonSlots 同步
+    var occupied: [Bool] = []
+    /// 当前落点槽位（nil = 未落到任何槽）
+    var dropSlot: Int?
+
+    private let pitch = BalancePanelView.headerButtonSlotPitch
+
+    override var isFlipped: Bool { false }
+
+    /// 纯装饰层：挂在按钮之上，必须永不参与命中测试 —— 否则会吃掉按钮的
+    /// 点击与 hover 进出（虽然非拖拽会话恒 hidden，但这条不能靠 hidden 兜底）
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let side = bounds.height
+        guard side > 0, !occupied.isEmpty else { return }
+        let tint = Palette.panelHeaderContentColor
+        for index in 0..<occupied.count {
+            let rect = NSRect(x: CGFloat(index) * pitch, y: 0, width: side, height: side)
+            let isEmpty = !occupied[index]
+            if isEmpty {
+                tint.withAlphaComponent(0.05).setFill()
+                NSBezierPath(ovalIn: rect).fill()
+                let dashed = NSBezierPath(ovalIn: rect.insetBy(dx: 0.75, dy: 0.75))
+                dashed.lineWidth = 1
+                dashed.setLineDash([2.5, 2.5], count: 2, phase: 0)
+                tint.withAlphaComponent(0.22).setStroke()
+                dashed.stroke()
+            }
+            if index == dropSlot {
+                if isEmpty {
+                    HoverIconButton.hoverBackgroundColor.setFill()
+                    NSBezierPath(ovalIn: rect).fill()
+                }
+                let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
+                ring.lineWidth = 1.5
+                tint.withAlphaComponent(0.45).setStroke()
+                ring.stroke()
+            }
+        }
+    }
+}
+
 /// 手动刷新按钮：点击时图标顺时针旋转一圈。
 /// AppKit layer-backed 视图经 Auto Layout 同步会把 anchorPoint 重置为 (0,0)，
 /// 直接旋转会绕左下角转；需在 layout() 里恢复中心锚点 + 补偿 position（同 MiniSwitch 思路）。
@@ -985,7 +1056,7 @@ final class RefreshIconButton: NSButton, PanelScrollHoverSync {
         imagePosition = .imageOnly
         title = ""
         imageScaling = .scaleProportionallyDown
-        contentTintColor = .systemGray
+        contentTintColor = Palette.secondaryForeground
         wantsLayer = true
         hoverBgLayer.masksToBounds = true
         hoverBgLayer.backgroundColor = NSColor.clear.cgColor
@@ -1009,7 +1080,7 @@ final class RefreshIconButton: NSButton, PanelScrollHoverSync {
         // 换窗（popover ↔ 置顶浮窗转移）不派发 mouseExited，hover 卡亮一并归零
         //（同 HoverIconButton）；鼠标仍在按钮上时系统会补发 mouseEntered
         isMouseInside = false
-        contentTintColor = .systemGray
+        contentTintColor = Palette.secondaryForeground
         hoverBgLayer.backgroundColor = NSColor.clear.cgColor
     }
 
@@ -1096,7 +1167,7 @@ final class RefreshIconButton: NSButton, PanelScrollHoverSync {
         updateHoverBgGeometry()
         // hover 背景：极淡白底淡入 + 图标 tint 提亮（0.22s，同全项目过渡节奏）
         animateLayerKey(hoverBgLayer, keyPath: "backgroundColor",
-                        to: NSColor.white.withAlphaComponent(0.12).cgColor)
+                        to: HoverIconButton.hoverBackgroundColor.cgColor)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = Motion.hover
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -1111,7 +1182,7 @@ final class RefreshIconButton: NSButton, PanelScrollHoverSync {
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = Motion.hover
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            self.animator().contentTintColor = .systemGray
+            self.animator().contentTintColor = Palette.secondaryForeground
         }, completionHandler: nil)
     }
 
@@ -1131,11 +1202,12 @@ extension RefreshIconButton: CAAnimationDelegate {
 /// header 右上角刷新周期饼图按钮：圆形饼图随时间填充，走满一圈 = 一个自动刷新周期
 /// （时长 = 设置的刷新分钟数），每秒重算重绘；点击弹出间隔单选菜单（1/3/5 分钟）。
 /// 大小/配色对齐 header 左上角 HoverIconButton：22×22 容器、11pt 图形、
-/// panelHeaderContentColor 常态色、hover 白@12% 正圆背景 + labelColor 提亮。
+/// 副前景色常态墨迹（= 系统灰基准 + 按面板底色对比度补偿，同 HoverIconButton）、
+/// hover 白@12% 正圆背景 + labelColor 提亮。
 /// 周期数据由 cycleProvider 直读 AppDelegate 的 repeating Timer（fireDate 恒为
 /// 下次自动刷新时刻，本轮起点 = fireDate − 间隔）：手动刷新不重建定时器、饼图
 /// 不跳变，改间隔重建定时器后自动跟随，面板侧零状态推送。
-final class RefreshPieButton: NSView, PanelScrollHoverSync, HeaderIconDraggable {
+final class RefreshPieButton: NSView, PanelScrollHoverSync, HeaderIconDraggable, HeaderTintAdjustable {
     static let buttonSize = HoverIconButton.buttonSize
     /// 饼图直径：与 header 图标 11pt 同尺寸，视觉分量对齐
     private let pieDiameter: CGFloat = 11
@@ -1154,6 +1226,11 @@ final class RefreshPieButton: NSView, PanelScrollHoverSync, HeaderIconDraggable 
 
     private var trackingArea: NSTrackingArea?
     private var isMouseInside = false
+    /// 非 hover 常态墨迹色（默认副前景灰）；与 HoverIconButton.normalTintColor 同语义 ——
+    /// 槽位重排后落在 header 中间格时由面板侧统一切成卡片主标题色
+    var normalTintColor: NSColor = Palette.secondaryForeground {
+        didSet { needsDisplay = true }
+    }
     /// hover 背景独立子 layer：固定 buttonSize 正圆（同 HoverIconButton 口径）
     private let hoverBgLayer = CALayer()
     /// 每秒推进的显示定时器（挂窗时建、离窗拆，防 Timer→target 引用环）
@@ -1223,7 +1300,9 @@ final class RefreshPieButton: NSView, PanelScrollHoverSync, HeaderIconDraggable 
     // MARK: - 绘制
 
     override func draw(_ dirtyRect: NSRect) {
-        let ink = isMouseInside ? NSColor.labelColor : Palette.panelHeaderContentColor
+        // 常态墨迹 = normalTintColor（默认副前景色：系统灰基准 + 按面板底色对比度补偿；
+        // 落在 header 中间格时被切成卡片主标题色），hover 提亮到系统标签色
+        let ink = isMouseInside ? NSColor.labelColor : normalTintColor
         let pieRect = NSRect(x: bounds.midX - pieDiameter / 2, y: bounds.midY - pieDiameter / 2,
                              width: pieDiameter, height: pieDiameter)
         // 轨道整圆（饼底）
@@ -1309,7 +1388,7 @@ final class RefreshPieButton: NSView, PanelScrollHoverSync, HeaderIconDraggable 
         isMouseInside = true
         updateHoverBgGeometry()
         animateLayerKey(hoverBgLayer, keyPath: "backgroundColor",
-                        to: NSColor.white.withAlphaComponent(0.12).cgColor)
+                        to: HoverIconButton.hoverBackgroundColor.cgColor)
         needsDisplay = true
     }
 
@@ -1848,217 +1927,6 @@ struct CheckinResultRow {
         self.state = state
         self.infoItems = infoItems
     }
-}
-
-/// 提示层贴靠边：bottom = 面板底缘（下方还有内容），top = 面板顶缘（上方还有内容）
-enum FadeHintEdge { case top, bottom }
-
-/// 滚动提示层可调参数（config.json 持久化；「滚动提示」弹窗滑杆实时预览）
-struct FadeHintParams: Equatable {
-    /// 提示条带高度（pt）
-    var bandHeight: Double = 54
-    /// 贴靠边高光渐变最亮处 alpha
-    var highlightAlpha: Double = -0.6
-    /// 底色遮罩 50% 处 alpha（贴靠边恒为 1）
-    var maskMidAlpha: Double = 0.45
-    /// 箭头描边 alpha
-    var arrowAlpha: Double = 0.75
-    /// 箭头浮动幅度（pt，2s 周期）
-    var bobAmplitude: Double = 2
-}
-
-/// 面板顶/底缘「还有内容」提示层：半透明底色渐变遮罩 + 透明白高光
-/// 渐变 + 指向箭头（2s 周期轻微浮动，top 指上 / bottom 指下）。
-/// 由控制器在内容超出视口且未滚到对应边缘时显示；纯视觉层，鼠标/滚轮事件全部穿透。
-/// （原磨砂快照 + CIGaussianBlur 方案已移除，现为纯静态遮罩，无需滚动时刷新）
-final class ScrollFadeHint: NSView {
-    override var isFlipped: Bool { true }
-
-    let edge: FadeHintEdge
-
-    /// 可调参数（调参弹窗滑杆拖动时实时赋值 → applyParams 即时生效）
-    var params = FadeHintParams() {
-        didSet {
-            guard oldValue != params else { return }
-            applyParams()
-        }
-    }
-
-    /// 底色遮罩层：半透明容器色，mask 控制不透明度渐变（贴靠边最深 → 对侧透明）
-    private let tintLayer = CALayer()
-    private let tintMaskLayer = CAGradientLayer()
-    private let gradientLayer = CAGradientLayer()
-    /// darken 蒙版：负值高光时作为 gradientLayer 的 mask，控制透明度渐变；
-    /// 灰阶本身均匀无 RGB 插值，渐变只发生在蒙版 alpha，避免渐变带状/ muddy。
-    private let gradientMaskLayer = CAGradientLayer()
-    private let arrowLayer = CAShapeLayer()
-    private var isShown = false
-
-    init(edge: FadeHintEdge) {
-        self.edge = edge
-        super.init(frame: .zero)
-        wantsLayer = true
-        // 本视图翻转坐标系（y=0 在顶）；贴靠边的 y：top=0，bottom=1
-        let nearY: CGFloat = edge == .top ? 0 : 1
-        let farY: CGFloat = edge == .top ? 1 : 0
-        // 底色遮罩层最底：半透明近黑/浅灰打底（动态色随主题）。
-        // 专用色而非 Palette.containerTint：提示层要比面板容器底更透，避免滚动提示发黑发重
-        tintLayer.backgroundColor = Palette.scrollHintTint.cgColor
-        tintMaskLayer.locations = [0, 0.5, 1]
-        tintMaskLayer.startPoint = CGPoint(x: 0.5, y: farY)
-        tintMaskLayer.endPoint = CGPoint(x: 0.5, y: nearY)
-        tintLayer.mask = tintMaskLayer
-        layer?.addSublayer(tintLayer)
-        gradientLayer.locations = [0, 0.5, 1]
-        gradientLayer.startPoint = CGPoint(x: 0.5, y: farY)
-        gradientLayer.endPoint = CGPoint(x: 0.5, y: nearY)
-        layer?.addSublayer(gradientLayer)
-        // darken 蒙版：与高光同向（对侧透明 → 贴靠边满），applyParams 负值分支挂到 gradientLayer.mask
-        gradientMaskLayer.locations = [0, 0.5, 1]
-        gradientMaskLayer.startPoint = CGPoint(x: 0.5, y: farY)
-        gradientMaskLayer.endPoint = CGPoint(x: 0.5, y: nearY)
-        // 箭头：圆角折线 chevron，bottom 指下 / top 指上（路径 y 向下，以 bounds 左上为原点）
-        arrowLayer.fillColor = nil
-        arrowLayer.lineWidth = 1.8
-        arrowLayer.lineCap = .round
-        arrowLayer.lineJoin = .round
-        arrowLayer.bounds = CGRect(x: 0, y: 0, width: 9, height: 4.2)
-        let tipY: CGFloat = edge == .top ? 0 : 4.2
-        let baseY: CGFloat = edge == .top ? 4.2 : 0
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: 0, y: baseY))
-        path.addLine(to: CGPoint(x: 4.5, y: tipY))
-        path.addLine(to: CGPoint(x: 9, y: baseY))
-        arrowLayer.path = path
-        layer?.addSublayer(arrowLayer)
-        applyParams()
-        alphaValue = 0
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    /// 动态色经 .cgColor 落盘会定格当时外观：系统/浅色主题切换时按新 effectiveAppearance
-    /// 重解算（tint 底色、高光分支、箭头颜色全部主题相关，统一走 applyParams 重设）
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyParams()
-    }
-
-    /// 参数变化即时生效：颜色/渐变重设 + 浮动动画按新幅度重建
-    /// （bandHeight 由 VC 的约束更新）
-    private func applyParams() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        // 当前生效外观（浅色主题时容器强制 aqua，本视图继承 → isDark=false）
-        let light = !effectiveAppearance.isDark
-        // 底色遮罩：深色=近黑半透明 / 浅色=亮白半透明（亮色渐变由蒙版 alpha 渐变呈现）；
-        // 动态色按本视图外观解算后落 layer
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            tintLayer.backgroundColor = Palette.scrollHintTint.cgColor
-        }
-        // 底色遮罩不透明度：0（对侧）→ maskMidAlpha（50%）→ 1（贴靠边）
-        tintMaskLayer.colors = [
-            NSColor.white.withAlphaComponent(0).cgColor,
-            NSColor.white.withAlphaComponent(params.maskMidAlpha).cgColor,
-            NSColor.white.cgColor,
-        ]
-        // 高光渐变：
-        //  · 正值 → 白色高光，Normal 混合（常规提亮）：透明度直接编码在渐变颜色 alpha 里。
-        //  · 负值 → 灰阶 + Photoshop「变暗 Darken」混合模式：逐通道取 min(底色, 灰阶)，
-        //           已暗通道保持原样、仅压暗亮于灰阶的通道，因此比直接叠黑色更保留内容色相。
-        //    关键：darken 的透明度渐变放进 gradientMaskLayer（纯 alpha 蒙版，无 RGB 插值），
-        //          gradientLayer 本身只铺均匀灰阶（backgroundColor）+ compositingFilter，
-        //          避免渐变颜色插值与混合模式叠加产生带状/ muddy。
-        //    灰阶：darken 即「变暗」，源灰阶本应偏暗——不再是 1−|alpha| 的近白灰，
-        //          取 0.3×(1−|alpha|)（下限 0.05，−0.7 → 0.09），始终落在暗灰区间。
-        //    强度：由蒙版 alpha 随 |alpha| 缩放（对侧 0 → 贴靠边 |alpha|），曲线 0 → 0.39 → 1 同高光形状；
-        //          |alpha| 越大、灰阶越暗 + 蒙版越满，效果越深。
-        //    说明：纯黑源在 Darken 下与 Normal 等价（min(底,0)=0），故下限保留 0.05 而非 0。
-        let hiAbs = abs(params.highlightAlpha)
-        // 浅色外观一律走白色高光分支：Darken 混合在浅色底上会压出深色条带，
-        // 与「浅色主题提示为亮色渐变」的视觉方向相反
-        if params.highlightAlpha >= 0 || light {
-            gradientLayer.compositingFilter = nil
-            gradientLayer.mask = nil
-            gradientLayer.backgroundColor = nil
-            gradientLayer.colors = [
-                NSColor.white.withAlphaComponent(0).cgColor,
-                NSColor.white.withAlphaComponent(hiAbs * 0.39).cgColor,
-                NSColor.white.withAlphaComponent(hiAbs).cgColor,
-            ]
-        } else {
-            gradientLayer.compositingFilter = CIFilter(name: "CIDarkenBlendMode")
-            // 均匀暗灰铺底（无渐变颜色），透明度交给蒙版
-            let grayLevel = CGFloat(max(0.05, 0.3 * (1 - hiAbs)))
-            gradientLayer.colors = nil
-            gradientLayer.backgroundColor = NSColor(white: grayLevel, alpha: 1).cgColor
-            // darken 蒙版：对侧透明 → 贴靠边，强度随 |alpha| 缩放（曲线 0 → 0.39 → 1 同高光形状）
-            let peak = min(1, hiAbs)
-            gradientMaskLayer.colors = [
-                NSColor.white.withAlphaComponent(0).cgColor,
-                NSColor.white.withAlphaComponent(0.39 * peak).cgColor,
-                NSColor.white.withAlphaComponent(peak).cgColor,
-            ]
-            gradientLayer.mask = gradientMaskLayer
-        }
-        // 箭头描边：深色外观透明白 / 浅色外观黑（亮色提示上保证对比度）
-        arrowLayer.strokeColor = (light ? NSColor.black : NSColor.white)
-            .withAlphaComponent(params.arrowAlpha).cgColor
-        CATransaction.commit()
-        // 浮动幅度变化：重建动画（正在显示时立即以新幅度浮动）
-        arrowLayer.removeAnimation(forKey: "fadeHintBob")
-        updateBobAnimation()
-    }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        tintLayer.frame = bounds
-        tintMaskLayer.frame = CGRect(origin: .zero, size: bounds.size)
-        gradientLayer.frame = bounds
-        gradientMaskLayer.frame = CGRect(origin: .zero, size: bounds.size)
-        // 箭头偏向贴靠边：top 层放 0.36 高度处（靠上），bottom 层放 0.64（靠下）；
-        // 统一再上移 5pt（翻转坐标系 y- = 视觉向上）
-        let yRatio = edge == .top ? 0.36 : 0.64
-        arrowLayer.position = CGPoint(x: bounds.midX, y: bounds.height * yRatio - 5)
-        CATransaction.commit()
-    }
-
-    private func updateBobAnimation() {
-        let key = "fadeHintBob"
-        if isShown && arrowLayer.animation(forKey: key) == nil {
-            // 1s 单程 + 自动回返 = 2s 完整周期，与全局脉冲节奏一致；
-            // 浮动方向朝贴靠边外：bottom 向下(+)，top 向上(−)
-            let amp = CGFloat(params.bobAmplitude)
-            guard amp > 0 else { return }
-            let bob = CABasicAnimation(keyPath: "transform.translation.y")
-            bob.fromValue = 0
-            bob.toValue = edge == .top ? -amp : amp
-            bob.duration = 1.0
-            bob.autoreverses = true
-            bob.repeatCount = .infinity
-            bob.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            arrowLayer.add(bob, forKey: key)
-        } else if !isShown {
-            arrowLayer.removeAnimation(forKey: key)
-        }
-    }
-
-    /// 显示/隐藏提示层（0.22s easeInEaseOut，与全局 hover 过渡一致）
-    func setShown(_ shown: Bool) {
-        guard isShown != shown else { return }
-        isShown = shown
-        updateBobAnimation()
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = Motion.hover
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            self.animator().alphaValue = shown ? 1 : 0
-        }
-    }
-
-    /// 纯指示层：不参与命中测试，滚轮与点击穿透到下方滚动内容
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 /// 置顶浮窗右下角 resize 把手：自绘两条 45° 斜线 + 承载拖拽 resize。

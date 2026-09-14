@@ -316,9 +316,21 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         // 「Key / 额度」pane 已无「保存」按钮 → 关窗即一次编辑结束，未落盘的草稿在此提交
         // （不提交的话：输入框里改了值、直接关窗就静默丢了）
         model.commitKeyQuotaIfDirty()
+        // 系统色盘（「面板」组两个 ColorPicker 的入口）是 app 级独立窗口，**不随设置窗口消失** ——
+        // 一起收起，免得设置窗口关了色盘还孤零零留在桌面上
+        SettingsWindowController.closeOpenColorPanels()
         // 先摘会话标记再回调：endKeepPanelAlive 据此判定能否恢复 .transient
         //（此刻窗口仍可见，若按可见性判定会把自己当「还在屏」而永久卡住保活）
         isSessionActive = false
         onClose?()
+    }
+
+    /// 关掉当前打开的系统色盘。只处理**已存在**的实例（`window is NSColorPanel` 覆盖其子类）：
+    /// 直接摸 `NSColorPanel.shared` 会在「压根没开过色盘」的普通关窗路径上凭空建一份实例。
+    /// 若色盘是以 popover 形式附在设置窗口上（系统实现差异），它本来就跟窗一起消失，这里无副作用。
+    private static func closeOpenColorPanels() {
+        for window in NSApp.windows where window is NSColorPanel {
+            window.close()
+        }
     }
 }

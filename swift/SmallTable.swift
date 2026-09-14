@@ -16,8 +16,8 @@ enum SmallTable {
     static let titleSize: CGFloat = 10
     /// 数据行字号
     static let rowSize: CGFloat = 10
-    /// 表头/标题/数据行常态色
-    static let textColor: NSColor = .systemGray
+    /// 表头/标题/数据行常态色 = 副前景色（浅色外观下按面板底色加深到可读）
+    static let textColor: NSColor = Palette.secondaryForeground
     /// 表头/区块标题字重
     static let titleWeight: NSFont.Weight = .semibold
     /// 数据行字重

@@ -1,5 +1,6 @@
 // Config.swift — 配置结构（Codable）+ 加载/保存（凭据走钥匙串，见 KeychainStore.swift）
 import Foundation
+import SettingsUI
 
 // MARK: - WorkBuddy 多号签到账号
 
@@ -152,8 +153,17 @@ struct AppConfig: Codable {
     var workbuddyEnabled: Bool = true
     var traeAutoCheckin: Bool = true
     var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
-    /// 「高对比背景」强度（0…1）：0 = 无遮罩（原生玻璃）；遮罩 alpha 按此值等比缩放（containerColors）
-    var panelMaskOpacity: Double = 1
+    /// 面板底色遮罩色（2026-09-14 由「高对比背景」强度改制）：整条遮罩就是这个颜色本身，
+    /// alpha 由设置窗口系统色盘直接给（0 = 无遮罩，露出原生毛玻璃）；落盘 `#RRGGBBAA`
+    var panelBackgroundColor: PanelBackgroundColor = .default
+    /// 点阵背景色（无用量底点 / 进度条轨道底 / 骨架行；2026-09-15 设置窗口开放，`hsv:H,S,V,A`）
+    var heatDotEmptyColor: PanelBackgroundColor = .heatDotEmptyDefault
+    /// 卡片 hover 背景色（`HoverMaterialHost` 材质块；2026-09-15 设置窗口开放，`hsv:H,S,V,A`）
+    var cardHoverBackgroundColor: PanelBackgroundColor = .cardHoverDefault
+    /// 面板底色遮罩**底端**的不透明度（0…1，2026-09-14 用户要求上下两端各自可调）：
+    /// 顶端用 `panelBackgroundColor` 自身的 alpha，底端用本键；两者同值 = 纯色遮罩。
+    /// 取代原先「底端 = alpha × 0.65」的自动递减（该残留已删）
+    var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
     /// 浅色主题开关：true = 强制浅色外观（即使系统是深色主题）；优先级高于渐变开关
     /// （浅色生效时不用深色遮罩，走原生浅色玻璃 + Palette 浅色分支）
     var lightThemeEnabled: Bool = false
@@ -170,24 +180,17 @@ struct AppConfig: Codable {
     ///（深色外观取浅色版、浅色外观取深色版；仅影响卡片 icon，面板外观不动）。
     /// 2026-09-07 用户定稿默认开启（旧配置无此键时解码兜底同为 true）
     var iconThemeSwap: Bool = true
-    /// 圆形图标开关：true = 余额卡片品牌 icon 裁成圆形（画布内切圆 alpha 蒙版，
-    /// 宽高不变仅四角裁切），任务状态光环同步翻圆形
-    var circularIcon: Bool = false
-    /// 卡片主标题字号（pt，10…18）：设置窗口「主题外观 → 卡片」开放（2026-09-13）
+    /// 卡片主标题字号（pt，10…16、步进 0.5）：设置窗口「主题外观 → 卡片」开放
+    ///（2026-09-13 开放；2026-09-15 用户把区间由 10…18 收到 10…16、步进细到 0.5）
     var cardTitleFontSize: Double = 13
     /// 卡片主标题启用 Sharp Grotesk（用户本机 ~/Library/Fonts 安装的商业字体；
     /// 未装对应字重时 NSFont(name:) 落空，自动回落系统字体）
     var cardTitleSharpGrotesk: Bool = false
-    /// Sharp Grotesk 字重档（0=Thin 1=Book 2=Light 3=Medium 4=SemiBold 5=Bold 6=Black）
-    var cardTitleSGWeight: Int = 3
-    /// Sharp Grotesk 宽度档（0=05 1=10 2=15 3=20 4=25）
-    var cardTitleSGWidth: Int = 3
-    /// 滚动提示层（顶/底 ScrollFadeHint）参数（已固化，config.json 可覆盖）
-    var fadeHintBandHeight: Double = 54
-    var fadeHintHighlightAlpha: Double = -0.6
-    var fadeHintMaskMidAlpha: Double = 0.45
-    var fadeHintArrowAlpha: Double = 0.75
-    var fadeHintBobAmplitude: Double = 2
+    /// 主标题↔副标题行距的**字体系数**（乘 `PanelLayout.titleRowBaseGap`，设置窗口「卡片」栏开放，
+    /// 2026-09-14）：主标题行高去掉硬定义后改由字体自然行高决定，两种字体的字形框疏密不同
+    /// （SG 字面 em 框恒 1.0em，比 SF 扁），用同一系数无法兼顾 → 系统字体与 SG 各一档
+    var cardTitleGapScaleSF: Double = 1.0
+    var cardTitleGapScaleSG: Double = 0.7
     var cockpitAppId: String = "com.jlcodes.cockpit-tools"
     var workbuddyAutoCheckin: Bool = true
     var workbuddyAccounts: [WBAccount] = []
@@ -228,22 +231,19 @@ struct AppConfig: Codable {
         case workbuddyEnabled = "workbuddy_enabled"
         case traeAutoCheckin = "trae_auto_checkin"
         case hideWbNickname = "hide_wb_nickname"
-        case panelMaskOpacity = "panel_mask_opacity"
+        case panelBackgroundColor = "panel_background_color"
+        case heatDotEmptyColor = "heat_dot_empty_color"
+        case cardHoverBackgroundColor = "card_hover_background_color"
+        case panelBackgroundBottomAlpha = "panel_background_bottom_alpha"
         case lightThemeEnabled = "light_theme_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case longProgressCard = "long_progress_card"
         case iconThemeSwap = "icon_theme_swap"
-        case circularIcon = "circular_icon"
         case cardTitleFontSize = "card_title_font_size"
         case cardTitleSharpGrotesk = "card_title_sharp_grotesk"
-        case cardTitleSGWeight = "card_title_sg_weight"
-        case cardTitleSGWidth = "card_title_sg_width"
+        case cardTitleGapScaleSF = "card_title_gap_scale_sf"
+        case cardTitleGapScaleSG = "card_title_gap_scale_sg"
         case updateAutoCheck = "update_auto_check"
-        case fadeHintBandHeight = "fade_hint_band_height"
-        case fadeHintHighlightAlpha = "fade_hint_highlight_alpha"
-        case fadeHintMaskMidAlpha = "fade_hint_mask_mid_alpha"
-        case fadeHintArrowAlpha = "fade_hint_arrow_alpha"
-        case fadeHintBobAmplitude = "fade_hint_bob_amplitude"
         case cockpitAppId = "cockpit_app_id"
         case workbuddyAutoCheckin = "workbuddy_auto_checkin"
         case workbuddyAccounts = "workbuddy_accounts"
@@ -258,18 +258,19 @@ struct AppConfig: Codable {
     }
 
     // 仅解码用的 legacy 字段（旧版统一 "decimals"，新版按服务拆分；读取兼容两者；
-    // balanceCardNewMode = 长进度卡片改名前的旧键）
+    // balanceCardNewMode = 长进度卡片改名前的旧键；panelMaskOpacity = 「面板背景色」前的强度滑杆旧键）
     private enum LegacyKeys: String, CodingKey {
         case decimals, balanceCardNewMode = "balance_card_new_mode"
         case panelGradientEnabled = "panel_gradient_enabled"
+        case panelMaskOpacity = "panel_mask_opacity"
     }
 
     init() {}
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let legacy = try decoder.container(keyedBy: LegacyKeys.self)
-            .decodeIfPresent(Int.self, forKey: .decimals)
+        let legacyContainer = try decoder.container(keyedBy: LegacyKeys.self)
+        let legacy = try legacyContainer.decodeIfPresent(Int.self, forKey: .decimals)
 
         deepseekApiKey = try c.decodeIfPresent(String.self, forKey: .deepseekApiKey) ?? ""
         deepseekCommonQuota = try c.decodeIfPresent(Double.self, forKey: .deepseekCommonQuota) ?? 0
@@ -289,12 +290,39 @@ struct AppConfig: Codable {
         workbuddyEnabled = try c.decodeIfPresent(Bool.self, forKey: .workbuddyEnabled) ?? true
         traeAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .traeAutoCheckin) ?? true
         hideWbNickname = try c.decodeIfPresent(Bool.self, forKey: .hideWbNickname) ?? false
-        // 新键 panel_mask_opacity（0…1 强度）；旧键 panel_gradient_enabled（布尔开关）兼容读取：开=1 / 关=0
-        if let v = try c.decodeIfPresent(Double.self, forKey: .panelMaskOpacity) {
-            panelMaskOpacity = min(max(v, 0), 1)
+        // 新键 panel_background_color（`hsv:H,S,V,A`；旧 `#RRGGBBAA` 仍可读、一次性分解成 HSB）；
+        // 更旧的键兼容读取：panel_mask_opacity（0…1 强度，0 = 关）→ 默认色按该强度缩放 alpha；
+        // panel_gradient_enabled（布尔开关）→ 开 = 默认色 / 关 = 全透明
+        if let raw = try c.decodeIfPresent(String.self, forKey: .panelBackgroundColor),
+           let parsed = PanelBackgroundColor(configValue: raw) {
+            panelBackgroundColor = parsed
         } else {
-            let legacyContainer = try decoder.container(keyedBy: LegacyKeys.self)
-            panelMaskOpacity = (try legacyContainer.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true) ? 1 : 0
+            let legacyOpacity: Double
+            if let v = try legacyContainer.decodeIfPresent(Double.self, forKey: .panelMaskOpacity) {
+                legacyOpacity = v
+            } else {
+                legacyOpacity = (try legacyContainer.decodeIfPresent(Bool.self, forKey: .panelGradientEnabled) ?? true) ? 1 : 0
+            }
+            var migrated = PanelBackgroundColor.default
+            migrated.alpha *= min(max(legacyOpacity, 0), 1)
+            panelBackgroundColor = migrated
+        }
+        // 点阵背景色 / 卡片 hover 背景色（2026-09-15 新增）：`hsv:H,S,V,A`；无键 = 内置默认
+        if let raw = try c.decodeIfPresent(String.self, forKey: .heatDotEmptyColor),
+           let parsed = PanelBackgroundColor(configValue: raw) {
+            heatDotEmptyColor = parsed
+        }
+        if let raw = try c.decodeIfPresent(String.self, forKey: .cardHoverBackgroundColor),
+           let parsed = PanelBackgroundColor(configValue: raw) {
+            cardHoverBackgroundColor = parsed
+        }
+        // 底端不透明度（2026-09-14 新增，上下两端各自可调）：新键直读；无该键时初值取
+        // **与顶端同值**（= 两端同值 ⇒ 纯色遮罩，正是用户反馈的「拉满就该纯色」）——
+        // 想要上下层次把底部滑杆往下拉即可。（原先的「底端 = 顶端 × 0.65」自动递减已删）
+        if let v = try c.decodeIfPresent(Double.self, forKey: .panelBackgroundBottomAlpha) {
+            panelBackgroundBottomAlpha = min(max(v, 0), 1)
+        } else {
+            panelBackgroundBottomAlpha = min(max(panelBackgroundColor.alpha, 0), 1)
         }
         lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? false
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
@@ -306,15 +334,11 @@ struct AppConfig: Codable {
             ?? false
         iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? true
         // 主标题字号/字体档：夹回取值域，旧值/越界值不会顶歪滑杆或组出非法 PS 名
-        cardTitleFontSize = min(max(try c.decodeIfPresent(Double.self, forKey: .cardTitleFontSize) ?? 13, 10), 18)
+        cardTitleFontSize = min(max(try c.decodeIfPresent(Double.self, forKey: .cardTitleFontSize) ?? 13, 10), 16)
         cardTitleSharpGrotesk = try c.decodeIfPresent(Bool.self, forKey: .cardTitleSharpGrotesk) ?? false
-        cardTitleSGWeight = min(max(try c.decodeIfPresent(Int.self, forKey: .cardTitleSGWeight) ?? 3, 0), 6)
-        cardTitleSGWidth = min(max(try c.decodeIfPresent(Int.self, forKey: .cardTitleSGWidth) ?? 3, 0), 4)
-        fadeHintBandHeight = try c.decodeIfPresent(Double.self, forKey: .fadeHintBandHeight) ?? 34
-        fadeHintHighlightAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintHighlightAlpha) ?? 0.18
-        fadeHintMaskMidAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintMaskMidAlpha) ?? 0.55
-        fadeHintArrowAlpha = try c.decodeIfPresent(Double.self, forKey: .fadeHintArrowAlpha) ?? 0.8
-        fadeHintBobAmplitude = try c.decodeIfPresent(Double.self, forKey: .fadeHintBobAmplitude) ?? 2.6
+        // 行距系数：夹进 0.2…2.0（滑杆同域），越界/旧值不会把行距压成 0 或撑爆
+        cardTitleGapScaleSF = min(max(try c.decodeIfPresent(Double.self, forKey: .cardTitleGapScaleSF) ?? 1.0, 0.2), 2.0)
+        cardTitleGapScaleSG = min(max(try c.decodeIfPresent(Double.self, forKey: .cardTitleGapScaleSG) ?? 0.7, 0.2), 2.0)
         cockpitAppId = try c.decodeIfPresent(String.self, forKey: .cockpitAppId) ?? "com.jlcodes.cockpit-tools"
         cockpitAppId = cockpitAppId.isEmpty ? "com.jlcodes.cockpit-tools" : cockpitAppId
         workbuddyAutoCheckin = try c.decodeIfPresent(Bool.self, forKey: .workbuddyAutoCheckin) ?? true
@@ -363,7 +387,10 @@ struct AppConfig: Codable {
         try c.encode(workbuddyEnabled, forKey: .workbuddyEnabled)
         try c.encode(traeAutoCheckin, forKey: .traeAutoCheckin)
         try c.encode(hideWbNickname, forKey: .hideWbNickname)
-        try c.encode(panelMaskOpacity, forKey: .panelMaskOpacity)
+        try c.encode(panelBackgroundColor.configValue, forKey: .panelBackgroundColor)
+        try c.encode(heatDotEmptyColor.configValue, forKey: .heatDotEmptyColor)
+        try c.encode(cardHoverBackgroundColor.configValue, forKey: .cardHoverBackgroundColor)
+        try c.encode(panelBackgroundBottomAlpha, forKey: .panelBackgroundBottomAlpha)
         try c.encode(lightThemeEnabled, forKey: .lightThemeEnabled)
         try c.encode(valueScrollPreviewEnabled, forKey: .valueScrollPreviewEnabled)
         try c.encode(updateAutoCheck, forKey: .updateAutoCheck)
@@ -371,13 +398,8 @@ struct AppConfig: Codable {
         try c.encode(iconThemeSwap, forKey: .iconThemeSwap)
         try c.encode(cardTitleFontSize, forKey: .cardTitleFontSize)
         try c.encode(cardTitleSharpGrotesk, forKey: .cardTitleSharpGrotesk)
-        try c.encode(cardTitleSGWeight, forKey: .cardTitleSGWeight)
-        try c.encode(cardTitleSGWidth, forKey: .cardTitleSGWidth)
-        try c.encode(fadeHintBandHeight, forKey: .fadeHintBandHeight)
-        try c.encode(fadeHintHighlightAlpha, forKey: .fadeHintHighlightAlpha)
-        try c.encode(fadeHintMaskMidAlpha, forKey: .fadeHintMaskMidAlpha)
-        try c.encode(fadeHintArrowAlpha, forKey: .fadeHintArrowAlpha)
-        try c.encode(fadeHintBobAmplitude, forKey: .fadeHintBobAmplitude)
+        try c.encode(cardTitleGapScaleSF, forKey: .cardTitleGapScaleSF)
+        try c.encode(cardTitleGapScaleSG, forKey: .cardTitleGapScaleSG)
         try c.encode(cockpitAppId, forKey: .cockpitAppId)
         try c.encode(workbuddyAutoCheckin, forKey: .workbuddyAutoCheckin)
         try c.encode(menuBarVisible, forKey: .menuBarVisible)
@@ -601,6 +623,11 @@ enum UDKey {
     static var coinLogoScalePercent: String { "coin_logo_scale_percent" }
     /// Logo 厚度（Double，px/160 盒）：mark 沿盖面法线挤出的深度，0 = 平贴
     static var coinMarkDepth: String { "coin_mark_depth" }
+    /// Shadow opacity（Double，**百分数** 0…100）：mark 边界阴影在轮廓处的可见峰值（N 遍合成后；
+    /// 遍数随值自适应，渲染封顶 98.4375%，见 CoinMetrics.markRimShadowPasses(forPeak:)）
+    static var coinMarkShadowOpacity: String { "coin_mark_shadow_opacity" }
+    /// Shadow spread（Double，px/160 盒 0…16）：mark 边界阴影的视觉衰减距离，0 = 整圈关断
+    static var coinMarkShadowSpread: String { "coin_mark_shadow_spread" }
     /// Edge finish（Int = CoinEdgeFinish.rawValue）
     static var coinEdgeFinish: String { "coin_edge_finish" }
     /// 静止俯仰（Double，度，-180…180）

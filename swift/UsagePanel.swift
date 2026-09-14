@@ -16,6 +16,7 @@
 
 import Cocoa
 import CoreImage
+import SettingsUI
 
 /// 单个周浏览页的数据：图表 7 天数值/文本 + 表头标签与周累计。
 struct UsageWeekData: Equatable {
@@ -166,12 +167,12 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             : UsageWeekData(daily: Array(repeating: 0, count: 7),
                             dailyTexts: Array(repeating: "—", count: 7),
                             headerLabel: "本周累计用量", totalText: row.weekText)
-        // 第一行：平台名 + 空格 + 周标签（9pt 同字号同色 + 0.8 字距，系统灰对齐 Token 子面板标题）
+        // 第一行：平台名 + 空格 + 周标签（9pt 同字号同色 + 0.8 字距，副前景灰对齐 Token 子面板标题）
         let headerAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .kern: 0.8]
         let headerText = "\(row.name) \(week.headerLabel)"
         let headerTextH = headerText.size(withAttributes: [.font: titleFont]).height
         (headerText as NSString).draw(at: NSPoint(x: plotInset, y: headerY),
-                                      withAttributes: headerAttrs.merging([.foregroundColor: NSColor.systemGray]) { cur, _ in cur })
+                                      withAttributes: headerAttrs.merging([.foregroundColor: Palette.secondaryForeground]) { cur, _ in cur })
         // 第二行：数值换行左对齐（17pt semibold 不变）
         let valueY = headerY + headerTextH + 4
         let weekSize = week.totalText.size(withAttributes: [.font: valueFont])
@@ -270,7 +271,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
                      // 纵坐标文本统一左对齐，所有刻度从轴线右侧同一个 x 起笔。
                      at: NSPoint(x: axisX + yAxisGap,
                                  y: y - labelHeight / 2),
-                     font: axisFont, color: NSColor.systemGray)
+                     font: axisFont, color: Palette.secondaryForeground)
         }
 
         if maxValue > 0.000001 {
@@ -331,7 +332,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
             let anchorY = plot.maxY + 10
             let labelColor: NSColor = index == todayIndex && isCurrentWeek
                 ? Palette.cardForeground
-                : .systemGray
+                : Palette.secondaryForeground
             let ctx = NSGraphicsContext.current?.cgContext
             ctx?.saveGState()
             ctx?.translateBy(x: anchorX, y: anchorY)
@@ -448,19 +449,19 @@ final class UsageHistoryPopoverController: NSViewController {
     /// 左侧额外缩进：在基础 inset 上再内推 4pt，让标题/图表更远离容器左缘。
     private let leadingExtraInset: CGFloat = 4
     var onHoverChanged: ((Bool) -> Void)?
-    /// 「高对比背景」强度（0…1，0 = 无遮罩原生玻璃；主面板滑杆拖动时同步）
-    var panelMaskOpacity: Double = 1 {
+    /// 面板底色遮罩色（0 alpha = 无遮罩原生玻璃；主面板色盘调色时同步）
+    var panelBackgroundColor: PanelBackgroundColor = .default {
         didSet { applyPanelBackground() }
     }
     /// 浅色主题开关：开启即强制浅色外观（优先级高于渐变，主面板切换时同步）
     var lightThemeEnabled = false {
         didSet { applyPanelBackground() }
     }
-    /// 主面板当前生效的背景遮罩色（含渐变开关状态）：子弹窗继承同一配色
-    var panelTintColor: NSColor? = Palette.containerTint {
+    /// 主面板当前生效的背景遮罩色：子弹窗继承同一配色
+    var panelTintColor: NSColor? = Palette.defaultContainerColors.top {
         didSet { applyPanelBackground() }
     }
-    var panelTintBottomColor: NSColor? = Palette.containerTintBottom {
+    var panelTintBottomColor: NSColor? = Palette.defaultContainerColors.bottom {
         didSet { applyPanelBackground() }
     }
 
@@ -472,7 +473,7 @@ final class UsageHistoryPopoverController: NSViewController {
         // 外观统一走 Palette.panelAppearance：浅色主题强制浅色；其余跟随系统
         backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
         backgroundView.tintColor = panelTintColor
-        backgroundView.tintBottomColor = Palette.maskEffective(panelMaskOpacity)
+        backgroundView.tintBottomColor = panelBackgroundColor.isEffective
             ? panelTintBottomColor : nil
         backgroundView.wantsLayer = true
         backgroundView.layer?.cornerRadius = Palette.cardCornerRadius
@@ -514,8 +515,12 @@ final class UsageHistoryPopoverController: NSViewController {
         // 外观随开关即时切换：统一走 Palette.panelAppearance（浅色强制浅色，其余跟随系统）
         backgroundView.appearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
         backgroundView.tintColor = panelTintColor
-        backgroundView.tintBottomColor = Palette.maskEffective(panelMaskOpacity)
+        backgroundView.tintBottomColor = panelBackgroundColor.isEffective
             ? panelTintBottomColor : nil
+        // 自绘图表把文字色/坐标轴色画进位图（表头、纵轴刻度、日期轴走
+        // Palette.secondaryForeground，动态色只在绘制时解算）——底色或外观换了必须重绘，
+        // 否则旧灰留在屏幕上（主面板侧同口径：Panel.refreshSecondaryForeground）
+        chartView.needsDisplay = true
     }
 }
 
@@ -527,7 +532,8 @@ final class UsageHistoryPopoverAnchorView: NSView {
 
 /// 卡片进度条（2026-09-02 由 9 方块点阵改造为渐变进度条，旧实现备份于
 /// backups/UsagePanel.swift.bak-20260902-dots-progressbar）：
-/// 灰色胶囊轨道（Palette.dotsDim）+ 蓝色左→右渐变填充（systemBlue alpha 0.10→0.80），
+/// 胶囊轨道 + 蓝色左→右渐变填充（systemBlue alpha 0.10→0.80）：轨道底色 = **点阵背景色**
+/// `Palette.heatDotEmpty`（词元活动热力图的无用量底点，横态/竖态同源，2026-09-14 用户要求复用），
 /// ratio 表示剩余比例（填充宽 = 轨道宽 × ratio），变化走 0.25s ease-in-out 宽度动画。
 /// pulsing=true 时填充层以 2s 周期透明度呼吸（0.55↔1.0），示意额度正在被消耗。
 /// 脉冲状态由外部（makePanelSnapshot）传入，不自行比较，避免被面板操作重置。
@@ -537,8 +543,9 @@ final class UsageHistoryPopoverAnchorView: NSView {
 final class UsageDots: NSView {
     var ratio: CGFloat = 0 { didSet { updateProgress() } }
     /// 竖向模式（默认卡片进度条贴容器最右）：2026-09-07 用户改版 = 4 个圆角正方形点
-    /// 竖向排列的点阵——边长 = 视图宽（verticalThickness），间隔 = (高 − 4×边长) ÷ 3
-    /// 随容器高度伸缩；填充自下而上按整点亮灭（ratio=剩余比例，四舍五入到档位），
+    /// 竖向排列的点阵——边长 = 槽高 ÷ verticalHeightToSideRatio（即视图宽），
+    /// 间隔 = 边长 × verticalGapRatio：槽高变化时整组等比缩放，比例恒定（2026-09-14）；
+    /// 填充自下而上按整点亮灭（ratio=剩余比例，四舍五入到档位），
     /// 点亮色 = 词元活动热力图三档最亮色（剩余越多越亮，2026-09-07 定稿；曾用绿黄橙红已废），
     /// 未点亮 = 热力图底点色 heatDotEmpty；无背景无边框（draw 直绘，隐藏轨道/填充层）。
     /// 历史口径：09-06 为连续竖条（1pt 边框+内缩填充），已被本点阵替换。须在进视图层级前置位
@@ -564,16 +571,24 @@ final class UsageDots: NSView {
     //    条高 4.06（2026-09-06 用户「高度减少1pt」，原 5.06）；槽高 7pt 由外部 heightAnchor 固定 ──
     /// 条的粗细（横态 = 条高；PanelLayout 引用常量防漂移）
     static let barHeight: CGFloat = 4.06
-    /// 竖向点阵点边长（默认卡片竖向模式 = 4 圆角正方点，2026-09-07 改版；容器宽由此
-    /// 常量推导同值，历史：09-06 竖条粗 4.06；同日点阵 +0.5pt → 4.56）
+    /// 竖向点阵点边长（名义值 = 原点阵口径 4.56；实际边长由槽高按
+    /// `verticalHeightToSideRatio` 反推，仅在 intrinsicContentSize 无约束兜底时用它）
     static let verticalThickness: CGFloat = 4.56
+    /// 竖向点阵「点边长 : 间隙」形状口径（原点阵 = 点 4.56 / 间隙 2.42 @ 槽高 25.5，
+    /// 2026-09-07 定稿）。2026-09-14 用户要求「进度条高度 = 主标题高 + 副标题高，
+    /// 点位大小与间隔的比例不变」→ 竖排点阵改为**由槽高等比反推**：边长、间隙按同一
+    /// 系数缩放，本比值就是那个不变的比例
+    static let verticalGapRatio: CGFloat = 2.42 / 4.56
+    /// 竖向点阵「槽高 : 点边长」= 点数 + (点数−1) × verticalGapRatio。
+    /// PanelLayout 按它给点阵上宽高比约束（点恒为正方形），槽高变化即整组等比缩放
+    static var verticalHeightToSideRatio: CGFloat {
+        CGFloat(verticalDotCount) + CGFloat(verticalDotCount - 1) * verticalGapRatio
+    }
     private static let barWidth: CGFloat = 9 * 5.06 * 1.1   // 50.09（原 45.54 加长 10%）
-    /// 轨道透明度（dotsDim 再乘此系数：深 systemGray@0.75→0.34 / 浅 systemGray→0.45）
-    private static let trackAlpha: CGFloat = 0.45
     /// 填充蓝（比 systemBlue 更亮的亮蓝 #409CFF，sRGB 所见即所得）
     private static let brightBlue = NSColor(srgbRed: 0x40/255.0, green: 0x9C/255.0, blue: 0xFF/255.0, alpha: 1)
 
-    /// 灰色背景轨道
+    /// 背景轨道层：底色 = 点阵背景色 `Palette.heatDotEmpty`（见 applyColors；不再自算灰/透明度）
     private let trackLayer = CALayer()
     /// 蓝色渐变填充
     private let progressLayer = CAGradientLayer()
@@ -603,7 +618,7 @@ final class UsageDots: NSView {
         // 窗口落定后生效外观才稳定，重着色一次（动态色落 CALayer 会定格外观）
         applyColors()
     }
-    /// 动态色（dotsDim / systemBlue）落 CALayer 会定格外观：主题切换时按视图生效外观重着色
+    /// 动态色（轨道色 `heatDotEmpty` / 填充蓝）落 CALayer 会定格外观：主题切换时按视图生效外观重着色
     /// （须走 Palette.borderCGColor 解算，勿直接 .cgColor——面板强制 aqua 与系统外观可能不一致）
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -632,8 +647,9 @@ final class UsageDots: NSView {
         if isVertical { drawVerticalDots(); return }
         super.draw(dirtyRect)
     }
-    /// 竖排点阵直绘（isVertical 现形态）：4 个圆角正方形点竖排，边长 = 视图宽、
-    /// 间隔 = (高 − 4×边长) ÷ 3 随容器高伸缩；填充自下而上整点亮灭（ratio 四舍五入
+    /// 竖排点阵直绘（isVertical 现形态）：4 个圆角正方形点竖排，边长 = 槽高 ÷
+    /// verticalHeightToSideRatio、间隔 = 边长 × verticalGapRatio（等比，比例恒定）；
+    /// 填充自下而上整点亮灭（ratio 四舍五入
     /// 到 4 档）。2026-09-07 用户改版：档位状态色 = 词元活动热力图**三个最亮档**
     ///（Palette.heatLevelColor L2/L3/L4，filled+1 起步跳过最暗档、顶两档共用峰值色；
     /// 曾用绿黄橙红已废），未点亮 = 热力图无用量底点色 heatDotEmpty；圆角 = 边长 ×
@@ -641,24 +657,30 @@ final class UsageDots: NSView {
     /// 点亮档外罩 0.3pt 同色微弱泛光（dotGlowWidth/dotGlowAlpha）
     private func drawVerticalDots() {
         let count = Self.verticalDotCount
-        let side = min(bounds.width, bounds.height / CGFloat(count))
-        let gap = max(0, (bounds.height - side * CGFloat(count)) / CGFloat(count - 1))
+        // 槽高 → 边长（视图宽恒 = 边长，见 PanelLayout 的宽高比约束）：整组等比缩放，
+        // 点大小与间隔的比例恒定，只有占高在变
+        let side = bounds.height / Self.verticalHeightToSideRatio
+        let gap = side * Self.verticalGapRatio
         let filled = min(count, max(0, Int((ratio * CGFloat(count)).rounded())))
         let scale = window?.backingScaleFactor ?? 2
         let snap = { (v: CGFloat) in (v * scale).rounded() / scale }
         let x0 = snap((bounds.width - side) / 2)
         let radius = side * Self.dotCornerRadiusFactor
         let dark = effectiveAppearance.isDark
-        // 深色：三个最亮档 L2/L3/L4（2026-09-07 用户指定，filled+1 起步跳过最暗档、
-        // 钳到 L4）；浅色：只用峰值色（2026-09-08 用户「卡片进度条只用最亮的颜色」）
-        let heatLevel = min(filled + 1, count)
+        // **逐格各一档**（2026-09-15 用户：「四格进度时同时使用四种颜色，三格时使用最亮的三个，以此类推」）：
+        // n 格点亮 ⇒ 取**最亮的 n 档**，暗端在低格、亮端在高格 ——
+        // 4 格 = L1…L4、3 格 = L2…L4、2 格 = L3…L4、1 格 = L4（档位色表见 Palette.heatLevelColor）。
+        // 浅色外观维持 2026-09-08 口径「点阵只用最亮那一档」：那张档位表方向相反
+        //（level 1 = 峰值原色、level 4 = 峰值 × 0.33 = 浅底上最可见），逐格取档会读成乱序
+        let firstLevel = count - filled + 1
         for i in 0..<count {   // i=0 = 底部点
             let y = snap(CGFloat(i) * (side + gap))
             let rect = NSRect(x: x0, y: y, width: side, height: side)
             // 未点亮底色 = 词元活动无用量底点色（heatDotEmpty：深 #262626 / 浅 210 灰，
             // 2026-09-07 用户指定与热力图底点同色）；动态色在 draw 内按生效外观解算
-            let color = i < filled ? Palette.heatLevelColor(dark ? heatLevel : 4, dark: dark)
-                                   : Palette.heatDotEmpty
+            let color = i < filled
+                ? Palette.heatLevelColor(dark ? min(firstLevel + i, count) : count, dark: dark)
+                : Palette.heatDotEmpty
             // 点亮泛光：同色低透明度外扩 0.3pt 晕圈先铺底，本体满色盖回 → 可见仅外圈；
             // 圆角同步外扩保持同心（2026-09-07 用户指定）
             if i < filled {
@@ -719,7 +741,10 @@ final class UsageDots: NSView {
         guard trackLayer.superlayer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        trackLayer.backgroundColor = Palette.borderCGColor(Palette.dotsDim.withAlphaComponent(Self.trackAlpha), in: self)
+        // 轨道底色 = **点阵背景色**（词元活动热力图的「无用量底点」`Palette.heatDotEmpty`）：
+        // 与竖态点阵的未点亮档同源，不再另写色值/透明度（2026-09-14 用户要求「注意颜色复用」）。
+        // 动态色落 layer 仍走 borderCGColor 按生效外观解算（直接 .cgColor 会定格错分支）
+        trackLayer.backgroundColor = Palette.borderCGColor(Palette.heatDotEmpty, in: self)
         progressLayer.colors = Self.progressStops(dark: effectiveAppearance.isDark)
             .map { Palette.borderCGColor(NSColor(srgbRed: $0.0 / 255.0, green: $0.1 / 255.0,
                                                  blue: $0.2 / 255.0, alpha: 1), in: self) }
@@ -766,8 +791,9 @@ final class UsageDots: NSView {
         progressLayer.opacity = 1.0
     }
     override var intrinsicContentSize: NSSize {
-        // 横态宽 = 点阵口径加长 10%（50.09）；竖态宽 = 点边长 4.06、高纵贯（由外部
-        // top/bottom 约束决定，点间隔随高伸缩）。另一维默认 7.0pt，实际由外部约束决定
+        // 横态宽 = 点阵口径加长 10%（50.09）；竖态宽 = 名义点边长（实际宽由 PanelLayout
+        // 的「宽 = 槽高 ÷ verticalHeightToSideRatio」约束定，本固有值只是无约束兜底）。
+        // 另一维默认 7.0pt，实际由外部约束决定
         return NSSize(width: isVertical ? Self.verticalThickness : Self.barWidth, height: 7.0)
     }
 }
@@ -816,7 +842,7 @@ extension BalancePanelView {
         let iconView = NSImageView()
         iconView.image = bundleIcon(row.icon, size: usageIconSize) ?? Self.trimmedSymbolImage("app.fill", size: usageIconSize)
         iconView.image?.isTemplate = true
-        iconView.contentTintColor = .systemGray
+        iconView.contentTintColor = Palette.secondaryForeground
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.widthAnchor.constraint(equalToConstant: 10).isActive = true
         iconView.heightAnchor.constraint(equalToConstant: 10).isActive = true
@@ -846,10 +872,10 @@ extension BalancePanelView {
         // 位移动画需要 layer-backed
         rowStack.wantsLayer = true
         // 用量条目 hover：整行渐变背景 + 发丝边框（与余额卡片/磁贴/折叠标题条同一套 Palette）；
-        // 行内容常态系统灰，hover 时文字/icon 一起提亮到 Palette.hoverForeground（不透明纯白）。
+        // 行内容常态副前景灰，hover 时文字/icon 一起提亮到 Palette.hoverForeground（不透明纯白）。
         // ⚠️ 别改成系统 labelColor：vibrant 外观下它是白 @85%，叠在深色玻璃上偏灰，
         // 观感即「先亮后有变暗」（2026-09-12 实测 txt alpha=0.85）；两个色路同源这一个值，
-        // 退出回落 systemGray；hover 锁定期间保持提亮
+        // 退出回落 Palette.secondaryForeground；hover 锁定期间保持提亮
         let hoverRow = wrapHoverRow(rowStack, hoverTextColor: Palette.hoverForeground,
                                     horizontalPadding: usageHorizontalInset,
                                     topInset: usageRowTopInset,
@@ -909,20 +935,17 @@ extension BalancePanelView {
         return nil
     }
 
-    /// 用量子面板背景配色 → 主面板当前生效值（渐变/浅色/系统主题切换时的重同步入口）：
+    /// 用量子面板背景配色 → 主面板当前生效值（底色/浅色/系统主题切换时的重同步入口）：
     /// 优先拷贝主面板容器当前生效实色，容器查找失败按 Palette.containerColors 兜底
-    /// （lightTint 与 Token 子面板同口径：浅色主题开关开或生效外观为浅色）
     func syncUsageHistoryPanelBackground() {
         guard let controller = usageHistoryController else { return }
-        controller.panelMaskOpacity = panelMaskOpacity
+        controller.panelBackgroundColor = panelBackgroundColor
         controller.lightThemeEnabled = lightThemeEnabled
         if let container = Self.findPanelContainer(from: self) {
             controller.panelTintColor = container.tintColor
             controller.panelTintBottomColor = container.tintBottomColor
         } else {
-            let colors = Palette.containerColors(
-                lightTint: lightThemeEnabled || !effectiveAppearance.isDark,
-                opacity: panelMaskOpacity)
+            let colors = Palette.containerColors(background: panelBackgroundColor)
             controller.panelTintColor = colors.top
             controller.panelTintBottomColor = colors.bottom
         }

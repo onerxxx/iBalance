@@ -13,6 +13,8 @@ enum CodexTokenStore {
     static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
+    /// 已构建缓存的同步只读（nil = 尚未构建过）：卡片副标题 tok/s 用
+    static func cachedSummary() -> TokenSummary? { cache.cachedIfBuilt }
 
     private static func query() -> TokenSummary? {
         loadDiskCacheIfNeeded()
@@ -131,9 +133,20 @@ enum CodexTokenStore {
         let daily = dailyMap
             .map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
-        return TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
+        // 最近 10 次会话均速（tok/s，卡片副标题 meta）：一个 rollout 文件 = 一次会话，
+        // tokens 只算 **output**（2026-09-14 用户指定），时长 = 首末 token_count 事件
+        // 时间差（单事件会话时长为 0，不计），均值口径归 recentSessionSpeed
+        var sessions: [(start: TimeInterval, tokens: Double, seconds: Double)] = []
+        for c in fresh.values where !c.usages.isEmpty {
+            let output = c.usages.reduce(0) { $0 + $1.outputTokens }
+            sessions.append((start: c.usages[0].t, tokens: Double(output),
+                             seconds: c.usages[c.usages.count - 1].t - c.usages[0].t))
+        }
+        var summary = TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
                             requestCount: requestCount, daily: daily, periodTotals: periodTotals,
                             periodProjects: periodProjects, periodModels: periodModels)
+        summary.recentSessionSpeed = recentSessionSpeed(sessions)
+        return summary
     }
 
     /// 单文件解析结果（增量缓存的值）；整体持久化到 App Support，
@@ -150,11 +163,13 @@ enum CodexTokenStore {
         let t: TimeInterval
         let model: String
         let tokens: Int64
+        let outputTokens: Int64  // 仅 output（卡片副标题 tok/s 用，2026-09-14 用户指定）
     }
 
-    /// 增量缓存落盘位置（App Support/codex-tokens-filecache-v1.json），命名与 WB 数据源同约定
+    /// 增量缓存落盘位置（App Support/codex-tokens-filecache-v2.json），命名与 WB 数据源同约定；
+    /// v2 = CachedUsage 增加 outputTokens 字段后换名，旧缓存解码失败自动全量重建一次
     private static var diskCacheURL: URL {
-        AppDataStore.applicationSupportURL.appendingPathComponent("codex-tokens-filecache-v1.json")
+        AppDataStore.applicationSupportURL.appendingPathComponent("codex-tokens-filecache-v2.json")
     }
 
     /// 首次查询前把持久化的单文件贡献装回内存（进程生命周期内只装一次）
@@ -207,7 +222,7 @@ enum CodexTokenStore {
                   let date = isoWithFraction.date(from: timestamp)
                         ?? isoWithoutFraction.date(from: timestamp) else { continue }
             usages.append(CachedUsage(t: date.timeIntervalSince1970, model: currentModel,
-                                      tokens: input + output))
+                                      tokens: input + output, outputTokens: output))
         }
         return FileContribution(mtime: mtime, size: size, cwd: cwd, usages: usages)
     }

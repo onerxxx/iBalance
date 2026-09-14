@@ -270,6 +270,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         config = ConfigStore.load()
         // 自建顶层窗口（模态壳 / 更新窗）的外观来源：必须在任何窗口弹出前与配置同步
         Palette.lightThemeActive = config.lightThemeEnabled
+        // 副前景色的底色来源：同上，任何视图构建前必须先落值（首次绘制就要按它解算）
+        Palette.panelBackgroundActive = config.panelBackgroundColor
+        // 遮罩底端不透明度镜像：与底色镜像同处写入（containerColors 读它，各调用点不必传参）
+        Palette.panelBackgroundBottomAlphaActive = config.panelBackgroundBottomAlpha
+        // 点阵背景色 / 卡片 hover 背景色的运行镜像（2026-09-15 设置窗口开放）：
+        // 与底色同处落值 —— 任何视图首次绘制就要按它解算 dynamic color
+        Palette.heatDotEmptyActive = config.heatDotEmptyColor
+        Palette.cardHoverBackgroundActive = config.cardHoverBackgroundColor
         // Codex 登录态来自本机 auth.json；启动时自动纳入账号列表，按钮仍可手动重新导入/更新凭据。
         if case .success(let account) = CodexService.importCurrentAccount(),
            !config.codexAccounts.contains(where: { $0.uid == account.uid }) {
@@ -816,7 +824,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 浮窗无箭头，safeAreaInsets 恒 0，同一套代码自动等价。
         popover.hasFullSizeContent = true
         let panelVC = BalancePanelViewController(panel: panel)
-        panelVC.fadeHintParams = Self.fadeHintParams(from: config)
         // 浮窗 resize 拖动结束：持久化尺寸到 config.json，下次 pin 时恢复
         panelVC.onFloatingSizeChanged = { [weak self] size in
             guard let self else { return }
@@ -1118,9 +1125,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == traeMainUid { return false }
             return false
         }
-        let traeDelta = dayDeltaText(platform: "trae",
-                                     accounts: cacheTraeAccounts.map { (uid: $0.key, current: $0.value.used) },
-                                     increasing: true, percent: false, decimals: config.traeDecimals)
         for ac in traeAccountsList {
             let isCurrent = ac.uid == traeMainUid
             let cached = cacheTraeAccounts[ac.uid]
@@ -1144,8 +1148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.traeCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.traeCheckinReward(ac.uid))
             snap.pulsing = traePulsingTracker.isPulsing(ac.uid)
-            snap.dayDeltaText = traeDelta.text
-            snap.dayDeltaDirection = traeDelta.direction
+            // TRAE 无会话级 token 数据源 → speedText 恒 nil，副标题 meta 隐藏
             s.traeAccounts.append(snap)
         }
         // WorkBuddy 多账号余额卡片：当前账号排最上
@@ -1155,9 +1158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == mainUid { return false }
             return false
         }
-        let wbDelta = dayDeltaText(platform: "wb",
-                                   accounts: cacheWbAccounts.map { (uid: $0.key, current: $0.value.remain) },
-                                   increasing: false, percent: false, decimals: config.workbuddyDecimals)
+        let wbSpeed = Self.tokSpeedText(WBTokenStore.cachedSummary()?.recentSessionSpeed)
         for ac in accounts {
             let isCurrent = ac.uid == mainUid
             let cached = cacheWbAccounts[ac.uid]
@@ -1176,8 +1177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             snap.streak = UserDefaults.standard.integer(forKey: UDKey.wbCheckinStreak(ac.uid))
             snap.reward = UserDefaults.standard.integer(forKey: UDKey.wbCheckinReward(ac.uid))
             snap.pulsing = wbPulsingTracker.isPulsing(ac.uid)
-            snap.dayDeltaText = wbDelta.text
-            snap.dayDeltaDirection = wbDelta.direction
+            snap.speedText = wbSpeed
             // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 5 分钟）
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.workbuddyVisible
@@ -1195,11 +1195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == zcodeMainUid { return false }
             return false
         }
-        let zcodeDelta = dayDeltaText(platform: "zcode",
-                                      accounts: cacheZcodeAccounts.compactMap {
-                                          $0.value.total > 0 ? (uid: $0.key, current: $0.value.remain / $0.value.total * 100) : nil
-                                      },
-                                      increasing: false, percent: true, decimals: 1)
+        let zcodeSpeed = Self.tokSpeedText(ZcodeTokenStore.cachedSummary()?.recentSessionSpeed)
         for ac in zcodeAccountsList {
             let isCurrent = ac.uid == zcodeMainUid
             let cached = cacheZcodeAccounts[ac.uid]
@@ -1225,8 +1221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 snap.taskState = AgentTaskStatusStore.zcodeVisible
             }
             snap.tokenInvalid = zcodeInvalidUids.contains(ac.uid)
-            snap.dayDeltaText = zcodeDelta.text
-            snap.dayDeltaDirection = zcodeDelta.direction
+            snap.speedText = zcodeSpeed
             s.zcodeAccounts.append(snap)
         }
         // Codex 多账号 usage 卡片：当前 auth.json 对应账号排首位，昵称固定显示邮箱。
@@ -1236,9 +1231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if b.uid == codexMainUid { return false }
             return false
         }
-        let codexDelta = dayDeltaText(platform: "codex",
-                                      accounts: cacheCodexAccounts.map { (uid: $0.key, current: $0.value.usedPercent) },
-                                      increasing: true, percent: true, decimals: 1)
+        let codexSpeed = Self.tokSpeedText(CodexTokenStore.cachedSummary()?.recentSessionSpeed)
         for ac in codexAccountsList {
             let isCurrent = ac.uid == codexMainUid
             let cached = cacheCodexAccounts[ac.uid]
@@ -1253,8 +1246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
             snap.pulsing = codexPulsingTracker.isPulsing(ac.uid)
-            snap.dayDeltaText = codexDelta.text
-            snap.dayDeltaDirection = codexDelta.direction
+            snap.speedText = codexSpeed
             // Codex Desktop/CLI 的 rollout 事件流：仅当前账号挂接 Agent 三态光环。
             if isCurrent {
                 snap.taskState = AgentTaskStatusStore.codexVisible
@@ -1399,15 +1391,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             s.lastCheckinTime = text
         }
         s.refreshIntervalSeconds = Int(config.refreshInterval)
-        s.panelMaskOpacity = config.panelMaskOpacity
+        s.panelBackgroundColor = config.panelBackgroundColor
+        s.panelBackgroundBottomAlpha = config.panelBackgroundBottomAlpha
         s.lightThemeEnabled = config.lightThemeEnabled
         s.cardTitleFontSize = config.cardTitleFontSize
         s.cardTitleSharpGrotesk = config.cardTitleSharpGrotesk
-        s.cardTitleSGWeight = config.cardTitleSGWeight
-        s.cardTitleSGWidth = config.cardTitleSGWidth
+        s.cardTitleGapScaleSF = config.cardTitleGapScaleSF
+        s.cardTitleGapScaleSG = config.cardTitleGapScaleSG
         s.longProgressCard = config.longProgressCard
         s.iconThemeSwap = config.iconThemeSwap
-        s.circularIcon = config.circularIcon
         return s
     }
 
@@ -1513,15 +1505,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         actions.saveKeyQuota = { [weak self] key, quota, zhipu, qwen in
             self?.applyKeyQuota(apiKey: key, quota: quota, zhipuToken: zhipu, qwenTicket: qwen)
         }
-        actions.deleteAllAccounts = { [weak self] in self?.onDeleteAllAccounts() }
         actions.manualCheckin = { [weak self] in self?.onManualCheckin() }
         actions.showCheckinHistory = { [weak self] in self?.onShowCheckinHistory() }
         actions.shareWbHistory = { [weak self] in self?.onShareWbHistory() }
-        // ── 「主题外观」pane：面板/卡片开关 + 滑杆 ──
+        // ── 「主题外观」pane：面板/卡片开关 + 底色色盘 ──
         // 开关沿用面板既有的翻转式实现（读 config 取反），传期望值时先比对再翻；
         // 点阵色相/饱和度直接落 Palette（UserDefaults 持久化）并对当前面板就地重绘
-        actions.setPanelMaskOpacity = { [weak self] opacity in
-            self?.applyPanelMaskOpacity(opacity)
+        actions.setPanelBackgroundColor = { [weak self] color in
+            self?.applyPanelBackgroundColor(color)
+        }
+        // 底端不透明度滑杆（顶端即上面那个色盘/顶部滑杆的 alpha，两端各自独立）
+        actions.setPanelBackgroundBottomAlpha = { [weak self] v in
+            self?.applyPanelBackgroundBottomAlpha(v)
         }
         actions.setLightTheme = { [weak self] want in
             guard let self, want != config.lightThemeEnabled else { return }
@@ -1530,10 +1525,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         actions.setIconThemeSwap = { [weak self] want in
             guard let self, want != config.iconThemeSwap else { return }
             onToggleIconThemeSwap()
-        }
-        actions.setCircularIcon = { [weak self] want in
-            guard let self, want != config.circularIcon else { return }
-            onToggleCircularIcon()
         }
         // ── 卡片主标题字体（字号滑杆 + Sharp Grotesk 字重×宽度）──
         // 直接写 config 即可：syncPanel → panel.update 快照比对到变化后就地重刷标题
@@ -1549,15 +1540,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ConfigStore.save(config)
             syncPanel()
         }
-        actions.setCardTitleSGWeight = { [weak self] idx in
-            guard let self, idx != config.cardTitleSGWeight else { return }
-            config.cardTitleSGWeight = idx
+        // 主副标题行距系数（系统字体 / SG 两档）：落盘后经快照同步，面板就地改 spacing（不重建卡片）
+        actions.setCardTitleGapScaleSF = { [weak self] v in
+            guard let self, v != config.cardTitleGapScaleSF else { return }
+            config.cardTitleGapScaleSF = v
             ConfigStore.save(config)
             syncPanel()
         }
-        actions.setCardTitleSGWidth = { [weak self] idx in
-            guard let self, idx != config.cardTitleSGWidth else { return }
-            config.cardTitleSGWidth = idx
+        actions.setCardTitleGapScaleSG = { [weak self] v in
+            guard let self, v != config.cardTitleGapScaleSG else { return }
+            config.cardTitleGapScaleSG = v
             ConfigStore.save(config)
             syncPanel()
         }
@@ -1565,11 +1557,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self, want != config.longProgressCard else { return }
             onToggleLongProgressCard()
         }
-        actions.setHeatHue = { [weak self] in self?.panelView?.applyHeatHue(CGFloat($0)) }
-        actions.setHeatSaturation = { [weak self] in self?.panelView?.applyHeatSaturation(CGFloat($0)) }
-        actions.setHeatBrightness = { [weak self] in self?.panelView?.applyHeatBrightness(CGFloat($0)) }
+        // 主题色（色盘拾色）：分解出的 HSB 三参一把落值 → 面板就地重绘点阵与卡片边框
+        actions.setHeatColor = { [weak self] hue, saturation, brightness in
+            self?.panelView?.applyHeatColor(hue: CGFloat(hue),
+                                            saturation: CGFloat(saturation),
+                                            brightness: CGFloat(brightness))
+        }
+        // 点阵背景色 / 卡片 hover 背景色（2026-09-15 开放）：落盘 + 镜像 + 就地重绘
+        actions.setHeatDotEmptyColor = { [weak self] color in self?.applyHeatDotEmptyColor(color) }
+        actions.setCardHoverBackgroundColor = { [weak self] color in
+            self?.applyCardHoverBackgroundColor(color)
+        }
         actions.setBounce = { [weak self] in self?.applyDotBounce($0) }
         actions.about = { [weak self] in self?.onAbout() }
+        // 「关于」pane 备份：导出打当前 config 全量；导入只走磁盘（覆盖写回后重启生效），
+        // 不碰内存态 —— 重启后由 ConfigStore.load 统一装载
+        actions.exportBackup = { [weak self] in
+            guard let self else { return }
+            BackupService.export(config: self.config)
+        }
+        actions.importBackup = { BackupService.importBackup() }
         // 设置窗口「平台」pane：定高表格，**勾选即生效**（保存链路见 applyPlatformConfig）
         SettingsWindowController.shared.platformConfig = { [weak self] in self?.config }
         SettingsWindowController.shared.applyPlatformConfig = { [weak self] in
@@ -1608,15 +1615,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func makeSettingsSnapshot() -> AppSettingsSnapshot {
         let s = makePanelSnapshot()
         let interval = s.refreshIntervalSeconds
-        let savedAccounts = config.workbuddyAccounts.count
-            + config.traeAccounts.count
-            + config.zcodeAccounts.count
-            + config.codexAccounts.count
-        let savedOverrides = [
-            config.deepseekApiKey,
-            config.bigmodelTokenOverride,
-            config.qwenTicketOverride
-        ].filter { !$0.isEmpty }.count
         // 「已保存账号」逐平台分组（2026-09-13 用户要求）：空平台不出现。
         // name 取各平台展示名（ZCode 走 displayName = 昵称/uid 尾号，Codex 邮箱优先），
         // detail 统一给 uid 便于区分同名账号；iconKey 与面板卡片图标名同源
@@ -1648,37 +1646,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             commonQuota: config.deepseekCommonQuota,
             zhipuToken: config.bigmodelTokenOverride,
             qwenTicket: config.qwenTicketOverride,
-            savedAccountCount: savedAccounts,
-            savedOverrideCount: savedOverrides,
             savedAccountGroups: accountGroups,
-            panelMaskOpacity: config.panelMaskOpacity,
+            panelBackgroundColor: config.panelBackgroundColor,
+            panelBackgroundBottomAlpha: config.panelBackgroundBottomAlpha,
             lightThemeEnabled: config.lightThemeEnabled,
             iconThemeSwap: config.iconThemeSwap,
-            circularIcon: config.circularIcon,
             longProgressCard: config.longProgressCard,
             cardTitleFontSize: config.cardTitleFontSize,
             cardTitleSharpGrotesk: config.cardTitleSharpGrotesk,
-            cardTitleSGWeight: config.cardTitleSGWeight,
-            cardTitleSGWidth: config.cardTitleSGWidth,
+            cardTitleGapScaleSF: config.cardTitleGapScaleSF,
+            cardTitleGapScaleSG: config.cardTitleGapScaleSG,
             heatHue: Double(Palette.heatPeakHue),
             heatSaturation: Double(Palette.heatPeakSaturation),
-            heatBrightness: Double(Palette.heatPeakBrightness))
+            heatBrightness: Double(Palette.heatPeakBrightness),
+            heatDotEmptyColor: config.heatDotEmptyColor,
+            cardHoverBackgroundColor: config.cardHoverBackgroundColor)
     }
 
-    /// 「高对比背景」强度（0…1，设置窗口滑杆实时拖动）：写配置并经快照同步重绘遮罩
-    private func applyPanelMaskOpacity(_ opacity: Double) {
-        config.panelMaskOpacity = opacity
+    /// 面板「面板背景色」（设置窗口色盘拾色 / 顶部不透明度滑杆）：写配置并经快照同步重绘遮罩
+    private func applyPanelBackgroundColor(_ color: PanelBackgroundColor) {
+        config.panelBackgroundColor = color
         ConfigStore.save(config)
+        // 副前景色（Palette.secondaryForeground）按底色解算对比度，镜像必须同步落值，
+        // 否则面板已换底色、副文本还按旧底色解算
+        Palette.panelBackgroundActive = color
         syncPanel()
     }
 
+    /// 面板底色遮罩**底端**不透明度（设置窗口滑杆）：写配置 + 同步镜像 + 重绘遮罩
+    private func applyPanelBackgroundBottomAlpha(_ v: Double) {
+        config.panelBackgroundBottomAlpha = min(max(v, 0), 1)
+        ConfigStore.save(config)
+        Palette.panelBackgroundBottomAlphaActive = config.panelBackgroundBottomAlpha
+        syncPanel()
+    }
+
+    /// 点阵背景色（设置窗口「主题外观 → 面板」色盘，2026-09-15 开放）：
+    /// 写配置 + 同步镜像 + 就地重绘（无用量底点/轨道底/骨架行都是自绘或烘色位图，
+    /// 必须走 `refreshDotMatrixAndHoverMaterials` 清缓存 + 整树重绘）
+    private func applyHeatDotEmptyColor(_ color: PanelBackgroundColor) {
+        guard color != config.heatDotEmptyColor else { return }
+        config.heatDotEmptyColor = color
+        ConfigStore.save(config)
+        Palette.heatDotEmptyActive = color
+        panelView?.refreshDotMatrixAndHoverMaterials()
+    }
+
+    /// 卡片 hover 背景色（设置窗口「主题外观 → 卡片」色盘，2026-09-15 开放）：
+    /// 写配置 + 同步镜像 + 逐材质宿主重解算（材质块颜色是 .cgColor 落 layer 的，会定格）
+    private func applyCardHoverBackgroundColor(_ color: PanelBackgroundColor) {
+        guard color != config.cardHoverBackgroundColor else { return }
+        config.cardHoverBackgroundColor = color
+        ConfigStore.save(config)
+        Palette.cardHoverBackgroundActive = color
+        panelView?.refreshDotMatrixAndHoverMaterials()
+    }
+
     /// 浅色主题：开启后强制浅色外观（即使系统是深色主题）；优先级高于渐变开关。
-    /// 保存后经快照同步，VC 容器/popover/子面板统一换外观
+    /// 保存后经快照同步，VC 容器/popover/子面板统一换外观。
+    ///
+    /// 2026-09-14 用户要求：开关**同步翻转「面板背景色」的亮度** —— 只换外观不换底色的话，
+    /// 「浅色外观 + 近黑遮罩」叠出来面板还是深色，等于白开；所以开 → 底色翻浅、关 → 翻回深，
+    /// 双向都是同一个翻转（明度取反，色相/饱和度/不透明度不变，见 `brightnessFlipped`）。
+    /// 落盘的是翻转后的真实颜色，设置窗口色盘即所见即所得；翻转只做一次，来回切换可精确还原。
+    ///
+    /// 2026-09-14 追加（用户要求）：**打开浅色主题时底色已亮于 50% 就不翻** ——
+    /// 浅色外观要的正是亮底，把用户自选的亮底翻成暗底等于又把面板按回深色；
+    /// 明度 ≤ 50% 的暗底照旧翻。关闭方向不变，仍按原逻辑无条件翻转。
     @objc private func onToggleLightTheme() {
-        config.lightThemeEnabled = !config.lightThemeEnabled
+        config.lightThemeEnabled.toggle()
+        let bg = config.panelBackgroundColor
+        if config.lightThemeEnabled, bg.brightness <= 0.5 {
+            config.panelBackgroundColor = bg.brightnessFlipped
+        }
+        // 点阵背景色 / 卡片 hover 背景色（2026-09-15 开放）：与底色**同一条规则** ——
+        // 开浅色主题时"本就暗的才翻"（已是亮色则保持），关时无条件翻回；
+        // 翻转是明度取反的自反操作，来回切换可精确还原（默认值翻转后 ≈ 旧内置浅色档：
+        // #292929 → #d6d6d6，黑@30% → 白@30%）
+        if config.lightThemeEnabled {
+            if config.heatDotEmptyColor.brightness <= 0.5 {
+                config.heatDotEmptyColor = config.heatDotEmptyColor.brightnessFlipped
+            }
+            if config.cardHoverBackgroundColor.brightness <= 0.5 {
+                config.cardHoverBackgroundColor = config.cardHoverBackgroundColor.brightnessFlipped
+            }
+        } else {
+            config.heatDotEmptyColor = config.heatDotEmptyColor.brightnessFlipped
+            config.cardHoverBackgroundColor = config.cardHoverBackgroundColor.brightnessFlipped
+        }
         ConfigStore.save(config)
         // 自建顶层窗口的外观镜像：模态壳在 present 时读它，已开着的更新窗立即重染
         Palette.lightThemeActive = config.lightThemeEnabled
+        // 底色镜像同步（翻转后的颜色才是面板实际画的底色，副前景色按它解算）
+        Palette.panelBackgroundActive = config.panelBackgroundColor
+        Palette.heatDotEmptyActive = config.heatDotEmptyColor
+        Palette.cardHoverBackgroundActive = config.cardHoverBackgroundColor
         updateProgressWinRef?.applyThemeAppearance()
         // popover 窗口外观（含箭头）必须同步重设，否则停留在启动时的主题
         popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled)
@@ -1707,13 +1769,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
-    /// 圆形图标：切换开关（余额卡片品牌 icon 裁圆 + 任务状态光环翻圆形，宽高不变）
-    private func onToggleCircularIcon() {
-        config.circularIcon.toggle()
-        ConfigStore.save(config)
-        syncPanel()
-    }
-
     /// 平台开关落盘（设置窗口「平台」pane 每次勾选变化即调，已无「保存」按钮）：落盘后同步右键菜单、
     /// 自动签到定时器和面板状态。2026-09-12 由玻璃弹窗迁入设置窗口，先「保存按钮」后改「勾选即生效」。
     private func applyPlatformConfig(_ updated: AppConfig) {
@@ -1738,18 +1793,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func onQuit() {
         NSApp.terminate(nil)
-    }
-
-    // MARK: - 滚动提示层参数
-
-    private static func fadeHintParams(from c: AppConfig) -> FadeHintParams {
-        var p = FadeHintParams()
-        p.bandHeight = c.fadeHintBandHeight
-        p.highlightAlpha = c.fadeHintHighlightAlpha
-        p.maskMidAlpha = c.fadeHintMaskMidAlpha
-        p.arrowAlpha = c.fadeHintArrowAlpha
-        p.bobAmplitude = c.fadeHintBobAmplitude
-        return p
     }
 
     @objc private func onAbout() {
@@ -2023,32 +2066,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         config.bigmodelTokenOverride = zhipuToken
         config.qwenTicketOverride = qwenTicket
         ConfigStore.save(config)
-        onRefresh()
-    }
-
-    /// 「账号」pane 底部「删除账号」：二次确认后清空全部已保存凭据。
-    /// 四平台账号数组 + 三件套手填覆盖一并清零；钥匙串 bundle 由 ConfigStore.save 内部删除（全空时 persist 删条目）。
-    @objc private func onDeleteAllAccounts() {
-        let shell = DialogShell()
-        shell.addTitle("删除账号")
-        shell.addInfo("即将清除 iBalance 中保存的全部凭据：\n\n"
-            + "· WorkBuddy / TRAE / ZCode / Codex 账号\n"
-            + "· DeepSeek Key、ZhiPu Token、Qwen Ticket 手填覆盖\n\n"
-            + "各平台在本机的登录状态不受影响。此操作不可撤销。")
-        _ = shell.addButton("取消", keyEquivalent: "\u{1b}")
-        let idxDelete = shell.addButton("删除", keyEquivalent: "")
-        shell.markDestructive(idxDelete)
-        guard shell.present() == idxDelete else { return }
-
-        config.workbuddyAccounts = []
-        config.traeAccounts = []
-        config.zcodeAccounts = []
-        config.codexAccounts = []
-        config.deepseekApiKey = ""
-        config.bigmodelTokenOverride = ""
-        config.qwenTicketOverride = ""
-        ConfigStore.save(config)
-        syncPanel()
         onRefresh()
     }
 
@@ -3312,6 +3329,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let h = (total % 86400) / 3600
         let m = (total % 3600) / 60
         return ["剩余", String(format: "%02d:%02d", h, m)]
+    }
+
+    /// Agent 卡副标题 meta 文案：最近 10 次会话均速 →「x tok/s」。
+    /// <100 保留 1 位小数、≥100 取整（面板宽 264，控制 meta 列宽）；nil = 无会话数据，meta 隐藏
+    private static func tokSpeedText(_ speed: Double?) -> String? {
+        guard let speed else { return nil }
+        let v = speed < 100 ? String(format: "%.1f", speed) : String(format: "%.0f", speed)
+        return v + " tok/s"
     }
 
     /// 通用系统通知通道（余额查询失败 / 切号失败回滚等一次性事件共用）：

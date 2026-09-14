@@ -64,6 +64,24 @@ final class TokenStoreCache {
             callbacks.forEach { $0(s) }
         }
     }
+
+    /// 已构建完成的缓存的同步只读（从未构建过 = nil）：余额卡片副标题 tok/s 快照装配用
+    /// ——快照在主线程同步构建，不能走 fetch 的挂起补发通道
+    var cachedIfBuilt: TokenSummary? { cached?.summary }
+}
+
+/// 最近 10 次会话均速（tok/s）：每次会话速率 = 该次会话 tokens ÷ 所花时间（秒），
+/// 取时间最近（start 降序前 10 个）会话速率的算术平均；时长 ≤ 0 的会话无法度量
+/// 耗时、不计入。三数据仓（ZCode / WB / Codex）各自收集会话后走这里归一口径
+///（tokens 的统计范围由调用方定：2026-09-14 用户指定三仓均只传 output）
+func recentSessionSpeed(_ sessions: [(start: TimeInterval, tokens: Double, seconds: Double)]) -> Double? {
+    let rates = sessions
+        .filter { $0.seconds > 0 && $0.tokens > 0 }
+        .sorted { $0.start > $1.start }
+        .prefix(10)
+        .map { $0.tokens / $0.seconds }
+    guard !rates.isEmpty else { return nil }
+    return rates.reduce(0, +) / Double(rates.count)
 }
 
 /// Token 子面板数据源分流：ZCode、WorkBuddy、Codex 共用同一面板视图，仅数据仓/区块标题/行图标不同
@@ -156,6 +174,9 @@ struct TokenSummary {
     /// .all 不存 = 全量即 projects/models，列表随总计周期切换换数据）
     var periodProjects: [TokenPeriod: [ProjectUsage]] = [:]
     var periodModels: [TokenPeriod: [ProjectUsage]] = [:]
+    /// 最近 10 次会话均速（tok/s，卡片副标题 meta 用；nil = 无可度量会话）。
+    /// 各数据仓在后台重建时顺手算好挂进来；聚合 merge 视图不填（卡片按平台单仓取）
+    var recentSessionSpeed: Double? = nil
 
     /// 列表行（周期口径）：All = 全量列表；窗口周期取各窗口聚合，窗口内无用量 = 空列表
     ///（不做全量回落——列表与首行大数字保持同一周期口径）
@@ -447,12 +468,39 @@ enum ZcodeTokenStore {
 
         let total = projects.reduce(Int64(0)) { $0 + $1.tokens }
         periodTotals[.all] = total   // All = 全量总计，无窗口
-        return projects.isEmpty ? nil : TokenSummary(totalTokens: total, projects: projects,
-                                                          models: models,
-                                                          requestCount: requests, daily: daily.sorted { $0.dayStart < $1.dayStart },
-                                                          periodTotals: periodTotals,
-                                                          periodProjects: periodProjects,
-                                                          periodModels: periodModels)
+        // 最近 10 次会话均速（tok/s，卡片副标题 meta）：一次会话 = 同一 session_id 的
+        // **output tokens** 合计 ÷ 会话时长（session.time_created → time_updated，毫秒）；
+        // 用户 2026-09-14 指定只算 output——input 是每轮重发的上下文，混入会把速率抬高一个量级。
+        // 均值口径归 recentSessionSpeed；ZCode 运行中库带 -wal，只读链路与上方聚合同源
+        var sessionSpeed: Double?
+        let speedSQL = """
+            SELECT SUM(m.output_tokens),
+                   s.time_created, s.time_updated
+            FROM model_usage m JOIN session s ON s.id = m.session_id
+            GROUP BY m.session_id
+            ORDER BY s.time_created DESC
+            """
+        if sqlite3_prepare_v2(db, speedSQL, -1, &stmt, nil) == SQLITE_OK {
+            var sessions: [(start: TimeInterval, tokens: Double, seconds: Double)] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let tokens = Double(sqlite3_column_int64(stmt, 0))
+                let created = Double(sqlite3_column_int64(stmt, 1))
+                let updated = Double(sqlite3_column_int64(stmt, 2))
+                sessions.append((start: created / 1000, tokens: tokens,
+                                 seconds: (updated - created) / 1000))
+            }
+            sessionSpeed = recentSessionSpeed(sessions)
+        }
+        sqlite3_finalize(stmt)
+        guard !projects.isEmpty else { return nil }
+        var summary = TokenSummary(totalTokens: total, projects: projects,
+                                   models: models,
+                                   requestCount: requests, daily: daily.sorted { $0.dayStart < $1.dayStart },
+                                   periodTotals: periodTotals,
+                                   periodProjects: periodProjects,
+                                   periodModels: periodModels)
+        summary.recentSessionSpeed = sessionSpeed
+        return summary
     }
 
     /// 异步取汇总：后台每 60s 重建缓存，fetch 只回缓存不触发读取
@@ -460,6 +508,8 @@ enum ZcodeTokenStore {
     static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
+    /// 已构建缓存的同步只读（nil = 尚未构建过）：卡片副标题 tok/s 用
+    static func cachedSummary() -> TokenSummary? { cache.cachedIfBuilt }
 
     // MARK: 数值格式化
 
@@ -558,8 +608,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 2026-09-12 用户指定可单独调；与弹窗的 Coin size 相互独立）。
     /// 在 `reloadInlineCoinSettings` 里按设置刷新。
     private var inlineCoinDiameter: CGFloat = CGFloat(CoinMetrics.defaultPanelSize)
-    /// 硬币与大数字之间的间距（硬币 frame 比标称直径略宽 1~2pt，间距留够避免视觉贴字）
-    private static let inlineCoinGap: CGFloat = 8
+    /// 硬币与大数字之间的间距 = 直径 × 0.25（2026-09-14 用户指定间距随硬币尺寸增减；
+    /// 默认 32pt 时 = 8pt 与原固定值等值）。硬币 frame 比标称直径略宽 1~2pt，间距留够避免视觉贴字
+    private static let inlineCoinGapRatio: CGFloat = 0.3
     /// 数字行带基准高（原硬编码 32）：数字 / 硬币 / 转圈共用它的中线，
     /// 硬币尺寸变化时不牵动数字的位置
     private static let numberRowBaseHeight: CGFloat = 32
@@ -875,20 +926,22 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             dotsImagesDirty = true  // 点阵位图按新几何重烘
             invalidateIntrinsicContentSize()
         }
-        totalRollView.frame = NSRect(x: insets.left + inlineCoinWidth, y: numberRowY,
-                                     width: max(0, bounds.width - insets.left - insets.right - inlineCoinWidth),
+        // 硬币大数值行左缩进 0（2026-09-14 用户指定）：硬币/大数字/spinner 整行贴
+        // 版心左缘，其余行（标题/列表/热力图）仍按 insets.left
+        totalRollView.frame = NSRect(x: inlineCoinWidth, y: numberRowY,
+                                     width: max(0, bounds.width - insets.right - inlineCoinWidth),
                                      height: Self.numberRowBaseHeight)
-        // 内嵌小硬币：贴版心左缘、以**数字行中线**垂直居中（不随硬币尺寸漂移，
+        // 内嵌小硬币：以**数字行中线**垂直居中（不随硬币尺寸漂移，
         // 所以「Panel coin size」调大调小都不会让硬币与数字错位）；
         // 宽高取硬币自身的紧凑边长（含厚度投影 + 弹跳余量）
         if showsInlineCoin {
             let side = inlineCoin.compactFittingHeight
-            inlineCoin.frame = NSRect(x: insets.left, y: numberRowCenterY - side / 2,
+            inlineCoin.frame = NSRect(x: 0, y: numberRowCenterY - side / 2,
                                       width: side, height: side)
         }
         // spinner 与大数字同带垂直居中、左对齐（小号系统转圈 ~16pt 见方）
         let spinSize = totalSpinner.intrinsicContentSize
-        totalSpinner.frame = NSRect(x: insets.left + inlineCoinWidth + 1,
+        totalSpinner.frame = NSRect(x: inlineCoinWidth + 1,
                                     y: numberRowCenterY - spinSize.height / 2,
                                     width: spinSize.width, height: spinSize.height)
         // 布局就绪后复算缩字号（打开瞬间 summary 落位时 view 可能尚未布局，宽度不可判）
@@ -898,7 +951,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 大数字行左侧内嵌硬币占掉的宽度（0 = 不显示）
     private var inlineCoinWidth: CGFloat {
-        showsInlineCoin ? inlineCoinDiameter + Self.inlineCoinGap : 0
+        showsInlineCoin ? inlineCoinDiameter * (1 + Self.inlineCoinGapRatio) : 0
     }
 
     /// 内嵌小硬币自转一圈（面板每次打开、以及 hover 换平台换数据时由外部调用）。
@@ -929,6 +982,10 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         inlineCoin.size = Double(inlineCoinDiameter)
         inlineCoin.thickness = s.thickness * Double(k)
         inlineCoin.markDepth = s.markDepth * Double(k)
+        // 边界阴影不乘 k：spread 是 160 盒单位，drawMark 里已按 sizeScale 自缩
+        // （与现状恒等 —— 之前常量口径同样不乘 k），乘了反而把小币的阴影压到近乎不可见
+        inlineCoin.markShadowOpacity = s.markShadowOpacity / 100
+        inlineCoin.markShadowSpread = s.markShadowSpread
         inlineCoin.logoScale = s.logoScalePercent / 100
         inlineCoin.material = s.material
         inlineCoin.logoArt = s.logoArt
@@ -1014,8 +1071,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 超出可用宽度时逐级缩字号（等宽 13 位数字也能放下；与原 draw 循环同参数）。
     /// 未布局（bounds 为 0）时跳过，等 layout() 就绪后复算
     private func applyTotalNumberSize(for text: String) {
-        // 可用宽要扣掉左侧内嵌硬币（它占的是同一行带），否则数字会压到硬币上
-        let availWidth = bounds.width - insets.left - insets.right - inlineCoinWidth
+        // 可用宽要扣掉左侧内嵌硬币（它占的是同一行带），否则数字会压到硬币上；
+        // 行左缩进 0，只扣右侧版心边距
+        let availWidth = bounds.width - insets.right - inlineCoinWidth
         guard availWidth > 40 else { return }
         var size: CGFloat = 26
         // 度量须用实际渲染字体（totalFont 与 totalRollView 同源）：Sharp Grotesk /
@@ -1217,8 +1275,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         super.draw(dirtyRect)
         rebuildMetricsIfNeeded()   // 文本度量/月份轴/行文本缓存：数据或字体变化时一次性重建
         let labelFont = makeLabelFont()
-        let labelColor = NSColor.secondaryLabelColor
-        // 区块标题统一系统灰 = 小表格口径（与列表行同色；切换文案的未选中态仍用次级灰）
+        // 次级文案 = **副前景灰**（2026-09-14 用户要求「Token 板块中的也改」）：覆盖面
+        // 周期切换（5h…All）/ 项目-模型切换 / 每日-每周切换的**未选中态**、月份轴、列表次要列 ——
+        // 与区块标题同源（= 系统灰为基准 + 按面板底色解算对比度补偿），原为系统
+        // `secondaryLabelColor`（只随外观分档、不随底色解算）
+        let labelColor = Palette.secondaryForeground
+        // 区块标题统一副前景灰 = 小表格口径（与列表行同色）
         let titleColor = SmallTable.textColor
 
         // ── 首行：平台名 + 总计（字重比区块标题低一档，两段间留 4pt 间距）──
@@ -1324,7 +1386,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// baseTotal = 百分比/hover 占比条的分母（周期口径：All = 全量总计，窗口 = periodTotals[period]）。
     /// 内容（icon/名/值/百分比）统一系统灰（语义色随主题适配）；
     /// hover 行（hoveredListRow）背景只显百分比条 + 1.2pt 发丝边框（2026-08-31 用户要求
-    /// 去掉用量行同款渐变底、边框保留），文字/icon 仍提亮到 Palette.cardForeground，
+    /// 去掉用量行同款渐变底、边框保留；2026-09-14 起占比条底色改用**卡片 hover 背景色**
+    /// `Palette.hoverGradientBright`），文字/icon 仍提亮到 Palette.cardForeground，
     /// 命中框回填 listRowRects 供 mouseMoved 判定。
     /// rowReveals = 平台切换动效的逐行交错进度（nil = 常态直绘）：每行裁切到行带、
     /// 内容自「起始全遮最小行程」(行高+墨迹高)/2 上滑显影，淡入全程同步（alpha=rv），
@@ -1421,15 +1484,18 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             defer { if rowMasked { cg?.restoreGState() } }
             let hovered = i == hoveredListRow
             let rowColor: NSColor = hovered ? Palette.cardForeground : SmallTable.textColor
-            // 百分比背景条（仅 hover 行显示）：按行占比从左到右填充行底
-            // （复用热力图无用量底点色，深 #262626/浅 210 灰）；常态行无背景
+            // 百分比背景条（仅 hover 行显示）：按行占比从左到右填充行底。
+            // 底色 = **卡片 hover 背景色**（`Palette.hoverGradientBright`，与 HoverMaterialHost
+            // 材质块同源：深 黑@30% / 浅 白@90%）—— 2026-09-14 用户「去掉百分比进度的背景色，
+            // 使用卡片 hover 背景色」：原用热力图无用量底点色（heatDotEmpty）自成一套灰。
+            // 常态行无背景
             if hovered {
                 let pctBarRatio = baseTotal > 0
                     ? CGFloat(p.tokens) / CGFloat(baseTotal) : 0
                 let barRect = NSRect(x: 0, y: rowY,
                                      width: bounds.width * pctBarRatio, height: rowH)
                 let barPath = NSBezierPath(roundedRect: barRect, xRadius: 6, yRadius: 6)
-                Palette.heatDotEmpty.setFill()
+                Palette.hoverGradientBright.setFill()
                 barPath.fill()
             }
             // hover 描边 2026-09-13 移入共享材质宿主（行间整块滑动，viewDidMoveToWindow
@@ -2035,21 +2101,36 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     /// 面板 icon 统一入口：来源（品牌 SVG / SF Symbol）一律 sourceAtop 单色化后按键缓存
-    /// （品牌色直接上屏在深色玻璃上不可读；单色化与文件历史定稿一致）
+    /// （品牌色直接上屏在深色玻璃上不可读；单色化与文件历史定稿一致）。
+    /// ⚠️ 键里带上解算后的色值：位图把颜色烘死了，色变了必须重烘 —— 副前景色会随面板底色
+    /// 加深/提亮，只按 symbol 命中的话换底色后面板里会留着旧灰的行图标
     private func tintedIcon(key: String, color: NSColor, make: () -> NSImage?) -> NSImage? {
-        if let cached = iconCache[key] { return cached }
+        let cacheKey = key + "@" + bakedColorTag(color)
+        if let cached = iconCache[cacheKey] { return cached }
         guard let base = make() else { return nil }
         let img = tintedImage(base, color)
-        iconCache[key] = img
+        iconCache[cacheKey] = img
         return img
     }
 
-    /// 列表行图标：SF Symbol 单色化（常态系统灰 = 行文本同色；hover 行提亮到主前景色，
+    /// 烘色位图的色标签（缓存键用）：按**视图生效外观**解算到 sRGB 再取分量 ——
+    /// lockFocus 里 NSAppearance.current 是系统外观，浅色主题下面板强制 aqua 时直读会解错分支
+    private func bakedColorTag(_ color: NSColor) -> String {
+        var resolved: NSColor?
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.sRGB)
+        }
+        guard let c = resolved else { return "?" }
+        return String(format: "%.3f,%.3f,%.3f,%.2f",
+                      c.redComponent, c.greenComponent, c.blueComponent, c.alphaComponent)
+    }
+
+    /// 列表行图标：SF Symbol 单色化（常态副前景灰 = 行文本同色；hover 行提亮到主前景色，
     /// 缓存键区分亮度）
     private func rowIcon(bright: Bool) -> NSImage? {
         let symbol = rowIconSymbol
         return tintedIcon(key: bright ? symbol + ".bright" : symbol,
-                          color: bright ? Palette.cardForeground : .systemGray) {
+                          color: bright ? Palette.cardForeground : Palette.secondaryForeground) {
             NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 9, weight: .medium))
         }
@@ -2076,13 +2157,17 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         }
     }
 
-    /// 叠色拷贝：底图 draw 后以 sourceAtop 盖前景色（保留 alpha 形状），与昵称签到角标同法
+    /// 叠色拷贝：底图 draw 后以 sourceAtop 盖前景色（保留 alpha 形状），与昵称签到角标同法。
+    /// ⚠️ 色值必须按**视图生效外观**解算（同 `bakedColorTag`）：lockFocus 里的
+    /// `NSAppearance.current` 是系统外观，动态色（副前景色）直读会解到深色分支
     private func tintedImage(_ base: NSImage, _ color: NSColor) -> NSImage {
         let out = NSImage(size: base.size)
         out.lockFocus()
         base.draw(in: NSRect(origin: .zero, size: base.size))
-        color.setFill()
-        NSRect(origin: .zero, size: base.size).fill(using: .sourceAtop)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            color.setFill()
+            NSRect(origin: .zero, size: base.size).fill(using: .sourceAtop)
+        }
         out.unlockFocus()
         return out
     }
