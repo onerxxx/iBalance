@@ -440,8 +440,12 @@ final class SubAccountItemView: NSStackView {
     /// 按 valueLabel 当前文本+字体重算墨迹回补（文本更新 / 字体策略切换后调用）
     func refreshOpticalPadding() {
         guard let lbl = valueLabel else { return }
+        // 兜底走主面板字体解析器（2026-09-15 SG 档全覆盖）：本 chip 的 valueLabel 经
+        // `BalancePanelView.registerFont` 建（font 恒非 nil），且字体档翻转后 applyPanelFonts
+        // 就地换字体 → 末字符 rsb 随之变，须重算墨迹回补（见 Panel.applyPanelFonts）
         applyOpticalPadding(text: lbl.stringValue,
-                            font: lbl.font ?? .systemFont(ofSize: ChipStyle.fontSize))
+                            font: lbl.font ?? PanelFont.font(size: ChipStyle.fontSize,
+                                                             weight: ChipStyle.fontWeight))
     }
 
     /// 离场下沉期间冻结背景写入。mouseExited 中 setHovered(false) 与离场块同拍执行，
@@ -864,7 +868,7 @@ protocol HeaderTintAdjustable: NSView {
 
 /// 无边框图标按钮（header 图标组共用）：hover 底自绘（hoverBgLayer 正圆 + hoverBackgroundColor），
 /// 系统 bezel 关闭，tracking area 管理「底色淡入 + 图标提亮到 hoverTintColor」。
-/// 默认提亮色 labelColor；header 五颗按钮走 PanelLayout.makeHeaderIconButton 统一构造，
+/// 默认提亮色 labelColor；header 六颗按钮走 PanelLayout.makeHeaderIconButton 统一构造，
 /// 不单独指定 hoverTintColor，hover 观感与同组一致。
 final class HoverIconButton: NSButton, PanelScrollHoverSync, HeaderIconDraggable, HeaderTintAdjustable {
     /// 按钮容器尺寸（正方形）

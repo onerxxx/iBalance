@@ -627,7 +627,11 @@ extension CoinSVG {
         var i = 0
 
         func flush() {
-            if let command, !buffer.isEmpty {
+            guard let command else { return }
+            // Z/z 是唯一的合法无参命令，也必须产出：丢掉它 closeSubpath 不执行、
+            // current 不回卷到子路径起点，其后的相对 moveto 全体平移
+            //（codex.svg 的箭头因此右移一个 h50.4，2026-09-15）
+            if !buffer.isEmpty || command == "z" || command == "Z" {
                 result.append((command, buffer))
                 buffer = []
             }

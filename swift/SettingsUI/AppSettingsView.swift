@@ -34,7 +34,10 @@ public enum SettingsSidebarItem: String, CaseIterable, Identifiable, Hashable {
     public var symbol: String {
         switch self {
         case .appearance: "paintbrush"
-        case .platforms: "circle.grid.2x2"
+        // 平台开关（2026-09-16 用户定稿）：`circle.grid.2x2.topleft.checkmark.filled`
+        // —— 多平台网格 + 左上角勾选，既表达「多个平台」也表达「开关勾选」。
+        // 历史：初版 `circle.grid.2x2`（只有网格，无勾选语义）→ 中途试过 `checkmark.square`（被否）
+        case .platforms: "circle.grid.2x2.topleft.checkmark.filled"
         case .accounts: "person.crop.circle.badge.plus"
         case .checkin: "checkmark.seal"
         case .coinDemo: "rotate.3d"
@@ -86,7 +89,8 @@ public struct AppSettingsView: View {
                 case .appearance: ThemePane(model: model)
                 case .platforms:
                     HostedPane(model: model, item: .platforms,
-                               fallbackIcon: .symbol("circle.grid.2x2"), fallbackTitle: "平台开关")
+                               fallbackIcon: .symbol("circle.grid.2x2.topleft.checkmark.filled"),
+                               fallbackTitle: "平台开关")
                 case .accounts: AccountsPane(model: model)
                 case .checkin: CheckinPane(model: model)
                 case .coinDemo:
@@ -412,32 +416,54 @@ private struct BouncePreview: View {
 
 // MARK: - 主题外观 pane（原面板右上角「主题调教」玻璃弹窗的 SwiftUI 原生版）
 
-/// 点阵主题色 + 面板 / 卡片外观。全部即时生效（不留「保存」按钮）——
+/// 主题预设 + 用量色 + 面板 / 卡片外观。
+/// 除顶部「主题预设」的「保存」按钮外全部即时生效 ——
 /// 与「菜单栏」「关于」等 pane 同口径：写入转交宿主动作（落盘 + 触发重绘）后
 /// 由模型 `sync()` 回读真实配置，所以这里用闭包 Binding 而不是 keyPath。
 private struct ThemePane: View {
-    let model: AppSettingsModel
+    /// 顶部「预设名称」输入框要写回模型草稿 → 需要 `$model.xxx` 取 Binding
+    ///（`@Bindable` 是属性包装器，不是宏，本 target 可用；见文件头注）
+    @Bindable var model: AppSettingsModel
+    // ⚠️ 本 pane **不读 `@Environment(\.colorScheme)`**：图卡的深浅档只由预设自己的
+    // 「浅色主题」开关决定（见 `presetThumb`），窗口/系统深浅不许漏进图卡。
+
+    init(model: AppSettingsModel) {
+        self.model = model
+    }
 
     var body: some View {
         Form {
+            // ── 「主题预设」（2026-09-15 用户要求：本页最上方）──
+            // 「保存」= 把本页**当前全部参数**固化成一枚预设（快照里该页那几项，见
+            // ThemePreset(name:snapshot:)）；每枚预设是一张**迷你面板**图卡（见 `presetThumb`，
+            // 2026-09-16 用户要求：预设不再是一行文字摘要，改成把该组参数画出来）。
+            // 预设列表存宿主 UserDefaults（ThemePresetStore），窗口每次打开由 sync() 回读
             Section {
-                // 主题色（2026-09-14 用户要求：原色相/饱和度/亮度三根滑杆 + 标题色样一起撤掉，
+                presetSaveRow
+                if model.snapshot.themePresets.isEmpty {
+                    Text("还没有预设。把下面的参数调成想要的样子，点「保存」固化一组。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    presetGrid
+                }
+            } header: {
+                Text("主题预设")
+            } footer: {
+                Text("「保存」把本页当前全部参数（用量色 / 面板背景色 + 顶端不透明度 / 次背景色 / 底端不透明度 / 浅色主题 / 图标深浅互换 / 无边框图标 / 长进度卡片 / 主标题字号 / Sharp Grotesk 字体）连同 3D 硬币的视觉身份（Preset / Style 两档 + 币面色 + 色场色）固化成一组，名字与已有预设重复时会先问是否覆盖；每张图卡就是该组参数的**可视预览**（底色遮罩两端不透明度 / 次背景色 / 用量色 / 主标题字号与字体 / 硬币视觉身份都画在上面），**点图卡即应用**、逐项原样写回（不做任何派生翻转），随时可切回来，蓝框那枚就是当前生效的一组。硬币的尺寸 / 厚度 / 边纹 / 姿态 / 自旋与上传的 logo 不属于主题，不随预设走。")
+            }
+            Section {
+                // 用量色（原「主题色」，2026-09-15 用户改名 —— 它只管用量类可视化那一支色阶，
+                // 与同组的「面板背景色 / 次背景色」不是一类，叫「主题色」会让人以为动它改整面板外观）。
+                // 2026-09-14 用户要求：原色相/饱和度/亮度三根滑杆 + 标题色样一起撤掉，
                 // 收成「面板」组里的一行系统色盘）——
                 // 拾色后由模型分解回 HSB 三参落值（下游点阵档位/卡片边框仍读 HSB，口径不变）；
-                // 主题色不含透明语义，故不透出不透明度滑杆
+                // 用量色不含透明语义，故不透出不透明度滑杆
                 LabeledContent {
-                    ColorPicker("主题色", selection: themeColor, supportsOpacity: false)
+                    ColorPicker("用量色", selection: themeColor, supportsOpacity: false)
                         .labelsHidden()
                 } label: {
-                    Text("主题色")
-                }
-                // 点阵背景色（2026-09-15 用户要求开放）：无用量底点 / 进度条轨道底 / 骨架行同源，
-                // 带不透明度（轨道与底点都是半透明观感）
-                LabeledContent {
-                    ColorPicker("点阵背景色", selection: heatDotEmptyColor, supportsOpacity: true)
-                        .labelsHidden()
-                } label: {
-                    Text("点阵背景色")
+                    Text("用量色")
                 }
                 // 面板底色（2026-09-14 用户要求：原「高对比背景」强度滑杆改制）——
                 // 行尾色块即系统色盘入口，点击弹出系统颜色面板（含「不透明度」滑杆，
@@ -447,6 +473,16 @@ private struct ThemePane: View {
                         .labelsHidden()
                 } label: {
                     Text("面板背景色")
+                }
+                // 次背景色（2026-09-15 用户要求：把原「点阵背景色」+「hover 背景色」两个参数
+                // **合并**成这一个，改名「次背景色」，并归到本「面板」栏）——
+                // 覆盖面板内第二层背景：无用量底点 / 进度条轨道底 / 骨架行 / Token 印章底 /
+                // 卡片 hover 材质块全部同源，带不透明度
+                LabeledContent {
+                    ColorPicker("次背景色", selection: secondaryBackgroundColor, supportsOpacity: true)
+                        .labelsHidden()
+                } label: {
+                    Text("次背景色")
                 }
                 // 遮罩上下两端的不透明度（2026-09-14 用户要求：删掉原「底端 = alpha × 0.65」的自动递减，
                 // 两端各给一个滑杆）。顶部滑杆与色盘的不透明度是同一字段的两个入口
@@ -461,10 +497,12 @@ private struct ThemePane: View {
             } header: {
                 Text("面板")
             } footer: {
-                Text("「主题色」= 点阵峰值配色（卡片边框同源）；「点阵背景色」= 无用量底点 / 进度条轨道底（骨架行同源）；「面板背景色」= 面板底色遮罩（色盘给颜色，其不透明度即顶端值）；「顶部/底部不透明度」= 遮罩纵向两端各管一档，两者相同即纯色、0% 露原生玻璃；「浅色主题」= 强制浅色外观，打开时仅在底色明度 ≤ 50% 时翻转其明度（已是亮底则保持）。")
+                Text("「用量色」= 用量强弱的色阶基色（原「主题色」，2026-09-15 改名）——卡片竖向点阵 / 长进度卡片进度条 / Token 热力图 / 卡片边框都从它派生出各档；「面板背景色」= 面板底色遮罩（色盘给颜色，其不透明度即顶端值）；「次背景色」= 面板内第二层背景（无用量底点 / 进度条轨道底 / 骨架行 / Token 印章底 / 卡片 hover 材质块同源，2026-09-15 由原「点阵背景色」与「hover 背景色」合并）；「顶部/底部不透明度」= 遮罩纵向两端各管一档，两者相同即纯色、0% 露原生玻璃；「浅色主题」= 强制浅色外观，打开时仅在底色明度 ≤ 50% 时翻转其明度（已是亮底则保持）。")
             }
             Section {
                 Toggle("图标深浅互换", isOn: toggle(\.iconThemeSwap, model.setIconThemeSwap))
+                // 无边框图标（2026-09-15 用户要求）：卡片品牌 icon 直接用同名 SVG 原图
+                Toggle("无边框图标", isOn: toggle(\.iconNoBorder, model.setIconNoBorder))
                 Toggle("长进度卡片", isOn: toggle(\.longProgressCard, model.setLongProgressCard))
                 // 主标题字号（2026-09-15 用户：区间收到 10…16、步进 0.5 —— 半档用于微调标题墨迹高，
                 // 读数同档显示小数）
@@ -473,33 +511,333 @@ private struct ThemePane: View {
                             set: model.setCardTitleFontSize,
                             in: 10...16, step: 0.5)
                 Toggle("Sharp Grotesk 字体", isOn: toggle(\.cardTitleSharpGrotesk, model.setCardTitleSharpGrotesk))
-                // 主副标题行距系数（2026-09-14 用户要求）：主标题不再写死行框高度，
-                // 行距 = 基准 1.5pt × 本系数；SG 字面更扁，单独一档（默认较小）
-                floatSliderRow("主副标题间距系数（系统字体）",
-                               get: { model.snapshot.cardTitleGapScaleSF },
-                               set: model.setCardTitleGapScaleSF,
-                               in: 0.2...2.0, step: 0.05)
-                floatSliderRow("主副标题间距系数（SG）",
-                               get: { model.snapshot.cardTitleGapScaleSG },
-                               set: model.setCardTitleGapScaleSG,
-                               in: 0.2...2.0, step: 0.05)
-                // 卡片 hover 背景色（2026-09-15 用户要求开放）：即 hover 时那块材质底（卡片 /
-                // 用量行 / Token 行共用），带不透明度
-                LabeledContent {
-                    ColorPicker("hover 背景色", selection: cardHoverBackgroundColor, supportsOpacity: true)
-                        .labelsHidden()
-                } label: {
-                    Text("hover 背景色")
-                }
+                // 主副标题行距系数（系统字体 / SG 两档）2026-09-15 用户「固化这两个参数，
+                // 然后在 forms 里隐藏调教」：两根滑杆与对应 config 键 / 宿主 setter 一并移除，
+                // 定稿值 SF ×0.30 / SG ×0.90（= 移除当刻的读数）写在
+                // BalancePanelView.cardTitleGapScaleSFFixed / SGFixed，此处不再暴露调节。
+                // 「hover 背景色」同日并入「面板 → 次背景色」，本组不再单列
             } header: {
                 Text("卡片")
             } footer: {
-                Text("「主标题字号」= 余额卡平台名（数值字号不变）；「Sharp Grotesk 字体」用本机安装版本（固定 Book20），未装该字重自动回落系统字体。间距系数 = 主标题行与副标题行之间距（基准 1.5pt）的倍率，按当前字体取对应档。「hover 背景色」= 鼠标悬停时那块底（卡片、用量行、Token 行共用）。")
+                Text("「主标题字号」= 余额卡平台名（数值字号不变）；「Sharp Grotesk 字体」用本机安装版本（固定 Book20），开启后面板内全部文字（卡片 / 用量表 / Token 板块 / 悬浮子面板）统一换用它，中文自动兜底苹方，未安装该字体时回落系统字体。主副标题行距系数已固化（系统字体 ×0.30 / SG ×0.90），不再开放调节。「hover 背景色」已并入「面板 → 次背景色」。")
+            }
+            // ── 动效（2026-09-16 用户要求：位数变化时整组左右平移的时长口径两种都落地）──
+            // 原先平移时长恒等于滚动预算 1.2s、与位移量无关 —— 位数增减时明显拖在滚字后面
+            Section {
+                // 动效曲线（2026-09-16 用户要求开放为设置项）：原先硬写死 ease-in cubic。
+                // 三档并排可比，故走 segmented（滑移时长只有两档且文案长，走 radioGroup）
+                Picker("动效曲线", selection: rollCurve) {
+                    ForEach(RollCurveOption.allCases) { opt in
+                        Text(opt.title).tag(opt.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Picker("滑移时长", selection: rollSlideTiming) {
+                    ForEach(RollSlideTimingOption.allCases) { opt in
+                        Text(opt.title).tag(opt.rawValue)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+            } header: {
+                Text("动效")
+            } footer: {
+                Text("「动效曲线」= 数值滚动的时间曲线（车轮位置 / 槽宽 / 位数变化平移三条量共用同一条，改一处即整体变）：从慢到快 = 起滚慢、末段最快、落定干脆；从快到慢 = 起手快、收尾长；慢-快-慢 = 两端减速、中段最快。单位换值时字符的滚入 / 滚出仍是另一条 ease-out，不随此项变。\n「滑移时长」= 位数增减（如 999.9 → 1,000.1）时**整组数字左右平移**的时长。原先是固定 1.2s、与移动距离无关。「跟随滚字」= 取本轮数字滚动的实际落定时刻（下限 0.30s），平移与滚字同拍收尾；「跟随位移」= 按实际移动距离在 0.30–0.60s 之间取，挪得少就快、挪得多也封顶。仅影响 Token 总计大数字的周期 / 平台切换；余额卡位数变化仍直接落值。\n两项都是动效参数，不进「主题预设」。")
             }
         }
     }
 
-    /// 主题色绑定：读 = 快照 HSB 三参经 `PanelThemeColor.rgb` 合成（与面板点阵同一解算，
+    // MARK: 主题预设（顶部「保存」+ 逐枚「应用 / 删除」）
+
+    /// 「保存」行：预设名称 + 保存按钮。按钮必须包在 HStack + Spacer 里才靠右 ——
+    /// grouped Form 里的裸 `Button` 恒独占一行且左对齐（同「关于」pane 的两个动作按钮）
+    private var presetSaveRow: some View {
+        HStack(spacing: 10) {
+            TextField("预设名称（可留空）", text: $model.themePresetName)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 220)
+            Spacer(minLength: 8)
+            Button("保存") { model.saveThemePreset() }
+        }
+    }
+
+    /// 预设图卡网格（2026-09-16 用户要求：预设从「一行文字摘要」改成「一张迷你面板」；
+    /// 同日「图卡太大」→ 收成**竖版长方形**）。
+    /// 列宽自适应 108…132：默认 680pt 窗口（内容区 ~430）三列、每列 ≈132pt（缩略图 ≈124pt 宽），
+    /// 最小窗口三列 ≈122pt。min 取 108 是为了锁住列数 —— 再小就凑出四列、卡片内那句主标题会挤
+    private var presetGrid: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 108, maximum: 132), spacing: 12)],
+                  alignment: .leading, spacing: 16) {
+            ForEach(model.snapshot.themePresets) { preset in
+                presetCard(preset)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    /// 单枚预设 = 迷你面板缩略图（**点它 = 应用**）+ 名字行（行尾垃圾桶 = 删除）。
+    /// 命名与交互照 macOS 系统设置「外观」那套：图缩略图即选项、名字居中在图下、
+    /// 当前生效那枚加一圈系统蓝描边（见 `presetThumb` 的 isActive）。
+    /// ⚠️ 垃圾桶不能压在缩略图上做 overlay —— 外层是 Button，overlay 里再放 Button 命中判定不可靠；
+    /// 放在名字行里，并用同宽占位保持名字居中。
+    private func presetCard(_ preset: ThemePreset) -> some View {
+        let isActive = preset.matches(model.snapshot)
+        return VStack(spacing: 6) {
+            Button { model.applyThemePreset(preset) } label: {
+                presetThumb(preset, isActive: isActive)
+            }
+            .buttonStyle(.plain)
+            .help("应用这组预设")
+            HStack(spacing: 4) {
+                Color.clear.frame(width: 16, height: 1)
+                Text(preset.name)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity)
+                Button(role: .destructive) { model.deleteThemePreset(id: preset.id) } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.red)
+                }
+                .buttonStyle(.borderless)
+                .frame(width: 16)
+                .help("删除这组预设")
+            }
+        }
+    }
+
+    /// 迷你面板缩略图（**竖版：约 124×152pt**，2026-09-16 用户「图卡太大 → 改竖版长方形」）：
+    /// 把该组预设**看得见的参数**画成一张小面板，自外向内三层 ——
+    /// ① 底色遮罩（**铺满整张图卡**：顶端 = `panelBackgroundColor.alpha`、底端 =
+    ///    `panelBackgroundBottomAlpha` 的竖直渐变）。卡外**不加任何底**（2026-09-16 用户
+    ///    「不要加这层东西 透明就行」）—— 遮罩 alpha < 1 处直接透出设置窗口自己的底，
+    ///    所以图卡上那道渐变就是面板真实的「一端实、一端透」；
+    /// ② 次背景色卡片（内含卡片 icon + 主标题：**字号 / Sharp Grotesk / 主前景色**都体现在这行字上，
+    ///    主前景色按预设的「浅色主题」开关解档 —— 开 = 面板走浅色外观，字就是那档的深色）；
+    /// ③ 用量色进度条（轨道仍是次背景色、填充读 `PanelHeatRamp` 与主面板同一条色阶，
+    ///    「长进度卡片」开关改它的长度）；
+    /// 卡片与进度条贴顶排，**底端居中**另落一枚硬币（见 `miniCoin`），中间那条带即底色遮罩本身。
+    /// 高度写死、宽度吃列宽：列宽被网格钉在 108…132，所以恒为竖版长方形。
+    /// 选中态 = 系统蓝描边（外扩 5pt、线宽 2.5 ⇒ 与面板留 2.5pt 缝；内容不重叠，
+    /// 有无描边都不改缩略图尺寸 ⇒ 网格不跳）。
+    private func presetThumb(_ preset: ThemePreset, isActive: Bool) -> some View {
+        // 面板外观档：**只由预设自己的「浅色主题」开关决定**（开 = 浅色外观，关 = 深色外观）。
+        // ⚠️ 2026-09-16 用户「主题预设的各种主题，需要对当前的深浅色设置做隔离」：
+        // 原先写的是 `!lightThemeEnabled && colorScheme == .dark` —— 系统/窗口翻深浅、
+        // 当前面板换主题，都会把**所有**图卡重画成另一副样子（连主前景色、图标档、
+        // 进度条色阶方向都跟着翻），而图卡上写的参数一个都没变，读起来就是「设置的数字和
+        // 图不符」。现在档位完全由预设自带的那一个布尔决定 ⇒ 图卡对当前环境**免疫**：
+        // 只有改预设本身的参数才会变。（真实面板确实跟随系统外观，图卡必须挑一档 ——
+        // 挑「关 = 深色」这一档，与用户日常看到的观感一致）
+        let appearanceDark = !preset.lightThemeEnabled
+        let fg = Color(nsColor: PanelForegroundColor.resolved(dark: appearanceDark))
+        let bg = preset.panelBackgroundColor
+        let maskTop = Color(nsColor: bg.nsColor)
+        let maskBottom = Color(nsColor: bg.withAlpha(preset.panelBackgroundBottomAlpha).nsColor)
+        let secondary = Color(nsColor: preset.secondaryBackgroundColor.nsColor)
+        return ZStack {
+            // 面板本体 = 底色遮罩，铺满整张图卡（外面那层「玻璃底」2026-09-16 用户要求删除）
+            RoundedRectangle(cornerRadius: 10)
+                .fill(LinearGradient(colors: [maskTop, maskBottom],
+                                     startPoint: .top, endPoint: .bottom))
+            VStack(alignment: .leading, spacing: 9) {
+                // 板块大标题（= 主面板每个板块头顶那行「API / Token / Usage / Agent」）：
+                // 字号与卡片主标题**同一档**（板块标题跟随 `cardTitleFontSize`，这是预设里那个
+                // 字号参数的四个消费点之一，图卡得把它们画出来）；
+                // 色是主面板的副前景色 —— 图卡把它近似成主前景色压暗（真解算
+                // `Palette.secondaryForeground` 按底色推对比度，在宿主 target，图卡拿不到）
+                Text("API")
+                    .font(Self.titleFont(preset))
+                    .foregroundStyle(fg.opacity(0.62))
+                    .lineLimit(1)
+                // 余额卡（次背景色）：icon + **平台名**（主面板里那张卡的标题是平台名，
+                // 板块大标题才是「API」；icon 用 DeepSeek 当例子，名字就对应用 DeepSeek）
+                HStack(spacing: 6) {
+                    miniCardIcon(preset, appearanceDark: appearanceDark)
+                    Text("DeepSeek")
+                        .font(Self.titleFont(preset))
+                        .foregroundStyle(fg)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)   // 16pt + SG 时这名字最宽，别截断
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(secondary))
+                // 进度条宽度要按可用宽算（长进度卡片 = 占满），只能借 GeometryReader
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(secondary)
+                        Capsule()
+                            .fill(LinearGradient(colors: Self.progressStops(preset, dark: appearanceDark),
+                                                 startPoint: .leading, endPoint: .trailing))
+                            .frame(width: geo.size.width * (preset.longProgressCard ? 1 : 0.62))
+                    }
+                }
+                .frame(height: 5)
+                Spacer(minLength: 0)
+            }
+            // 左右内缩进 12 → 8（2026-09-16 用户「mini 面板的左右内缩进缩小」）：
+            // 图卡是窄竖版，12pt 两边一挤版心只剩 ~98pt，卡片显得又瘦又空
+            .padding(.horizontal, 8)
+            .padding(.vertical, 10)
+            // 硬币落底居中（竖版：上面卡片 + 进度条，中间留出底色遮罩那条带，底下一枚币）
+            VStack {
+                Spacer(minLength: 0)
+                miniCoin(preset, box: 56)
+            }
+            .padding(.bottom, 10)
+        }
+        .frame(height: 152)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        // 面板自身那道细描边跟着面板走（外圈透明后它就是图卡的边界）。
+        // 色取**预设自己那档主前景色**（不是 `Color.primary`）—— 与面板同源，也不吃窗口深浅
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(fg.opacity(0.18), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.30), radius: 2.5, y: 1)
+        // 选中框：外扩 5pt、线宽 2.5（`strokeBorder` 是内描 ⇒ 与面板之间留 **2.5pt**）。
+        // 常量占位，有无描边都不改缩略图尺寸 ⇒ 网格不跳
+        .padding(5)
+        .overlay {
+            if isActive {
+                RoundedRectangle(cornerRadius: 15)
+                    .strokeBorder(Color.accentColor, lineWidth: 2.5)
+            }
+        }
+    }
+
+    /// 卡片品牌 icon 的示例（图卡统一用 **DeepSeek** 的图标当例子）：**两条来源跟预设走** ——
+    /// - 「无边框图标」开 = 同名 **SVG 原图**（去 Icon Composer 底板），主机给 template 图，
+    ///   这里按该档主前景色着色（与面板 `contentTintColor` 同一档：外观 ⊕ 图标深浅互换）；
+    /// - 关 = Icon Composer **PNG**（自带底板，原色直画）。
+    /// 深浅档 = 面板外观是否深色 **异或**「图标深浅互换」，与宿主 `brandIconDark` 同一条式子。
+    /// 宿主没注入图标（预览环境）时回退成示意方块。
+    @ViewBuilder
+    private func miniCardIcon(_ preset: ThemePreset, appearanceDark: Bool) -> some View {
+        let iconDark = appearanceDark != preset.iconThemeSwap
+        let req = BrandIconRequest(key: "deepseek", dark: iconDark, borderless: preset.iconNoBorder)
+        if let img = model.iconProvider?(req) {
+            if preset.iconNoBorder {
+                // template 图：着色取该档主前景色（`PanelForegroundColor` 与宿主同一解算体）。
+                // ⚠️ 必须 `.resizable()` —— `Image(nsImage:)` 默认按图自身尺寸（24pt 基准框）绘制，
+                // 只给 frame 不会缩，会盖住右边那句主标题
+                Image(nsImage: img)
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(Color(nsColor: PanelForegroundColor.resolved(dark: iconDark)))
+                    .frame(width: 14, height: 14)
+            } else {
+                Image(nsImage: img).resizable().scaledToFit().frame(width: 14, height: 14)
+            }
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 3).fill(Color.black.opacity(0.45))
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Color(nsColor: PanelForegroundColor.resolved(dark: iconDark)))
+                    .frame(width: 6, height: 6)
+            }
+            .frame(width: 14, height: 14)
+        }
+    }
+
+    /// 硬币的**真实 3D 渲染**（宿主按视觉身份四项离屏出的那枚币，见 `CoinThumbnailRenderer`）：
+    /// 几何 / 工艺 / 姿态都是用户自己在「3D 硬币」pane 里调的那一套，图卡只换币面色 / 色场色 /
+    /// 两档视觉身份 —— 即「应用这组预设后面板里那枚币长什么样」。
+    /// 宿主没注入（Xcode 预览）或渲染失败 → 回退成同色示意币（平面圆盘 + 色场光晕 + 线稿档）。
+    @ViewBuilder
+    private func miniCoin(_ preset: ThemePreset, box: CGFloat) -> some View {
+        if let img = model.coinThumbnailProvider?(CoinVisualIdentity(preset), box) {
+            // 图自然尺寸 = box（含投影轮廓），直接用其 pt 尺寸，不再缩放
+            Image(nsImage: img)
+        } else {
+            Self.drawnCoin(preset, size: box * 0.78).frame(width: box, height: box)
+        }
+    }
+
+    /// 示意币（**仅预览环境 / 渲染失败时的兜底**）：币面色圆盘 + 斜向高光 + 色场光晕 + 线稿档。
+    /// 真机走的是上面那条 3D 渲染，这里只是让 SwiftUI 预览与失败路径有个像样的替身
+    private static func drawnCoin(_ preset: ThemePreset, size: CGFloat) -> some View {
+        let material = coinColor(preset.coinMaterialColor)
+        let field = coinColor(preset.coinFieldColor)
+        let outline = preset.coinAppearance != ThemePreset.defaultCoinAppearance
+        let hasField = preset.coinPreset != ThemePreset.defaultCoinPreset
+        return ZStack {
+            if hasField {
+                // endRadius = 半径 ⇒ 帧边缘处正好淡到 0，方形帧的四角看不出来（无硬边）
+                Circle()
+                    .fill(RadialGradient(colors: [field.opacity(0.75), field.opacity(0)],
+                                         center: .center, startRadius: 0, endRadius: size / 2))
+                    .frame(width: size * 1.9, height: size * 1.9)
+            }
+            if outline {
+                Circle().strokeBorder(material, lineWidth: size * 0.07)
+                    .frame(width: size, height: size)
+                Circle().strokeBorder(material.opacity(0.5), lineWidth: 1)
+                    .frame(width: size * 0.62, height: size * 0.62)
+                RoundedRectangle(cornerRadius: size * 0.05).fill(material)
+                    .frame(width: size * 0.34, height: size * 0.16)
+            } else {
+                Circle().fill(material).frame(width: size, height: size)
+                Circle()
+                    .fill(LinearGradient(colors: [.white.opacity(0.55), .white.opacity(0.04),
+                                                  .black.opacity(0.30)],
+                                         startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: size, height: size)
+                RoundedRectangle(cornerRadius: size * 0.05).fill(Color.black.opacity(0.24))
+                    .frame(width: size * 0.36, height: size * 0.34)
+            }
+        }
+        .frame(width: size, height: size)
+    }
+
+    /// 缩略图里那两句主标题的字体档（板块大标题 + 卡片标题共用）：主面板字号 **× 0.7** ——
+    /// 图卡宽 ≈ 主面板的一半（122 vs 264），文字按比例缩才读得出「这是面板的缩影」；
+    /// 原样 13.5pt 塞进 122pt 宽的卡里又大又挤。系数先试过 0.5（2026-09-16 用户「太小了 70%吧」）
+    /// —— 0.7 比严格半比例大一档，是**可读性**换来的：13.5 → 9.45pt，档差（10/16pt → 7/11.2pt）更明显。
+    /// SG 开关 → 本机 PostScript 名（未装自动回落系统字体），否则系统字体。
+    /// ⚠️ 字体名是**字面量**（`PanelFont` 在宿主 target，本 target 引不到）；
+    /// 宿主改了 `PanelFont.sgPostScriptName` 就得同步这里。
+    /// ⚠️ **只缩字号**：icon 恒 14pt = 主面板图标列 27.75pt 的严格半比例，不跟这个系数走
+    private static let thumbnailTypeScale: CGFloat = 0.7
+    private static func titleFont(_ preset: ThemePreset) -> Font {
+        let pt = CGFloat(preset.cardTitleFontSize) * thumbnailTypeScale
+        return preset.cardTitleSharpGrotesk
+            ? .custom("SharpGrotesk-Book20", size: pt)
+            : .system(size: pt, weight: .medium)
+    }
+
+    /// 预设里的用量色**峰值** RGB（HSB → RGB，各 0…1）：解算体与面板点阵 / 本页色盘同一份
+    private static func peakRGB(_ preset: ThemePreset) -> (red: CGFloat, green: CGFloat, blue: CGFloat) {
+        PanelThemeColor.rgb(hue: CGFloat(preset.heatHue),
+                            saturation: CGFloat(preset.heatSaturation),
+                            brightness: CGFloat(preset.heatBrightness))
+    }
+
+    /// 图卡进度条的渐变两端：**与主面板「长进度卡片」同一条色阶**（档位序列 + 压暗系数都读
+    /// `PanelHeatRamp`）—— 深色 = 左暗端（峰值 ×0.62）→ 右峰值；浅色 = 左峰值 → 右最暗（×0.33）。
+    /// ⚠️ 2026-09-16 用户「进度条的渐变颜色还是相反了」：原来是 `[峰值, 峰值@50%]`，
+    /// 左强右弱（与面板反向），且右端靠 alpha 朝底色发灰 —— 浅底上那一端反而更亮。
+    /// 压暗必须走「峰值 RGB × 系数」，不能叠透明度。
+    private static func progressStops(_ preset: ThemePreset, dark: Bool) -> [Color] {
+        let peak = peakRGB(preset)
+        return PanelHeatRamp.progressLevels(dark: dark).map { level in
+            let f = PanelHeatRamp.factor(level: level, dark: dark)
+            return Color(nsColor: NSColor(calibratedRed: peak.red * f, green: peak.green * f,
+                                          blue: peak.blue * f, alpha: 1))
+        }
+    }
+
+    /// 预设里的硬币颜色串（`#RRGGBB`，宿主 `CoinRGB` 的落串）→ Color。
+    /// 复用 `PanelBackgroundColor(hex:)` 的解析（同一套十六进制口径，6 位按不透明处理），
+    /// 解析失败按 sGHO 的币面色兜底 —— 宿主写进预设的一定是合法 hex，走到这一步只可能是手改坏了预设 JSON
+    private static func coinColor(_ hex: String) -> Color {
+        let fallback = PanelBackgroundColor(hue: 0.33, saturation: 1, brightness: 0.86, alpha: 1)
+        return (PanelBackgroundColor(hex: hex) ?? fallback).swiftUIColor
+    }
+
+    /// 用量色绑定：读 = 快照 HSB 三参经 `PanelThemeColor.rgb` 合成（与面板点阵同一解算，
     /// 色块所见即面板所得；色盘轮盘/明度也随之定位）；
     /// 写 = 色盘给的颜色分解回 HSB —— 先归一到 sRGB 再读分量，
     /// ⚠️ `hueComponent` 只对 RGB 空间有效（灰度 / 设备空间直接读会抛异常），
@@ -532,36 +870,24 @@ private struct ThemePane: View {
                 set: { model.setPanelBackgroundColor(PanelBackgroundColor(swiftUIColor: $0)) })
     }
 
-    /// 点阵背景色绑定（2026-09-15）：同底色口径 —— 快照读写 + 宿主落盘后回读
-    private var heatDotEmptyColor: Binding<Color> {
-        Binding(get: { model.snapshot.heatDotEmptyColor.swiftUIColor },
-                set: { model.setHeatDotEmptyColor(PanelBackgroundColor(swiftUIColor: $0)) })
+    /// 次背景色绑定（2026-09-15 由「点阵背景色」+「hover 背景色」合并）：
+    /// 同底色口径 —— 快照读写 + 宿主落盘后回读
+    private var secondaryBackgroundColor: Binding<Color> {
+        Binding(get: { model.snapshot.secondaryBackgroundColor.swiftUIColor },
+                set: { model.setSecondaryBackgroundColor(PanelBackgroundColor(swiftUIColor: $0)) })
     }
 
-    /// 卡片 hover 背景色绑定（2026-09-15）：同底色口径
-    private var cardHoverBackgroundColor: Binding<Color> {
-        Binding(get: { model.snapshot.cardHoverBackgroundColor.swiftUIColor },
-                set: { model.setCardHoverBackgroundColor(PanelBackgroundColor(swiftUIColor: $0)) })
+    /// 数值滚动滑移时长口径绑定（单选，跨 target 传 rawValue 字符串）：
+    /// 快照读写，写入转交宿主动作（落盘 + 同步 RollingNumberView 静态镜像）后回读
+    private var rollSlideTiming: Binding<String> {
+        Binding(get: { model.snapshot.rollSlideTiming },
+                set: { model.setRollSlideTiming($0) })
     }
 
-    /// 系数滑杆行：同款布局，量纲为小数（步进可配，读数按 ×1.00 呈现）
-    private func floatSliderRow(_ title: String, get: @escaping () -> Double,
-                                set: @escaping (Double) -> Void,
-                                in range: ClosedRange<Double>, step: Double) -> some View {
-        LabeledContent {
-            HStack(spacing: 10) {
-                Slider(value: snapped(Binding(get: get, set: set), in: range, step: step), in: range)
-                    .frame(width: 150)
-                Text(String(format: "×%.2f", get()))
-                    .font(.footnote)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(width: 56, alignment: .trailing)
-                    .accessibilityHidden(true)
-            }
-        } label: {
-            Text(title)
-        }
+    /// 数值滚动时间曲线档位绑定（同滑移时长口径：rawValue 字符串跨 target）
+    private var rollCurve: Binding<String> {
+        Binding(get: { model.snapshot.rollCurve },
+                set: { model.setRollCurve($0) })
     }
 
     /// 字号滑杆行（pt，步进 0.5）：布局同其他滑杆行，读数为整数不补小数、
@@ -854,7 +1180,8 @@ private struct OperationRow: View {
                 .frame(width: 18)
                 .foregroundStyle(.secondary)
         case .platform(let key):
-            if let img = model.iconProvider?(key) {
+            // 深浅档固定取 dark、带边框（账号行历来如此）；「主题预设」图卡另按预设解档
+            if let img = model.iconProvider?(BrandIconRequest(key: key, dark: true)) {
                 Image(nsImage: img)
                     .resizable()
                     .scaledToFit()

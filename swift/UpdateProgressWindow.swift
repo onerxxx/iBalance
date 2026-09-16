@@ -833,7 +833,7 @@ final class UpdateProgressWindowController: NSObject, NSWindowDelegate {
         notesScroll.hasHorizontalScroller = false
         notesScroll.autohidesScrollers = true
         notesScroll.wantsLayer = true
-        // hover 卡片同款皮肤（动态色，随窗口外观深浅切换）：点阵主题色@30% 描边 +
+        // hover 卡片同款皮肤（动态色，随窗口外观深浅切换）：用量色@30% 描边 +
         // 深色 黑@50% 底 / 浅色 白@90% 底（Palette.hoverBorderBright /
         // hoverGradient 取值，与面板 hover 卡片同源）；圆角由
         // ConcentricScrollView.cornerConfiguration（containerConcentric）驱动。

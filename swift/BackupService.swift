@@ -2,7 +2,7 @@
 //
 // ─── 数据范围 ───
 // · config：AppConfig 全量（含 7 个凭据字段——钥匙串 bundle 的同一份数据，明文导出）
-// · defaults：应用自己的 UserDefaults 持久域整包（面板排序/折叠/主题色/3D 硬币/弹跳参数/
+// · defaults：应用自己的 UserDefaults 持久域整包（面板排序/折叠/用量色/3D 硬币/弹跳参数/
 //   签到标记与历史等），取 `persistentDomain(forName:)` 而非逐键枚举——新键自动跟着走
 // · 刻意不含 cache.json（数值缓存，可重建）与 usage.json（用量观测，属数据不属于设置）
 //

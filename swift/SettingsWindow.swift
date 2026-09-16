@@ -87,6 +87,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         coinDemoPanelIfNeeded().stageHost
     }
 
+    /// 「主题预设」应用后回灌「3D 硬币」pane（宿主 `applyCoinIdentity` 调）：预设把硬币的
+    /// 视觉身份四项改掉了，参数区的控件初值与硬币预览都得跟着走。
+    /// 面板**没建过就什么都不做** —— 建的时候本来就按当时的磁盘值初始化控件，那一刻不存在旧值
+    func reloadCoinPanelIfNeeded() {
+        coinDemoPanel?.reloadFromDisk()
+    }
+
     /// Control / Edge / Motion 三个 Section 的内容 = 三块参数区（裸模式，当普通 Form 行）
     private func coinParamsGroupIfNeeded(_ index: Int) -> NSView {
         let groups = coinDemoPanelIfNeeded().splitGroupViews
@@ -122,10 +129,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     /// AppDelegate 启动接线时装配一次；闭包弱捕获 self，重复 configure 直接覆盖
     func configure(actions: AppSettingsActions, snapshot: @escaping () -> AppSettingsSnapshot,
-                   iconProvider: ((String) -> NSImage?)? = nil) {
+                   iconProvider: ((BrandIconRequest) -> NSImage?)? = nil,
+                   coinThumbnail: ((CoinVisualIdentity, CGFloat) -> NSImage?)? = nil) {
         model.actions = actions
         model.snapshotProvider = snapshot
         model.iconProvider = iconProvider
+        model.coinThumbnailProvider = coinThumbnail
     }
 
     /// - Parameter pane: 打开后定位到的 pane（缺省 = 侧栏第一项「主题外观」）；面板「Key / 额度」磁贴、

@@ -7,7 +7,20 @@ import AppKit
 import CoreImage
 import SwiftUI
 
-/// 点阵主题色的**取值域与解算**（HSB → RGB 的唯一实现）。2026-09-14 由设置窗口三根滑杆
+/// 主前景色（卡片文字色）的**唯一解算体**：宿主 `Palette.cardForeground`（动态色）与
+/// `Palette.resolvedCardForeground(dark:)`（静态档），以及设置窗口「主题预设」图标的右下圆，
+/// 都读这一份 —— 跨 target 共用同一个色号，免得两处各写一遍后漂移。
+/// 深色外观 #EBEBEB / 浅色外观 0.13 黑灰（2026-09-15 从宿主 Panel.swift 上收，
+/// 与 `PanelThemeColor` 同一条「取值域放 SettingsUI、宿主引用」的共存口径）。
+public enum PanelForegroundColor {
+    public static func resolved(dark: Bool) -> NSColor {
+        dark
+            ? NSColor(calibratedRed: 0xEB/255.0, green: 0xEB/255.0, blue: 0xEB/255.0, alpha: 1)
+            : NSColor(calibratedWhite: 0.13, alpha: 1)
+    }
+}
+
+/// 用量色的**取值域与解算**（HSB → RGB 的唯一实现）。2026-09-14 由设置窗口三根滑杆
 /// 改制成系统色盘时上提到这里：宿主 `Palette.heatPeakRGB`（点阵档位色 / 卡片边框 / 热力图印章）
 /// 与设置窗口色盘色块共用同一份 —— 与 `MenuBarBounceSettings.solve` 同一条
 /// 「两边各写一份迟早漂移」的共存铁律。
@@ -51,6 +64,39 @@ public enum PanelThemeColor {
         }
         return (hue, saturation, brightness)
     }
+
+    /// 内置默认用量色的 HSB 三参（各 0…1）：峰值基准亮黄绿 (225, 254, 119) 的分解 ——
+    /// hue=(2+(B−R)/Δ)/6、sat=Δ/max、V=max/255。**宿主 `Palette.heatPeakDefault*`
+    /// 直接引用这三个常量**（不再各写一份算式），「主题预设」缺项兜底同源。
+    public static let defaultHue: CGFloat = (2 + (119 - 225) / 135) / 6
+    public static let defaultSaturation: CGFloat = 135.0 / 254.0
+    public static let defaultBrightness: CGFloat = 254.0 / 255.0
+}
+
+/// 用量色的**档位坡**（峰值色 × 压暗系数）：用量类可视化色阶的唯一实现。
+/// 2026-09-16 从宿主 `Palette.heatLevelColor` 上收 —— 「主题预设」图卡那根进度条必须画
+/// **与主面板「长进度卡片」完全同一条**两端（深色 左暗端→右峰值 / 浅色 左峰值→右最暗），
+/// 各写一份必然漂移；**「图卡的渐变颜色正好相反」那次就是这么来的**。
+/// 消费点三处读同一份：卡片竖排点阵 4 档、长进度卡片进度条渐变、主题预设图卡进度条。
+public enum PanelHeatRamp {
+    /// 深色档压暗系数（1…4 档，档 4 = 峰值；2026-09-15 用户「提亮两个较暗的」定稿）
+    public static let darkFactors: [CGFloat] = [0.62, 0.76, 0.88, 1.0]
+    /// 浅色档最暗端系数（1.0 → 0.33 线性：浅底上「越暗 = 用量越高」）
+    public static let lightFactorAtMax: CGFloat = 0.33
+
+    /// 档位（1…4，越界夹取）→ 峰值色的压暗系数。
+    /// ⚠️ 是「峰值 RGB × 系数」而不是叠透明度：叠 alpha 会朝底色发灰，
+    /// 在浅底上那一端反而**更亮**，两端方向读起来就反了
+    public static func factor(level: Int, dark: Bool) -> CGFloat {
+        let l = min(max(level, 1), 4)
+        if dark { return darkFactors[l - 1] }
+        return 1 + (lightFactorAtMax - 1) * CGFloat(l - 1) / 3
+    }
+
+    /// 进度条渐变的档位序列（长进度卡片与图卡共用）：深色 = L1→L4（左暗端 → 右峰值）；
+    /// 浅色 = L2→L4（左峰值 → 右最暗）。方向随 2026-09-15「翻转颜色对应的进度表示」定稿，
+    /// 与竖态点阵同向：低进度端在同侧
+    public static func progressLevels(dark: Bool) -> [Int] { dark ? [1, 4] : [2, 3, 4] }
 }
 
 /// 面板「面板背景色」：主面板底色遮罩的颜色。
@@ -63,9 +109,9 @@ public enum PanelThemeColor {
 /// ⚠️ **存储以 HSB 为准，RGB 只是派生渲染值**（`red/green/blue` 是计算属性）。
 /// 原因见 `brightnessFlipped`：若按 RGB 存储，「浅色主题」开关的明度翻转会在
 /// 翻转结果落到灰阶（V=1 → 纯黑、V=0 → 纯白）时**永久丢掉色相与饱和度**。
-/// 与点阵「主题色」的存储口径一致（那边也是 HSB 三参分开存）。
+/// 与「用量色」的存储口径一致（那边也是 HSB 三参分开存）。
 /// 落盘格式 `hsv:H,S,V,A`（见 `configValue`，config.json 可手改；旧 `#RRGGBBAA` 仍可读）。
-public struct PanelBackgroundColor: Equatable {
+public struct PanelBackgroundColor: Equatable, Codable {
     /// 色相 / 饱和度 / 明度 / 不透明度（各 0…1）—— 存储真值，渲染用的 RGB 由前三者合成
     public var hue: Double
     public var saturation: Double
@@ -75,13 +121,12 @@ public struct PanelBackgroundColor: Equatable {
     /// 默认 = 原「高对比背景 100%」的顶部色（近黑 @70%）：老配置迁移到新键时观感不变
     public static let `default` = PanelBackgroundColor(red: 0.02, green: 0.02, blue: 0.02, alpha: 0.70)
 
-    /// 点阵**背景色**默认（= 无用量底点 / 进度条轨道底 / 骨架行；2026-09-15 起设置窗口可改）：
-    /// 深灰 #292929，与旧内置值同源。浅色主题开关会把明度翻转（翻到 ≈ #d6d6d6）
-    public static let heatDotEmptyDefault = PanelBackgroundColor(red: 0x29 / 255.0, green: 0x29 / 255.0,
-                                                                 blue: 0x29 / 255.0, alpha: 1)
-    /// 卡片 **hover 背景色**默认（= `HoverMaterialHost` 材质块底色；2026-09-15 起设置窗口可改）：
-    /// 黑 @30%，与旧内置值同源（浅色主题开关 → 白 @30%）
-    public static let cardHoverDefault = PanelBackgroundColor(red: 0, green: 0, blue: 0, alpha: 0.30)
+    /// **次背景色**默认（= 无用量底点 / 进度条轨道底 / 骨架行 / 卡片 hover 材质块 / Token 印章底；
+    /// 设置窗口「面板 → 次背景色」可改）：深灰 #292929（不透明），沿用原「点阵背景色」的内置默认 ——
+    /// 它覆盖面板上面积最大的常驻元素（底点/轨道/骨架），合并后以常驻面为准更稳。
+    /// 浅色主题开关会把明度翻转（翻到 ≈ #d6d6d6）
+    public static let secondaryBackgroundDefault = PanelBackgroundColor(red: 0x29 / 255.0, green: 0x29 / 255.0,
+                                                                       blue: 0x29 / 255.0, alpha: 1)
 
     /// 遮罩**底端**不透明度的默认值（0…1）：= 默认色自身的 alpha（两端同值 ⇒ 纯色遮罩）。
     /// 2026-09-14 起上下两端各自独立（`panel_background_bottom_alpha`），此值只作各处属性的初值；
@@ -213,6 +258,245 @@ public struct PanelBackgroundColor: Equatable {
                       blue: Double((v >> 8) & 0xFF) / 255,
                       alpha: Double(v & 0xFF) / 255)
         }
+    }
+
+    /// Codable 落盘格式**跟着 config.json 走**（`hsv:H,S,V,A` 单字符串，不是键值对象）：
+    /// 「主题预设」存的是同一批颜色，格式与 config 各键保持一致 → 手改预设 JSON 的读法与
+    /// config.json 完全一样，不需要记第二套编码（旧 `#RRGGBBAA` 也照旧可读）。
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        guard let parsed = PanelBackgroundColor(configValue: raw) else {
+            throw DecodingError.dataCorruptedError(in: container,
+                                                   debugDescription: "颜色串无法解析：\(raw)")
+        }
+        self = parsed
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(configValue)
+    }
+}
+
+// MARK: - 主题预设（「主题外观」pane 顶部）
+
+/// 品牌 icon 的取图请求（跨 target 传值）：键 + 深浅档 + 是否无边框。
+/// 深浅档一条式子管两条来源——PNG 版 = 取哪一版资产，无边框版 = 主前景色的深浅档
+///（都 = 面板外观是否深色 ⊕「图标深浅互换」）。
+public struct BrandIconRequest: Equatable {
+    /// 图标键（workbuddy / zhipu / deepseek / qwen / trae-color / codex）
+    public var key: String
+    public var dark: Bool
+    /// 「无边框图标」= 卡片 icon 走 SVG 原图（去 Icon Composer 底板）→ 返回 template 图，由视图着色
+    public var borderless: Bool
+
+    public init(key: String, dark: Bool, borderless: Bool = false) {
+        self.key = key
+        self.dark = dark
+        self.borderless = borderless
+    }
+}
+
+/// 硬币的**视觉身份四项**（跨 target 传值用）：宿主 `CoinPreset` / `CoinAppearance` / `CoinRGB`
+/// 都在宿主 target，SettingsUI 引不到 —— 所以只传原始值（rawValue / `#RRGGBB`），
+/// 与 `ThemePreset` 里那四项同一份口径（宿主负责原始值 ↔ 类型换算）。
+/// 用在「主题预设」图卡上：宿主按这四项离屏渲染一枚**真实 3D 硬币**给图卡用。
+public struct CoinVisualIdentity: Equatable {
+    public var preset: Int
+    public var appearance: Int
+    public var materialColor: String
+    public var fieldColor: String
+
+    public init(preset: Int, appearance: Int, materialColor: String, fieldColor: String) {
+        self.preset = preset
+        self.appearance = appearance
+        self.materialColor = materialColor
+        self.fieldColor = fieldColor
+    }
+
+    /// 从一枚主题预设取（图卡唯一的构造入口）
+    public init(_ p: ThemePreset) {
+        self.init(preset: p.coinPreset, appearance: p.coinAppearance,
+                  materialColor: p.coinMaterialColor, fieldColor: p.coinFieldColor)
+    }
+
+    /// 渲染缓存键（宿主侧用）
+    public var cacheKey: String {
+        "\(preset)|\(appearance)|\(materialColor)|\(fieldColor)"
+    }
+}
+
+/// 「主题外观」页面**一整组参数**的快照 —— 点该页顶部的「保存」即把页面当前参数固化成一枚。
+/// 覆盖该页两段的全部可调项：面板（用量色 / 面板背景色 + 顶端不透明度 / 次背景色 /
+/// 底端不透明度 / 浅色主题）+ 卡片（图标深浅互换 / 无边框图标 / 长进度卡片 / 主标题字号 /
+/// Sharp Grotesk）+ **3D 硬币的视觉身份**（见 `coinPreset` 等四项）。
+/// ⚠️ 用量色按 **HSB 三参**存（与 UserDefaults 的 `heat_dot_*` 同口径），不是 RGB ——
+/// 与 `PanelBackgroundColor` 同一条「存储以 HSB 为准、RGB 只是派生渲染值」的理由。
+/// 落盘/读回见宿主 `ThemePresetStore`（UserDefaults 单键存 JSON 串）。
+public struct ThemePreset: Codable, Equatable, Identifiable {
+    /// 唯一键（UUID 串）：应用 / 删除按它命中，与展示名无关 ——
+    /// 名字唯一性由保存路径保证（重名走覆盖确认，见宿主 `saveThemePreset`），
+    /// 覆盖时沿用原条目的 id，所以这一项只保证「列表内不重复」，不承担查重职责
+    public var id: String
+    /// 展示名（用户可留空 → 保存时由模型补「预设 N」）
+    public var name: String
+    public var heatHue: Double
+    public var heatSaturation: Double
+    public var heatBrightness: Double
+    public var panelBackgroundColor: PanelBackgroundColor
+    /// 遮罩底端不透明度（顶端 = `panelBackgroundColor.alpha`，两者独立）
+    public var panelBackgroundBottomAlpha: Double
+    public var secondaryBackgroundColor: PanelBackgroundColor
+    public var lightThemeEnabled: Bool
+    public var iconThemeSwap: Bool
+    /// 无边框图标（卡片品牌 icon 直接用 SVG 原图，不套 Icon Composer 底板）
+    public var iconNoBorder: Bool
+    public var longProgressCard: Bool
+    public var cardTitleFontSize: Double
+    public var cardTitleSharpGrotesk: Bool
+    /// ── 3D 硬币（2026-09-16 用户要求：预设除了本页参数，**还要带上必要的硬币参数**）──
+    /// 只取硬币的**视觉身份**：Preset 档（色场开关）/ Style 档 + 币面色 + 色场色。
+    /// 几何（尺寸 / 面板币直径 / 厚度 / logo 比例 / 浮雕深度 / 阴影）、工艺（边纹）、
+    /// 运动（静止姿态 / 自旋圈数）与上传的 logo SVG 都**不在**预设里 ——
+    /// 那些是「这枚币怎么做出来的」，不是「这枚币长什么样」；换主题不该动它们。
+    /// ⚠️ 存**原始值**（Int rawValue + "#RRGGBB"）而不是 `CoinPreset` / `CoinRGB`：
+    /// 那两个类型在宿主 target（CoinDemo.swift），本 target 引不到。宿主负责原始值 ↔ 类型
+    /// 的换算，取值域与 `CoinSettings.load()/save()` 同一条（见宿主 `ThemePreset` 的读写两处）。
+    /// 缺省基准 = 宿主 `CoinSettings.initial`（sGHO + Default + sgho 绿/紫）
+    public var coinPreset: Int
+    public var coinAppearance: Int
+    public var coinMaterialColor: String
+    public var coinFieldColor: String
+
+    /// 硬币四项的出厂默认（= 宿主 `CoinSettings.initial`，即 `CoinMaterial.sgho` 那套手工挑的
+    /// 色 token 落到 sRGB 的 hex）。两个颜色常量在这里是**字面值**：本 target 引不到
+    /// `CoinRGB` / `CoinMaterial`，所以宿主侧改了 sgho 预设就得同步这里 —— 一处兜底，别再多写
+    public static let defaultCoinPreset = 1                  // CoinPreset.sgho
+    public static let defaultCoinAppearance = 0              // CoinAppearance.default
+    public static let defaultCoinMaterialColor = "#00DC00"   // CoinMaterial.sgho.faceBase
+    public static let defaultCoinFieldColor = "#9E91FF"      // CoinMaterial.sgho.field
+
+    public init(id: String = UUID().uuidString, name: String,
+                heatHue: Double, heatSaturation: Double, heatBrightness: Double,
+                panelBackgroundColor: PanelBackgroundColor,
+                panelBackgroundBottomAlpha: Double,
+                secondaryBackgroundColor: PanelBackgroundColor,
+                lightThemeEnabled: Bool, iconThemeSwap: Bool, iconNoBorder: Bool = false,
+                longProgressCard: Bool,
+                cardTitleFontSize: Double, cardTitleSharpGrotesk: Bool,
+                coinPreset: Int = ThemePreset.defaultCoinPreset,
+                coinAppearance: Int = ThemePreset.defaultCoinAppearance,
+                coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor,
+                coinFieldColor: String = ThemePreset.defaultCoinFieldColor) {
+        self.id = id
+        self.name = name
+        self.heatHue = heatHue
+        self.heatSaturation = heatSaturation
+        self.heatBrightness = heatBrightness
+        self.panelBackgroundColor = panelBackgroundColor
+        self.panelBackgroundBottomAlpha = panelBackgroundBottomAlpha
+        self.secondaryBackgroundColor = secondaryBackgroundColor
+        self.lightThemeEnabled = lightThemeEnabled
+        self.iconThemeSwap = iconThemeSwap
+        self.iconNoBorder = iconNoBorder
+        self.longProgressCard = longProgressCard
+        self.cardTitleFontSize = cardTitleFontSize
+        self.cardTitleSharpGrotesk = cardTitleSharpGrotesk
+        self.coinPreset = coinPreset
+        self.coinAppearance = coinAppearance
+        self.coinMaterialColor = coinMaterialColor
+        self.coinFieldColor = coinFieldColor
+    }
+
+    /// 从「主题外观」页面的当前快照固化（页面参数与预设字段的**唯一映射点**）：
+    /// 该页日后新增参数，只在这里 + `applyThemePreset` 两处补一行即可，视图层不用动。
+    /// 硬币四项不来自本页 —— 值由宿主的快照代读（`CoinSettings.load()`，见 main.swift 装配处）
+    public init(name: String, snapshot s: AppSettingsSnapshot) {
+        self.init(name: name,
+                  heatHue: s.heatHue, heatSaturation: s.heatSaturation, heatBrightness: s.heatBrightness,
+                  panelBackgroundColor: s.panelBackgroundColor,
+                  panelBackgroundBottomAlpha: s.panelBackgroundBottomAlpha,
+                  secondaryBackgroundColor: s.secondaryBackgroundColor,
+                  lightThemeEnabled: s.lightThemeEnabled,
+                  iconThemeSwap: s.iconThemeSwap,
+                  iconNoBorder: s.iconNoBorder,
+                  longProgressCard: s.longProgressCard,
+                  cardTitleFontSize: s.cardTitleFontSize,
+                  cardTitleSharpGrotesk: s.cardTitleSharpGrotesk,
+                  coinPreset: s.coinPreset,
+                  coinAppearance: s.coinAppearance,
+                  coinMaterialColor: s.coinMaterialColor,
+                  coinFieldColor: s.coinFieldColor)
+    }
+
+    /// 这枚预设是否**就是当前生效的那组参数**（「主题预设」图卡选中描边的唯一依据）。
+    ///
+    /// 逐项比对本页参数 + 硬币四项，不另做「上次应用了谁」的记账：预设存的就是这些值本身，
+    /// 于是「应用某枚 → 它自动亮蓝框」「手动改任何一项 → 所有图卡自动落选」都是自然结果，
+    /// 也不会出现「账记着 A、实际参数已是 B」的错位。
+    /// 浮点带 1e-4 容差：值经「config 落盘 → 快照 → 预设 JSON」几趟，逐位相等本就成立，
+    /// 容差只为挡住量化口径不一致的意外。
+    public func matches(_ s: AppSettingsSnapshot) -> Bool {
+        func eq(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-4 }
+        func eqColor(_ a: PanelBackgroundColor, _ b: PanelBackgroundColor) -> Bool {
+            eq(a.hue, b.hue) && eq(a.saturation, b.saturation)
+                && eq(a.brightness, b.brightness) && eq(a.alpha, b.alpha)
+        }
+        return eq(heatHue, s.heatHue) && eq(heatSaturation, s.heatSaturation)
+            && eq(heatBrightness, s.heatBrightness)
+            && eqColor(panelBackgroundColor, s.panelBackgroundColor)
+            && eq(panelBackgroundBottomAlpha, s.panelBackgroundBottomAlpha)
+            && eqColor(secondaryBackgroundColor, s.secondaryBackgroundColor)
+            && lightThemeEnabled == s.lightThemeEnabled
+            && iconThemeSwap == s.iconThemeSwap
+            && iconNoBorder == s.iconNoBorder
+            && longProgressCard == s.longProgressCard
+            && eq(cardTitleFontSize, s.cardTitleFontSize)
+            && cardTitleSharpGrotesk == s.cardTitleSharpGrotesk
+            && coinPreset == s.coinPreset
+            && coinAppearance == s.coinAppearance
+            && coinMaterialColor == s.coinMaterialColor
+            && coinFieldColor == s.coinFieldColor
+    }
+
+    /// 解码：**逐项 `decodeIfPresent` + 缺省兜底**，不用合成的「整份必须齐全」实现 ——
+    /// 否则日后给本结构加一个参数，老预设（JSON 里没那个键）就整份解不出，
+    /// `ThemePresetStore.load()` 静默返回空列表、用户存过的预设全没了。
+    /// 缺项基准 = 当时内置默认（颜色/开关取默认配置，用量色取 `PanelThemeColor` 的内置默认）
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = AppSettingsSnapshot()
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "预设"
+        heatHue = try c.decodeIfPresent(Double.self, forKey: .heatHue) ?? Double(PanelThemeColor.defaultHue)
+        heatSaturation = try c.decodeIfPresent(Double.self, forKey: .heatSaturation)
+            ?? Double(PanelThemeColor.defaultSaturation)
+        heatBrightness = try c.decodeIfPresent(Double.self, forKey: .heatBrightness)
+            ?? Double(PanelThemeColor.defaultBrightness)
+        panelBackgroundColor = try c.decodeIfPresent(PanelBackgroundColor.self,
+                                                     forKey: .panelBackgroundColor) ?? d.panelBackgroundColor
+        panelBackgroundBottomAlpha = try c.decodeIfPresent(Double.self,
+                                                           forKey: .panelBackgroundBottomAlpha)
+            ?? d.panelBackgroundBottomAlpha
+        secondaryBackgroundColor = try c.decodeIfPresent(PanelBackgroundColor.self,
+                                                         forKey: .secondaryBackgroundColor)
+            ?? d.secondaryBackgroundColor
+        lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? d.lightThemeEnabled
+        iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? d.iconThemeSwap
+        iconNoBorder = try c.decodeIfPresent(Bool.self, forKey: .iconNoBorder) ?? d.iconNoBorder
+        longProgressCard = try c.decodeIfPresent(Bool.self, forKey: .longProgressCard) ?? d.longProgressCard
+        cardTitleFontSize = try c.decodeIfPresent(Double.self, forKey: .cardTitleFontSize)
+            ?? d.cardTitleFontSize
+        cardTitleSharpGrotesk = try c.decodeIfPresent(Bool.self, forKey: .cardTitleSharpGrotesk)
+            ?? d.cardTitleSharpGrotesk
+        // 硬币四项晚于首版预设加入 → 老预设（JSON 里没这几个键）一并落到 d 的默认值，
+        // 不会连坐整份列表（同本结构上面那条注释）
+        coinPreset = try c.decodeIfPresent(Int.self, forKey: .coinPreset) ?? d.coinPreset
+        coinAppearance = try c.decodeIfPresent(Int.self, forKey: .coinAppearance) ?? d.coinAppearance
+        coinMaterialColor = try c.decodeIfPresent(String.self, forKey: .coinMaterialColor)
+            ?? d.coinMaterialColor
+        coinFieldColor = try c.decodeIfPresent(String.self, forKey: .coinFieldColor) ?? d.coinFieldColor
     }
 }
 
@@ -398,6 +682,55 @@ public struct SavedAccountEntry: Equatable, Identifiable {
     }
 }
 
+/// 数值滚动「滑移」（位数变化时的整组左右平移）时长口径 —— 设置窗口
+/// 「主题外观 → 动效」单选。
+///
+/// 宿主那侧的 `RollSlideTiming` 在可执行 target 里，本 target 引不到，故快照与动作
+/// 只传 **rawValue 字符串**（同 CoinPreset 的处境），两侧 rawValue 逐字对齐。
+public enum RollSlideTimingOption: String, CaseIterable, Identifiable {
+    /// 跟随滚字：取本轮数字轮里最长的滚动时长（= 滚字实际落定时刻，下限 0.30s）——
+    /// 平移与滚字同拍收尾，不拖在滚字后面
+    case wheelTail
+    /// 跟随位移：按整组位移量缩放，钳制在 0.30…0.60s——位移小就快，位移大也封顶
+    case distance
+
+    public var id: String { rawValue }
+
+    /// 单选控件的行内显示名
+    public var title: String {
+        switch self {
+        case .wheelTail: return "跟随滚字"
+        case .distance:  return "跟随位移"
+        }
+    }
+}
+
+/// 数值滚动的**时间曲线**档位 —— 设置窗口「主题外观 → 动效」单选。
+///
+/// 宿主那侧的 `RollCurve` 在可执行 target 里，本 target 引不到，故快照与动作
+/// 只传 **rawValue 字符串**（同 `RollSlideTimingOption` 的处境），两侧逐字对齐。
+/// 只管数字滚动族（车轮位置 / 槽宽 / 位数变化平移三条量同曲线）；
+/// 单位换值的槽内滚字另有自己的 ease-out，不随之变。
+public enum RollCurveOption: String, CaseIterable, Identifiable {
+    /// 从慢到快（ease-in cubic）：起滚慢、末段最快，落定干脆
+    case easeIn
+    /// 从快到慢（ease-out cubic）：起手快、收尾长
+    case easeOut
+    /// 慢-快-慢（ease-in-out cubic）：两端减速、中段最快
+    case easeInOut
+
+    public var id: String { rawValue }
+
+    /// 单选控件的行内显示名
+    public var title: String {
+        switch self {
+        case .easeIn:    return "从慢到快"
+        case .easeOut:   return "从快到慢"
+        case .easeInOut: return "慢-快-慢"
+        }
+    }
+}
+
 /// 设置窗口各项的当前值快照：宿主从真实状态（config / 面板快照）装配，预览给静态值。
 public struct AppSettingsSnapshot: Equatable {
     /// 刷新间隔（秒）：60 / 180 / 300，存量异常值由宿主归一到 300
@@ -418,27 +751,45 @@ public struct AppSettingsSnapshot: Equatable {
     public var lightThemeEnabled = false
     /// 品牌 icon 深浅版互换
     public var iconThemeSwap = false
+    /// 无边框图标（卡片品牌 icon 直接用 SVG 原图，不套 Icon Composer 底板）
+    public var iconNoBorder = false
     /// 长进度卡片（整行进度条 + 副标题下移）
     public var longProgressCard = false
     /// 卡片主标题字号（pt，10…16、步进 0.5）
     public var cardTitleFontSize: Double = 13
     /// 卡片主标题 Sharp Grotesk（本机安装的商业字体；未装该字重回落系统字体）
     public var cardTitleSharpGrotesk = false
-    /// 主标题↔副标题行距的字体系数（× `PanelLayout.titleRowBaseGap`，0.2…2.0）：
-    /// 主标题去掉硬行框后按字体疏密补偿，SG 更扁 → 单独一档
-    public var cardTitleGapScaleSF: Double = 1.0
-    public var cardTitleGapScaleSG: Double = 0.7
-    /// 点阵主题色（HSB 三参 0…1）：设置窗口「面板 → 主题色」系统色盘拾色后分解落值
+    /// 数值滚动滑移（位数变化时的整组左右平移）时长口径的 rawValue（2026-09-16 用户
+    /// 要求两种口径都落地）：见 `RollSlideTimingOption`。**不进主题预设**（动效参数，
+    /// 不属于外观身份）
+    public var rollSlideTiming: String = RollSlideTimingOption.wheelTail.rawValue
+    /// 数值滚动时间曲线档位的 rawValue（2026-09-16 用户要求开放为设置项）：见
+    /// `RollCurveOption`。同样**不进主题预设**
+    public var rollCurve: String = RollCurveOption.easeIn.rawValue
+    // 主标题↔副标题行距的字体系数（SF/SG 两档）2026-09-15 已固化：快照字段、滑杆与宿主
+    // setter 全部移除，真值见 BalancePanelView.cardTitleGapScaleSFFixed / SGFixed
+    /// 用量色（HSB 三参 0…1）：设置窗口「面板 → 用量色」系统色盘拾色后分解落值
     /// （下游点阵档位色与卡片边框仍按 HSB 口径取值）
     public var heatHue: Double = 0
     /// 点阵主题饱和度（0…1）
     public var heatSaturation: Double = 0
     /// 点阵主题峰值明度（0…1）
     public var heatBrightness: Double = 0
-    /// 点阵**背景色**（无用量底点 / 进度条轨道底 / 骨架行；2026-09-15 用户要求开放）
-    public var heatDotEmptyColor: PanelBackgroundColor = .heatDotEmptyDefault
-    /// 卡片 **hover 背景色**（HoverMaterialHost 材质块底色；2026-09-15 用户要求开放）
-    public var cardHoverBackgroundColor: PanelBackgroundColor = .cardHoverDefault
+    /// **次背景色**（无用量底点 / 进度条轨道底 / 骨架行 / 卡片 hover 材质块 / Token 印章底）：
+    /// 2026-09-15 由「点阵背景色」+「hover 背景色」两个参数**合并**而来（用户要求），
+    /// 归到设置窗口「面板」栏 —— 两个消费点从此读同一个值
+    public var secondaryBackgroundColor: PanelBackgroundColor = .secondaryBackgroundDefault
+    /// ── 3D 硬币的**视觉身份**四项（2026-09-16）：本页没有对应控件，纯为「主题预设」代读 ——
+    /// 宿主装配快照时从 `CoinSettings.load()` 取，`ThemePreset(name:snapshot:)` 再固化进预设，
+    /// 应用预设时宿主写回 UserDefaults 并回灌硬币 pane / 主面板内嵌小硬币。
+    /// 原始值（rawValue / "#RRGGBB"）与默认值的理由见 `ThemePreset` 那四项的注释
+    public var coinPreset: Int = ThemePreset.defaultCoinPreset
+    public var coinAppearance: Int = ThemePreset.defaultCoinAppearance
+    public var coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor
+    public var coinFieldColor: String = ThemePreset.defaultCoinFieldColor
+    /// 「主题预设」列表（该页顶部）：宿主从 UserDefaults 读（`ThemePresetStore.load()`），
+    /// 保存 / 应用 / 删除都先交宿主动作落盘再回读本条
+    public var themePresets: [ThemePreset] = []
     /// DeepSeek API Key（真实值来自钥匙串；空 = 未配置）
     public var apiKey: String = ""
     /// DeepSeek 常用充值额度（0 = 未设置 → 面板不画点阵；>0 = 点阵分母）
@@ -460,12 +811,18 @@ public struct AppSettingsSnapshot: Equatable {
                 panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha,
                 lightThemeEnabled: Bool = false,
                 iconThemeSwap: Bool = false,
+                iconNoBorder: Bool = false,
                 longProgressCard: Bool = false,
                 cardTitleFontSize: Double = 13, cardTitleSharpGrotesk: Bool = false,
-                cardTitleGapScaleSF: Double = 1.0, cardTitleGapScaleSG: Double = 0.7,
+                rollSlideTiming: String = RollSlideTimingOption.wheelTail.rawValue,
+                rollCurve: String = RollCurveOption.easeIn.rawValue,
                 heatHue: Double = 0, heatSaturation: Double = 0, heatBrightness: Double = 0,
-                heatDotEmptyColor: PanelBackgroundColor = .heatDotEmptyDefault,
-                cardHoverBackgroundColor: PanelBackgroundColor = .cardHoverDefault) {
+                secondaryBackgroundColor: PanelBackgroundColor = .secondaryBackgroundDefault,
+                coinPreset: Int = ThemePreset.defaultCoinPreset,
+                coinAppearance: Int = ThemePreset.defaultCoinAppearance,
+                coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor,
+                coinFieldColor: String = ThemePreset.defaultCoinFieldColor,
+                themePresets: [ThemePreset] = []) {
         self.refreshInterval = refreshInterval
         self.autoCheckin = autoCheckin
         self.autoCheckinSub = autoCheckinSub
@@ -480,16 +837,21 @@ public struct AppSettingsSnapshot: Equatable {
         self.panelBackgroundBottomAlpha = panelBackgroundBottomAlpha
         self.lightThemeEnabled = lightThemeEnabled
         self.iconThemeSwap = iconThemeSwap
+        self.iconNoBorder = iconNoBorder
         self.longProgressCard = longProgressCard
         self.cardTitleFontSize = cardTitleFontSize
         self.cardTitleSharpGrotesk = cardTitleSharpGrotesk
-        self.cardTitleGapScaleSF = cardTitleGapScaleSF
-        self.cardTitleGapScaleSG = cardTitleGapScaleSG
+        self.rollSlideTiming = rollSlideTiming
+        self.rollCurve = rollCurve
         self.heatHue = heatHue
         self.heatSaturation = heatSaturation
         self.heatBrightness = heatBrightness
-        self.heatDotEmptyColor = heatDotEmptyColor
-        self.cardHoverBackgroundColor = cardHoverBackgroundColor
+        self.secondaryBackgroundColor = secondaryBackgroundColor
+        self.coinPreset = coinPreset
+        self.coinAppearance = coinAppearance
+        self.coinMaterialColor = coinMaterialColor
+        self.coinFieldColor = coinFieldColor
+        self.themePresets = themePresets
     }
 }
 
@@ -517,27 +879,40 @@ public struct AppSettingsActions {
     public var setPanelBackgroundBottomAlpha: (Double) -> Void = { _ in }
     public var setLightTheme: (Bool) -> Void = { _ in }
     public var setIconThemeSwap: (Bool) -> Void = { _ in }
+    /// 无边框图标（宿主：落盘 + 就地换卡片 icon，不重建卡片）
+    public var setIconNoBorder: (Bool) -> Void = { _ in }
     public var setLongProgressCard: (Bool) -> Void = { _ in }
-    /// 「主题外观」pane 点阵主题色（HSB 三参 0…1，**一把写**；2026-09-14 由三根滑杆改为
+    /// 数值滚动滑移时长口径（宿主：按 rawValue 落 config + 同步 RollingNumberView
+    /// 静态镜像；传的是 `RollSlideTimingOption.rawValue`）
+    public var setRollSlideTiming: (String) -> Void = { _ in }
+    /// 数值滚动时间曲线档位（宿主：按 rawValue 落 config + 同步 RollingNumberView 镜像）
+    public var setRollCurve: (String) -> Void = { _ in }
+    /// 「主题外观」pane 用量色（HSB 三参 0…1，**一把写**；2026-09-14 由三根滑杆改为
     /// 系统色盘拾色 —— 色盘给的是一个颜色，分解回 HSB 后一次落值、只重绘一次）。
     /// 宿主：落 UserDefaults + 就地重绘点阵与卡片边框
     public var setHeatColor: (Double, Double, Double) -> Void = { _, _, _ in }
-    /// 点阵背景色 / 卡片 hover 背景色（2026-09-15 开放；宿主：写 config + 落盘 + 镜像 + 就地重绘）
-    public var setHeatDotEmptyColor: (PanelBackgroundColor) -> Void = { _ in }
-    public var setCardHoverBackgroundColor: (PanelBackgroundColor) -> Void = { _ in }
+    /// **次背景色**（2026-09-15 合并自「点阵背景色」+「hover 背景色」；宿主：写 config +
+    /// 落盘 + 镜像 + 就地重绘 —— 底点/轨道/骨架/材质块都是自绘或烘色位图，须整树重绘）
+    public var setSecondaryBackgroundColor: (PanelBackgroundColor) -> Void = { _ in }
+    /// 「主题外观」pane **顶部「主题预设」**（2026-09-15 用户要求）：该页顶部一组预设，
+    /// 「保存」把页面当前全部参数固化成一组、「应用」原样写回、「删除」移除一枚。
+    /// 宿主：预设列表存 UserDefaults（`ThemePresetStore`，JSON 串单键）+ 应用时逐项落值重绘。
+    /// ⚠️ **返回 false = 没存下去**（重名时用户在同名覆盖确认里选了「取消」）→
+    /// 命名草稿保留，用户可以直接改个名字再按一次保存
+    public var saveThemePreset: (ThemePreset) -> Bool = { _ in false }
+    public var applyThemePreset: (ThemePreset) -> Void = { _ in }
+    /// 删除一枚预设（按 id 命中；移除后其余顺序不变）
+    public var deleteThemePreset: (String) -> Void = { _ in }
     public var manualCheckin: () -> Void = {}
     public var showCheckinHistory: () -> Void = {}
     public var shareWbHistory: () -> Void = {}
     /// 菜单栏小球弹跳参数变更（宿主：写内存 + 落盘 + 推给 MenuBarStatusGlowController）
     public var setBounce: (MenuBarBounceSettings) -> Void = { _ in }
-    /// 卡片主标题字号 / Sharp Grotesk 开关与字重×宽度档（「主题外观 → 卡片」；
+    /// 卡片主标题字号 / Sharp Grotesk 开关（「主题外观 → 卡片」；
     /// 宿主：写 config + 落盘 + syncPanel，面板快照比对变化后就地重刷标题）
     public var setCardTitleFontSize: (Double) -> Void = { _ in }
     public var setCardTitleSharpGrotesk: (Bool) -> Void = { _ in }
-    /// 主副标题行距系数（系统字体 / SG 两档）：宿主写 config + 落盘 + syncPanel，
-    /// 面板比对到变化后**就地改间距**（不重建卡片）
-    public var setCardTitleGapScaleSF: (Double) -> Void = { _ in }
-    public var setCardTitleGapScaleSG: (Double) -> Void = { _ in }
+    // 主副标题行距系数（SF/SG）2026-09-15 已固化 → 两个 setter 一并移除
     public var about: () -> Void = {}
     /// 「关于」pane 备份（BackupService）：导出 = config 全量（含凭据）+ UserDefaults 域 → JSON；
     /// 导入 = 覆盖写回并重启（确认弹窗与破坏性提示都在宿主侧）
@@ -677,17 +1052,28 @@ public final class AppSettingsModel {
     public var actions = AppSettingsActions()
     /// 宿主提供的真实状态回读（nil = 预览静态值）
     public var snapshotProvider: (() -> AppSettingsSnapshot)?
-    /// 平台品牌图标解析（宿主注入：键 → 品牌 PNG，App 侧固定取 dark 版）；
-    /// nil 或缺图时行视图回退通用 SF Symbol（预览环境即走回退）
-    public var iconProvider: ((String) -> NSImage?)?
+    /// 品牌图标解析（宿主注入）：按 `BrandIconRequest` 给图 —— 键 + 深浅档
+    ///（PNG 版选版 / SVG 版取主前景色档）+ 是否无边框（true = SVG 原图，返回 template 图、
+    /// 由视图按该档主前景色着色）。nil 或缺图时行视图回退通用 SF Symbol（预览环境即走回退）。
+    /// 深浅档由调用方给：账号行固定 dark + 带边框，「主题预设」图卡按该预设的外观与
+    ///「图标深浅互换 / 无边框图标」两开关解档（见 `ThemePane.miniCardIcon`）
+    public var iconProvider: ((BrandIconRequest) -> NSImage?)?
     /// 内嵌 AppKit 内容的 pane（3D 硬币 / 平台开关）；缺项 = 预览 → 回退单动作行。
     /// **数组 = 该 pane 的若干段**，每段一个 Form Section（各画各的卡片）——
     /// 「3D 硬币」用它把预览框与表单框拆成两块（2026-09-13 用户：预览框不要包裹下方 forms），
     /// 单段 pane 就给一个元素的数组。顺序即上屏顺序。
     /// 「主题外观」是原生 SwiftUI `ThemePane`，不走这里
     public var hostedPanes: [SettingsSidebarItem: [SettingsHostedContent]] = [:]
+    /// 硬币图卡渲染（宿主注入）：按视觉身份四项离屏渲染一枚**真实 3D 硬币** ——
+    /// 几何 / 工艺 / 姿态照用当前设置，只换那四项（= 应用该预设后主面板那枚币的样子）；
+    /// 第二个参数是目标方框边长（pt，含投影轮廓），返回图按自身 pt 尺寸直接用。
+    /// nil / 返回 nil（预览环境）→ 视图回退成同色示意币
+    public var coinThumbnailProvider: ((CoinVisualIdentity, CGFloat) -> NSImage?)?
     /// Key/额度表单的编辑草稿（窗口打开时按真实配置重置，见 `beginSession`）
     public var keyQuotaDraft = KeyQuotaDraft()
+    /// 「主题预设」的命名草稿（顶部输入框；保存后清空、关窗丢弃）——
+    /// 走模型属性而不是 `@State`：本 target 只有属性包装器可用（见文件头注）
+    public var themePresetName = ""
 
     /// pane 导航历史（系统设置同款后退/前进）；初始 = [初始 pane]，两侧按钮初始均禁用
     private var history: [SettingsSidebarItem] = [.appearance]
@@ -725,6 +1111,7 @@ public final class AppSettingsModel {
     public func beginSession() {
         sync()
         resetKeyQuotaDraft()
+        themePresetName = ""
         for sections in hostedPanes.values {
             for content in sections { content.refresh?() }
         }
@@ -774,6 +1161,10 @@ public final class AppSettingsModel {
         actions.setIconThemeSwap(on)
         sync()
     }
+    public func setIconNoBorder(_ on: Bool) {
+        actions.setIconNoBorder(on)
+        sync()
+    }
     public func setCardTitleFontSize(_ size: Double) {
         actions.setCardTitleFontSize(size)
         sync()
@@ -782,31 +1173,63 @@ public final class AppSettingsModel {
         actions.setCardTitleSharpGrotesk(on)
         sync()
     }
-    public func setCardTitleGapScaleSF(_ v: Double) {
-        actions.setCardTitleGapScaleSF(v)
-        sync()
-    }
-    public func setCardTitleGapScaleSG(_ v: Double) {
-        actions.setCardTitleGapScaleSG(v)
-        sync()
-    }
     public func setLongProgressCard(_ on: Bool) {
         actions.setLongProgressCard(on)
         sync()
     }
-    /// 主题色拾取（色盘）：先交宿主动作（落 UserDefaults + 就地重绘），随后回读快照
+    /// 数值滚动滑移时长口径（2026-09-16 用户要求两种口径都落地）：先交宿主动作
+    ///（落盘 + 静态镜像），随后回读快照
+    public func setRollSlideTiming(_ raw: String) {
+        actions.setRollSlideTiming(raw)
+        sync()
+    }
+    /// 数值滚动时间曲线档位（2026-09-16 用户要求开放）：先交宿主动作
+    ///（落盘 + 静态镜像），随后回读快照
+    public func setRollCurve(_ raw: String) {
+        actions.setRollCurve(raw)
+        sync()
+    }
+    /// 用量色拾取（色盘）：先交宿主动作（落 UserDefaults + 就地重绘），随后回读快照
     public func setThemeColor(hue: Double, saturation: Double, brightness: Double) {
         actions.setHeatColor(hue, saturation, brightness)
         sync()
     }
-    /// 点阵背景色拾取（色盘，2026-09-15）：宿主落盘 + 镜像 + 清烘焙缓存就地重绘，随后回读快照
-    public func setHeatDotEmptyColor(_ color: PanelBackgroundColor) {
-        actions.setHeatDotEmptyColor(color)
+    /// 次背景色拾取（色盘，2026-09-15）：宿主落盘 + 镜像 + 清烘焙缓存就地重绘，随后回读快照
+    public func setSecondaryBackgroundColor(_ color: PanelBackgroundColor) {
+        actions.setSecondaryBackgroundColor(color)
         sync()
     }
-    /// 卡片 hover 背景色拾取（色盘，2026-09-15）：宿主落盘 + 镜像 + 逐材质宿主重解算，随后回读快照
-    public func setCardHoverBackgroundColor(_ color: PanelBackgroundColor) {
-        actions.setCardHoverBackgroundColor(color)
+
+    // ── 「主题预设」（该页顶部）：固化 / 应用 / 删除 ──
+
+    /// 保存一组预设：把**页面当前全部参数**（快照里该页那几项）固化下来 ——
+    /// 草稿名为空时自动补「预设 N」（N = 现有枚数 + 1）。
+    /// 同名由宿主弹确认（覆盖 / 取消）：**取消时不落盘、命名草稿也不清**，
+    /// 用户能就着手改个名字再存（清掉等于让他重敲一遍）。
+    ///
+    /// ⚠️ 固化前**先回读一次真实状态**（2026-09-16）：硬币那四项不在本页、也不走本模型的
+    /// setter（「3D 硬币」是内嵌 AppKit 面板，改一次落一次盘，全程不经过这里）——
+    /// 只靠开窗那次 sync 的话，中途在 3D pane 改过的币面色 / 档位会按**开窗时**的旧值存进预设。
+    /// `sync()` 只是本地读盘 + 读预设列表，无网络代价，每次保存都来一遍
+    public func saveThemePreset() {
+        sync()
+        let name = themePresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preset = ThemePreset(name: name.isEmpty ? "预设 \(snapshot.themePresets.count + 1)" : name,
+                                 snapshot: snapshot)
+        let saved = actions.saveThemePreset(preset)
+        if saved { themePresetName = "" }
+        sync()
+    }
+
+    /// 应用一组预设（宿主逐项原样落值），随后回读快照 —— 该页所有控件随之显示新值
+    public func applyThemePreset(_ preset: ThemePreset) {
+        actions.applyThemePreset(preset)
+        sync()
+    }
+
+    /// 删除一枚预设（不二次确认：非破坏性数据，删错了重存一组即可）
+    public func deleteThemePreset(id: String) {
+        actions.deleteThemePreset(id)
         sync()
     }
     /// 草稿是否有未落盘的改动（提交点的守卫：脏才写，避免空提交反复刷网络）
@@ -863,6 +1286,7 @@ extension AppSettingsModel {
             apiKey: "sk-preview-key", commonQuota: 20,
             panelBackgroundColor: .default, lightThemeEnabled: false,
             iconThemeSwap: true,
+            iconNoBorder: true,
             longProgressCard: true,
             heatHue: 0.25, heatSaturation: 0.6, heatBrightness: 0.996)
         m.resetKeyQuotaDraft()   // 「Key / 额度」pane 的草稿也要有值，否则预览是空框

@@ -618,32 +618,39 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     private var numberRowCenterY: CGFloat { numberRowY + Self.numberRowBaseHeight / 2 }
     /// 是否显示内嵌硬币（由 `setupInlineTokens()` 打开）
     var showsInlineCoin = false
+    /// 大数值行（硬币 + 大数字 + spinner）整体左缩进：默认 0 = 贴版心左缘（hover 子面板口径）；
+    /// 主面板内嵌实例设 3（2026-09-15 用户指定）。整行同基准，硬币与数字间距不受影响
+    var numberRowLeadingInset: CGFloat = 0
     /// `CoinSettings.save()` 变更通知的观察者 token（弹窗调参 → 小硬币实时重灌，见 init）
     private var settingsChangeObserver: NSObjectProtocol?
+    /// 弹窗 CoinSettings 的 logo 原图：聚合态（无平台可对应）与平台 SVG 缺失时的回落
+    private var inlineCoinSettingsArt: CoinLogoArt = CoinSVG.ghoPreset
     /// 总计占位 loading：数据未到时替代「—」横杆（2026-09-09 用户指定）
     private let totalSpinner = NSProgressIndicator()
-    /// 大数字当前字号（超宽逐级缩 26→15；字号变化才重新 configure）
-    private var totalNumberSize: CGFloat = 26
+    /// 大数字基准字号（2026-09-16 用户指定由 26 缩 10%）与字距增量（em，加宽，同日指定）
+    private static let totalBaseSize: CGFloat = 26 * 0.9
+    private static let totalTrackingEm: CGFloat = 0.02
+    /// 大数字当前字号（超宽逐级缩 基准→15；字号变化才重新 configure）
+    private var totalNumberSize: CGFloat = TokensPanelView.totalBaseSize
     var onHoverChanged: ((Bool) -> Void)?
     /// 词元活动视图切换每日/每周时回调（控制器据此刷新 popover 尺寸）
     var onActivityModeChanged: (() -> Void)?
-    /// Sharp Grotesk 字体名（主标题字体档，2026-09-13）：开启时大数字同套该字体，
-    /// 字重×宽度档由面板注入（与卡片标题/余额数值同源）；nil = 未开启，
-    /// 本机未装该档时 totalFont 回落原字体策略
-    var sharpGroteskFontName: String? {
-        didSet {
-            guard sharpGroteskFontName != oldValue else { return }
-            totalRollView.refreshFont()
-            metricsDirty = true   // 字体变了 → 所有文本度量缓存作废
-            invalidateIntrinsicContentSize()
-            needsDisplay = true
-        }
+    /// 面板字体档（Sharp Grotesk 开关）翻转时由宿主调用：字体解析已收口到 `PanelFont`
+    /// （全局读开关，不需要注入字体名），这里只负责让本视图按新字体重算 ——
+    /// 滚动数值重解析 + 文本度量缓存作废 + 固有尺寸失效 + 重绘
+    func refreshFontStyle() {
+        totalRollView.refreshFont()
+        metricsDirty = true   // 字体变了 → 所有文本度量缓存作废
+        invalidateIntrinsicContentSize()
+        needsDisplay = true
     }
     /// 数据源分流（ZCode=项目 / WorkBuddy、Codex=模型）：影响区块标题与行图标
     var source: TokensPanelSource = .zcode {
         didSet {
             guard oldValue != source else { return }
             metricsDirty = true   // 平台名宽度随 source 变化
+            // 硬币 logo 跟随平台换品牌 SVG（尺寸/材质等参数不动）—— 走「先自旋、转过 90° 再换」
+            swapInlineCoinLogoOnSpin()
             needsDisplay = true
         }
     }
@@ -779,7 +786,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 列表行数上限（超出按用量截断，头部项目已覆盖绝大多数占比）：
     /// 项目 / 模型两个视图共用；行数少则列表区留白（intrinsic 高度、骨架行、
     /// 词元活动标题定位三处都钉死这个值，改这里即整体生效）
-    static let maxListRows = 2
+    /// 2026-09-15 用户要求「显示前三位项目/模型」：2 → 3（列表已按 tokens 降序，取前 N 即前 N 名）
+    static let maxListRows = 3
     /// 项目行点击的文件夹打开应用（用户指定 QSpace Pro；未安装回退系统默认）
     private static let folderOpenerBundleID = "com.jinghaoshe.qspace.pro"
     // 标称版心宽：仅未布局/尺寸未落时回退用，不参与实际宽度解算——布局后热力图
@@ -812,9 +820,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     override init(frame: NSRect) {
         super.init(frame: frame)
         totalRollView.alignsLeft = true
-        totalRollView.configure(size: 26, weight: .semibold, fontProvider: { [weak self] s, w, monoDigits in
-            self?.totalFont(size: s, weight: w, monoDigits: monoDigits)
-                ?? .monospacedDigitSystemFont(ofSize: s, weight: w)
+        // 字距加宽（2026-09-16）：refreshFont 读它按当前字号折算 pt
+        totalRollView.trackingEm = Self.totalTrackingEm
+        // 字体档统一由 PanelFont 全局解析（SG 开关 + 中文兜底）；不捕获 self，
+        // SG 翻转时经 refreshFontStyle() 就地重算
+        totalRollView.configure(size: Self.totalBaseSize, weight: .semibold, fontProvider: { s, w, monoDigits in
+            PanelFont.font(size: s, weight: w, monoDigits: monoDigits)
         })
         addSubview(totalRollView)
         // 内嵌小硬币：紧凑呈现（无弹跳、按自身尺寸收紧高度）。
@@ -856,12 +867,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     /// 9pt 小注释字体：仅「项目/模型」「每日/每周」切换文案与热力图月份轴（非标题）
     private func makeLabelFont() -> NSFont {
-        NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+        PanelFont.font(size: 9, weight: .regular, monoDigits: true)
     }
     /// 选中周期字体：字重加一档（regular → medium，2026-09-08 用户指定；未选中仍 regular）。
     /// 宽度度量（cachedPeriodWidths）按此字体测——槽位取较宽态，选中切换不跳动。
     private func makePeriodSelectedFont() -> NSFont {
-        NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        PanelFont.font(size: 9, weight: .medium, monoDigits: true)
     }
     /// 标签墨迹高度（9pt 小注释）
     private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
@@ -876,7 +887,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// 列表行墨迹高度（小表格行字体 10pt medium）
     private var rowInkHeight: CGFloat { ceil(SmallTable.rowFont().boundingRectForFont.height) }
     /// 大数字字体（与 totalRollView configure 同参；数字轮行带贴顶排版，墨迹底 = 带顶 + ascender）
-    private var numberFont: NSFont { totalFont(size: totalNumberSize, weight: .semibold, monoDigits: true) }
+    private var numberFont: NSFont { PanelFont.font(size: totalNumberSize, weight: .semibold, monoDigits: true) }
 
     /// 总计标签顶 = 面板首行（与平台名同行）
     private var totalLabelTop: CGFloat { insets.top }
@@ -926,22 +937,24 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             dotsImagesDirty = true  // 点阵位图按新几何重烘
             invalidateIntrinsicContentSize()
         }
-        // 硬币大数值行左缩进 0（2026-09-14 用户指定）：硬币/大数字/spinner 整行贴
-        // 版心左缘，其余行（标题/列表/热力图）仍按 insets.left
-        totalRollView.frame = NSRect(x: inlineCoinWidth, y: numberRowY,
-                                     width: max(0, bounds.width - insets.right - inlineCoinWidth),
+        // 硬币大数值行左缩进 = numberRowLeadingInset（默认 0：硬币/大数字/spinner 整行贴
+        // 版心左缘，2026-09-14 用户指定；主面板内嵌实例 +3，2026-09-15 用户指定），
+        // 其余行（标题/列表/热力图）仍按 insets.left
+        let rowX = numberRowLeadingInset
+        totalRollView.frame = NSRect(x: rowX + inlineCoinWidth, y: numberRowY,
+                                     width: max(0, bounds.width - insets.right - rowX - inlineCoinWidth),
                                      height: Self.numberRowBaseHeight)
         // 内嵌小硬币：以**数字行中线**垂直居中（不随硬币尺寸漂移，
         // 所以「Panel coin size」调大调小都不会让硬币与数字错位）；
         // 宽高取硬币自身的紧凑边长（含厚度投影 + 弹跳余量）
         if showsInlineCoin {
             let side = inlineCoin.compactFittingHeight
-            inlineCoin.frame = NSRect(x: 0, y: numberRowCenterY - side / 2,
+            inlineCoin.frame = NSRect(x: rowX, y: numberRowCenterY - side / 2,
                                       width: side, height: side)
         }
         // spinner 与大数字同带垂直居中、左对齐（小号系统转圈 ~16pt 见方）
         let spinSize = totalSpinner.intrinsicContentSize
-        totalSpinner.frame = NSRect(x: inlineCoinWidth + 1,
+        totalSpinner.frame = NSRect(x: rowX + inlineCoinWidth + 1,
                                     y: numberRowCenterY - spinSize.height / 2,
                                     width: spinSize.width, height: spinSize.height)
         // 布局就绪后复算缩字号（打开瞬间 summary 落位时 view 可能尚未布局，宽度不可判）
@@ -988,7 +1001,10 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         inlineCoin.markShadowSpread = s.markShadowSpread
         inlineCoin.logoScale = s.logoScalePercent / 100
         inlineCoin.material = s.material
-        inlineCoin.logoArt = s.logoArt
+        // logo 先存弹窗原图，再按当前平台覆盖：弹窗调参时其余参数实时反映，
+        // logo 维持平台 SVG（hover 切换平台即换 logo，2026-09-15 用户指定「其他参数不变」）
+        inlineCoinSettingsArt = s.logoArt
+        applyInlineCoinLogo()
         inlineCoin.edgeFinish = s.finish
         inlineCoin.style = s.appearance
         inlineCoin.outlineLevel = Int(s.outlineLevel.rounded())
@@ -999,6 +1015,60 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         inlineCoin.turns = Int(s.turns.rounded())
         inlineCoin.isHidden = false
         needsLayout = true
+    }
+
+    /// 平台切换时的 logo 换代：**先自旋，等币转过 90°（盖面侧对观众）那一刻再换图** ——
+    /// 正对观众换 logo 是一次「闪变」，转过去换就看不见（2026-09-16 用户要求）。
+    /// 圈数跟 Motion 区 **Turns** 走（`spin()` 只有 `turns` 一个口径）—— 用户 2026-09-17 追问
+    /// 「为什么不跟随 turns」，就把它接回去：临界阻尼下弹簧的落定时间只由 ω 决定、与振幅无关
+    ///（ω = √15 ≈ 3.9 rad/s，约 1.7s 落定），所以转 5 圈不比转 1 圈**更久**，只是角速度更快，
+    /// 「90° 那一刻」来得更早（≈70ms），闪变更不可能被看见。
+    ///
+    /// ⚠️ 币**不出帧**时钩子永不触发（`onTick` 的闸门：窗口不可见 / 自己被隐藏 / 祖先隐藏），
+    /// 那时**直接换**：这枚币本来就没人看得见，也不必为一次看不见的换代白转一圈。
+    /// 判定条件与 `onTick` 的闸门逐条对齐，别只判 `window != nil`。
+    private func swapInlineCoinLogoOnSpin() {
+        let tickerWillRun = showsInlineCoin
+            && inlineCoin.window?.isVisible == true
+            && !inlineCoin.isHiddenOrHasHiddenAncestor
+            && !isHiddenOrHasHiddenAncestor
+        guard tickerWillRun else {
+            inlineCoin.onEdgeCrossing = nil
+            applyInlineCoinLogo()
+            return
+        }
+        inlineCoin.onEdgeCrossing = { [weak self] in self?.applyInlineCoinLogo() }
+        inlineCoin.spin()
+    }
+
+    /// 内嵌硬币 logo 跟随当前平台：单平台 = 该平台品牌 SVG 解析出的 mark 轮廓；
+    /// aggregate 聚合（无单一平台）与解析失败回落弹窗设置的 logo。只换 logoArt。
+    private func applyInlineCoinLogo() {
+        guard showsInlineCoin else { return }
+        inlineCoin.logoArt = Self.platformCoinArt(for: source) ?? inlineCoinSettingsArt
+        // WB 的 logo 图形再放大 1.5 倍（2026-09-15 用户指定，由 2 收窄）：乘在 contentFit
+        // 之后不被「收进裁剪圆」的自动缩放抵消；超出裁剪圆的部分由圆切住
+        inlineCoin.logoExtraScale = source == .workbuddy ? 1.5 : 1
+    }
+
+    /// 平台 → 品牌 SVG 资源名（与卡片品牌 icon 键同源：ZCode 用 ZhiPu 的 zhipu.svg）
+    private static let coinLogoResources: [TokensPanelSource: String] = [
+        .zcode: "zhipu", .workbuddy: "workbuddy", .codex: "codex",
+    ]
+    /// 解析缓存（含失败 = nil，恒不重试）：bundle SVG 只读盘解析一次
+    private static var coinLogoArtCache: [TokensPanelSource: CoinLogoArt?] = [:]
+
+    private static func platformCoinArt(for source: TokensPanelSource) -> CoinLogoArt? {
+        guard let resource = coinLogoResources[source] else { return nil }
+        if let cached = coinLogoArtCache[source] { return cached }
+        let art = Bundle.main.url(forResource: resource, withExtension: "svg")
+            .flatMap { try? Data(contentsOf: $0) }
+            .flatMap { try? CoinSVG.parse($0) }
+        if art == nil {
+            Logger.log(.layout, "Token 板块：\(resource).svg 缺失或解析失败，硬币 logo 回落弹窗设置")
+        }
+        coinLogoArtCache[source] = art
+        return art
     }
 
     /// 上次布局宽度（intrinsic 高度依赖实际宽，宽度变化时需重算，见 layout()）
@@ -1058,28 +1128,21 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         totalRollView.setText(text, animated: true, slideOnRebuild: slideOnRebuild, totalDuration: effectiveTotal)
     }
 
-    /// 大数字字体：Sharp Grotesk 开启优先（与卡片数值同策略，本机未装回落）；
-    /// 系统字体态用等宽数字变体（滚轮槽宽恒定）
-    private func totalFont(size: CGFloat, weight: NSFont.Weight, monoDigits: Bool) -> NSFont {
-        if let sg = sharpGroteskFontName, let f = NSFont(name: sg, size: size) { return f }
-        if monoDigits {
-            return .monospacedDigitSystemFont(ofSize: size, weight: weight)
-        }
-        return uiFont(size: size, weight: weight)
-    }
-
     /// 超出可用宽度时逐级缩字号（等宽 13 位数字也能放下；与原 draw 循环同参数）。
     /// 未布局（bounds 为 0）时跳过，等 layout() 就绪后复算
     private func applyTotalNumberSize(for text: String) {
         // 可用宽要扣掉左侧内嵌硬币（它占的是同一行带），否则数字会压到硬币上；
-        // 行左缩进 0，只扣右侧版心边距
-        let availWidth = bounds.width - insets.right - inlineCoinWidth
+        // 再扣行左缩进 numberRowLeadingInset（与 layout() 同一基准），只留右侧版心边距
+        let availWidth = bounds.width - insets.right - inlineCoinWidth - numberRowLeadingInset
         guard availWidth > 40 else { return }
-        var size: CGFloat = 26
-        // 度量须用实际渲染字体（totalFont 与 totalRollView 同源）：Sharp Grotesk /
-        // 等宽数字档按比例系统字体测宽会低估，超宽数字溢出版心
+        var size = Self.totalBaseSize
+        // 度量须用实际渲染字体（PanelFont 与 totalRollView 同源）：Sharp Grotesk /
+        // 等宽数字档按比例系统字体测宽会低估，超宽数字溢出版心；字距增量按当前档
+        // 字号折算一并计入（advance 度量不含 tracking），系统 SF 档的 −0.01em 紧缩
+        // 不抵扣（保守侧：宁早缩不溢出）
         while size > 15,
-              text.size(withAttributes: [.font: totalFont(size: size, weight: .semibold, monoDigits: true)]).width > availWidth {
+              text.size(withAttributes: [.font: PanelFont.font(size: size, weight: .semibold, monoDigits: true)]).width
+                + CGFloat(max(0, text.count - 1)) * size * Self.totalTrackingEm > availWidth {
             size -= 1
         }
         guard size != totalNumberSize else { return }
@@ -1089,9 +1152,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         // 才一次性落地，文档高度跳变带动面板内容肉眼位移
         invalidateIntrinsicContentSize()
         totalRollView.configure(size: size, weight: .semibold,
-                                fontProvider: { [weak self] s, w, monoDigits in
-            self?.totalFont(size: s, weight: w, monoDigits: monoDigits)
-                ?? .monospacedDigitSystemFont(ofSize: s, weight: w)
+                                fontProvider: { s, w, monoDigits in
+            PanelFont.font(size: s, weight: w, monoDigits: monoDigits)
         })
     }
 
@@ -1155,9 +1217,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         return NSSize(width: Self.contentWidth, height: height)
     }
 
-    /// 图表文本字体（系统字体）
+    /// 图表文本字体（走主面板字体档 PanelFont）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        .systemFont(ofSize: size, weight: weight)
+        PanelFont.font(size: size, weight: weight)
     }
 
     override func updateTrackingAreas() {
@@ -1386,8 +1448,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     /// baseTotal = 百分比/hover 占比条的分母（周期口径：All = 全量总计，窗口 = periodTotals[period]）。
     /// 内容（icon/名/值/百分比）统一系统灰（语义色随主题适配）；
     /// hover 行（hoveredListRow）背景只显百分比条 + 1.2pt 发丝边框（2026-08-31 用户要求
-    /// 去掉用量行同款渐变底、边框保留；2026-09-14 起占比条底色改用**卡片 hover 背景色**
-    /// `Palette.hoverGradientBright`），文字/icon 仍提亮到 Palette.cardForeground，
+    /// 去掉用量行同款渐变底、边框保留；2026-09-14 起占比条底色改用 hover 材质色
+    /// `Palette.hoverGradientBright` —— 2026-09-15 该色与点阵底点色合并为「次背景色」），文字/icon 仍提亮到 Palette.cardForeground，
     /// 命中框回填 listRowRects 供 mouseMoved 判定。
     /// rowReveals = 平台切换动效的逐行交错进度（nil = 常态直绘）：每行裁切到行带、
     /// 内容自「起始全遮最小行程」(行高+墨迹高)/2 上滑显影，淡入全程同步（alpha=rv），
@@ -1395,7 +1457,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     @discardableResult
     /// 占位骨架行（summary 未到时列表区）：与真实行同构的四列——icon 圆点 + 名称灰条 +
     /// 数值灰条 + 百分比灰条，列位/列宽与 drawProjectRows 一致，色与点阵底点同源
-    ///（heatDotEmpty），名称/数值宽度逐行错开避免呆板
+    ///（secondaryBackground = 次背景色），名称/数值宽度逐行错开避免呆板
     private func drawSkeletonRows(count: Int, topY: CGFloat) {
         let pctColWidth: CGFloat = 45
         let valueRight = bounds.width - insets.right - pctColWidth
@@ -1403,7 +1465,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         let nameX = insets.left + 14
         let barH: CGFloat = 8
         let nameWidths: [CGFloat] = [92, 66, 80, 58]
-        Palette.heatDotEmpty.setFill()
+        Palette.secondaryBackground.setFill()
         for i in 0..<count {
             let y = topY + CGFloat(i) * rowHeight + (rowHeight - barH) / 2
             // icon：10×10 圆点（与真实行 iconRect 同位同径）
@@ -1485,9 +1547,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
             let hovered = i == hoveredListRow
             let rowColor: NSColor = hovered ? Palette.cardForeground : SmallTable.textColor
             // 百分比背景条（仅 hover 行显示）：按行占比从左到右填充行底。
-            // 底色 = **卡片 hover 背景色**（`Palette.hoverGradientBright`，与 HoverMaterialHost
-            // 材质块同源：深 黑@30% / 浅 白@90%）—— 2026-09-14 用户「去掉百分比进度的背景色，
-            // 使用卡片 hover 背景色」：原用热力图无用量底点色（heatDotEmpty）自成一套灰。
+            // 底色 = **次背景色**（`Palette.hoverGradientBright` → `secondaryBackground`，
+            // 与 HoverMaterialHost 材质块同源）—— 2026-09-14 用户「去掉百分比进度的背景色，
+            // 使用卡片 hover 背景色」；2026-09-15 该色与点阵底点色合并为同一个「次背景色」参数。
             // 常态行无背景
             if hovered {
                 let pctBarRatio = baseTotal > 0
@@ -2146,7 +2208,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
 
     /// 品牌图标染色经 sourceAtop 烘进缓存图，会定格当时外观：主题切换时清缓存重染；
-    /// 点阵印章（NSImage 绘制块烘焙，无用量底点 = 动态色 heatDotEmpty 浅灰/深灰）同样定格，一并清
+    /// 点阵印章（NSImage 绘制块烘焙，无用量底点 = 动态色 secondaryBackground）同样定格，一并清
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         dotsImagesDirty = true   // 点阵位图定格了旧外观的印章色，需重烘
@@ -2213,7 +2275,6 @@ extension BalancePanelView {
     func setupInlineTokens() {
         let view = TokensPanelView()
         view.source = .zcode
-        view.sharpGroteskFontName = inlineTokensSGFontName
         // 左右缩进 8 = 用量行 / 设置卡片内容边界（usageHorizontalInset），内容撑满版心后
         // 热力图按实际宽等比放大、字号不变（hover 子面板保持默认 16 不受影响）；
         // 顶部缩进 4 = usageRowTopInset，标题→首行间距与用量区块同口径
@@ -2222,6 +2283,8 @@ extension BalancePanelView {
         view.bottomInset = 3
         // 大数字左边的内嵌小 3D 硬币：参数取自「3D 硬币」弹窗落盘的那份 CoinSettings
         view.showsInlineCoin = true
+        // 大数值行（硬币 + 大数字）整体左缩进 +3（2026-09-15 用户指定；hover 子面板不受影响）
+        view.numberRowLeadingInset = 3
         view.reloadInlineCoinSettings()
         view.isHidden = true
         // 列表（项目/模型）/热力图（每日/每周）切换改变内容高度：与折叠标题同口径

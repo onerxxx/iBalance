@@ -60,9 +60,17 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
     var onHoverChanged: ((Bool) -> Void)?
     private var trackingArea: NSTrackingArea?
 
-    /// 图表文本字体（系统字体）
-    private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
-        .systemFont(ofSize: size, weight: weight)
+    /// 图表文本字体：**走主面板字体解析器 `PanelFont`**（2026-09-15 SG 档全覆盖）——
+    /// 本视图是主面板用量行 hover 弹出的子面板，背景色与主面板同源继承，
+    /// 字体档同样跟随（SG 开启时表头/坐标轴/数值一并换 Sharp Grotesk + 中文兜底）。
+    /// 字体随开关翻转后就地重绘见 `refreshFontStyle()`
+    private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
+        PanelFont.font(size: size, weight: weight, monoDigits: monoDigits)
+    }
+
+    /// 主面板字体档（SG 开关）翻转时由宿主调用：全自绘，重绘即按新字体重新度量与排版
+    func refreshFontStyle() {
+        needsDisplay = true
     }
 
     override var isFlipped: Bool { true }
@@ -142,7 +150,9 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         super.draw(dirtyRect)
         guard let row else { return }
 
-        let titleFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+        // 表头 / 坐标轴字体：原为 `NSFont.monospacedDigitSystemFont(ofSize: 9)` 散写 ——
+        // 2026-09-15 SG 档全覆盖后改走 uiFont（PanelFont），否则切 SG 时子面板这三处仍留系统字体
+        let titleFont = uiFont(size: 9, monoDigits: true)
         let detailFont = uiFont(size: 10)
         let axisFont = titleFont
         let titleColor = Palette.cardForeground
@@ -157,7 +167,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         // 首行同款，右缘同一纵坐标为周切换箭头）；第二行周用量数值换行左对齐（字号不变）。
         let plotFullWidth = max(1, bounds.width - plotInset - yAxisGap
                                 - yAxisLabelWidth - yAxisRightInset)
-        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        let valueFont = uiFont(size: 17, weight: .semibold, monoDigits: true)
         // 当前浏览的周页（weekOffset 由右上角箭头切换；越界防御性夹取）
         let pageCount = max(1, row.historyWeeks.count)
         let safeOffset = min(max(0, weekOffset), pageCount - 1)
@@ -443,6 +453,12 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
 /// 一周用量趋势图（柱状图）的原生 popover 控制器。
 final class UsageHistoryPopoverController: NSViewController {
     private let chartView = UsageHistoryChartView()
+
+    /// 主面板字体档（SG 开关）翻转时由宿主调用：转发给全自绘的图表视图重绘
+    ///（面板侧只知道 controller，不直接持有 chartView）
+    func refreshFontStyle() {
+        chartView.refreshFontStyle()
+    }
     private let backgroundView = TintedVisualEffectView(frame: .zero)
     /// 子面板内容左右各留 2pt，避免图表贴边，同时保持高度和箭头定位不变。
     private let horizontalContentInset: CGFloat = 2
@@ -532,8 +548,9 @@ final class UsageHistoryPopoverAnchorView: NSView {
 
 /// 卡片进度条（2026-09-02 由 9 方块点阵改造为渐变进度条，旧实现备份于
 /// backups/UsagePanel.swift.bak-20260902-dots-progressbar）：
-/// 胶囊轨道 + 蓝色左→右渐变填充（systemBlue alpha 0.10→0.80）：轨道底色 = **点阵背景色**
-/// `Palette.heatDotEmpty`（词元活动热力图的无用量底点，横态/竖态同源，2026-09-14 用户要求复用），
+/// 胶囊轨道 + 蓝色左→右渐变填充（systemBlue alpha 0.10→0.80）：轨道底色 = **次背景色**
+/// `Palette.secondaryBackground`（= 无用量底点色，横态/竖态同源，2026-09-14 用户要求复用；
+/// 该色 2026-09-15 与卡片 hover 底色合并为同一个「次背景色」参数），
 /// ratio 表示剩余比例（填充宽 = 轨道宽 × ratio），变化走 0.25s ease-in-out 宽度动画。
 /// pulsing=true 时填充层以 2s 周期透明度呼吸（0.55↔1.0），示意额度正在被消耗。
 /// 脉冲状态由外部（makePanelSnapshot）传入，不自行比较，避免被面板操作重置。
@@ -547,7 +564,7 @@ final class UsageDots: NSView {
     /// 间隔 = 边长 × verticalGapRatio：槽高变化时整组等比缩放，比例恒定（2026-09-14）；
     /// 填充自下而上按整点亮灭（ratio=剩余比例，四舍五入到档位），
     /// 点亮色 = 词元活动热力图三档最亮色（剩余越多越亮，2026-09-07 定稿；曾用绿黄橙红已废），
-    /// 未点亮 = 热力图底点色 heatDotEmpty；无背景无边框（draw 直绘，隐藏轨道/填充层）。
+    /// 未点亮 = 热力图底点色 secondaryBackground；无背景无边框（draw 直绘，隐藏轨道/填充层）。
     /// 历史口径：09-06 为连续竖条（1pt 边框+内缩填充），已被本点阵替换。须在进视图层级前置位
     var isVertical = false { didSet { needsLayout = true } }
     // （竖线模式 lineBarMode 及其几何常量已于 2026-09-13 随开关整体移除，git 可查）
@@ -588,7 +605,7 @@ final class UsageDots: NSView {
     /// 填充蓝（比 systemBlue 更亮的亮蓝 #409CFF，sRGB 所见即所得）
     private static let brightBlue = NSColor(srgbRed: 0x40/255.0, green: 0x9C/255.0, blue: 0xFF/255.0, alpha: 1)
 
-    /// 背景轨道层：底色 = 点阵背景色 `Palette.heatDotEmpty`（见 applyColors；不再自算灰/透明度）
+    /// 背景轨道层：底色 = **次背景色** `Palette.secondaryBackground`（见 applyColors；不再自算灰/透明度）
     private let trackLayer = CALayer()
     /// 蓝色渐变填充
     private let progressLayer = CAGradientLayer()
@@ -618,7 +635,7 @@ final class UsageDots: NSView {
         // 窗口落定后生效外观才稳定，重着色一次（动态色落 CALayer 会定格外观）
         applyColors()
     }
-    /// 动态色（轨道色 `heatDotEmpty` / 填充蓝）落 CALayer 会定格外观：主题切换时按视图生效外观重着色
+    /// 动态色（轨道色 `secondaryBackground` / 填充蓝）落 CALayer 会定格外观：主题切换时按视图生效外观重着色
     /// （须走 Palette.borderCGColor 解算，勿直接 .cgColor——面板强制 aqua 与系统外观可能不一致）
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -652,7 +669,7 @@ final class UsageDots: NSView {
     /// 填充自下而上整点亮灭（ratio 四舍五入
     /// 到 4 档）。2026-09-07 用户改版：档位状态色 = 词元活动热力图**三个最亮档**
     ///（Palette.heatLevelColor L2/L3/L4，filled+1 起步跳过最暗档、顶两档共用峰值色；
-    /// 曾用绿黄橙红已废），未点亮 = 热力图无用量底点色 heatDotEmpty；圆角 = 边长 ×
+    /// 曾用绿黄橙红已废），未点亮 = 热力图无用量底点色 secondaryBackground；圆角 = 边长 ×
     /// dotCornerRadiusFactor（现 0.2）；位置按 backing 像素取整防亚像素发糊；无背景无边框，
     /// 点亮档外罩 0.3pt 同色微弱泛光（dotGlowWidth/dotGlowAlpha）
     private func drawVerticalDots() {
@@ -668,19 +685,24 @@ final class UsageDots: NSView {
         let radius = side * Self.dotCornerRadiusFactor
         let dark = effectiveAppearance.isDark
         // **逐格各一档**（2026-09-15 用户：「四格进度时同时使用四种颜色，三格时使用最亮的三个，以此类推」）：
-        // n 格点亮 ⇒ 取**最亮的 n 档**，暗端在低格、亮端在高格 ——
-        // 4 格 = L1…L4、3 格 = L2…L4、2 格 = L3…L4、1 格 = L4（档位色表见 Palette.heatLevelColor）。
-        // 浅色外观维持 2026-09-08 口径「点阵只用最亮那一档」：那张档位表方向相反
-        //（level 1 = 峰值原色、level 4 = 峰值 × 0.33 = 浅底上最可见），逐格取档会读成乱序
+        // 两态**共用同一个档位序列** firstLevel…count（低格低档、高格高档），
+        // 深浅只差色表方向（Palette.heatLevelColor：深色 level 越大越亮、浅色越大越暗）——
+        // 于是深浅互为镜像，这就是 2026-09-15 用户「翻转颜色对应的进度表示」的落点：
+        //   深色 n 格：底较暗→顶最亮（4 格 = L1→L4、3 格 = L2→L4、2 格 = L3→L4、1 格 = L4）
+        //   浅色 n 格：底较亮→顶最暗（4 格 = L1→L4、3 格 = L2→L4、2 格 = L3→L4、1 格 = L4）
+        // 档位集合大小恒 = 点亮格数（「n 格取 n 档」），两端方向对调。
+        // 原「浅色只用最亮那一档」（单色 L4）与「浅色底最暗」两版均已作废
         let firstLevel = count - filled + 1
         for i in 0..<count {   // i=0 = 底部点
             let y = snap(CGFloat(i) * (side + gap))
             let rect = NSRect(x: x0, y: y, width: side, height: side)
-            // 未点亮底色 = 词元活动无用量底点色（heatDotEmpty：深 #262626 / 浅 210 灰，
-            // 2026-09-07 用户指定与热力图底点同色）；动态色在 draw 内按生效外观解算
+            // 未点亮底色 = 无用量底点色（**次背景色** `Palette.secondaryBackground`；
+            // 2026-09-07 用户指定与热力图底点同色，2026-09-15 起与卡片 hover 底色同源）；
+            // 动态色在 draw 内按生效外观解算
+            // 档位 i < filled ⇒ firstLevel + i ≤ count，无需 clamp
             let color = i < filled
-                ? Palette.heatLevelColor(dark ? min(firstLevel + i, count) : count, dark: dark)
-                : Palette.heatDotEmpty
+                ? Palette.heatLevelColor(firstLevel + i, dark: dark)
+                : Palette.secondaryBackground
             // 点亮泛光：同色低透明度外扩 0.3pt 晕圈先铺底，本体满色盖回 → 可见仅外圈；
             // 圆角同步外扩保持同心（2026-09-07 用户指定）
             if i < filled {
@@ -693,7 +715,6 @@ final class UsageDots: NSView {
             NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
         }
     }
-    /// 首次布局前 bounds 为零：跳过（intrinsicContentSize 驱动 Auto Layout 随后到位）。
     /// 仅横态（长进度卡片胶囊轨道）走层路径；竖态点阵在 layout 早退走 draw 直绘
     private func layoutBar() {
         guard bounds.width > 0, bounds.height > 0 else { return }
@@ -720,11 +741,16 @@ final class UsageDots: NSView {
     }
     /// 渐变端点 = 点阵热力色阶（2026-09-07 用户「进度颜色的改变需要泛化到长进度卡片」：
     /// 原硬编码绿档废弃，改由 heatLevelColor 推导，header 调色气泡调色相/饱和度即时跟随）。
-    /// 深色 = L1→L4（45% 压暗端→峰值）；浅色 = 两端均峰值色（2026-09-08 用户
-    /// 「卡片进度条只用最亮的颜色」，单色条）。返回 sRGB 0–255 元组：
-    /// 横态层渐变共用（竖线模式已随 09-13 开关移除）。
+    /// 深色 = L1→L4（0.62 压暗端→峰值，左暗右亮）；浅色 = **L2→L4**：档位集合仍是
+    /// 「最暗三档」（2026-09-15 用户「浅色主题下长进度卡片的前景色用前三个较暗颜色」），
+    /// 但方向随同日「翻转颜色对应的进度表示」调头 —— 左端较亮、右端最暗
+    ///（与竖态点阵同向：低进度端较亮、高进度端最暗；浅色档位表方向与深色相反，
+    /// level 4 = 峰值 ×0.33 才是最暗端）。原「两端均峰值色」单色条已作废。
+    /// 返回 sRGB 0–255 元组：横态层渐变共用（竖线模式已随 09-13 开关移除）。
+    /// 档位序列本身在 `PanelHeatRamp.progressLevels`（SettingsUI）—— 「主题预设」图卡的进度条
+    /// 读同一份，免得两处各写一遍方向（图卡渐变方向反过一次就是这条）
     private static func progressStops(dark: Bool) -> [(r: CGFloat, g: CGFloat, b: CGFloat)] {
-        (dark ? [1, 4] : [4, 4]).map { level in
+        PanelHeatRamp.progressLevels(dark: dark).map { level in
             let c = Palette.heatLevelColor(level, dark: dark).usingColorSpace(.sRGB) ?? .black
             return (c.redComponent * 255, c.greenComponent * 255, c.blueComponent * 255)
         }
@@ -741,10 +767,11 @@ final class UsageDots: NSView {
         guard trackLayer.superlayer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        // 轨道底色 = **点阵背景色**（词元活动热力图的「无用量底点」`Palette.heatDotEmpty`）：
-        // 与竖态点阵的未点亮档同源，不再另写色值/透明度（2026-09-14 用户要求「注意颜色复用」）。
+        // 轨道底色 = **次背景色**（`Palette.secondaryBackground`）：与竖态点阵的未点亮档同源，
+        // 不再另写色值/透明度（2026-09-14 用户要求「注意颜色复用」；
+        // 2026-09-15 该色与卡片 hover 底合并为同一个「次背景色」参数）。
         // 动态色落 layer 仍走 borderCGColor 按生效外观解算（直接 .cgColor 会定格错分支）
-        trackLayer.backgroundColor = Palette.borderCGColor(Palette.heatDotEmpty, in: self)
+        trackLayer.backgroundColor = Palette.borderCGColor(Palette.secondaryBackground, in: self)
         progressLayer.colors = Self.progressStops(dark: effectiveAppearance.isDark)
             .map { Palette.borderCGColor(NSColor(srgbRed: $0.0 / 255.0, green: $0.1 / 255.0,
                                                  blue: $0.2 / 255.0, alpha: 1), in: self) }

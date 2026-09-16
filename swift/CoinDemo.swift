@@ -53,6 +53,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import Cocoa
+import SettingsUI          // CoinVisualIdentity（「主题预设」图卡的硬币视觉身份四项）
 import UniformTypeIdentifiers
 
 // 本文件是「一个自成体系的复刻件」：下面这些类型只服务本文件，名字带 Coin 前缀避免撞模块内其他类型。
@@ -213,7 +214,7 @@ enum CoinMetrics {
     static let idleBounceDuration = 3.0
     /// 弹簧（profile = reference：stiffness 15；damping = 2√k → 临界阻尼、不过冲）
     static let springStiffness = 15.0
-    /// rendering.motion.spinDegrees：一次点按**一圈**的度数，实际转 `turns` 圈（Turns 滑杆 1…5）
+    /// rendering.motion.spinDegrees：一次点按**一圈**的度数，实际转 `turns` 圈（Turns 滑杆 1…3）
     static let spinDegrees = 360.0
     /// motion.pitchArc：点按过程中的额外俯仰，进度中点为峰值、结束回零
     static let pitchArc = 18.0
@@ -233,10 +234,13 @@ enum CoinMetrics {
     /// restingRotation / restingTilt 属性，由弹窗与内嵌实例各自灌值。
     static let defaultRestingRotation = 45.0
     /// Motion 区滑杆范围（用户 2026-09-11 指定）：静止俯仰 / 静止朝向 ±180（可翻到背面），
-    /// 点按自旋 1…5 圈。
+    /// 点按自旋圈数。
+    /// ⚠️ Turns 原为 **1…5**，2026-09-17 用户要求收到 **1…3**（「转太多圈看着晕」）——
+    /// 老配置的 4 / 5 由 `CoinSettings.load()` 夹回 3，不会把滑杆顶歪。点按与
+    /// 「平台切换换 logo」的自旋**共用这一个范围**（`spin()` 只有 `turns` 一个口径）
     static let restingTiltRange: ClosedRange<Double> = -180...180
     static let restingRotationRange: ClosedRange<Double> = -180...180
-    static let turnsRange: ClosedRange<Double> = 1...5
+    static let turnsRange: ClosedRange<Double> = 1...3
     /// Outline 线稿的内部结构层级（Style = Outline 时 Outline level 滑杆）。
     /// 原为 1…5，2026-09-12 用户指定**去掉 L5**（mark 扫掠过程线）→ 上限收到 4。
     /// 老值 5 由 `CoinSettings.load()` 夹回 4，不会把滑杆顶歪。
@@ -893,7 +897,7 @@ final class Coin3DView: NSView {
         }
     }
 
-    /// Outline 线稿的内部结构层级（1…5，Style = Outline 时 Control 区「Outline level」可调）：
+    /// Outline 线稿的内部结构层级（1…4，Style = Outline 时 Control 区「Outline level」可调）：
     /// 级别越高内部线越多，见 `drawOutline` 的分层说明。只影响 outline 渲染 → 丢缓存
     var outlineLevel = 1 {
         didSet {
@@ -914,6 +918,13 @@ final class Coin3DView: NSView {
     /// logo 缩放（Mintform.tsx mark.scale，滑杆范围 0.5…1.25）：丢缓存
     var logoScale = 1.0 {
         didSet { guard logoScale != oldValue else { return }; invalidateRender() }
+    }
+
+    /// logo 额外缩放系数：乘在 `logoContentFit` **之后**，不被「收进裁剪圆」的自动
+    /// 缩放抵消（烘进 SVG 路径会被 contentFit 精确抵消，必须走这里）。
+    /// 主面板 Token 板块 WB 平台 logo ×2（2026-09-15 用户指定），其余恒 1
+    var logoExtraScale = 1.0 {
+        didSet { guard logoExtraScale != oldValue else { return }; invalidateRender() }
     }
 
     /// logo 厚度（沿盖面法线挤出的深度，px/160 盒）：只动 mark 怎么画 → 丢缓存。
@@ -1003,8 +1014,15 @@ final class Coin3DView: NSView {
             tiltVelocity = 0
         }
     }
-    /// 点按自旋圈数（Motion 区 Turns 滑杆 1…5）：spin() 一次转 turns × 360°
+    /// 点按自旋圈数（Motion 区 Turns 滑杆 1…3）：spin() 一次转 turns × 360°
     var turns = 1
+
+    /// 自旋**转过 90°**（盖面侧对观众、图案几乎看不见）时执行一次的动作 —— 一次性，
+    /// 触发后自动清空。用途：平台切换换 logo —— 正对观众时换图是一次「闪变」，
+    /// 等币转过去再换就看不见（2026-09-16 用户要求）
+    var onEdgeCrossing: (() -> Void)?
+    /// 本次自旋的起点朝向（判定「转过 90°」用；`spin()` 每次重设）
+    private var edgeStartRotation = 0.0
 
     private let springDamping = 2 * CoinMetrics.springStiffness.squareRoot()
     /// 侧壁模板：随尺寸 / 厚度 / 材质（lowerField 参数）重建（见 `rebuildGeometry()`）
@@ -1165,6 +1183,12 @@ final class Coin3DView: NSView {
             let acceleration = CoinMetrics.springStiffness * (target - rotation) - springDamping * velocity
             velocity += acceleration * dt
             rotation += velocity * dt
+            // 「转过 90°」钩子（平台切换换 logo 用）：一次性触发，取绝对差 ⇒ 正反向自旋都算。
+            // 90° = 盖面与屏幕法线垂直，那一刻图案侧对观众，换图看不见
+            if let hook = onEdgeCrossing, abs(rotation - edgeStartRotation) >= 90 {
+                onEdgeCrossing = nil
+                hook()
+            }
             if abs(target - rotation) < CoinMetrics.restEpsilon, abs(velocity) < CoinMetrics.restEpsilon {
                 rotation = target
                 velocity = 0
@@ -1264,7 +1288,8 @@ final class Coin3DView: NSView {
         }
     }
 
-    /// 点按自旋：方向顺时针、`turns` 圈（Motion 区 Turns 滑杆 1…5，默认 1）
+    /// 点按自旋：方向顺时针、`turns` 圈（Motion 区 Turns 滑杆 1…3，默认 1）。
+    /// 圈数就是 `turns` 一个来源 —— 点按与「平台切换换 logo」共用它，没有第二条口径
     func spin() {
         usesPitchArc = true
         // 上一次自旋可能正处在俯仰弧中途：先把当前可见的弧折进起始偏移，避免瞬间跳变
@@ -1272,6 +1297,7 @@ final class Coin3DView: NSView {
                                                   target: pitchTarget, startOffset: pitchStartOffset,
                                                   arc: CoinMetrics.pitchArc)
         pitchOrigin = rotation
+        edgeStartRotation = rotation          // 「转过 90°」从这一刻算起
         target += Double(turns) * CoinMetrics.spinDegrees
         pitchTarget = target
         startTicker()
@@ -1309,6 +1335,15 @@ final class Coin3DView: NSView {
         cachedImage = image
         cachedKey = key
         return image
+    }
+
+    /// 静态位图（离屏快照用）：只出**硬币本体**那张 3D 位图 —— 不含 `draw(_:)` 里的舞台居中
+    /// 与惰性弹跳（那两项都读 `bounds` / 墙上时钟），于是无窗口、无 displayLink 的离屏场景拿到的
+    /// 就是「静止位上的这枚币」，同一份参数每次得到同一张图。
+    /// 位图像素 = (size + 2×thickness) × 2（`coinImage` 的 scale 写死 2，离屏没有 backingScale）。
+    /// ⚠️ 调用方负责先把 size / thickness / material / logoArt / style / 姿态灌好。
+    func staticBitmap() -> CGImage? {
+        coinImage(pose: currentPose, scale: 2)
     }
 
     /// 把硬币画进一张离屏位图。正交投影下平面→屏幕是仿射，所以侧壁面板与盖面分层
@@ -1390,7 +1425,7 @@ final class Coin3DView: NSView {
         // 几何口径与 `drawMark` 同源（solids + base 映射 + 裁剪），不挤出不叠阴影
         let art = logoArt
         if !art.isEmpty {
-            let total = logoScale * sizeScale * logoContentFit
+            let total = logoScale * logoExtraScale * sizeScale * logoContentFit
             let center = Double(CoinSVG.box) / 2
             let base = CGAffineTransform(translationX: -center, y: -center)
                 .concatenating(CGAffineTransform(scaleX: total, y: total))
@@ -1695,7 +1730,7 @@ final class Coin3DView: NSView {
                           pose: (rotation: Double, pitch: Double), front: Bool) {
         let art = logoArt
         guard !art.isEmpty else { return }
-        let total = logoScale * sizeScale * logoContentFit
+        let total = logoScale * logoExtraScale * sizeScale * logoContentFit
         let center = Double(CoinSVG.box) / 2
         let base = CGAffineTransform(translationX: -center, y: -center)
             .concatenating(CGAffineTransform(scaleX: total, y: total))
@@ -1977,9 +2012,9 @@ struct CoinSettings {
     var restingTilt: Double
     /// 静止朝向（度，Motion 区 Resting rotation，-180…180，出厂 45）
     var restingRotation: Double
-    /// 点按自旋圈数（Motion 区 Turns，1…5）
+    /// 点按自旋圈数（Motion 区 Turns，1…3）
     var turns: Double
-    /// Outline 线稿的内部结构层级（Control 区 Outline level，1…5；仅 Outline 外观生效）
+    /// Outline 线稿的内部结构层级（Control 区 Outline level，1…4；仅 Outline 外观生效）
     var outlineLevel: Double
     /// Outline 线稿基准线宽（Control 区 Outline width，1…10 px；仅 Outline 外观生效）
     var outlineWidth: Double
@@ -2310,7 +2345,7 @@ class CoinFormSectionView: NSView {
 
 /// 「标签 + 滑杆 + 数值」行：Thickness / Coin size / Logo size / Turns 等滑杆行共用。
 /// 滑杆连续上报（拖动中实时改几何）+ 1 单位步进取整；数值标签 monospacedDigit 右对齐。
-/// `ticks > 0` 时滑杆下方画**原生刻度**并只允许取刻度值（如 Turns 1…5 给 5 档刻度）——
+/// `ticks > 0` 时滑杆下方画**原生刻度**并只允许取刻度值（如 Turns 1…3 给 3 档刻度）——
 /// 刻度占竖向空间，滑杆 frame 因此加高，仍按行框居中。
 final class CoinSliderRowView: CoinFormRowView {
     let label: NSTextField
@@ -2436,7 +2471,7 @@ final class CoinControlSectionView: CoinFormSectionView {
     /// 拉下按钮按**最长档名**量出的宽度：切档时按钮不跳，右缘始终贴同一列
     private var appearancePopUpWidth: CGFloat = 0
 
-    // 行 1：Outline level 滑杆（1…5，整数档刻度；仅 Outline 外观下可用）
+    // 行 1：Outline level 滑杆（1…4，整数档刻度；仅 Outline 外观下可用）
     let outlineLevelRow: CoinSliderRowView
     // 行 2：Outline width 滑杆（1…4 px 基准线宽；仅 Outline 外观下可用）
     let outlineWidthRow: CoinSliderRowView
@@ -2674,6 +2709,26 @@ final class CoinControlSectionView: CoinFormSectionView {
 
     private static let wellWidth: CGFloat = 52
 
+    /// 外部改盘后回灌本区承载的**视觉身份四项**（「主题预设」应用硬币参数时由
+    /// `CoinDemoPanelView.reloadFromDisk()` 调）。
+    /// ⚠️ **不回发回调**：值已经落盘了，再发一遍等于把刚落的值原样写回去。
+    /// 只碰这 4 项控件 —— 其余行（尺寸 / 厚度 / 工艺 / 运动 / logo）不在预设语义内，
+    /// 那些值磁盘上本来就是现值，控件也就不用动
+    func reload(preset newPreset: CoinPreset, appearance newAppearance: CoinAppearance,
+                materialColor: CoinRGB, fieldColor: CoinRGB) {
+        if newPreset != preset {
+            preset = newPreset
+            syncPresetState()
+        }
+        if newAppearance != selectedAppearance {
+            selectedAppearance = newAppearance
+            syncAppearanceState()
+        }
+        // 色井：程序设 `color` 不触发 action，所以这里不会绕回回调
+        coinColorWell.color = materialColor.nsColor
+        fieldColorWell.color = fieldColor.nsColor
+    }
+
     /// Logo 行说明文案（上传后 = 文件名；否则 = 内置预设），tooltip 给全文
     private func setLogoCaption(_ caption: String) {
         logoNameLabel.stringValue = caption
@@ -2849,7 +2904,7 @@ final class CoinEdgeSectionView: CoinFormSectionView {
 // MARK: - Motion 参数区
 
 /// 「Motion」参数区（排在 Edge 之后，用户 2026-09-11 指定）：
-/// Resting tilt（静止俯仰 -180…180）/ Resting rotation（静止朝向 -180…180）/ Turns（自旋 1…5 圈）。
+/// Resting tilt（静止俯仰 -180…180）/ Resting rotation（静止朝向 -180…180）/ Turns（自旋 1…3 圈）。
 /// 三行都是滑杆、整数步进（`CoinSliderRowView` 自带 rounded），改动经回调实时上币。
 final class CoinMotionSectionView: CoinFormSectionView {
 
@@ -2874,7 +2929,7 @@ final class CoinMotionSectionView: CoinFormSectionView {
         turnsRow = CoinSliderRowView(label: "Turns",
                                      range: CoinMetrics.turnsRange,
                                      value: settings.turns,
-                                     ticks: 5) { "\(Int($0))" }
+                                     ticks: 3) { "\(Int($0))" }
         super.init(title: CoinMotionSectionView.sectionTitle, bare: bare)
         addRow(restingTiltRow)
         addRow(restingRotationRow)
@@ -3047,6 +3102,21 @@ final class CoinDemoPanelView: NSView {
         settings.save()
     }
 
+    /// 外部改盘后整份回灌（「主题预设」应用硬币参数后由宿主调）。
+    /// **重读磁盘**而不是从外面塞值进来：本面板的内存快照是 19 个 apply 累加出来的状态，
+    /// 只有磁盘是权威（宿主刚写进去的是那 4 项，其余项盘上本来就是现值）。
+    /// 回灌 = 参数区控件 → 硬币本体。
+    /// ⚠️ 这里**不发通知也不落盘**：磁盘是本次回灌的来源；主面板内嵌小硬币由宿主
+    /// `applyCoinIdentity` 统一重灌一次（面板没建过时本函数根本不会被调到，那条路不能省）
+    func reloadFromDisk() {
+        let s = CoinSettings.load()
+        settings = s
+        control.reload(preset: s.preset, appearance: s.appearance,
+                       materialColor: s.materialColor, fieldColor: s.fieldColor)
+        coin.material = s.material
+        coin.style = s.appearance
+    }
+
     /// Preset：只决定 lowerField 开关（gho 关 / sgho 开），面/边 token 与色值不动
     private func apply(preset: CoinPreset) {
         settings.preset = preset
@@ -3061,7 +3131,7 @@ final class CoinDemoPanelView: NSView {
         notifyLiveChange()
     }
 
-    /// Outline level：线稿内部结构层级（1…5，仅 Outline 外观生效）
+    /// Outline level：线稿内部结构层级（1…4，仅 Outline 外观生效）
     private func apply(outlineLevel: Double) {
         settings.outlineLevel = outlineLevel
         coin.outlineLevel = Int(outlineLevel.rounded())
@@ -3185,7 +3255,7 @@ final class CoinDemoPanelView: NSView {
         notifyLiveChange()
     }
 
-    /// 自旋圈数（1…5，滑杆已整数步进）：spin() 一次转 turns × 360°
+    /// 自旋圈数（1…3，滑杆已整数步进）：spin() 一次转 turns × 360°
     private func apply(turns: Double) {
         settings.turns = turns
         coin.turns = Int(turns.rounded())
@@ -3368,5 +3438,71 @@ enum CoinDemoDialog {
             }
             onClose?()
         }
+    }
+}
+
+// MARK: - 主题预设图卡的小硬币（离屏渲染）
+
+/// 设置窗口「主题外观 → 主题预设」图卡右下那枚币：把**当前几何 / 工艺 / 姿态**与预设的
+/// **视觉身份四项**组合起来，离屏渲染一次并缓存（每枚预设一种身份 + 一个固定像素尺寸 → 只算一次）。
+///
+/// ⚠️ 为什么在这儿而不在 SettingsUI：`Coin3DView` / `CoinSettings` / `CoinRGB` 都在本 target，
+/// SettingsUI 只有原始值（`CoinVisualIdentity`）。接线见 main.swift 的 configure。
+///
+/// ⚠️ 只用 `Coin3DView.staticBitmap()`（硬币本体位图），**不**把视图挂进任何窗口 ——
+/// 离屏没有 displayLink，`draw(_:)` 那套舞台居中/惰性弹跳既不需要也会引入随机相位。
+enum CoinThumbnailRenderer {
+    /// 缓存键 = 视觉身份 + 像素边长（同一枚预设重复出现在网格里也只渲染一次）
+    private static var cache: [String: NSImage] = [:]
+
+    /// - Parameters:
+    ///   - identity: 预设的硬币视觉身份四项（Preset / Style 档 + 币面色 + 色场色）
+    ///   - box: 目标方框边长（pt，含投影轮廓 = 直径 + 两侧厚度）
+    /// - Returns: pt 尺寸 = box、像素 = box×2 的成品图；渲染失败返回 nil（视图回退示意币）
+    static func image(identity: CoinVisualIdentity, box: CGFloat) -> NSImage? {
+        let key = "\(identity.cacheKey)|\(Int((box * 2).rounded()))"
+        if let hit = cache[key] { return hit }
+        var s = CoinSettings.load()
+        if let p = CoinPreset(rawValue: identity.preset) { s.preset = p }
+        if let a = CoinAppearance(rawValue: identity.appearance) { s.appearance = a }
+        if let m = CoinRGB(hex: identity.materialColor) { s.materialColor = m }
+        if let f = CoinRGB(hex: identity.fieldColor) { s.fieldColor = f }
+        // 币径 = 方框 ÷ (1 + 2×厚度比)：正交投影下轮廓 = 直径 + 两侧厚度，正好填满方框
+        let ratio = s.thickness / max(1, s.size)
+        let diameter = Double(box) / (1 + 2 * ratio)
+        let k = diameter / max(1, s.size)
+        let view = Coin3DView(frame: NSRect(x: 0, y: 0, width: box, height: box))
+        view.compactInline = true
+        view.interactive = false
+        // 参数灌法照 TokensPanel.reloadInlineCoinSettings（内嵌小币那一份）：厚度 / 浮雕深度按
+        // 直径比等比缩放，边界阴影不乘 k（spread 是 160 盒单位，drawMark 里自缩）
+        view.size = diameter
+        view.thickness = s.thickness * k
+        view.markDepth = s.markDepth * k
+        view.markShadowOpacity = s.markShadowOpacity / 100
+        view.markShadowSpread = s.markShadowSpread
+        view.logoScale = s.logoScalePercent / 100
+        view.material = s.material
+        view.logoArt = s.logoArt
+        view.edgeFinish = s.finish
+        view.style = s.appearance
+        view.outlineLevel = Int(s.outlineLevel.rounded())
+        view.outlineWidth = s.outlineWidth
+        view.logoInverted = s.logoInverted
+        view.restingTilt = s.restingTilt
+        view.restingRotation = s.restingRotation
+        guard let cg = view.staticBitmap() else {
+            // 渲染失败要**说出来**：图卡会安静地退回示意币，不看日志会以为是「参数没生效」
+            Logger.log(.layout, "主题预设图卡：硬币离屏渲染失败（\(identity.cacheKey)）")
+            return nil
+        }
+        let side = CGFloat(diameter + view.thickness * 2)
+        let pt = NSSize(width: side, height: side)
+        let rep = NSBitmapImageRep(cgImage: cg)
+        rep.size = pt                 // rep 自带 2× 像素 → 图卡在 Retina 上是清晰的
+        let image = NSImage(size: pt)
+        image.addRepresentation(rep)
+        cache[key] = image
+        return image
     }
 }

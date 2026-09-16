@@ -1,6 +1,6 @@
 // PanelDrag.swift — iBalance
 // 平台卡片拖拽排序框架:拖动状态机、幽灵卡片、重排动画、drop highlight
-// header 图标拖动换位（2026-09-13，无需修饰键）：五颗 header 按钮链式约束实时重排
+// header 图标拖动换位（2026-09-13，无需修饰键）：header 按钮链式约束实时重排（现 6 颗，2026-09-16 加平台开关）
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 
 import Cocoa
@@ -522,13 +522,16 @@ extension BalancePanelView {
         header.layoutSubtreeIfNeeded()
         // 前景色按落点分档（唯一落点，重排/换槽都走这里）：
         //  · **正中间那一格** → 卡片主标题色（Palette.cardForeground）；
-        //  · 其余 → **面板底色上端色降亮度**（Palette.panelTintDimmed：同色相压深一档）
-        //（2026-09-14 用户要求）。9 槽时的中间格 = 下标 4；槽数为偶数时取靠左的中格
+        //  · 其余 → 卡片**副标题色**（Palette.secondaryForeground：与卡片副标题行 /
+        //    到期倒计时 / meta 同一个灰，含按面板底色解算的对比度补偿）
+        //（2026-09-15 用户：「header 的非中间按钮，前景色改为副标题的前景色」——
+        //  原为「面板底色上端色降亮度」Palette.panelTintDimmed，该常量已随本次改动删除）。
+        // 9 槽时的中间格 = 下标 4；槽数为偶数时取靠左的中格
         let centerSlot = BalancePanelView.headerButtonSlotCount / 2
         for (slot, view) in placed {
             (view as? HeaderTintAdjustable)?.normalTintColor = (slot == centerSlot)
                 ? Palette.cardForeground
-                : Palette.panelTintDimmed
+                : Palette.secondaryForeground
         }
         // 指引层占用表跟随槽位表（唯一同步点，避免两处各算一份）
         headerSlotGuidesView?.occupied = headerButtonSlots.map { $0 != nil }

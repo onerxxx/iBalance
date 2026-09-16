@@ -328,7 +328,7 @@ extension NSView {
 
     /// 自身安装的宿主（不做向上查找）：applyHeatHueInPlace 逐宿主重染描边用——
     /// 根宿主 / 用量行宿主 / Token 行宿主是三个独立实例，各自的描边色都定格在
-    /// 创建时，主题色（峰值色）变化后须逐一重解算
+    /// 创建时，用量色（峰值色）变化后须逐一重解算
     var installedHoverMaterialHost: HoverMaterialHost? {
         objc_getAssociatedObject(self, &HoverMaterialAssociate.host) as? HoverMaterialHost
     }

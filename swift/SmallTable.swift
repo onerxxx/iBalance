@@ -23,11 +23,14 @@ enum SmallTable {
     /// 数据行字重
     static let rowWeight: NSFont.Weight = .medium
 
-    /// 小表格字体（monoDigits = 等宽数字系统字体，数值右对齐列用）
+    /// 小表格字体：**走主面板字体解析器 `PanelFont`**（2026-09-15 SG 字体档全覆盖）——
+    /// 系统档 = 原口径（系统字体 / 等宽数字变体），SG 档 = Sharp Grotesk + 中文兜底。
+    /// ⚠️ 本函数是**度量与渲染的共同来源**（用量表 label 经 `registerFont` 取同一档、
+    /// Token 面板自绘直接调它、`computeUsageColumnLayout` 拿它测列宽）——
+    /// 若这里散写 `.systemFont(...)`，SG 档下「测宽用系统字体、渲染用 SG」列宽就会错配。
+    /// monoDigits = 等宽数字（数值右对齐列用；SG 档下无意义，SG 只有比例数字）
     static func font(size: CGFloat, weight: NSFont.Weight, monoDigits: Bool = false) -> NSFont {
-        monoDigits
-            ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
-            : .systemFont(ofSize: size, weight: weight)
+        PanelFont.font(size: size, weight: weight, monoDigits: monoDigits)
     }
     /// 表头/区块标题字体
     static func titleFont() -> NSFont {

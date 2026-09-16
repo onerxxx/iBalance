@@ -5,6 +5,8 @@
 // 卡片字号         主标题 = 设置窗口「主题外观」开放（config.cardTitleFontSize，默认13）
 //                  Palette.cardSubFontSize(9，副标题+积分)；数值固定 13pt
 //                  ⚠️ 改字号改常量，勿在调用点写数字
+// 行距系数         主副标题行距系数（SF/SG）已固化 → BalancePanelView.cardTitleGapScaleSFFixed /
+//                  cardTitleGapScaleSGFixed（设置窗口不再开放）
 // 卡片 icon 尺寸    CardStyle.iconSize(25)（本文件，全平台统一）
 // 行高 / 间距       PanelLayout.swift balanceContentRow：row1 16、row2 12、两行 spacing 1
 // 菜单栏指示点      CardMenuBarDotView（PanelLayout.swift，icon 下方 2pt、直径 3.6pt 圆点）；
@@ -61,23 +63,29 @@ struct PanelSnapshot: Equatable {
     var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
     /// 浅色主题开关（同步自配置；开启时强制浅色外观，优先级高于渐变开关）
     var lightThemeEnabled = false
-    /// 卡片主标题字号（pt，同步自配置；设置窗口「主题外观 → 卡片」开放）
+    /// 卡片主标题字号（pt，同步自配置；设置窗口「主题外观 → 卡片」开放，10…16 步进 0.5）
     var cardTitleFontSize: Double = 13
     /// 卡片主标题 Sharp Grotesk（本机安装的商业字体；未装该字重回落系统字体）。
-    /// 字重×宽度**已固定** Medium20（见 cardTitleSGPostScriptName），不再开放档位
+    /// 字重×宽度**已固定** Book20（见 cardTitleSGPostScriptName），不再开放档位。
+    /// ⚠️ 主副标题行距系数（SF/SG）**已固化**（2026-09-15 用户）：不再是快照字段，
+    /// 真值只此一处 → `BalancePanelView.cardTitleGapScaleSFFixed / SGFixed`
     var cardTitleSharpGrotesk = false
-    /// 主标题↔副标题行距的字体系数（× `PanelLayout.titleRowBaseGap`，设置窗口「卡片」栏开放）：
-    /// 两种字体字形框疏密不同（SG 字面 em 恒 1.0em、更扁），各一档
-    var cardTitleGapScaleSF: Double = 1.0
-    var cardTitleGapScaleSG: Double = 0.7
     /// 数值滚动预览开关（开启后余额卡片周期随机变化，演示逐位滚动动画）
     var valueScrollPreviewEnabled = false
     /// 长进度卡片开关（开启后余额卡片进度条独占整行 + 副标题下移一行）
     var longProgressCard = false
     /// 图标深浅互换开关（开启后卡片品牌 icon ClearDark/ClearLight 版本互换）
     var iconThemeSwap = false
+    /// 无边框图标开关（开启后卡片品牌 icon 直接用同名 SVG 原图，不套 Icon Composer 底板）
+    var iconNoBorder = false
     /// 自动检查更新开关（GitHub Releases 启动静默检查）
     var updateAutoCheckEnabled = true
+    /// 数值滚动「滑移」时长口径（同步自配置；设置窗口「主题外观 → 动效」单选）。
+    /// 消费点 = `RollingNumberView.slideTiming` 静态镜像（本面板 update 处落值）
+    var rollSlideTiming: RollSlideTiming = .wheelTail
+    /// 数值滚动时间曲线档位（同步自配置；设置窗口「主题外观 → 动效」单选）。
+    /// 消费点 = `RollingNumberView.curve` 静态镜像（本面板 update 处落值）
+    var rollCurve: RollCurve = .easeIn
 }
 
 /// 副标题右侧 meta 的变化方向（2026-09-13）：up/down 选上下箭头；
@@ -129,9 +137,19 @@ enum Motion {
     /// 余额数字滚动（Number Rolling）：数据变化反馈类动效，非 UI 状态切换，
     /// 用户指定加长时长，不适用 0.40 硬顶
     static let roll: CFTimeInterval = 3.0
+    /// 数值滚动「滑移」（位数变化时的整组左右平移）时长钳制区间（2026-09-16 用户要求）：
+    /// 原先滑移时长恒取 `rollDuration`（1.2s）而与位移量无关，用户反馈「位数左右移动
+    /// 花的时间太长」。「距离驱动」档按位移在此区间内插值，「跟随滚字」档用它当下限 ——
+    /// 计算唯一入口 `RollingNumberView.slideTime(rollDuration:)`
+    static let rollSlideMin: CFTimeInterval = 0.30
+    static let rollSlideMax: CFTimeInterval = 0.60
     /// Agent 卡 hover 确认时长：光标驻留此时长才切换 Token 板块，
     /// 子账号积分条换入同此节拍（用户指定 0.8s，滤掉光标快速掠过）
     static let hoverDwell: CFTimeInterval = 0.8
+    /// SG 比例数字滚动的槽宽变化启动延迟（用户指定 50ms）：宽度滞后数字起滚
+    /// 50ms 再开始跟随，横向位移与滚字起点解耦更柔和；宽度时间轴压缩进 tween
+    /// 剩余时长，落定瞬间恰达目标宽——到位后零调整。等宽字体宽度恒定，无效果。
+    static let rollWidthDelay: CFTimeInterval = 0.05
     /// 打开面板后滚动数字重滚入场的延迟（用户指定 0.5s）
     static let openRerollDelay: CFTimeInterval = 0.5
     /// 打开面板补发整段时长（用户指定 2s）：从开始到停下恒为此时长——行进最长的
@@ -204,9 +222,13 @@ enum Palette {
     /// 渐变背景开=面板强制深色外观恒取深色值；关=面板跟随系统外观，浅色主题自动转黑灰。
     /// 动态色按绘制环境外观解算；经 .cgColor 落盘（layer）会定格当时外观，需外观变化时重设。
     static let cardForeground = NSColor(name: nil) { appearance in
-        appearance.isDark
-            ? NSColor(calibratedRed: 0xEB/255.0, green: 0xEB/255.0, blue: 0xEB/255.0, alpha: 1)
-            : NSColor(calibratedWhite: 0.13, alpha: 1)
+        resolvedCardForeground(dark: appearance.isDark)
+    }
+    /// 按**指定深浅档**取主前景色（静态色，不随绘制环境变）：供「无边框图标」的 SVG 模板着色用 ——
+    /// 那里要的是「图标深浅互换」解出来的档，可能与视图当前生效外观相反，动态色做不到这件事。
+    /// 色号单一定义在 `PanelForegroundColor`（SettingsUI），设置窗口的预设图标读同一份
+    static func resolvedCardForeground(dark: Bool) -> NSColor {
+        PanelForegroundColor.resolved(dark: dark)
     }
     /// 非当前账号前景色：深色石墨灰（用户定稿 0.61）/ 浅色 0.42
     static let cardForegroundDimmed = NSColor(name: nil) { appearance in
@@ -337,19 +359,20 @@ enum Palette {
     /// 卡片 hover 提亮色 #333333 @ 30%
     static let cardBackgroundHover = NSColor(calibratedWhite: 51.0 / 255.0, alpha: 0.3)
     /// hover 底色（2026-09-12 用户定稿，色井设定已移除改固定值）：
-    /// 深色 = 黑@30%（「固定30%深灰」，与点阵主题色脱钩——中间态点阵最暗档实色已废）/
+    /// 深色 = 黑@30%（「固定30%深灰」，与用量色脱钩——中间态点阵最暗档实色已废）/
     /// 浅色 = 白@90%
     static let hoverCardDefaultDark = NSColor.black.withAlphaComponent(0.30)
     static let hoverCardDefaultLight = NSColor.white.withAlphaComponent(0.90)
 
     /// 统一 hover 渐变背景（余额卡片/操作磁贴/折叠标题条/用量条目共用）：
-    /// 默认深色 = 黑@30%、浅色 = 白@90%；2026-09-15 起由设置窗口「主题外观 → 卡片 → hover 背景色」
-    /// 开放 —— 用户改后两档同值、**不再按外观分档**（浅色主题开关会把明度翻转）。
-    /// 值来自运行镜像 `cardHoverBackgroundActive`；材质块颜色是 .cgColor 落 layer 的（定格外观），
-    /// 改值后须逐个材质宿主 `refreshAppearance()` 重解算 —— 见 `Panel.refreshDotMatrixAndHoverMaterials()`
-    static var cardHoverBackgroundActive: PanelBackgroundColor = .cardHoverDefault
-    static let hoverGradientBright = NSColor(name: nil) { _ in cardHoverBackgroundActive.nsColor }
-    static let hoverGradientDark = NSColor(name: nil) { _ in cardHoverBackgroundActive.nsColor }
+    /// 默认深色 = 黑@30%、浅色 = 白@90%；2026-09-15 起改由**次背景色**统一提供 ——
+    /// 当天用户要求把原「hover 背景色」与「点阵背景色」合并成一个参数（「次背景色」，归到设置
+    /// 窗口「面板」栏）⇒ 两档同值、**不再按外观分档**（浅色主题开关会把明度翻转）。
+    /// 值来自运行镜像 `secondaryBackgroundActive`（见下方「次背景色」定义处）；
+    /// 材质块颜色是 .cgColor 落 layer 的（定格外观），改值后须逐个材质宿主 `refreshAppearance()`
+    /// 重解算 —— 见 `Panel.refreshDotMatrixAndHoverMaterials()`
+    static let hoverGradientBright = NSColor(name: nil) { _ in secondaryBackgroundActive.nsColor }
+    static let hoverGradientDark = NSColor(name: nil) { _ in secondaryBackgroundActive.nsColor }
     /// 渐变端点数组（CAGradientLayer.colors 直接可用）
     static let hoverGradient: [NSColor] = [hoverGradientBright, hoverGradientDark]
     /// 拖拽幽灵背景定调色（2026-09-06 两段式幽灵：只背景加模糊、叠 hover 强背景色）。
@@ -499,14 +522,19 @@ enum Palette {
             ? NSColor(calibratedRed: 0xEB/255.0, green: 0xEB/255.0, blue: 0xEB/255.0, alpha: 1)
             : NSColor(calibratedWhite: 0x26 / 255.0, alpha: 1)
     }
-    /// Token 热力图无用量底点 = **点阵背景色**（默认深 中性灰 #292929（2026-09-07 用户由 #262626 提亮）/
-    /// 浅 #dddddd（2026-09-08 用户指定）；2026-09-15 起由设置窗口「主题外观 → 面板 → 点阵背景色」开放，
-    /// 浅色主题开关会把明度翻转）。
-    /// 值来自运行镜像 `heatDotEmptyActive`（Config 装载 / 色盘落值时写），
-    /// 动态色只在绘制时解算 ⇒ 改值后靠 `Panel.refreshDotMatrixAndHoverMaterials()` 整树重绘落屏。
+    /// **次背景色**（设置窗口「面板 → 次背景色」）：面板内**第二层背景**的统一色 ——
+    /// 无用量底点 / 进度条轨道底 / 骨架行 / Token 印章底 / 卡片 hover 材质块
+    /// （后者见上方 `hoverGradientBright/Dark`）全部同源。
+    /// 2026-09-15 由原「点阵背景色」+「hover 背景色」两个参数**合并**（用户要求：合并、
+    /// 改名「次背景色」、参数归到设置窗口「面板」栏）—— 原两个运行镜像
+    /// `heatDotEmptyActive` / `cardHoverBackgroundActive` 一并合并为本变量。
+    /// 默认 = 深 #292929 / 浅 #dddddd 系（沿用原「点阵背景色」内置默认，
+    /// 2026-09-07 由 #262626 提亮）；浅色主题开关会把明度翻转。
+    /// 值来自运行镜像（Config 装载 / 色盘落值时写），动态色只在绘制时解算 ⇒
+    /// 改值后靠 `Panel.refreshDotMatrixAndHoverMaterials()` 整树重绘落屏。
     /// ⚠️ 用户改的颜色一律**原样**用（用户选什么就是什么，不再按外观分档）
-    static var heatDotEmptyActive: PanelBackgroundColor = .heatDotEmptyDefault
-    static let heatDotEmpty = NSColor(name: nil) { _ in heatDotEmptyActive.nsColor }
+    static var secondaryBackgroundActive: PanelBackgroundColor = .secondaryBackgroundDefault
+    static let secondaryBackground = NSColor(name: nil) { _ in secondaryBackgroundActive.nsColor }
     /// Token 热力图 hover 高亮环（深 白@90% / 浅 黑@70%）
     static let heatDotRing = NSColor(name: nil) { appearance in
         appearance.isDark ? NSColor.white.withAlphaComponent(0.9) : NSColor.black.withAlphaComponent(0.7)
@@ -518,14 +546,16 @@ enum Palette {
     ///（「前三档过暗提亮」定稿；首版 28/50/73/100 作废）；
     /// 浅色主题 = 两端点线性插值，低用量端 = 峰值色原样、高用量端 = 33% 压暗
     ///（替换 2026-08-29 GitHub 绿阶 #063A16…#56D364 与浅色 #9BE9A8→#216E39 旧档）。
-    /// 峰值基准色 HSB 分解：三参由设置窗口「面板 → 主题色」系统色盘拾色后分解写入
+    /// 峰值基准色 HSB 分解：三参由设置窗口「面板 → 用量色」系统色盘拾色后分解写入
     ///（原三根滑杆 2026-09-14 撤掉，落值链路不变）。
     /// 明度默认 = 254/255（弹层圆点取色同用，故 internal）。
-    static let heatPeakDefaultBrightness: CGFloat = 254.0 / 255.0
+    /// 三个默认值一律**引用 `PanelThemeColor` 的常量**（解算体在 SettingsUI）：
+    /// 宿主点阵、「主题预设」缺项兜底、设置窗口色盘三者同源，避免各写一遍算式后漂移
+    static let heatPeakDefaultBrightness: CGFloat = PanelThemeColor.defaultBrightness
     /// 基准黄绿的色相/饱和（0..1）：峰值 (225,254,119) → hue=(2+(B−R)/Δ)/6、sat=Δ/max。
-    static let heatPeakDefaultHue: CGFloat = (2 + (119 - 225) / 135) / 6
-    static let heatPeakDefaultSaturation: CGFloat = 135.0 / 254.0
-    /// 点阵色相（0..1）：设置窗口主题色色盘写入；UserDefaults 持久化跨重启。
+    static let heatPeakDefaultHue: CGFloat = PanelThemeColor.defaultHue
+    static let heatPeakDefaultSaturation: CGFloat = PanelThemeColor.defaultSaturation
+    /// 用量色色相（0..1）：设置窗口用量色色盘写入；UserDefaults 持久化跨重启。
     static var heatPeakHue: CGFloat {
         get {
             ((UserDefaults.standard.object(forKey: UDKey.heatDotHue) as? Double).map { CGFloat($0) })
@@ -533,7 +563,7 @@ enum Palette {
         }
         set { UserDefaults.standard.set(Double(newValue), forKey: UDKey.heatDotHue) }
     }
-    /// 点阵饱和度（0..1）：同上。
+    /// 用量色饱和度（0..1）：同上。
     static var heatPeakSaturation: CGFloat {
         get {
             ((UserDefaults.standard.object(forKey: UDKey.heatDotSaturation) as? Double)
@@ -541,7 +571,7 @@ enum Palette {
         }
         set { UserDefaults.standard.set(Double(newValue), forKey: UDKey.heatDotSaturation) }
     }
-    /// 点阵峰值明度（0..1）：HSB 的 V，同上持久化。
+    /// 用量色峰值明度（0..1）：HSB 的 V，同上持久化。
     static var heatPeakBrightness: CGFloat {
         get {
             ((UserDefaults.standard.object(forKey: UDKey.heatDotBrightness) as? Double)
@@ -561,24 +591,17 @@ enum Palette {
                                     brightness: heatPeakBrightness)
         return (c.red, c.green, c.blue)
     }
-    /// 热力档位 → 实色（0 = 无用量底点；= 峰值色 × 压暗系数：深色离散档、
-    /// 浅色 1.0→0.33 线性）。2026-09-07 从 TokensPanel 上收到此集中管理：词元活动
-    /// 热力图与默认卡片竖排点阵四档状态色共用同一口径，勿再散落
-    ///
-    /// 2026-09-15 用户「点阵的四个颜色改为四个较亮的颜色（提亮两个较暗的）」：
-    /// 深色档 1/2 抬亮 **0.45 → 0.62、0.65 → 0.76**（档 3/4 的 0.82/1.0 不动），整条坡更亮、更紧凑。
+    /// 热力档位 → 实色（0 = 无用量底点；= 峰值色 × 压暗系数）。
+    /// 2026-09-07 从 TokensPanel 上收到此集中管理：词元活动热力图与默认卡片竖排点阵四档状态色共用；
+    /// **2026-09-16 系数表本身再上收到 `PanelHeatRamp`**（SettingsUI）—— 「主题预设」图卡的进度条
+    /// 要画同一条坡，各写一份必然漂移（图卡渐变方向反过一次就是这条）。这里只剩「取峰值 RGB × 系数」
+    /// 与「0 档 = 次背景色」两件事。
     /// ⚠️ 本函数是**两处共用**的（卡片竖排点阵 + 词元活动热力图），改档位两处一起变 —— 那是刻意的：
     /// 同一个「用量档位」在两个视图里必须同色，否则同屏出现两套色阶
     static func heatLevelColor(_ level: Int, dark: Bool) -> NSColor {
-        if level <= 0 { return heatDotEmpty }
+        if level <= 0 { return secondaryBackground }
         let peak = heatPeakRGB()
-        let factor: CGFloat
-        if dark {
-            factor = [0.62, 0.76, 0.88, 1.0][min(level, 4) - 1]
-        } else {
-            let t = CGFloat(min(level, 4) - 1) / 3
-            factor = 1 + (0.33 - 1) * t
-        }
+        let factor = PanelHeatRamp.factor(level: level, dark: dark)
         return NSColor(calibratedRed: peak.r * factor, green: peak.g * factor,
                        blue: peak.b * factor, alpha: 1)
     }
@@ -593,28 +616,13 @@ enum Palette {
             ? NSColor.white.withAlphaComponent(0.16)
             : NSColor.black.withAlphaComponent(0.15)
     }
-    /// **面板底色的「降亮度」版**（2026-09-14 用户：「其余按钮使用面板色上端颜色 降低亮度」）：
-    /// 取当前生效底色的 HSB，**只压明度**（× `panelTintDimFactor`），色相/饱和度原样沿用 ——
-    /// 于是画出来的是同一色相下暗一档的色，落在面板底色上读作"同色系压深"，不是另起一套灰。
-    /// **恒不透明**（与同排的 `cardForeground`、面板文字一致）：跟着底色 alpha 走的话，
-    /// 半透明面板上这排图标会一半实一半虚，且与中间那颗（不透明）并排就显成两档。
-    /// 面板无遮罩（alpha ≤ 1%，没有"面板色"可取）时回落副前景色。
-    /// ⚠️ 动态色：provider 每次绘制现算，底色改动后须靠整树标脏（`refreshSecondaryForeground`）落屏。
-    static let panelTintDimmed = NSColor(name: nil) { appearance in
-        let bg = panelBackgroundActive
-        guard bg.isEffective else { return resolveSecondaryForeground(in: appearance) }
-        let c = PanelThemeColor.rgb(hue: CGFloat(bg.hue), saturation: CGFloat(bg.saturation),
-                                    brightness: CGFloat(bg.brightness) * panelTintDimFactor)
-        return NSColor(srgbRed: c.red, green: c.green, blue: c.blue, alpha: 1)
-    }
-    /// 面板色降亮度的系数（1 = 原色、0 = 纯黑）；调深/调浅只改这一个数
-    static let panelTintDimFactor: CGFloat = 0.62
     /// 卡片边框宽度 1.2pt（2026-09-12 用户定稿：1pt → 1.2pt → 1.7pt → 1.5pt → 1.2pt；
     /// 由共享 hover 材质描边 / 拖拽 ghost / 各预设点统一引用）
     static let cardBorderWidth: CGFloat = 1.2
     /// 卡片主标题字号：2026-09-13 起由设置窗口「主题外观 → 卡片」开放（config.cardTitleFontSize，
     /// 默认 13pt），经 registerCardTitle/applyCardTitleFont 就地下发，不再走本常量；
-    /// 数值字号仍固定 13pt（balanceContentRow 内 registerRollingNumber 字面量）
+    /// 数值字号仍固定 13pt（balanceContentRow 内 registerRollingNumber 字面量）。
+    /// 主副标题**行距系数**（SF/SG 两档）2026-09-15 已固化 → `BalancePanelView.cardTitleGapScaleSFFixed / SGFixed`
     /// 卡片副标题（到期/剩余分段）、其余账号积分 chip、气泡积分行：9pt（2026-08-31 统一，原 8pt）
     static let cardSubFontSize: CGFloat = 9
 }
@@ -661,6 +669,70 @@ enum MonoFontProvider {
             return base
         }
         return .systemFont(ofSize: size, weight: weight)
+    }
+}
+
+/// 主面板字体解析器（2026-09-15）：**主面板内所有文字字体的唯一入口**。
+///
+/// 两档（设置窗口「主题外观 → 卡片 → Sharp Grotesk 字体」开关）：
+/// - 系统档 = 系统字体 / 等宽数字系统字体（原 `uiFont` 口径）；
+/// - SG 档 = Sharp Grotesk（固定 Book20）。
+///
+/// 中文兜底：SG **无中文字形**（实测 `CTFontGetGlyphsForCharacters` 汉字全覆盖
+/// 返回 false），走 descriptor 的 `cascadeList` 兜底到 PingFang。两个实测结论定了
+/// 这里的两处写法：
+/// 1. cascade 必须给**具体 PostScript 名**（PingFangSC-Medium / Semibold）。
+///    用 `NSFont.systemFont(ofSize:weight:)` 的 descriptor 作 cascade，中文字重
+///    恒落 PingFangSC-Regular（weight trait 不被级联采纳）→ 表头/数值的汉字会偏细；
+/// 2. SG 拉丁字重只有 Book 一档 → 字重参数只用来挑中文兜底档（regular/medium/semibold
+///    三档），拉丁字母不随 weight 变粗细。
+///
+/// ⚠️ 面板内新加文字一律走 `font(size:weight:monoDigits:)`，禁止再散写
+/// `.systemFont(...)`：散写会绕过 SG 档，切字体时那块文字不跟随。
+enum PanelFont {
+    /// SG 档运行镜像（与 `Palette.lightThemeActive` 同款全局状态）。
+    /// 静态上下文（`SmallTable` / 自绘层）也要能解析字体，故不放视图实例上。
+    /// 写入点两处：AppDelegate 启动载入配置处、`BalancePanelView.update` 同步快照处
+    static var sharpGroteskActive = false
+    /// 固定档 PostScript 名（Book20）：字重与宽度档已固定，不再开放（见
+    /// `BalancePanelView.cardTitleSGPostScriptName` 注释）
+    static let sgPostScriptName = "SharpGrotesk-Book20"
+    /// 解析缓存：键 = 字号 | 字重（含 descriptor 属性合并，值得缓存）。
+    /// 组合数 = 面板用到的字号 × 3 档字重，量级几十，不需要淘汰
+    private static var cache: [String: NSFont] = [:]
+
+    /// 系统档字体（原 `BalancePanelView.uiFont` 口径；SG 关闭 / 本机未装 SG 时也走这里）
+    static func system(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
+        monoDigits
+            ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
+            : .systemFont(ofSize: size, weight: weight)
+    }
+
+    /// 中文兜底字体（只作 SG 的 cascade 项，不单独给视图用）
+    private static func cjkFallback(size: CGFloat, weight: NSFont.Weight) -> NSFont {
+        let name: String
+        switch weight.rawValue {
+        case ..<0.12: name = "PingFangSC-Regular"
+        case ..<0.27: name = "PingFangSC-Medium"
+        default:      name = "PingFangSC-Semibold"
+        }
+        return NSFont(name: name, size: size) ?? .systemFont(ofSize: size, weight: weight)
+    }
+
+    /// 面板字体（唯一入口）。
+    /// `monoDigits` 只在系统档有意义 —— SG 的数字是**比例数字**（实测 "0" 9.035 /
+    /// "1" 5.863，且 tnum 特性档不存在），等宽列靠各自右对齐保证对齐
+    static func font(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
+        guard sharpGroteskActive, let base = NSFont(name: sgPostScriptName, size: size) else {
+            return system(size: size, weight: weight, monoDigits: monoDigits)
+        }
+        let key = "\(size)|\(weight.rawValue)"
+        if let cached = cache[key] { return cached }
+        let desc = base.fontDescriptor.addingAttributes(
+            [.cascadeList: [cjkFallback(size: size, weight: weight).fontDescriptor]])
+        let font = NSFont(descriptor: desc, size: size) ?? base
+        cache[key] = font
+        return font
     }
 }
 
@@ -1253,7 +1325,9 @@ final class BalancePanelView: NSView {
 
     /// 参与排序的 header 图标 id 固定清单（= 持久化顺序键；新增 header 按钮须
     /// 同步此清单与 build() 的注册表字面量）
-    static let headerButtonIdentifiers = ["quit", "settings", "refresh", "github", "cockpit"]
+    /// 2026-09-16 加 "platforms"（第六颗：原「平台开关」分段控件 2026-09-12 撤出 header
+    /// 迁进设置窗口，今按要求在 header 上补一个直达该 pane 的入口）
+    static let headerButtonIdentifiers = ["quit", "settings", "refresh", "github", "cockpit", "platforms"]
     /// id → 按钮视图（build() 填充）
     var headerButtonRegistry: [String: NSView] = [:]
     /// header 图标槽位表：下标 = 槽位序号（0..<headerButtonSlotCount），值 = 该槽的按钮 id
@@ -1293,6 +1367,9 @@ final class BalancePanelView: NSView {
     var onOpenGitHub: (() -> Void)?
     /// 打开 SwiftUI 设置窗口（header 左上角退出按钮右侧的设置按钮触发）
     var onOpenSettings: (() -> Void)?
+    /// 打开设置窗口并直达「平台」pane（2026-09-16 新增的 header 平台开关按钮触发：
+    /// 原「平台开关」分段控件 2026-09-12 从 header 撤出后，用户要求补回一个直达入口）
+    var onOpenPlatformSettings: (() -> Void)?
     /// header 右上角刷新周期饼图按钮：选中刷新间隔（秒），AppDelegate 落到 applyRefreshInterval
     var onChangeRefreshInterval: ((TimeInterval) -> Void)?
     /// header 右上角刷新周期饼图按钮：左键点击立即手动刷新（顺带重置自动周期与饼图）
@@ -1371,7 +1448,10 @@ final class BalancePanelView: NSView {
         let titleLabel: FadeableTextField  // 平台名主标题（hover 字重动画载体）
         let dots: UsageDots
         let segmentLabels: [NSTextField] // 到期副标题分段 labels（icon + 段落，段间 3pt stack 布局；空数组 = 无第二行）
-        let expireIcon: NSImageView?   // 到期行倒计时图标 time（随 expired 状态变色，2026-08-27 起统一副前景灰）
+        /// 到期行图标（随 expired 状态变色，2026-08-27 起统一副前景灰）。
+        /// 数组而非单值：TRAE 卡放**三个** xmark（2026-09-15 用户「写 xmark xmark xmark 不要空格」），
+        /// 其余平台恒 1 个
+        let expireIcons: [NSImageView]
         let badgeView: NSView          // 签到失败角标（icon 右上角，无签到平台恒隐藏）
         let iconView: NSImageView      // 平台 icon
         let statusRing: CardTaskStatusRingView?  // 任务状态光环（Agent 卡挂任务态 / API 卡挂脉冲进行中态，其余 nil）
@@ -1513,8 +1593,7 @@ final class BalancePanelView: NSView {
             if let iv = v as? NSImageView, let id = iv.identifier?.rawValue,
                id.hasPrefix("brandIcon:") {
                 applyBrandIcon(iv, key: String(id.dropFirst("brandIcon:".count)),
-                               dark: brandIconDark(for: appearance),
-                               appearanceIsDark: appearance.isDark)
+                               appearance: appearance)
             }
             if let layer = v.layer, layer.borderWidth == 0 {
                 appearance.performAsCurrentDrawingAppearance {
@@ -1534,30 +1613,22 @@ final class BalancePanelView: NSView {
         appearance.isDark != iconThemeSwapEnabled
     }
 
-    /// 单个品牌 icon 视图换到指定深浅版（cardBrandImage 内部含缺资产回退另一版 +
-    /// 深色主题浅色版压暗）；长进度卡片的菜单栏辉光以 icon 为蒙版，
-    /// 随换版同步 maskImage
-    private func applyBrandIcon(_ iv: NSImageView, key: String, dark: Bool, appearanceIsDark: Bool) {
-        guard iv.bounds.width > 0,
-              let brand = Self.cardBrandImage(key, dark: dark,
-                                              appearanceIsDark: appearanceIsDark) else { return }
-        let scaled = brand.copy() as! NSImage
-        scaled.size = iv.bounds.size
-        iv.image = scaled
-        iv.superview?.subviews.compactMap { $0 as? CardMenuBarGlowView }.forEach {
-            $0.maskImage = scaled
-        }
+    /// 单个品牌 icon 视图就地换图：取图与落图统一收口在 `applyBrandIconImage`
+    ///（无边框 = SVG 原图（按互换后深浅档的主前景色着色）/ 默认 = Icon Composer PNG，
+    /// 含缺资产回退、identifier 与辉光 maskImage）
+    private func applyBrandIcon(_ iv: NSImageView, key: String, appearance: NSAppearance) {
+        guard iv.bounds.width > 0 else { return }
+        applyBrandIconImage(iv, iconName: key, size: iv.bounds.size, appearance: appearance)
     }
 
-    /// 图标深浅互换开关变化：遍历视图树就地换品牌 icon 版（与外观切换钩子同一换版逻辑）
+    /// 图标深浅互换 / 无边框图标开关变化：遍历视图树就地换图（与外观切换钩子同一换图逻辑）
     func swapBrandIconsInPlace() {
         var stack = subviews
         while let v = stack.popLast() {
             if let iv = v as? NSImageView, let id = iv.identifier?.rawValue,
                id.hasPrefix("brandIcon:") {
                 applyBrandIcon(iv, key: String(id.dropFirst("brandIcon:".count)),
-                               dark: brandIconDark(for: effectiveAppearance),
-                               appearanceIsDark: effectiveAppearance.isDark)
+                               appearance: effectiveAppearance)
             }
             stack.append(contentsOf: v.subviews)
         }
@@ -1617,12 +1688,20 @@ final class BalancePanelView: NSView {
     private(set) var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
     /// 浅色主题开关状态（update 同步；优先级高于渐变——开启即强制浅色外观）
     private(set) var lightThemeEnabled = false
-    /// 卡片主标题字号（pt）与 Sharp Grotesk 开关（update 同步；变化时就地重刷标题字体）
+    // ── 主副标题行距系数「固化档」（2026-09-15 用户：「固化这两个参数 然后在 forms 里隐藏调教」）──
+    // 原为设置窗口「主题外观 → 卡片」的两根滑杆 + 两个 config 键
+    //（card_title_gap_scale_sf / card_title_gap_scale_sg），已随固化整体移除。
+    // 定稿值 = 移除当刻面板上的读数：SF 0.30 / SG 0.90。
+    // 真值只此一处，PanelLayout 直接读下面两个只读属性（不要再从配置里取）
+    static let cardTitleGapScaleSFFixed: CGFloat = 0.30
+    static let cardTitleGapScaleSGFixed: CGFloat = 0.90
+    /// 卡片主标题字号（pt）与 Sharp Grotesk 开关（update 同步；变化时就地重刷标题字体）。
+    /// ⚠️ 字号仍由设置窗口「主题外观 → 卡片」开放（10…16、步进 0.5），未固化
     private(set) var cardTitleFontSize: CGFloat = 13
     private(set) var cardTitleSharpGrotesk = false
-    /// 主标题↔副标题行距的字体系数（update 同步；变化时就地改内容 stack 的 spacing，见 applyTitleRowGap）
-    private(set) var cardTitleGapScaleSF: CGFloat = 1.0
-    private(set) var cardTitleGapScaleSG: CGFloat = 0.7
+    /// 主标题↔副标题行距的字体系数（固化两档，按当前字形档取哪一档；见 applyTitleRowGap）
+    var cardTitleGapScaleSF: CGFloat { Self.cardTitleGapScaleSFFixed }
+    var cardTitleGapScaleSG: CGFloat { Self.cardTitleGapScaleSGFixed }
     /// 行距作用点：每张默认卡片的内容 stack（见 PanelLayout.registerTitleRowGap）。
     /// 卡片重建后旧 stack 的 superview 变 nil，由 register/apply 两处顺带清理
     var cardGapStacks: [NSStackView] = []
@@ -1632,13 +1711,14 @@ final class BalancePanelView: NSView {
     private(set) var longProgressCardEnabled = false
     /// 图标深浅互换开关状态（update 同步；品牌 icon 取深版还是浅版）
     private(set) var iconThemeSwapEnabled = false
-    // MARK: - 字体（余额卡片 + 用量列表；等宽数字列用系统等宽数字变体）
+    /// 无边框图标开关状态（update 同步；品牌 icon 用 SVG 原图还是 Icon Composer 的 PNG）
+    private(set) var iconNoBorderEnabled = false
+    // MARK: - 字体（主面板全部文字；两档见 PanelFont）
 
-    /// 取字体：系统字体，monoDigits = 等宽数字变体（余额数值等右对齐数字列用）
+    /// 取字体：主面板字体解析器（SG 开关关闭 = 系统字体；开启 = Sharp Grotesk + 中文兜底）。
+    /// monoDigits = 等宽数字变体（右对齐数字列用；SG 档下无意义，见 PanelFont.font）
     private func uiFont(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
-        monoDigits
-            ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
-            : .systemFont(ofSize: size, weight: weight)
+        PanelFont.font(size: size, weight: weight, monoDigits: monoDigits)
     }
 
     /// 右上角 pin 按钮：悬浮在面板顶部留白带内（不占布局）
@@ -1655,9 +1735,40 @@ final class BalancePanelView: NSView {
         return v
     }()
 
-    /// 注册 label 并设置字体（字号/字重固定档；Sharp Grotesk 主标题走 registerCardTitle）
+    /// 字体注册表：registerFont 的入参留档，SG 档翻转时按它就地重刷主面板全部文字
+    /// （与 cardTitleTargets 同款：weak 引用 + 空引用清理，卡片重建不留残项）
+    private struct FontTarget {
+        weak var label: NSTextField?
+        let size: CGFloat
+        let weight: NSFont.Weight
+        let monoDigits: Bool
+    }
+    private var fontTargets: [FontTarget] = []
+
+    /// 注册 label 并设置字体（主面板字体档统一入口 `PanelFont`；SG 开关翻转时就地重刷）
     func registerFont(_ label: NSTextField, size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) {
         label.font = uiFont(size: size, weight: weight, monoDigits: monoDigits)
+        fontTargets.append(FontTarget(label: label, size: size, weight: weight, monoDigits: monoDigits))
+        if fontTargets.count % 64 == 0 { fontTargets.removeAll { $0.label == nil } }
+    }
+
+    /// SG 档翻转：主面板全部已注册文字就地换字体（不重建卡片）。
+    /// 自绘层（内嵌 Token 板块 / 点阵 / 滚动数值）各自另有刷新入口，见 update。
+    /// 两类**派生度量**也必须在这里重算，否则字体换了而它们的旧值还挂着：
+    /// 1. 子账号 chip 的右内缩进（末字符墨迹空档 rsb 随字体变 → 背景贴边错位）；
+    /// 2. 用量历史子面板图表（全自绘，字体在 draw 内现取，只需标脏重绘）。
+    /// ⚠️ 用量表的**列宽**不在这里 —— 它由 `computeUsageColumnLayout` 按 SmallTable 度量算，
+    ///    靠 update 里清 `renderedUsageRows` 强制重建整表（列宽是行的定值约束，改不了就地）
+    private func applyPanelFonts() {
+        for t in fontTargets {
+            guard let label = t.label else { continue }
+            label.font = uiFont(size: t.size, weight: t.weight, monoDigits: t.monoDigits)
+        }
+        fontTargets.removeAll { $0.label == nil }
+        for e in allCardEntries() {
+            for item in e.subItems { item.refreshOpticalPadding() }
+        }
+        usageHistoryController?.refreshFontStyle()
     }
 
     // MARK: 卡片主标题字体（字号滑杆 + Sharp Grotesk 字重×宽度，设置窗口「主题外观」开放）
@@ -1689,25 +1800,20 @@ final class BalancePanelView: NSView {
     /// Sharp Grotesk PostScript 名：**固定 Book20**（2026-09-15 用户先定「固定 Medium + 20」，
     /// 同日再「改为 book 字重」→ 字重 Medium → **Book**，宽度仍 20；字重/宽度两个 Picker
     /// 与对应 config 键已随固定化一并移除）。
-    /// 用户本机 ~/Library/Fonts 安装，PS 名 = 文件名干；缺该档时 applyCardTitleFont 回落系统字体
-    private var cardTitleSGPostScriptName: String { "SharpGrotesk-Book20" }
+    /// 解析已收口到 `PanelFont`（本机未装该档时那里回落系统字体），本属性只作档案注释位
+    private var cardTitleSGPostScriptName: String { PanelFont.sgPostScriptName }
 
-    /// Token 面板大数字共用的 Sharp Grotesk 字体名（未开启 = nil）；与卡片标题同档同源，
-    /// 供跨文件宿主（setupInlineTokens / update）注入 TokensPanelView
-    var inlineTokensSGFontName: String? {
-        cardTitleSharpGrotesk ? cardTitleSGPostScriptName : nil
+    /// Token 面板大数字共用的字体档通知：SG 开关变化时让内嵌 Token 板块重算度量
+    /// （字体策略改由 `PanelFont` 全局解析，这里只负责"变化了 → 刷"）
+    private func refreshInlineTokensFont() {
+        inlineTokenView?.refreshFontStyle()
     }
 
     private func applyCardTitleFont(to label: FadeableTextField, weight: NSFont.Weight,
                                     rolling: RollingNumberView?, valueWidth: NSLayoutConstraint?,
                                     valueBaseline: NSLayoutConstraint? = nil) {
-        if cardTitleSharpGrotesk,
-           let sg = NSFont(name: cardTitleSGPostScriptName, size: cardTitleFontSize) {
-            label.font = sg
-        } else {
-            // 未启用 / 本机未装该字重 → 回落系统字体
-            label.font = uiFont(size: cardTitleFontSize, weight: weight)
-        }
+        // SG 档与中文兜底统一由 PanelFont 解析（未启用 / 本机未装该字重均回落系统字体）
+        label.font = uiFont(size: cardTitleFontSize, weight: weight)
         // 数值（积分/金额 + ¥$ 前缀）与标题同字号联动、Sharp Grotesk 同套：
         // setSize 处理字号变化（同字号时 no-op），refreshFont 让字体提供器按当前
         // SG 开关重新解析（开关翻转而字号未变时也要重刷）
@@ -1729,17 +1835,40 @@ final class BalancePanelView: NSView {
                                valueWidth: t.valueWidth, valueBaseline: t.valueBaseline)
         }
         cardTitleTargets.removeAll { $0.label == nil }
+        // 板块（分组）标题字号同源（2026-09-16 用户要求「板块标题跟随卡片主标题字号」）：
+        // 一并就地重刷，不重建区块
+        for t in sectionTitleTargets {
+            guard let label = t.label else { continue }
+            label.font = uiFont(size: cardTitleFontSize, weight: t.weight)
+        }
+        sectionTitleTargets.removeAll { $0.label == nil }
     }
 
-    /// 注册余额滚动数值视图并注入字体策略（uiFont：系统字体 + 等宽数字）
+    // MARK: 板块（分组）标题（字号跟随卡片主标题）
+
+    /// 板块/分组标题注册表（`PanelLayout.sectionTitleRow / plainSectionTitle /
+    /// collapsibleSectionTitle` 三处标题都登记于此）。字号唯一来源 = `cardTitleFontSize`，
+    /// 变化时由 `applyCardTitleFont()` 就地重刷（行高 / 缩进保持固定 24pt / 8pt，
+    /// 面板总高不随字号连锁变化）。
+    private struct SectionTitleTarget {
+        weak var label: NSTextField?
+        let weight: NSFont.Weight
+    }
+    private var sectionTitleTargets: [SectionTitleTarget] = []
+
+    /// 注册板块标题并按**当前**主标题字号立即落字体。
+    /// ⚠️ 不走 `registerFont`：那条路径把注册时的 size 固化进 `fontTargets`，字号变化时
+    /// 只会换字体重解析、不会换 size —— 这里的诉求恰恰是"跟随主标题字号"
+    func registerSectionTitle(_ label: NSTextField, weight: NSFont.Weight = .semibold) {
+        sectionTitleTargets.append(SectionTitleTarget(label: label, weight: weight))
+        if sectionTitleTargets.count % 32 == 0 { sectionTitleTargets.removeAll { $0.label == nil } }
+        label.font = uiFont(size: cardTitleFontSize, weight: weight)
+    }
+
+    /// 注册余额滚动数值视图并注入字体策略（走主面板字体解析器：SG 开关下数值同套该字体）
     func registerRollingNumber(_ v: RollingNumberView, size: CGFloat, weight: NSFont.Weight) {
         v.configure(size: size, weight: weight, fontProvider: { [weak self] s, w, mono in
-            guard let self else { return .monospacedDigitSystemFont(ofSize: s, weight: w) }
-            // Sharp Grotesk 开启时数值（积分/金额 + ¥$ 前缀）同套该字体（2026-09-13）；
-            // 本机未装该字重回落系统字体策略（mono/等宽数字口径不变）
-            if cardTitleSharpGrotesk, let sg = NSFont(name: cardTitleSGPostScriptName, size: s) {
-                return sg
-            }
+            guard let self else { return PanelFont.system(size: s, weight: w, monoDigits: mono) }
             return self.uiFont(size: s, weight: w, monoDigits: mono)
         })
     }
@@ -1782,22 +1911,33 @@ final class BalancePanelView: NSView {
             // 副前景色按底色解算（动态色只在绘制时解算）：整树标脏才换得上新灰
             refreshSecondaryForeground()
         }
-        // 卡片主标题字号/字体档/行距系数同步：变化时就地重刷已注册标题与行距（不重建卡片）
+        // 卡片字体档同步（行距系数已固化，不再有"随配置变化"这一路）：
+        // ① 先落 PanelFont 全局镜像（本面板已有的与随后重建的卡片都按它解析字体）；
+        // ② 变化时：已注册 label 就地换字体（不重建卡片）+ 主标题/数值/内嵌 Token 板块刷新
         let titleFontChanged = s.cardTitleFontSize != cardTitleFontSize
             || s.cardTitleSharpGrotesk != cardTitleSharpGrotesk
-        let titleGapChanged = s.cardTitleGapScaleSF != cardTitleGapScaleSF
-            || s.cardTitleGapScaleSG != cardTitleGapScaleSG
         cardTitleFontSize = s.cardTitleFontSize
         cardTitleSharpGrotesk = s.cardTitleSharpGrotesk
-        cardTitleGapScaleSF = s.cardTitleGapScaleSF
-        cardTitleGapScaleSG = s.cardTitleGapScaleSG
+        PanelFont.sharpGroteskActive = s.cardTitleSharpGrotesk
+        // 滑移时长口径运行镜像（与 PanelFont.sharpGroteskActive 同款模式）：
+        // RollingNumberView 实例不自持设置，rebuild 时静态读本镜像
+        RollingNumberView.slideTiming = s.rollSlideTiming
+        // 滚动时间曲线档位镜像（同上）：逐帧静态解析，切档对下一次滚动立即生效
+        RollingNumberView.curve = s.rollCurve
         if titleFontChanged {
             applyCardTitleFont()
-            // 主面板内嵌 Token 板块大数字跟随同一 Sharp Grotesk 档（就地刷字体，未装回落）
-            inlineTokenView?.sharpGroteskFontName = inlineTokensSGFontName
+            applyPanelFonts()
+            // 主面板内嵌 Token 板块（自绘 + 滚动数值）按新字体档重算度量并重绘
+            refreshInlineTokensFont()
+            // 行距 = 基准 × 系数，而系数按当前字形档取 → 改字号/切字体都要一并重算行距
+            applyTitleRowGap()
+            // SG 行高比系统字体矮（13pt：13.0 vs 15.31）→ 面板总高会变，通知 VC 重算尺寸
+            contentSizeChanged = true
+            // 用量表两列宽是**定值约束**（按 SmallTable 字体度量算的），就地换字体改不了它 ——
+            // 清空已渲染记录强制下方重建整表，列宽随之按新字体档重新解算
+            //（SG 与系统字体的数字 advance 差约 5%，不重建会留出/挤掉几个 pt）
+            renderedUsageRows = []
         }
-        // 行距 = 基准 × 系数，而系数按当前字形档取 → 切字体也要重算（故并入 titleFontChanged）
-        if titleGapChanged || titleFontChanged { applyTitleRowGap() }
         valueScrollPreviewEnabled = s.valueScrollPreviewEnabled
         // 预览定时器状态与配置保持一致（幂等：无变化不动）
         setValueScrollPreview(s.valueScrollPreviewEnabled)
@@ -1816,11 +1956,13 @@ final class BalancePanelView: NSView {
             applyPlatformCardGaps()   // 组内平台卡间距随模式切换（列表态 4 / 长进度 2.5）
             contentSizeChanged = true
         }
-        // 图标深浅互换开关同步：变化时按当前生效外观就地换版（不重建卡片；
-        // 设置段先于卡片构建执行，后续新建卡直接读 iconThemeSwapEnabled 取对版）
+        // 图标两开关同步：变化时按当前生效外观就地换图（不重建卡片；
+        // 设置段先于卡片构建执行，后续新建卡直接读这两个开关取对图）
         let iconSwapChanged = s.iconThemeSwap != iconThemeSwapEnabled
         iconThemeSwapEnabled = s.iconThemeSwap
-        if iconSwapChanged { swapBrandIconsInPlace() }
+        let iconNoBorderChanged = s.iconNoBorder != iconNoBorderEnabled
+        iconNoBorderEnabled = s.iconNoBorder
+        if iconSwapChanged || iconNoBorderChanged { swapBrandIconsInPlace() }
         offlineBanner.isHidden = !s.offline
 
         // 行序跟随面板卡片视觉序：API 板块在前、Agent 板块在后，
@@ -2036,7 +2178,7 @@ final class BalancePanelView: NSView {
                 entries.append(CardEntry(uid: ac.uid, valueView: RollingNumberView(),
                                          titleLabel: FadeableTextField(labelWithString: ""),
                                          dots: UsageDots(),
-                                         segmentLabels: [], expireIcon: nil,
+                                         segmentLabels: [], expireIcons: [],
                                          badgeView: makeFailureBadge(),
                                          iconView: NSImageView(),
                                          statusRing: nil,
@@ -2044,6 +2186,8 @@ final class BalancePanelView: NSView {
                 continue
             }
             let valueView = RollingNumberView()   // 初始 "—" 占位（init 内置）
+            // 积分下方那条：所有 Agent 平台一律竖向点阵（TRAE 的「三颗 ×」不占这一列，
+            // 它走副标题行右侧的 `subtitleMeta` 那一格 = 积分正下方，见下方 metaStack）
             let dots: UsageDots? = UsageDots()
             let uid = ac.uid
             weak var cardRef: NSView?
@@ -2149,16 +2293,17 @@ final class BalancePanelView: NSView {
             // info=nil 时点阵/账号条仍作第二行入组（标题+积分贴顶，与其他卡对齐）；非当前账号无第二行
             var segLabels: [NSTextField] = []
             let segBox = ExpireSegBox()
-            var expireIcon: NSImageView? = nil
+            var expireIcons: [NSImageView] = []
             let info: NSStackView?
             if isCurrent && style.showsExpire {
                 var rowViews: [NSView] = []
                 // 第二行图标可选：重置倒计时按周期用 clock-stop-w（Qwen 7 天）/ clock-stop-m（WB/TRAE/Codex 月），
                 // 周期不确定（ZCode 套餐到期）用 clock-stop，DS/ZhiPu 用 external-link 打开页面图标
                 if let symbol = style.expireIconSymbol {
+                    // TRAE 已停止维护：用原生 xmark（icons 里没有 xmark.svg）。
+                    // ⚠️ 这里的图标是**副标题行那颗**，恒 1 个；「积分下方」另有三颗 xmark，
+                    // 走 `makeXmarkTriple()` + balanceContentRow 的 trailingMarkView（2026-09-15 用户指定）
                     let icon = NSImageView()
-                    // TRAE 已停止维护，使用原生 xmark；其他平台继续使用既有 SVG 图标。
-                    // SVG 裁剪后墨迹最大边精确 10pt，与 SF Symbol 口径一致。
                     icon.image = symbol == "xmark"
                         ? NSImage(systemSymbolName: "xmark", accessibilityDescription: nil)
                         : Self.trimmedBundleSvgIcon(symbol, size: 10)
@@ -2168,7 +2313,7 @@ final class BalancePanelView: NSView {
                     icon.widthAnchor.constraint(equalToConstant: 10).isActive = true
                     icon.heightAnchor.constraint(equalToConstant: 10).isActive = true
                     rowViews.append(icon)
-                    expireIcon = icon
+                    expireIcons.append(icon)
                 }
                 // 最多 3 段（剩余 / x天 / HH:MM）；apply 按分段数组填充，未用的段 isHidden 收起间距
                 for _ in 0..<3 {
@@ -2201,12 +2346,20 @@ final class BalancePanelView: NSView {
             var metaStack: NSView? = nil
             var metaChangeLabel: NSTextField? = nil
             if info != nil {
-                let lbl = NSTextField(labelWithString: "")
-                registerFont(lbl, size: Palette.cardSubFontSize)
-                lbl.textColor = Palette.secondaryForeground
-                lbl.isHidden = true
-                metaChangeLabel = lbl
-                metaStack = lbl
+                if style.platformID == "trae" {
+                    // TRAE：副标题行右侧 = **三颗 ×**（2026-09-15 用户「积分正下方写 xxx」）。
+                    // 位置照**别的 Agent 卡**的做法 —— 走同一个 `subtitleMeta` 那一格
+                    //（它们的 24h 变化量 / 速度文本就在这儿）：与积分数值同一列、紧贴其下，
+                    // 不另起一列、也不动右侧的竖向点阵
+                    metaStack = Self.makeTripleX()
+                } else {
+                    let lbl = NSTextField(labelWithString: "")
+                    registerFont(lbl, size: Palette.cardSubFontSize)
+                    lbl.textColor = Palette.secondaryForeground
+                    lbl.isHidden = true
+                    metaChangeLabel = lbl
+                    metaStack = lbl
+                }
             }
             // 昵称展示已彻底移除（2026-09-02 卡片 hover 昵称改由积分按钮悬浮气泡承载；
             // 2026-09-13 连空占位 nickLabel 一并删除，标题行恒为平台名单分支）
@@ -2215,7 +2368,8 @@ final class BalancePanelView: NSView {
             // isCurrent 分支已随死代码清理移除（2026-08-31）
             let imgSize: CGFloat = style.iconSize
             // 上下内边距大小卡统一（2026-08-31 → 5.5；2026-09-01 用户指定 → 6；
-            // 2026-09-14 用户「默认卡片的上下缩进 +1pt」→ 7）
+            // 2026-09-14 用户「默认卡片的上下缩进 +1pt」→ 7；
+            // 2026-09-16 用户「卡片上下内缩进 −0.6pt」→ 6.4，真值在 cardVerticalPadding）
             // ⚠️ 本处是**两种卡型共用**的（默认卡片 / 长进度卡片同走这个调用点），改则一起变
             let cardPadTop: CGFloat = BalancePanelView.cardVerticalPadding
             let cardPadBottom: CGFloat = BalancePanelView.cardVerticalPadding
@@ -2513,7 +2667,7 @@ final class BalancePanelView: NSView {
                                      titleLabel: capturedTitle ?? FadeableTextField(labelWithString: ""),
                                      dots: dots ?? UsageDots(),
                                      segmentLabels: segLabels,
-                                     expireIcon: expireIcon, badgeView: badge,
+                                     expireIcons: expireIcons, badgeView: badge,
                                      iconView: fadeIcon,
                                      statusRing: capturedStatusRing,
                                      menuBarDot: capturedMenuBarDot ?? NSView()))
@@ -2634,8 +2788,9 @@ final class BalancePanelView: NSView {
             }
             // 到期副标题分段（无值时全部 isHidden 收起，占位保持行高稳定）；副标题统一中性灰
             // （2026-08-27：「套餐已到期」取消红色警告，与其他到期文本一致用副前景灰）
-            // TRAE 已停止维护：副标题固定「不再维护」（2026-09-10 简化），xmark icon 不变。
-            let segs = style.platformID == "trae" ? ["不再维护"] : (ac.expireSegments ?? [])
+            // TRAE 已停止维护：副标题固定「官方加密」+ 前面一颗 xmark（2026-09-15 用户「副标题写 x官方加密」），
+            // 「积分下方」那三颗 xmark 是另一处（trailingMarkView）
+            let segs = style.platformID == "trae" ? ["官方加密"] : (ac.expireSegments ?? [])
             e.segBox?.full = segs
             // 账号条换入期间保持精简文案（单一事实源 = 账号条可见性）：hover 中途刷新
             // 不把完整文案顶回来，破坏副标题给账号条让位的约定
@@ -2649,12 +2804,13 @@ final class BalancePanelView: NSView {
                 }
                 lbl.textColor = Palette.secondaryForeground
             }
-            e.expireIcon?.contentTintColor = Palette.secondaryForeground
+            e.expireIcons.forEach { $0.contentTintColor = Palette.secondaryForeground }
             // 副标题右侧 meta：Agent 卡 = 最近 10 次会话均速「x tok/s」（无会话数据隐藏）；
             // API 卡 = 箭头附件 + 24h 变化量（dayDeltaText 恒有值，2026-09-13 用户指定不隐藏）；
             // 子账号数随重建走（账号增减触发 uid 变化重建），apply 不更新
             if let lbl = e.metaChangeLabel {
-                let font = lbl.font ?? NSFont.systemFont(ofSize: Palette.cardSubFontSize)
+                // 兜底走 PanelFont（label 经 registerFont，font 恒非 nil；此处只防 SG 档翻转后取到旧字体）
+                let font = lbl.font ?? uiFont(size: Palette.cardSubFontSize)
                 if let text = ac.speedText {
                     lbl.attributedStringValue = NSAttributedString(string: text, attributes: [
                         .font: font, .foregroundColor: Palette.secondaryForeground])
@@ -2796,6 +2952,8 @@ final class BalancePanelView: NSView {
     /// 当前生效遮罩色（用量子面板同口径）,按「圆角矩形+箭头」路径做 layer mask 裁切,
     /// 圆角统一 Palette.cardCornerRadius。默认弹卡片右侧（箭头顶点贴卡右缘）,
     /// 右侧屏幕空间不足时翻到左缘。
+    /// **无描边**（2026-09-15 用户：「去掉边框，继承主面板的边框属性」—— 主面板容器
+    /// 自身就没有描边，气泡随之一致；原 0.5pt hoverBorderBright 覆盖层已删）
     /// （原 `panelTintSample`：按锚点视图在容器中的高度插值采样遮罩色的实现，
     ///  2026-09-14 用户要求气泡背景「继承面板背景色上端的颜色」后已删除 —— 见 showSubAccountTip）
 
@@ -2805,13 +2963,19 @@ final class BalancePanelView: NSView {
         cancelChipTip()
         guard let anchorWindow = anchorCard.window else { return }
         let nick = NSTextField(labelWithString: "昵称: \(nickname)")
-        // 两行统一：小字（cardSubFontSize）+ 亮色前景 cardForeground
-        registerFont(nick, size: Palette.cardSubFontSize, weight: .medium)
+        // 两行统一：小字（cardSubFontSize）+ 亮色前景 cardForeground。
+        // ⚠️ 字体**恒走系统档，且不进 registerFont**：
+        // ① SG 是拉丁字体，9pt 下 ascender/descender = 7.2/1.8（标称行框 9），而气泡内容是中文
+        //    （字形走 cascade 兜底的 PingFang，CTLine 实测行高 12.6）——label 按那套偏矮的度量排版，
+        //    会把整块文字在气泡内压低 ~4.3pt（离线 harness 实测：SG 档上留白 14.3 / 下留白 5.7，
+        //    同口径系统档 8 / 10）。气泡文字是「中文标签 + 昵称/数字」，度量按系统档取才与字形一致。
+        // ② 不注册 = SG 档开关翻转时不会被 applyPanelFonts 改回 SG（气泡是临时视图，无跟随必要）
+        nick.font = PanelFont.system(size: Palette.cardSubFontSize, weight: .medium)
         nick.textColor = Palette.cardForeground
         // 徽章挂昵称后（字体取 nick 实际字体，经 registerFont 已生效）
         let line = NSMutableAttributedString(
             string: "昵称: \(nickname)",
-            attributes: [.font: nick.font ?? .systemFont(ofSize: Palette.cardSubFontSize),
+            attributes: [.font: nick.font ?? uiFont(size: Palette.cardSubFontSize, weight: .medium),
                          .foregroundColor: Palette.cardForeground])
         if tokenInvalid, let font = nick.font {
             // 令牌失效/账号无套餐（账号级问题，不进刷新失败）：黄色警示胶囊。
@@ -2868,7 +3032,8 @@ final class BalancePanelView: NSView {
         nick.lineBreakMode = .byClipping
         nick.attributedStringValue = line
         let val = NSTextField(labelWithString: "积分: \(value)")
-        registerFont(val, size: Palette.cardSubFontSize, weight: .medium)
+        // 同上：系统档字体，不注册（理由见 nick 处注释）
+        val.font = PanelFont.system(size: Palette.cardSubFontSize, weight: .medium)
         val.textColor = Palette.cardForeground
         val.usesSingleLineMode = true
         val.lineBreakMode = .byClipping
@@ -2876,7 +3041,7 @@ final class BalancePanelView: NSView {
         // 含附件/部分字体组合下 cellSize 低估宽度，正是徽章被裁的根因
         let valLine = NSAttributedString(
             string: "积分: \(value)",
-            attributes: [.font: val.font ?? .systemFont(ofSize: Palette.cardSubFontSize),
+            attributes: [.font: val.font ?? uiFont(size: Palette.cardSubFontSize, weight: .medium),
                          .foregroundColor: Palette.cardForeground])
         val.attributedStringValue = valLine
         let nickSize = line.size()
@@ -2886,7 +3051,7 @@ final class BalancePanelView: NSView {
         // 会被附件撑到 14（无徽章的平台只有 11）→ 气泡行距与整体高各差 3pt，正是
         // 2026-09-14 用户「两个平台的悬浮气泡行距不一样」的根因。两行同字号 ⇒ 同一个 bandH。
         // 徽章图标本就按 ascender+descender 在字体行框内居中（见上面 att.bounds），收紧行带不会裁它
-        let bandFont = nick.font ?? .systemFont(ofSize: Palette.cardSubFontSize)
+        let bandFont = nick.font ?? uiFont(size: Palette.cardSubFontSize, weight: .medium)
         let bandH = ceil(bandFont.ascender - bandFont.descender + bandFont.leading)
         let titleBand: CGFloat = max(10, bandH)
         let infoBand: CGFloat = max(10, bandH)
@@ -2932,11 +3097,11 @@ final class BalancePanelView: NSView {
         glass.layer?.masksToBounds = true
         glass.layer?.mask = maskLayer
         container.addSubview(glass)
-        // 轮廓描边（独立覆盖层,不受 mask 裁切）
-        let outline = SubAccountTipBubbleView(frame: container.bounds)
-        outline.autoresizingMask = [.width, .height]
-        outline.arrowEdge = edge
-        container.addSubview(outline)
+        // 气泡**不再有描边**（2026-09-15 用户：「去掉卡片子账号悬浮气泡的边框，继承主面板的
+        // 边框属性」）—— 主面板容器自身就没有描边（只有 Palette.cardCornerRadius 圆角 +
+        // 玻璃 + 系统阴影，见 BalancePanelViewController.loadView），气泡随之一致：
+        // 原「轮廓描边覆盖层」（独立于 mask 之外、0.5pt Palette.hoverBorderBright 自绘）
+        // 已随之删除。轮廓形状仍由上面 glass 的 layer mask 提供（只是不描边）
         // 非 flipped 容器：y 自底向上——积分行带在下、昵称行带在上,文本在行带内垂直居中;
         // 文本左缘 = 本体左缘 + 10（箭头顶点在窗口左缘时本体右移 arrowLen）
         let textX: CGFloat = (edge == .maxX ? arrowLen : 0) + 10
@@ -2971,22 +3136,24 @@ final class BalancePanelView: NSView {
         subAccountTipWindow = nil
     }
 
-    /// 气泡轮廓（圆角矩形+一侧三角箭头,圆角=Palette.cardCornerRadius 与卡片统一）：
-    /// 同一份 tipShapePath 供两处消费——玻璃层 layer mask 裁切 + 本视图描边覆盖层
-    private final class SubAccountTipBubbleView: NSView {
-        /// 箭头方向：.maxX=箭头在本体左侧指向左（气泡在锚点右侧）;.minX 反向
-        var arrowEdge: NSRectEdge = .maxX
-        /// 箭头顶点纵坐标（窗口局部）：nil=垂直居中（账号气泡口径）；
-        /// 高气泡（调色弹层）窗口被屏幕顶钳位后，由展示方注入锚点中点相对值
-        var tipY: CGFloat?
+    /// 气泡轮廓（圆角矩形+一侧三角箭头，圆角 = Palette.cardCornerRadius 与卡片统一）。
+    /// **只提供 `tipShapePath` 给玻璃层做 layer mask 裁切** —— 气泡不再自绘描边
+    /// （2026-09-15 用户：「去掉卡片子账号悬浮气泡的边框，继承主面板的边框属性」：
+    ///  主面板容器本身就没有描边，原先那层 0.5pt `hoverBorderBright` 覆盖层已删除；
+    ///  故本类型也不再需要 NSView 身份 —— 实例属性 arrowEdge / tipY 与 draw 一并移除）
+    private enum SubAccountTipBubbleView {
         static let arrowLength: CGFloat = 8
         static let arrowHalfWidth: CGFloat = 6
 
         /// 单轮廓路径（bounds 局部坐标）：逆时针 上缘→右上弧→右缘（.minX 嵌箭头）
-        /// →右下弧→下缘→左下弧→左缘（.maxX 嵌箭头）→左上弧→闭合
-        static func tipShapePath(bounds: NSRect, edge: NSRectEdge, tipY: CGFloat? = nil) -> NSBezierPath {
+        /// →右下弧→下缘→左下弧→左缘（.maxX 嵌箭头）→左上弧→闭合。
+        /// 箭头顶点恒在垂直中线（原「高气泡/调色弹层」按锚点注入 tipY 的入口已随
+        /// 描边层一起删除 —— 气泡现在只此一个消费方）
+        static func tipShapePath(bounds: NSRect, edge: NSRectEdge) -> NSBezierPath {
             let r = Palette.cardCornerRadius
-            let inset: CGFloat = 0.25   // 描边半宽,防轮廓被裁
+            // 轮廓内缩 0.25pt：mask 抗锯齿边缘留余量（原为「描边半宽，防轮廓被裁」，
+            // 描边已删，这半像素余量继续用于避免玻璃边缘被切出发丝）
+            let inset: CGFloat = 0.25
             let body: NSRect
             let tipX: CGFloat
             if edge == .maxX {
@@ -3000,7 +3167,7 @@ final class BalancePanelView: NSView {
                               height: bounds.height - inset * 2)
                 tipX = bounds.maxX - inset
             }
-            let midY = tipY ?? bounds.midY
+            let midY = bounds.midY
             let path = NSBezierPath()
             path.move(to: NSPoint(x: body.minX + r, y: body.maxY))
             path.line(to: NSPoint(x: body.maxX - r, y: body.maxY))
@@ -3027,18 +3194,6 @@ final class BalancePanelView: NSView {
                            radius: r, startAngle: 180, endAngle: 90, clockwise: true)
             path.close()
             return path
-        }
-
-        override func draw(_ dirtyRect: NSRect) {
-            // 只描边（玻璃填充由 mask 后的 TintedVisualEffectView 承担）；
-            // 描边**继承主面板卡片的边框口径**：与 `HoverMaterialHost.outlineLayer` 同一个
-            // `Palette.hoverBorderBright`（= 点阵峰值色），本视图不再自持颜色
-            //（2026-09-14 用户要求。此前写的是 `hoverBorderNormal` —— 那是「用量行/Token 行的
-            //  常态边框」口径，虽然当时与该值同源，但语义不是"卡片边框"）
-            let path = Self.tipShapePath(bounds: bounds, edge: arrowEdge, tipY: tipY)
-            Palette.hoverBorderBright.setStroke()
-            path.lineWidth = 0.5
-            path.stroke()
         }
     }
 
@@ -3097,6 +3252,27 @@ final class BalancePanelView: NSView {
     }
     private func applyCodexCardData(_ accounts: [AccountCardSnapshot]) {
         applyAccountCardData(accounts, entries: &codexCardEntries, style: .codex)
+    }
+
+    /// TRAE 卡副标题行右侧的三颗 ×（2026-09-15 用户）：9pt 一颗、`spacing = 0` 紧贴（「不要空格」）、
+    /// 色走副前景灰。走**系统字体档** —— SG 是拉丁字体，`✕` 的字符度量会带出莫名的垂直偏移
+    ///（同日悬浮气泡踩过同一个坑：SG 的行框装不下中文/符号字形）
+    private static func makeTripleX() -> NSView {
+        let row = NSStackView(views: (0..<3).map { _ -> NSTextField in
+            let lbl = NSTextField(labelWithString: "✕")   // U+2715 MULTIPLICATION X
+            lbl.font = PanelFont.system(size: Palette.cardSubFontSize, weight: .medium)
+            lbl.textColor = Palette.secondaryForeground
+            lbl.usesSingleLineMode = true
+            lbl.lineBreakMode = .byClipping
+            lbl.setContentHuggingPriority(.required, for: .horizontal)
+            lbl.setContentCompressionResistancePriority(.required, for: .horizontal)
+            return lbl
+        })
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 0
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
     }
 
     private func rebuildTraeCards(_ accounts: [AccountCardSnapshot]) {
@@ -3295,10 +3471,12 @@ final class BalancePanelView: NSView {
     @objc func quitTapped() { onQuit?() }
     @objc func openGitHubTapped() { onOpenGitHub?() }
     @objc func settingsTapped() { onOpenSettings?() }
+    /// header 平台开关按钮（第六颗）：直达设置窗口「平台」pane
+    @objc func platformSettingsTapped() { onOpenPlatformSettings?() }
 
-    // MARK: - 点阵主题色（设置窗口「主题外观 → 面板 → 主题色」色盘落值）
+    // MARK: - 用量色（设置窗口「主题外观 → 面板 → 用量色」色盘落值）
 
-    /// 主题色落值（HSB 三参一把写）：持久化 + 视图树重绘（按钮图标不着色，2026-09-07 用户定稿）。
+    /// 用量色落值（HSB 三参一把写）：持久化 + 视图树重绘（按钮图标不着色，2026-09-07 用户定稿）。
     /// 由宿主在设置窗口色盘回调里对当前面板调用。
     /// ⚠️ 三参必须一把写：`applyHeatHueInPlace` 每次调用都要清印章/淡变位图缓存并全树重刷边框，
     /// 分三次写会连着重绘三遍（原三根滑杆各自写是拖动节奏，色盘一次给整色，没必要拆）
@@ -3322,15 +3500,16 @@ final class BalancePanelView: NSView {
     /// 点阵色相/饱和度/明度变化就地重绘：热力图印章/淡变位图与卡片点阵均烘色，须清缓存重绘
     ///（同外观切换钩子口径）；UsageDots 两形态（横条层/竖点阵）统一走
     /// refreshHeatColors（2026-09-07 长进度卡片进度色泛化后含层路径）。
-    /// 2026-09-12 起卡片边框也取点阵主题色（hoverBorderNormal/Bright = 峰值色）：
+    /// 2026-09-12 起卡片边框也取用量色（hoverBorderNormal/Bright = 峰值色）：
     /// 每个安装了共享 hover 材质的视图（面板根 / 用量行容器 / Token 板块）各持一个
     /// 独立宿主实例，描边色定格在创建时——遍历逐宿主 refreshAppearance 重解算
-    /// （2026-09-13 修复：原只沿 HoverCard 向上查根宿主，行级宿主描边不跟随主题色）。
+    /// （2026-09-13 修复：原只沿 HoverCard 向上查根宿主，行级宿主描边不跟用量色）。
     func applyHeatHueInPlace() {
         refreshDotMatrixAndHoverMaterials()
     }
-    /// **点阵 / 材质类颜色变更的统一就地重绘入口**（三类调用点：主题色 `applyHeatHueInPlace`、
-    /// 点阵背景色、卡片 hover 背景色 —— 三者影响的视图集合完全相同）：
+    /// **点阵 / 材质类颜色变更的统一就地重绘入口**（三类调用点：用量色 `applyHeatHueInPlace`、
+    /// 面板底色、**次背景色** —— 三者影响的视图集合完全相同；其中「点阵背景色」与「hover 背景色」
+    /// 已于 2026-09-15 合并为次背景色这一个参数）：
     /// 清烘焙缓存（热力图印章/淡变位图）+ 点阵重绘 + 每个 hover 材质宿主重解算（材质块底色 + 描边）。
     func refreshDotMatrixAndHoverMaterials() {
         var stack = subviews

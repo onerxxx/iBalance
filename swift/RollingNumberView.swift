@@ -21,6 +21,12 @@
 //     各数字 advance 相等，槽宽恒定，行为与 tabular 方案零差异；
 //   - 数字轮 cell 字形贴槽左（kern=0 自然定位），右对齐时数值右边缘 =
 //     最后一位 advance 边界，整齐。
+//   - **槽间间隙是弹性缓冲**（2026-09-16）：滚动中数字轮的**排布推进量**改用
+//     `layoutWidth`（= max(理想宽, 墨迹护栏)，理想宽 = 起点→目标 advance 的单调
+//     ease-in；护栏 = 可见墨迹右沿 − 槽距/邻槽空档），与 `currentWidth`
+//     （防裁剪帧宽）解耦。前缀和逐槽守恒 ⇒ 字符位置只走单调路径，不再因帧宽的
+//     逐格冲收而整串往复震动；静止态两者相等 → 排版与被吸收前逐像素一致。
+//     容器侧「推进量」与「帧宽」必须分开取：`slotAdvance` / `slotWidth`。
 //   - 槽位右锚点 = bounds.width − 2.5（原右对齐 label 的 textContainer
 //     lineFragmentPadding=2.5，文本行右缘实际在单元格右缘 − 2.5 处；
 //     锚在 65 会整体右偏 2.5pt，即「数字偏右」根因，已修正）。
@@ -33,6 +39,11 @@
 // rollDuration 预算；行进距离不同的位到达时刻天然错开（异步落定，里程表观感：
 // 各轮转到自己的数字就停，不等别的轮）。每轮再有 ±6% 确定性相位抖动，
 // 打破「行进距离恰好相同」的车轮之间的同步。
+// 时间曲线 = 设置窗口「主题外观 → 动效 → 动效曲线」单选的三档之一
+// （默认 ease-in cubic「从慢到快」；2026-09-16 用户要求开放为设置项）：
+// 位 / 宽度 / 滑移三条量必须共用同一条曲线（不同形会在中段错速，
+// 让宽度低于可见宽数字的 advance 造成裁剪）。解析唯一入口 `rollEase(_:)`，
+// 运行镜像 `RollingNumberView.curve`（宿主在配置装载 / 面板快照同步处落值）。
 // 中途改目标（新数据打断未完的滚动）时，从所在的连续位置重新规划 tween，天然续接。
 // 滚动期间每帧重排 slots（数字右缘固定、左缘随槽宽插值平移——比例数字字体下的
 // 自然滚动观感）。槽宽由「过渡中贴住较宽数字」的 C¹ 曲线唯一推导：滚过的数值
@@ -52,6 +63,25 @@ private func textWidth(_ s: String, font: NSFont) -> CGFloat {
 private func smoothstep(_ x: Double) -> Double {
     let c = max(0, min(1, x))
     return c * c * (3 - 2 * c)
+}
+
+/// 数字滚动的**时间曲线解析唯一入口**（2026-09-16 用户要求开放为设置项，
+/// 此前硬写死 ease-in cubic）。档位由设置窗口「主题外观 → 动效 → 动效曲线」选，
+/// 运行镜像 = `RollingNumberView.curve`（与 `slideTiming` 同址落值）。
+///
+/// ⚠️ 四条量必须共用本函数：`DigitWheelView.advance`（车轮位置）/
+/// `delayedWidthPos`（宽度专用位置）/ `updateLayoutWidth`（排布理想宽）/
+/// `RollingNumberView.slideProgress`（滑移）——不同形会在中段错速，让宽度低于
+/// 可见宽数字的 advance，造成字形右缘被窗口裁掉。
+/// 单位换值的槽内滚字 / 横向位移另有自己的 ease-out（另一条动效语言，不随之改）。
+private func rollEase(_ x: Double) -> Double {
+    let c = max(0, min(1, x))
+    switch RollingNumberView.curve {
+    case .easeIn:    return c * c * c                          // 从慢到快（单加速段）
+    case .easeOut:   return 1 - pow(1 - c, 3)                  // 从快到慢（单减速段）
+    case .easeInOut: return c < 0.5 ? 4 * c * c * c            // 慢-快-慢（标准对称式）
+                                     : 1 - pow(-2 * c + 2, 3) / 2
+    }
 }
 
 /// 像素网格对齐（2x 屏 = 0.5pt 步进）：位图槽/图层落在亚像素处会被合成器
@@ -103,8 +133,10 @@ private func attachEdgeFadeMask(_ mask: CAGradientLayer, to view: NSView, font: 
 /// 最短路径滚动；视图裁剪出单格高度窗口，滚动 = 平移 strip。
 final class DigitWheelView: NSView {
 
-    /// 主字体（与数值整体字体一致；变化时重算度量并重渲染 strip）
-    var font: NSFont = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold) {
+    /// 主字体（与数值整体字体一致；变化时重算度量并重渲染 strip）。
+    /// 初值走 `PanelFont.system`（= 原系统等宽数字口径）：实际字体恒由
+    /// `RollingNumberView.refreshFont()` 经注入的 fontProvider 覆写，这里只作占位
+    var font: NSFont = PanelFont.system(size: 13, weight: .semibold, monoDigits: true) {
         didSet { guard font != oldValue else { return }; rebuildMetrics() }
     }
     /// 数字颜色（hover 提亮时由外部整体设置）
@@ -142,12 +174,93 @@ final class DigitWheelView: NSView {
     /// 当前槽宽：由连续滚动位置唯一推导（widthForPosition，C¹ 平滑——平台段与
     /// smoothstep 爬坡段零斜率衔接，无速度突跳）；等宽字体下各数字 advance 相等，
     /// 自然恒定宽度。
+    ///
+    /// ⚠️ 这是**防裁剪帧宽**：滚动中贴住窗口内可见的较宽数字，保证滚出/滚入的字形
+    /// 不被裁。它只决定 wheel 自己的 frame 宽（绘制/裁剪口径），**不决定排布推进量**
+    /// —— 后者见 `layoutWidth`。
     private(set) var currentWidth: CGFloat = 0
+
+    // MARK: 排布宽与帧宽解耦（「拿槽间间隙当缓冲」—— 消除滚动时相邻字符的位置震动）
+    //
+    // 问题：`currentWidth` 是**防裁剪帧宽**——收窄过渡要撑住离场的宽字形，直到行程
+    // 72% 才开始收。这份宽度过去**同时**充当排布推进量：每跨一格就冲一次、收一次，
+    // 后面所有字符被推出去又拽回来，方向反复 = 滚动时的「位置震动」。SG 比例数字
+    // 单槽 advance 最大差 5.71pt @23.4pt，观感明显。
+    //
+    // 解法：排布推进量改用 `layoutWidth`，与帧宽彻底解耦：
+    //
+    //   layoutWidth = max(理想宽, 墨迹护栏)
+    //     理想宽   = 起点数字 advance → 目标数字 advance，沿 ease-in
+    //                （与车轮同一条时间曲线）**单调**推进 —— 单调是关键，杜绝
+    //                「先撑住再猛收」的往复；
+    //     墨迹护栏 = 窗口内可见两格的**墨迹右沿**（只算与核心可见带相交的格）
+    //                −（槽间字距 + 邻槽最小左侧空档）—— 给「滚入的宽数字别碰上
+    //                右邻」兜底。像素级离线实测：单靠理想宽在 1→5 这类场合差 2.1pt。
+    //
+    // 端点精确性：护栏项恒 ≤ 该位自然 advance（墨迹右沿 ≤ advance，且扣掉了字距与
+    // 邻槽空档），故整数位置处 max() 恒取理想宽 = advance —— 静止排版与不用本机制时
+    // 逐像素一致（离线实测 t=0/1 误差 0.000000pt）。
+    //
+    // 帧宽仍取 `currentWidth`（保住「滚出/滚入的字形不被裁」这条既有口径）；
+    // `currentWidth − layoutWidth` 那份多出来的宽度**全落在相邻两槽之间的空隙里**
+    // （帧右缘探进空隙，字形绘制基准仍在帧左缘 = 布局位置不动）—— 这正是「字符间距
+    // 充当缓冲、优先挤压间距」的落点：帧多占的只是空隙里的空白，位置纹丝不动。
+    //
+    // 离线实测（Sharp Grotesk Book20 @23.4pt，逐格 7 帧 @60fps）：
+    //   现行：多格滚动每段 1~3 次方向反转，最大单步位移 4.9pt（0→5 的 167→117→154 鞭打）
+    //   本条：方向反转 0 次，最大单步位移 0.08pt
+
+    /// 排布推进宽（容器算下一槽位置用：`step = layoutWidth + slotTracking`）
+    private(set) var layoutWidth: CGFloat = 0
+    /// 本段理想宽端点：起点取**当前已渲染的排布宽**（滚动被打断时承接，横向无跳）
+    private var layoutStart: CGFloat = 0
+    private var layoutEnd: CGFloat = 0
+    /// 排布宽需扣除的固定量 = 槽间字距 + 邻槽最小左侧空档（容器注入，见 `slotAllowance`）
+    var slotAllowance: CGFloat = 0
+
+    /// 每帧推进排布宽（`advance` 里、`currentWidth` 之后调用；无 tween 即落定值）
+    private func updateLayoutWidth() {
+        guard tweenDuration > 0 else {
+            layoutWidth = layoutEnd
+            return
+        }
+        let t = min(1, tweenElapsed / tweenDuration)
+        let ideal = layoutStart + (layoutEnd - layoutStart) * CGFloat(rollEase(t))
+        // 护栏由 pos 实时给出（pos 连续 ⇒ 护栏连续）；max 整体单调，仅交叉处有速度折点
+        layoutWidth = max(ideal, visibleInkGuard())
+    }
+
+    /// 墨迹护栏：窗口内可见两格的墨迹右沿（仅计入与核心可见带相交的格）− `slotAllowance`。
+    /// 「核心可见带」= 窗口上下各扣掉边缘渐隐带（`attachEdgeFadeMask` 同口径）——
+    /// 落在渐隐带里的字形已被柔化，不必再为它让出间隙。
+    private func visibleInkGuard() -> CGFloat {
+        var ownInk: CGFloat = 0
+        let frac = pos - floor(pos)
+        // 可见两格：离场（cell 顶在窗口顶上方 frac 格）、入场（下方 1−frac 格）
+        for (d, cellTop) in [(Int(floor(pos)).mod10, -CGFloat(frac) * cellH),
+                             (Int(ceil(pos)).mod10, (1 - CGFloat(frac)) * cellH)] {
+            let lo = max(digitInkTops[d] + cellTop, inkFade)
+            let hi = min(digitInkBottoms[d] + cellTop, cellH - inkFade)
+            if hi > lo { ownInk = max(ownInk, digitInkRights[d]) }
+        }
+        return ownInk - slotAllowance
+    }
+
+    /// 数字 d 的墨迹右沿（自槽左缘 = advance − rsb）；随字体在 `rebuildMetrics` 重算
+    private var digitInkRights: [CGFloat] = []
+    /// 数字 d 墨迹的上下沿（cell 坐标，自 cell 顶向下）——护栏判断字形是否还在可见带内
+    private var digitInkTops: [CGFloat] = []
+    private var digitInkBottoms: [CGFloat] = []
+    /// 边缘渐隐带高（`attachEdgeFadeMask` 同口径；随字体在 `rebuildMetrics` 重算）
+    private var inkFade: CGFloat = 0
 
     /// 每个数字自己的真实 advance。不要用统一 tabular width 做外部排版，
     /// tabularWidth 只负责给内部排版提供足够的绘制宽度。
     private var digitWidths: [CGFloat] = []
     private var tabWidth: CGFloat = 0
+    /// 比例数字判定（SG 档：各数字 advance 不等）。advance 每帧读（advance/widthForPosition
+    /// 热点），随字体在 rebuildMetrics 落存储，热路径不走属性重算
+    private var widthDelayActive = false
 
     /// 数字带图层：12 格（含顶部 9/底部 0 环绕缓冲）一次性预渲染成位图，
     /// 滚动每帧只改图层 origin.y —— 主线程零绘制，合成器以屏幕刷新率平移。
@@ -182,8 +295,31 @@ final class DigitWheelView: NSView {
         baselinePad = (cellH - natural) / 2
         digitWidths = (0...9).map { textWidth(String($0), font: font) }
         tabWidth = digitWidths.max() ?? textWidth("0", font: font)
-        rebuildStrip()
-        currentWidth = widthForPosition(pos)
+        widthDelayActive = digitWidths.contains { $0 != digitWidths[0] }
+        // 墨迹表（自槽左缘 / 自 cell 顶，flipped）：护栏「字形是否还在可见带内」的判据。
+    // 用 CTLine 墨迹盒（与绘制同一渲染栈，逐字体精确）；advance − rsb 即墨迹右沿
+    let lineBoxes = (0...9).map { d -> CGRect in
+        CTLineGetBoundsWithOptions(
+            CTLineCreateWithAttributedString(
+                NSAttributedString(string: String(d), attributes: [.font: font])),
+            .useGlyphPathBounds)
+    }
+    digitInkRights = (0...9).map { d in lineBoxes[d].maxX }   // 笔尖在槽左缘，故 = maxX
+    digitInkTops = (0...9).map { d in baselinePad + font.ascender - lineBoxes[d].maxY }
+    digitInkBottoms = (0...9).map { d in baselinePad + font.ascender - lineBoxes[d].minY }
+    // 边缘渐隐带高（`attachEdgeFadeMask` 同口径）：带内的字形已被柔化，护栏不必为它让位
+    inkFade = max(1, (font.pointSize * 0.25).rounded() / 2)
+    rebuildStrip()
+    currentWidth = widthForPosition(pos)
+    // 字体变了 → 排布宽按新度量重置（落定口径，无动画）
+    syncLayoutWidthToCurrentDigit()
+}
+
+    /// 把排布宽同步到「当前显示数字」的落定值（换字体 / 非动画落值 / 初始化用）
+    private func syncLayoutWidthToCurrentDigit() {
+        layoutEnd = digitWidths[displayDigit]
+        layoutStart = layoutEnd
+        layoutWidth = layoutEnd
     }
 
     /// 一次性渲染整条数字带（12 格位图，@2x）。
@@ -246,6 +382,7 @@ final class DigitWheelView: NSView {
             targetPos = best
             tweenDuration = 0   // 使任何进行中的 tween 失效
             currentWidth = widthForPosition(pos)
+            syncLayoutWidthToCurrentDigit()
             applyStripOrigin()
         }
     }
@@ -279,11 +416,19 @@ final class DigitWheelView: NSView {
     /// 车轮完美同步」的机械感。同一格距重复触发（0 格）时 tween 时长为 0 →
     /// advance 首帧即落定，不产生无谓滚动。
     private func beginTween(to dest: Double, rollDuration: CFTimeInterval) {
+        // 宽度时间轴起点先取（在重置 tweenElapsed 之前）：滚动中重规划时承接
+        // 当前延迟宽度对应的位置，槽宽连续无跳变；无在途 tween 时 = pos
+        widthStartPos = delayedWidthPos
         tweenStart = pos
         tweenElapsed = 0
         let cells = abs(dest - pos)
         let phase = 0.94 + 0.12 * tweenPhase   // 0.94…1.06，实例级恒定
         tweenDuration = rollDuration * cells / 10 * phase
+        // 布局宽本段端点：起点承接**当前已渲染值**（滚动被打断时横向不跳），
+        // 终点 = 目标数字的 advance（护栏每帧由 pos 实时给出，无需端点）
+        layoutStart = layoutWidth
+        let td = ((Int(round(dest)) % 10) + 10) % 10
+        layoutEnd = digitWidths[td]
     }
 
     /// 实例固定相位 0..<1（确定性伪随机：同距离车轮因各自的相位而错峰落定；
@@ -293,24 +438,26 @@ final class DigitWheelView: NSView {
         return Double(m % 997) / 997.0
     }()
 
-    /// 帧推进：沿本段 tween 时间轴积分（ease-out cubic：起手快、收尾稳，
-    /// 与全 App 动效语言一致），到点后精确落在目标位置——时间轴模型没有
-    /// 指数尾巴，天然不存在亚像素爬行的逐帧微抖。
+    /// 帧推进：沿本段 tween 时间轴积分（曲线 = `rollEase(_:)` 按设置档位实时解析），
+/// 到点后精确落在目标位置 —— 时间轴模型没有指数尾巴，天然不存在
+/// 亚像素爬行的逐帧微抖。
     /// 槽宽永远由连续位置推导（单一状态源，过渡全程贴住较宽数字防裁剪），每帧
     /// 只改 strip 图层位置，无任何主线程重绘。返回是否仍在滚动。
     func advance(dt: CFTimeInterval) -> Bool {
         guard tweenDuration > 0 else { return false }   // 无进行中的 tween：已落定
         tweenElapsed += dt
         let p = min(1, tweenElapsed / tweenDuration)
-        let eased = 1 - pow(1 - p, 3)
+        let eased = rollEase(p)
         pos = tweenStart + (targetPos - tweenStart) * eased
-        currentWidth = widthForPosition(pos)
+        currentWidth = widthForPosition(delayedWidthPos)
+        updateLayoutWidth()
         applyStripOrigin()
         if p >= 1 {
             pos = targetPos            // 精确落点
             normalize()
             tweenDuration = 0
             currentWidth = widthForPosition(pos)   // 落定宽即目标宽（曲线整数精确），无回缩
+            syncLayoutWidthToCurrentDigit()        // 布局宽也精确落定（偏差归零）
             applyStripOrigin()
             return false
         }
@@ -322,6 +469,25 @@ final class DigitWheelView: NSView {
     private var tweenStart: Double = 0          // 本段动画起点（连续位置）
     private var tweenElapsed: CFTimeInterval = 0
     private var tweenDuration: CFTimeInterval = 0   // 0 = 无动画（已落定）
+    /// 本段 tween 的总时长只读出口（0 = 已落定）。宿主 `RollingNumberView` 汇总
+    /// 「本轮最长轮的落定时刻」来定滑移时长（见 `slideTime(rollDuration:)`），
+    /// 故不做 private —— 读的就是规划时已经算好、含实例相位抖动的那个真值
+    var activeTweenDuration: CFTimeInterval { tweenDuration }
+    /// 宽度时间轴起点（连续位置）：beginTween 时承接在途延迟宽度，见 beginTween
+    private var widthStartPos: Double = 0
+
+    /// 宽度专用连续位置：SG 比例数字下滞后 Motion.rollWidthDelay 启动、压缩进
+    /// tween 剩余时长（与 pos 同一条曲线 `rollEase`——必须同形，否则中段
+    /// 错速会让宽度低于可见宽数字的 advance 造成裁剪），tween 结束点恰达
+    /// targetPos —— 落定宽度精确等于目标 advance，到位后不再有任何宽度调整。
+    /// 等宽字体（宽度恒定）与短于延迟的微滚直接跟 pos。
+    private var delayedWidthPos: Double {
+        let delay = Motion.rollWidthDelay
+        guard widthDelayActive, tweenDuration > delay else { return pos }
+        let wp = min(1, max(0, (tweenElapsed - delay) / (tweenDuration - delay)))
+        let eased = rollEase(wp)
+        return widthStartPos + (targetPos - widthStartPos) * eased
+    }
 
     /// 根据连续位置计算当前槽宽。
     /// 例如 1→8 的中间态，宽度在 advance(1) 与 advance(8) 之间连续插值——
@@ -329,11 +495,13 @@ final class DigitWheelView: NSView {
     /// 过渡中窗口里同时有「上侧滚出的旧数字」与「下侧滚入的新数字」，两者共用
     /// 同一条静态 strip 位图（同一 x 基准），槽宽一旦低于较宽一方的 advance，
     /// 其字形右缘立即被窗口裁掉——因此插值以「贴住宽者」为第一优先：
-    /// - 收窄（下一格更窄）：前 80% 过渡槽宽恒贴旧数字（滚过的数值零裁剪），
-    ///   最后 15% smoothstep 收完——此刻旧数字只剩 ≤5% 格高的边缘残条（落在
-    ///   窗口渐隐带内不可见），且收窄早于车轮视觉停止（无到位后回缩）；
-    /// - 变宽（下一格更宽）：前 15% smoothstep 快速撑开到新数字宽，让进入的
-    ///   宽数字尽早免裁（残差仅起始的细条，同在渐隐带内）。
+    /// - 收窄（下一格更窄）：前 72% 过渡槽宽恒贴旧数字（滚过的数值零裁剪），
+    ///   72%→97% smoothstep 收完——窗口由 0.8→0.95 拉长（2026-09-16 用户
+    ///   「宽度变化太急促」：同一条 C¹ S 曲线跑更长区间，峰值速度约减半，
+    ///   且早段亏宽反而更小，旧数字墨迹仍落在渐隐带内不可见）；收窄完成点
+    ///   97% 仍早于车轮视觉停止（无到位后回缩）；
+    /// - 变宽（下一格更宽）：前 22% smoothstep 撑开到新数字宽（原 0.15 同日
+    ///   拉长缓动），让进入的宽数字尽早免裁（残差仅起始的细条，同在渐隐带内）。
     /// 落定态 pos 为整数（t=0）恒精确等于当前数字 advance，静止排版不受影响。
     private func widthForPosition(_ p: Double) -> CGFloat {
         guard digitWidths.count == 10 else { return 0 }
@@ -344,10 +512,10 @@ final class DigitWheelView: NSView {
         let wa = digitWidths[a]
         let wb = digitWidths[b]
         if wb > wa {
-            return wa + (wb - wa) * CGFloat(smoothstep(t / 0.15))
+            return wa + (wb - wa) * CGFloat(smoothstep(t / 0.22))
         }
         if wb < wa {
-            return wa + (wb - wa) * CGFloat(smoothstep((t - 0.8) / 0.15))
+            return wa + (wb - wa) * CGFloat(smoothstep((t - 0.72) / 0.25))
         }
         return wa
     }
@@ -399,7 +567,9 @@ final class TextSlotView: NSView {
     /// 当前落定字符（滚字过渡期间 = 目标字符；正在滚出的旧字符走 `outgoing`）。
     /// 外部读它求墨迹空档（`trailingInkGap` / `leadingInkGap`）与结构配对判据。
     private(set) var text: String = ""
-    var font: NSFont = NSFont.systemFont(ofSize: 13) {
+    // 初值走 PanelFont.system（原 systemFont 口径）：实际字体恒由 RollingNumberView
+    // 排布时覆写，这里只作占位，统一到 PanelFont 便于「禁散写」grep 审计
+    var font: NSFont = PanelFont.system(size: 13) {
         didSet {
             guard font != oldValue else { return }
             updateBaselinePad()
@@ -544,11 +714,22 @@ final class RollingNumberView: NSView {
 
     typealias FontProvider = (CGFloat, NSFont.Weight, Bool) -> NSFont
 
-    // —— 字体策略（由面板注入；Mono/Inter/系统开关切换时 refreshFont() 就地更新）——
+    /// 滑移时长口径运行镜像（与 `PanelFont.sharpGroteskActive` 同款全局状态）：
+    /// 实例不自持设置，`rebuild` 时静态读它；写入点 = 面板快照同步处
+    /// （`BalancePanelView.update`）与 AppDelegate 启动载入配置处。
+    /// 只影响走 `slideOnRebuild: true` 的位数增减场景（Token 总计大数字的
+    /// 周期 / 平台切换），余额卡位数变化仍直接落值
+    static var slideTiming: RollSlideTiming = .wheelTail
+
+    /// 滚动时间曲线档位运行镜像（同 `slideTiming` 的机制）：`rollEase(_:)` 静态读它。
+    /// 每条 tween 在运行时逐帧按当前档位解析，所以切档**立刻生效**（下一次滚动即新曲线）
+    static var curve: RollCurve = .easeIn
+
+    // —— 字体策略（由面板注入；configure 时恒被宿主覆盖，默认档只作未 configure 的占位）——
     private var specSize: CGFloat = 13
     private var specWeight: NSFont.Weight = .semibold
-    private var fontProvider: FontProvider = { size, weight, _ in
-        .monospacedDigitSystemFont(ofSize: size, weight: weight)
+    private var fontProvider: FontProvider = { size, weight, mono in
+        PanelFont.system(size: size, weight: weight, monoDigits: mono)
     }
 
     private(set) var currentText: String = "—"   // 最近一次应用的文本（滚动续接/判据用）
@@ -581,8 +762,9 @@ final class RollingNumberView: NSView {
     private let prefixIconGap: CGFloat = ChipStyle.iconTextGap
     private let prefixIconView = NSImageView()
 
-    private var mainFont: NSFont = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-    private var prefixFont: NSFont = .monospacedDigitSystemFont(ofSize: 7.8, weight: .semibold)
+    // 初值走 PanelFont.system（= 原系统等宽数字口径），refreshFont() 恒会覆写
+    private var mainFont: NSFont = PanelFont.system(size: 13, weight: .semibold, monoDigits: true)
+    private var prefixFont: NSFont = PanelFont.system(size: 7.8, weight: .semibold, monoDigits: true)
     private var lineH: CGFloat = 16
     private var prefixLineH: CGFloat = 10
     private var digitWidth: CGFloat = 8   // 仅诊断日志用（字体等宽性验证）
@@ -591,6 +773,12 @@ final class RollingNumberView: NSView {
     /// （2026-09-13）。随 refreshFont 按主字体重算；Mono / Sharp Grotesk 恒 0 保持
     /// 字体自带度量（fontName 带 "." 前缀 = 系统私有 SF 家族）
     private var slotTracking: CGFloat = 0
+    /// 全数字最小左空档（lsb，随 refreshFont 重算）：数字轮护栏的固定扣除量之一
+    private var minNeighborInkCache: CGFloat = 0
+
+    /// 实例级字距增量（em，正 = 加宽，2026-09-16）：叠加在字体默认口径之上（系统 SF
+    /// 的 −0.01em 紧缩仍保留）。Token 总计大数字用它加宽字距；默认 0 = 其余实例不变
+    var trackingEm: CGFloat = 0
     private var textColor: NSColor = Palette.cardForeground
 
     // —— 基础字体档（configure 注入）：chip 态切走、退出态复原的复原锚点 ——
@@ -830,7 +1018,18 @@ final class RollingNumberView: NSView {
         lineH = ceil(mainFont.ascender - mainFont.descender + mainFont.leading)
         prefixLineH = ceil(prefixFont.ascender - prefixFont.descender + prefixFont.leading)
         digitWidth = DigitWheelView.tabularWidth(mainFont)
-        slotTracking = mainFont.fontName.hasPrefix(".") ? -mainFont.pointSize * 0.01 : 0
+        slotTracking = mainFont.pointSize * (trackingEm + (mainFont.fontName.hasPrefix(".") ? -0.01 : 0))
+        // 全数字最小左空档（lsb）：邻槽字形最坏的起笔位置；与 slotTracking 一起构成
+        // 数字轮「排布宽需扣除的固定量」（护栏判据用，见 DigitWheelView.visibleInkGuard）
+        minNeighborInkCache = (0...9).map {
+            CTLineGetBoundsWithOptions(
+                CTLineCreateWithAttributedString(
+                    NSAttributedString(string: String($0), attributes: [.font: mainFont])),
+                .useGlyphPathBounds).minX
+        }.min() ?? 0
+        for s in slots where s.view is DigitWheelView {
+            (s.view as? DigitWheelView)?.slotAllowance = slotTracking + minNeighborInkCache
+        }
         // 基线探针恒用基础档字体：对外 firstBaselineAnchor 稳定，标题行不随 chip 态跳动
         let probeFont = fontProvider(baseSize, baseWeight, true)
         baseLineH = ceil(probeFont.ascender - probeFont.descender + probeFont.leading)
@@ -1140,6 +1339,7 @@ final class RollingNumberView: NSView {
                     w = DigitWheelView()
                     w.font = mainFont
                     w.textColor = textColor
+                    w.slotAllowance = slotTracking + minNeighborInkCache
                     addSubview(w)
                     isFresh = true
                     fresh.insert(ObjectIdentifier(w))
@@ -1216,7 +1416,7 @@ final class RollingNumberView: NSView {
                     slideStarts[ObjectIdentifier(s.view)] = sx
                 }
             }
-            slideDuration = rollDuration
+            slideDuration = slideTime()
             slideElapsed = 0
         }
         relayoutSlots()
@@ -1237,11 +1437,40 @@ final class RollingNumberView: NSView {
     private var slideElapsed: CFTimeInterval = 0
     private var slideDuration: CFTimeInterval = 0
 
-    /// 滑移进度 0→1（ease-out cubic；非滑移期恒 1 = 直接落最终布局）
+    /// 滑移时长（2026-09-16 用户「钳制」需求，本文件唯一计算入口）。
+    /// 原先恒取 `rollDuration`（默认 1.2s）而**与位移量无关** → 位数变化时整组平移
+    /// 明显拖在滚字后面（用户反馈）。口径由设置窗口「主题外观 → 动效」单选：
+    /// - `.wheelTail`：取本轮**数字轮里最长的 tween 时长**（共享角速度下最晚的落定
+    ///   时刻，已含各轮的实例相位抖动），下限 `Motion.rollSlideMin` —— 平移与滚字
+    ///   同拍收尾，不再拖在滚字之后；无轮滚动（纯位数变化）时走下限；
+    /// - `.distance`：按整组位移量 `|slideDelta|` 缩放，钳制在
+    ///   `rollSlideMin … rollSlideMax`（位移 ≤1 个数字宽取下限，≥3 个取上限）。
+    /// 两档都不再看 `rollDuration` —— 它是滚字预算，与平移距离无关。
+    private func slideTime() -> CFTimeInterval {
+        switch Self.slideTiming {
+        case .wheelTail:
+            var longest = 0.0
+            for s in slots {
+                if let w = s.view as? DigitWheelView {
+                    longest = max(longest, w.activeTweenDuration)
+                }
+            }
+            return max(Motion.rollSlideMin, longest)
+        case .distance:
+            // 一个数字宽的近似值：比例数字档实测 ≈0.62em（等宽档差异不影响量级）
+            let digitWidth = max(1, mainFont.pointSize * 0.62)
+            let steps = abs(slideDelta) / digitWidth
+            let p = min(1, max(0, (steps - 1) / 2))   // 1 个宽 → 0；≥3 个宽 → 1
+            return Motion.rollSlideMin + (Motion.rollSlideMax - Motion.rollSlideMin) * Double(p)
+        }
+    }
+
+    /// 滑移进度 0→1（曲线与数字滚动统一，同走 `rollEase`；
+    /// 非滑移期恒 1 = 直接落最终布局）
     private func slideProgress() -> CGFloat {
         guard slideDuration > 0 else { return 1 }
         let p = min(1, slideElapsed / slideDuration)
-        return CGFloat(1 - pow(1 - p, 3))
+        return CGFloat(rollEase(p))
     }
 
     /// 滑移立即落定（setText 重入/视图销毁前的清理口径）
@@ -1283,10 +1512,19 @@ final class RollingNumberView: NSView {
         (s.view as? DigitWheelView)?.currentWidth ?? s.width
     }
 
-    /// 槽组总占宽：Σadvance + 槽间负字距（n 个槽共 n−1 个间隙）。固有宽度与滑移
-    /// slideDelta（整组平移量）都以它为口径，漏加会让滑移起点/终点差出一个字距
+    /// 槽位**排布推进量**（容器算下一槽 x 用）：数字槽读 wheel.layoutWidth（与帧宽解耦，
+    /// 见 DigitWheelView 顶部注释「排布宽与帧宽解耦」）；静态槽 = 自身 advance。
+    /// ⚠️ 帧宽（`slotWidth`）与排布推进量必须分开：前者管绘制/裁剪，后者管位置
+    private func slotAdvance(_ s: Slot) -> CGFloat {
+        (s.view as? DigitWheelView)?.layoutWidth ?? s.width
+    }
+
+    /// 槽组总占宽：Σ排布推进量 + 槽间负字距（n 个槽共 n−1 个间隙）。固有宽度与滑移
+    /// slideDelta（整组平移量）都以它为口径，漏加会让滑移起点/终点差出一个字距。
+    /// ⚠️ 用 `slotAdvance`（排布量）而非 `slotWidth`（帧宽）：静止态两者相等，滚动中
+    /// 帧宽会多出防裁剪的余量，混用会让固有宽/滑移量跟着抖
     private func slotsTotalWidth(_ list: [Slot]) -> CGFloat {
-        list.reduce(0) { $0 + slotWidth($1) } + slotTracking * CGFloat(max(0, list.count - 1))
+        list.reduce(0) { $0 + slotAdvance($1) } + slotTracking * CGFloat(max(0, list.count - 1))
     }
 
     /// 右对齐排布 slots（与原右对齐 label 一致；总宽超出外部宽度时左溢裁掉）。
@@ -1329,13 +1567,14 @@ final class RollingNumberView: NSView {
         var x = alignsLeft ? 0 : bounds.width - rightInset
         let pxScale = window?.backingScaleFactor ?? 2   // 槽位横向像素网格对齐（见 pixelAligned）
         for s in alignsLeft ? slots : slots.reversed() {
-            let w = slotWidth(s)
+            let w = slotWidth(s)          // 帧宽（防裁剪口径：绘制/裁剪用）
+            let adv = slotAdvance(s)      // 排布推进量（与帧宽解耦：位置用）
             var fx: CGFloat
             if alignsLeft {
                 fx = x
-                x += w + slotTracking      // 负字距：后续槽左移收紧（左缘锚定）
+                x += adv + slotTracking    // 负字距：后续槽左移收紧（左缘锚定）
             } else {
-                x -= w
+                x -= adv
                 fx = x
                 x -= slotTracking          // 负字距：下一槽（左侧）右移收紧（右缘锚定）
             }

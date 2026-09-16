@@ -4,7 +4,7 @@
 //
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
 // 主装配      build()（面板所有区段的组装入口；改整体结构先读它）
-// header      左上角五颗图标按钮（退出/设置/饼图/GitHub/Cockpit；拖动换位，逻辑在 PanelDrag.swift）
+// header      左上角六颗图标按钮（退出/设置/饼图/GitHub/Cockpit/平台开关；拖动换位，逻辑在 PanelDrag.swift）
 // 卡片容器     addCard(rows:to:...)（圆角背景 + hover + 点击/右键/拖拽回调都在这挂）
 // 卡片内容     balanceContentRow(...)（两行：标题+数值 / 副标题+点阵）
 //              ⚠️ **卡片字号·行高·icon 列宽的数值权威就在这一个方法里**（字号走 Palette 常量）
@@ -22,6 +22,7 @@
 import Cocoa
 import CoreImage
 import CoreText
+import SettingsUI          // BrandIconRequest（设置窗口「主题预设」图卡的品牌 icon 取图口径）
 
 /// Agent 卡副标题的可用空间不足时，在右侧渐隐，避免被子账号按钮条硬截断。
 private final class SubtitleFadeView: NSView {
@@ -185,11 +186,11 @@ extension BalancePanelView {
         header.addSubview(updatedLabel)
         // 右上角按钮组 2026-09-12 整组移除（原「主题调教 + 平台开关」NSSegmentedControl）：
         // 两个入口迁进设置窗口（「主题外观」「平台」pane），header 右侧因此不再挂任何控件。
-        // 四颗 HoverIconButton（退出/设置/GitHub/Cockpit）全部走 makeHeaderIconButton 这
+        // 五颗 HoverIconButton（退出/设置/GitHub/Cockpit/平台开关）全部走 makeHeaderIconButton 这
         // 一个入口：尺寸、图标口径、常态色、hover 提亮与 hover 底全同源，差异只有
         // 图标 / 动作 / 提示 —— 同组的 hover 观感由构造保证一致。
-        // 2026-09-14 收齐：退出按钮此前是五颗里唯一的特例（单独把 hover 提亮改成红色 →
-        // 「hover 跟别人不一样」）。现在四颗全部同构，且**不做任何单颗视觉偏移** ——
+        // 2026-09-14 收齐：退出按钮此前是这几颗里唯一的特例（单独把 hover 提亮改成红色 →
+        // 「hover 跟别人不一样」）。现在全部同构，且**不做任何单颗视觉偏移** ——
         // 曾试过给 power 加 +0.75pt「把圆环顶到圆心」，结果整颗墨迹外框比同组高 0.75pt，
         // 用户看到的就是「退出按钮偏高了」；同组对齐只认一条规则：裁墨迹后按墨迹外框居中。
         let quitBtn = makeHeaderIconButton(in: header, symbol: "power",
@@ -219,6 +220,12 @@ extension BalancePanelView {
         let cockpitBtn = makeHeaderIconButton(in: header, symbol: "list.bullet.rectangle.portrait",
                                               action: #selector(openCockpitTapped),
                                               tooltip: "打开 Cockpit")
+        // 第六颗（2026-09-16 用户要求）：平台开关 —— 直接打开设置窗口并落到「平台」pane
+        // （原 header 右上角的「平台开关」分段控件 2026-09-12 撤出迁进设置窗口，此处补回直达入口；
+        //  图标用 circle.grid.2x2.topleft.checkmark.filled，与设置侧栏「平台」项同款）
+        let platformsBtn = makeHeaderIconButton(in: header, symbol: "circle.grid.2x2.topleft.checkmark.filled",
+                                               action: #selector(platformSettingsTapped),
+                                               tooltip: "平台开关")
         let headerSeparator = PanelSeparatorView()
         headerSeparator.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(headerSeparator)
@@ -230,7 +237,8 @@ extension BalancePanelView {
         // 注册 id → 视图、还原落盘槽位表、给每颗按钮挂起手回调；leading 由
         // applyHeaderButtonSlots 按槽位下标统一装配（落位 = 整组重装），这里只钉尺寸与垂直居中
         headerButtonRegistry = ["quit": quitBtn, "settings": settingsBtn, "refresh": refreshPieBtn,
-                                "github": githubBtn, "cockpit": cockpitBtn]
+                                "github": githubBtn, "cockpit": cockpitBtn,
+                                "platforms": platformsBtn]
         headerButtonSlots = savedHeaderButtonSlots()
         for (id, view) in headerButtonRegistry {
             (view as? HeaderIconDraggable)?.onDragStart = { [weak self] event in
@@ -260,6 +268,9 @@ extension BalancePanelView {
             cockpitBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             cockpitBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
             cockpitBtn.centerYAnchor.constraint(equalTo: header.topAnchor, constant: headerRowCenterY),
+            platformsBtn.widthAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            platformsBtn.heightAnchor.constraint(equalToConstant: HoverIconButton.buttonSize),
+            platformsBtn.centerYAnchor.constraint(equalTo: header.topAnchor, constant: headerRowCenterY),
             // ── 槽位指引层：整条 = 全部槽位，左缘与首槽同起点、右缘与末槽同终点 ──
             // 垂直方向钉在**按钮带**上（height = 按钮边长 + centerY 与按钮同轴），
             // 而不是 header 上下缘：按钮中心距 header 顶 16pt、header 几何中心 16.5pt，
@@ -304,13 +315,14 @@ extension BalancePanelView {
         updatedLabel.wantsLayer = true
 
         // ── 离线横幅 ──
-        offlineBanner.font = .systemFont(ofSize: 12)
+        registerFont(offlineBanner, size: 12)
         offlineBanner.textColor = .systemOrange
         offlineBanner.isHidden = true
         root.addArrangedSubview(offlineBanner)
         pinFullWidth(offlineBanner, in: root)
 
-        // ── API 分组标题（12pt bold + 副前景灰）+ 行尾 pin 置顶按钮 ──
+        // ── API 分组标题（字号 = 卡片主标题字号 + semibold + 副前景灰，行高固定 24pt）
+        //    + 行尾 pin 置顶按钮 ──
         // DeepSeek/ZhiPu API 余额板块，置于面板最上；pin 随首行标题
         let apiTitle = sectionTitleRow(name: "API")
         apiTitle.translatesAutoresizingMaskIntoConstraints = false
@@ -397,8 +409,12 @@ extension BalancePanelView {
         balanceTitle.layer?.cornerCurve = .continuous
         balanceTitle.layer?.masksToBounds = true
         // hover 材质（背景 + 框）由容器共享（HoverMaterialHost），卡片自身恒无边框
+        // ⚠️ 本标题因要挂 hover 驻留（→ Token 板块切 .aggregate）而手写，不走
+        // `sectionTitleRow` —— 字号/字重/颜色/左缩进/行高必须与其他三处板块标题
+        // （API / Token / Usage）**逐项一致**：字号走 `registerSectionTitle`（跟随卡片
+        // 主标题字号，2026-09-16 用户要求），其余参数同 `sectionTitleRow` 的口径
         let balanceTitleLabel = NSTextField(labelWithString: "Agent")
-        balanceTitleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        registerSectionTitle(balanceTitleLabel)
         balanceTitleLabel.textColor = Palette.secondaryForeground
         balanceTitleLabel.translatesAutoresizingMaskIntoConstraints = false
         balanceTitle.addSubview(balanceTitleLabel)
@@ -522,7 +538,8 @@ extension BalancePanelView {
 
         // ── 日/周用量区块（可折叠；行内容随快照重建）──
         var usageCollapseTargets: [NSView] = []
-        let usageTitle = collapsibleSectionTitle(name: "用量", key: UDKey.usageSectionCollapsed,
+        // 标题英文（与 API / Token 两个区块标题同口径，2026-09-16 用户要求）
+        let usageTitle = collapsibleSectionTitle(name: "Usage", key: UDKey.usageSectionCollapsed,
                                                  targets: { usageCollapseTargets })
         root.addArrangedSubview(usageTitle)
         pinFullWidth(usageTitle, in: root)
@@ -564,7 +581,7 @@ extension BalancePanelView {
             dragGrabber.topAnchor.constraint(equalTo: header.topAnchor, constant: panelTopPadding + 3),
         ])
 
-        updatedLabel.font = .systemFont(ofSize: 9, weight: .regular)
+        registerFont(updatedLabel, size: 9, weight: .regular)
         updatedLabel.textColor = Palette.panelHeaderContentColor
         // 原贴底 footer（GitHub 按钮）2026-09-13 整体移除：按钮迁入 header 左侧按钮组，
         // 底部不再有固定区，root 底部 cap 同步收窄到底边距 11pt（见上方 rootBottomCap）
@@ -637,10 +654,12 @@ extension BalancePanelView {
         return card
     }
 
-    /// 分组标题行：标题，13pt semibold + 副前景灰，左对齐，固定行高 24pt
+    /// 分组标题行：标题字号 = **卡片主标题字号**（2026-09-16 用户要求「板块标题跟随卡片
+    /// 主标题字号」；原先硬编码 13pt，见 `registerSectionTitle`）+ 副前景灰，左对齐，
+    /// 固定行高 24pt（10…16pt 都装得下，版心高不随字号连锁变化）
     private func sectionTitleRow(name: String, color: NSColor = Palette.secondaryForeground) -> NSStackView {
         let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        registerSectionTitle(label)
         label.textColor = color
         let row = NSStackView(views: [label])
         row.orientation = .horizontal
@@ -653,7 +672,7 @@ extension BalancePanelView {
     /// 静态区块标题条（不可折叠）：与可折叠标题同字号、同左缩进、同高，无箭头无点击无 hover。
     private func plainSectionTitle(name: String) -> NSView {
         let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        registerSectionTitle(label)
         label.textColor = Palette.secondaryForeground
         label.translatesAutoresizingMaskIntoConstraints = false
         let v = NSView()
@@ -675,7 +694,7 @@ extension BalancePanelView {
     private func collapsibleSectionTitle(name: String, key: String,
                                          targets: @escaping () -> [NSView]) -> HoverCard {
         let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        registerSectionTitle(label)
         label.textColor = Palette.secondaryForeground
         let chevron = NSImageView()
         chevron.contentTintColor = Palette.secondaryForeground
@@ -786,6 +805,140 @@ extension BalancePanelView {
         return dimmed
     }
 
+    /// 品牌 SVG 原图（「无边框图标」开关用）：资源名与 `CardStyle.icon` 图标名同名
+    ///（workbuddy / zhipu / deepseek / qwen / trae-color / codex —— 全部对得上，无需映射表）。
+    /// 静态缓存：`bundleIcon` 每次读盘，卡片构建与开关切换都是高频路径，不能直呼。
+    /// 这里只负责取**未着色的原图**：template / 前景色着色由 `applyBrandIconImage` 统一设。
+    /// 缺资源 / 解析失败返回 nil → 调用方回落 PNG（开关关闭态）或系统符号
+    private static var brandSVGImages: [String: NSImage] = [:]
+    static func cardBrandSVG(_ iconName: String) -> NSImage? {
+        if let hit = brandSVGImages[iconName] { return hit }
+        guard let img = bundleIcon(iconName, size: 24) else { return nil }
+        brandSVGImages[iconName] = img
+        return img
+    }
+
+    /// 品牌 icon 取图（设置窗口「主题预设」图卡用）：与卡片**同一条取图口径**，差别只在「谁上色」。
+    /// - 无边框（`iconNoBorder`）= 同名 **SVG 原图**，返回 **template** 图 —— 着色交给调用方
+    ///   （SwiftUI `Image.renderingMode(.template)` + 该档主前景色；面板那边是 NSImageView +
+    ///   `contentTintColor`，两侧读同一档色）。SVG 自带 fill 是写死单色（见 `brandSVGShrink` 上方注释），
+    ///   不 template 化必有一半主题下隐形；并按 `brandSVGShrink` 微缩 —— 做法与
+    ///   `applyBrandIconImage` 一致：**把内容绘进基准 24pt 画布**（不是改 image.size）。
+    /// - 默认 = Icon Composer **PNG**（`brandIconImage` 按深浅档选版），原色直画，不着色。
+    static func brandIcon(_ req: BrandIconRequest) -> NSImage? {
+        guard req.borderless, let svg = cardBrandSVG(req.key) else {
+            return brandIconImage(req.key, dark: req.dark)
+        }
+        let box: CGFloat = 24                       // SVG 基准框（`bundleIcon(_:size:)` 同口径）
+        let ratio = brandSVGShrink[req.key] ?? 1
+        let inner = box * ratio
+        let canvas = NSImage(size: NSSize(width: box, height: box), flipped: false) { rect in
+            svg.draw(in: NSRect(x: rect.midX - inner / 2, y: rect.midY - inner / 2,
+                                width: inner, height: inner))
+            return true
+        }
+        canvas.isTemplate = true
+        return canvas
+    }
+
+    /// 「无边框图标」下的**按平台微缩比例**（表外 = 1 不缩）。
+    /// 由来：SVG 是满框裸 logo，而 PNG 里的 logo 只占 Icon Composer 底板的一部分 ——
+    /// 同一个 size 下 SVG 显得更大。这三个平台的图形最满，缩 7% 后与其余平台视觉等大
+    ///（2026-09-15 用户指定 zcode / codex / trae 缩 7%）。
+    /// ⚠️ 键是 `CardStyle.icon` 的图标名：zcode 卡共用 "zhipu"（智谱同图，一并生效）、
+    /// trae 卡是 "trae-color"，不是平台名
+    private static let brandSVGShrink: [String: CGFloat] = [
+        "zhipu": 0.93,
+        "codex": 0.93,
+        "trae-color": 0.93,
+    ]
+
+    /// 「无边框图标」下 SVG 一律按**主要前景色**着色（`Palette.cardForeground`：深色外观 #EBEBEB /
+    /// 浅色外观 0.13 黑灰，动态色随生效外观解算）。
+    /// 不用 SVG 自带填充色的原因（离线实测）：那些 fill 是**写死的单色** ——
+    /// workbuddy / deepseek / qwen / trae-color = `#e9e9e9`（浅灰，为深色底设计）、
+    /// zhipu 无 fill（= 黑，浅色底设计）、codex 是渐变彩色；原样直画必有一半平台在对应主题下隐形。
+    /// codex 的渐变也一并归到同一口径（2026-09-15 用户指定「svg 需要使用深浅主题的主要前景色」），
+    /// 免得同一排图标出现「彩色 + 单色」混排
+
+    /// 品牌 icon 落图：**两条取图来源的唯一收口**（无边框 = 同名 SVG 原图 / 默认 = Icon Composer
+    /// 的 PNG），建卡（`balanceContentRow`）与开关/外观变化的就地换图（`applyBrandIcon`）共用。
+    /// 同时负责 identifier 标签（`brandIcon:<键>`，就地换图按它找视图）与长进度卡片菜单栏辉光的
+    /// maskImage（以 icon 为蒙版，必须随图同步）。
+    /// - Parameters:
+    ///   - size: 目标显示尺寸（长进度卡片与列表态不同，由调用方按当前版式给）
+    ///   - appearance: 取版/着色的生效外观。建卡时传**与容器同源解算**的那份
+    ///     （`Palette.panelAppearance(lightTheme:)`，首建未挂窗时 `effectiveAppearance` 会误取系统档），
+    ///     换图时传视图自己的 `effectiveAppearance`
+    /// - Returns: 是否取到图；两条来源都缺资产时返回 false，由调用方回落 SVG/系统符号
+    @discardableResult
+    func applyBrandIconImage(_ iv: NSImageView, iconName: String, size: NSSize,
+                             appearance: NSAppearance) -> Bool {
+        let noBorder = iconNoBorderEnabled
+        let targetDark = brandIconDark(for: appearance)
+        let source = noBorder
+            ? Self.cardBrandSVG(iconName)
+            : Self.cardBrandImage(iconName, dark: targetDark, appearanceIsDark: appearance.isDark)
+        guard let source else { return false }
+        let scaled = source.copy() as! NSImage
+        scaled.size = size
+        // 无边框：SVG 是**满框裸 logo**（PNG 的 logo 只占 Icon Composer 底板的一部分），
+        // 同一尺寸下 SVG 视觉更大 → 按平台微缩（见 brandSVGShrink）。
+        // ⚠️ 做法是**把内容绘进一张基准 size 的画布**，不是改 image.size：后者会让 iconView 的
+        // intrinsicContentSize 跟着缩，而就地换图路径是拿 `iv.bounds.size` 当基准的 →
+        // 换一次缩一次，越换越小。画布用 drawingHandler 形式（按目标 context 实时重绘，
+        // 矢量不糊）；别用 `lockFocus`（那是 1x 位图，Retina 上会糊）。
+        let shrink = noBorder ? Self.brandSVGShrink[iconName] : nil
+        let drawn: NSImage
+        if let r = shrink, r < 1 {
+            let inner = NSSize(width: size.width * r, height: size.height * r)
+            drawn = NSImage(size: size, flipped: false) { rect in
+                scaled.draw(in: NSRect(x: rect.midX - inner.width / 2,
+                                       y: rect.midY - inner.height / 2,
+                                       width: inner.width, height: inner.height))
+                return true
+            }
+        } else {
+            drawn = scaled
+        }
+        // 无边框：SVG 一律当模板，色 = **互换后深浅档**的主前景色 —— 这是「图标深浅互换」
+        //（`iconThemeSwap`，语义 = 在生效外观上反向取版）在 SVG 路径上的落点；
+        // 用动态色而非静态色：provider 每次绘制按当前外观重解，外观变了不必等换图钩子。
+        // 默认 PNG：自带深浅两版资产（按 targetDark 选版），原色直画，tint 必须清掉（残留会污染原色图）
+        drawn.isTemplate = noBorder
+        iv.identifier = NSUserInterfaceItemIdentifier("brandIcon:" + iconName)
+        if noBorder {
+            let swap = iconThemeSwapEnabled
+            iv.contentTintColor = NSColor(name: nil) { appearance in
+                Palette.resolvedCardForeground(dark: appearance.isDark != swap)
+            }
+        } else {
+            iv.contentTintColor = nil
+        }
+        iv.image = drawn
+        iv.superview?.subviews.compactMap { $0 as? CardMenuBarGlowView }.forEach {
+            $0.maskImage = drawn
+        }
+        // 状态层「中心挖空」同步（同「附属物随图更新」的口径）：形状恒取 **PNG 版**
+        //（见 statusRingCarveImage）。切开关 / 换深浅版 / 外观变化三条换图路径都经这里。
+        // ⚠️ 建卡路径首次落图时状态层还没建出来，那一处由 balanceContentRow 建好后补设
+        iv.superview?.subviews.compactMap { $0 as? CardTaskStatusRingView }.forEach {
+            $0.carveIconView = iv
+            $0.carveMaskImage = statusRingCarveImage(iconName: iconName, appearance: appearance)
+        }
+        return true
+    }
+
+    /// 状态层**形状蒙版**用图（2026-09-16 用户要求）：卡片以 **SVG 原图**当 icon（无边框模式）时
+    /// 返回**同名 PNG 版**（Icon Composer 底板 = squircle，与 icon 同心同尺寸），供
+    /// `CardTaskStatusRingView.carveMaskImage` 按该轮廓**挖空**状态层（只保留外圈）；
+    /// 其余情况 nil（默认 PNG icon 模式不需要挖空）。深浅取版只为命中同一份资产（外轮廓相同）
+    func statusRingCarveImage(iconName: String, appearance: NSAppearance) -> NSImage? {
+        guard iconNoBorderEnabled else { return nil }
+        return Self.cardBrandImage(iconName, dark: brandIconDark(for: appearance),
+                                   appearanceIsDark: appearance.isDark)
+    }
+
     /// 余额卡片内容行：左大 icon + 中间纵向（标题/签到信息）+ 右纵向（额度值/点阵）
     /// 三列撑满整行：icon 与图标列宽同宽（27.75pt，2026-09-05 由 25pt +15%） / middle ≥ 70% / right 40pt
     /// 中间内容垂直居中；点阵进度放右侧额度值下方（DeepSeek 无点阵）
@@ -809,7 +962,8 @@ extension BalancePanelView {
     static let subRowHeight: CGFloat = 12
 
     /// 默认卡片「主标题行 ↔ 副标题行」的**基准行距**（2026-09-06 用户指定 +1.5pt 的定稿值）。
-    /// 实际行距 = 本值 × 字体系数（`cardTitleGapScaleSF/SG`，设置窗口「卡片」栏开放）：
+    /// 实际行距 = 本值 × 字体系数（`cardTitleGapScaleSF/SG`，两档已**固化**：2026-09-15 起
+    /// 常量在 `BalancePanelView.cardTitleGapScaleSFFixed / SGFixed`，设置窗口不再开放）：
     /// 主标题去掉硬行框高度后由字体自然行高决定，SG（字面 em 恒 1.0em、更扁）与 SF 的
     /// 字形框疏密不同，同一系数兼顾不了，故两档分设
     static let titleRowBaseGap: CGFloat = 1.5
@@ -817,7 +971,10 @@ extension BalancePanelView {
     /// 系统字体数字墨迹高（CTLine glyph path bounds，取「0」字形实测）：
     /// 数值基线锚 offset = 数字墨迹半高，墨迹中心与行中心精确重合——capHeight 是
     /// 大写字高，与数字字形高有固有差且误差随字号放大（见 valueBaseline 创建处注释）。
-    /// balanceContentRow（build）与 applyCardTitleFont（就地联动）两处共用，internal
+    /// balanceContentRow（build）与 applyCardTitleFont（就地联动）两处共用，internal。
+    /// ⚠️ 这里的 `NSFont.systemFont` 是**刻意的**，不是漏改 —— 它量的是「基线该放哪」这个
+    /// 与字形无关的锚点，只由字号决定；若改走 `PanelFont`，SG 档下 offset 会随字体变，
+    /// 切字体时数值整行上下跳一次（正是 2026-09-13 定稿要避免的）。SG 全覆盖不含这一处。
     static func systemDigitInkHeight(_ size: CGFloat) -> CGFloat {
         let attr = NSAttributedString(string: "0", attributes: [.font: NSFont.systemFont(ofSize: size)])
         return CTLineGetBoundsWithOptions(
@@ -848,13 +1005,12 @@ extension BalancePanelView {
         let brandAppearance = Palette.panelAppearance(lightTheme: lightThemeEnabled)
             ?? NSApp.effectiveAppearance
         // brandIconDark：生效外观 ⊕ 图标深浅互换开关（开关开启时深浅版互换）
-        if let brand = Self.cardBrandImage(iconName, dark: brandIconDark(for: brandAppearance),
-                                           appearanceIsDark: brandAppearance.isDark) {
-            iconView.identifier = NSUserInterfaceItemIdentifier("brandIcon:" + iconName)
-            let scaled = brand.copy() as! NSImage
-            scaled.size = NSSize(width: imgSize, height: imgSize)
-            iconView.image = scaled
-        } else {
+        // 无边框图标开关（2026-09-15 用户要求）：跳过 Icon Composer 导出的 PNG（自带 squircle
+        // 底板），改用同名 SVG 原图；两条来源统一在 applyBrandIconImage 里落图
+        if !applyBrandIconImage(iconView, iconName: iconName,
+                                size: NSSize(width: imgSize, height: imgSize),
+                                appearance: brandAppearance) {
+            // 两条来源都缺资产（旧 bundle / SVG 解析失败）：回落同名 SVG 或系统符号，按 template 着色
             iconView.image = bundleIcon(iconName, size: imgSize) ?? symbolImage("app.fill", size: imgSize)
             iconView.image?.isTemplate = true
             iconView.contentTintColor = iconTint
@@ -877,8 +1033,7 @@ extension BalancePanelView {
             let ring = CardTaskStatusRingView()
             ring.translatesAutoresizingMaskIntoConstraints = false
             iconContainer.addSubview(ring)
-            iconContainer.addSubview(iconView)
-            // 长进度卡片：host 含左侧点位 lane，光环钉 icon 本体（钉容器会整体偏左）
+            iconContainer.addSubview(iconView)            // 长进度卡片：host 含左侧点位 lane，光环钉 icon 本体（钉容器会整体偏左）
             let ringBounds = longProgressCard ? iconView : iconContainer
             NSLayoutConstraint.activate([
                 ring.leadingAnchor.constraint(equalTo: ringBounds.leadingAnchor),
@@ -892,6 +1047,10 @@ extension BalancePanelView {
                 // 统一图标列宽（不再随各平台 iconSize 变化）：所有卡标题严格左对齐
                 iconContainer.widthAnchor.constraint(equalToConstant: iconColumnWidth),
             ])
+            // 状态层「中心挖空」（SVG 模式）：形状 = PNG 版图标、位置 = iconView
+            //（frame 每次 layout 现算，见 CardTaskStatusRingView.refreshCarveMask）
+            ring.carveIconView = iconView
+            ring.carveMaskImage = statusRingCarveImage(iconName: iconName, appearance: brandAppearance)
             ringRef(ring)
         } else {
             iconContainer.addSubview(iconView)
@@ -1281,7 +1440,10 @@ extension BalancePanelView {
 
     /// 余额卡片的上下内边距（单侧；卡片高 = 行高 + 2 × 本值）。
     /// Panel.rebuildAccountCards 传给 addCard(topPadding:bottomPadding:)
-    static let cardVerticalPadding: CGFloat = 7
+    /// 调参史：5.5（2026-08-31 大小卡统一）→ 6（2026-09-01）→ 7（2026-09-14「上下缩进 +1pt」）
+    ///        → **6.4**（2026-09-16 用户「卡片上下内缩进 −0.6pt」）
+    /// ⚠️ 两种卡型（默认卡片 / 长进度卡片）共用本常量，改则一起变
+    static let cardVerticalPadding: CGFloat = 6.4
 
     /// 主标题↔副标题行距 = 基准 × 字体系数（按当前字形档取哪一档系数；两档在设置窗口「卡片」栏可调）
     static func titleRowGap(sg: Bool, scaleSF: CGFloat, scaleSG: CGFloat) -> CGFloat {
@@ -1545,10 +1707,10 @@ extension BalancePanelView {
         return img.withSymbolConfiguration(.init(pointSize: size, weight: .medium))
     }
 
-    // ── header 图标按钮统一口径（退出/设置/刷新周期饼图/GitHub/Cockpit 五颗共用）──
+    // ── header 图标按钮统一口径（退出/设置/刷新周期饼图/GitHub/Cockpit/平台开关 六颗共用）──
 
     /// header 图标统一 pt 尺寸（= RefreshPieButton.pieDiameter：饼图 11pt 直径 + 1pt 描边，
-    /// 与四颗 SF Symbol / SVG 图标视觉同尺寸）
+    /// 与其余 SF Symbol / SVG 图标视觉同尺寸）
     static let headerIconPointSize: CGFloat = 11
 
     // ── header 图标槽位（拖动落点）──
@@ -1583,14 +1745,16 @@ extension BalancePanelView {
             + CGFloat(headerButtonSlotCount - 1) * headerButtonSlotGap
     }
 
-    /// header 图标按钮统一构造入口（四颗 HoverIconButton 共用）：
+    /// header 图标按钮统一构造入口（五颗 HoverIconButton 共用）：
     /// 尺寸（HoverIconButton.buttonSize）、图标口径（headerIconImage）、常态色
     /// （**副前景色** `Palette.secondaryForeground`：系统灰为基准 + 按面板底色解算对比度补偿，
     /// 2026-09-14 用户要求；原为两档固定色 `Palette.panelHeaderContentColor`）、
     /// hover 提亮（HoverIconButton.hoverTintColor 默认 labelColor）与 hover 底
     /// （HoverIconButton.hoverBackgroundColor）全部同源 ——
     /// 同组按钮的 hover 观感由构造保证一致，不存在单颗特例；新增一颗只加一行调用。
-    /// 垂直位置：五颗（含 RefreshPieButton）都只钉 centerY = headerRowCenterY，
+    /// ⚠️ 这里给的是**初值**：真正落屏的常态色由 `applyHeaderButtonSlots` 按落点统一覆写 ——
+    /// 中间格 = 卡片主标题色、其余格 = 本副前景色（两档口径见 PanelDrag）。
+    /// 垂直位置：六颗（含 RefreshPieButton）都只钉 centerY = headerRowCenterY，
     /// 图标一律按墨迹外框居中，**没有任何按图标微调的偏移参数**（对齐口径唯一）。
     /// - symbol：SF Symbol 名；svgIcon：bundle 内品牌 SVG 名（优先，缺失回退 symbol）
     private func makeHeaderIconButton(in parent: NSView, symbol: String? = nil,
@@ -1873,7 +2037,9 @@ extension BalancePanelView {
             // 与 icon 同形的圆角正方形：居中、边长取图标列宽、圆角比例 0.22（app 图标口径），
             // 外扩 3pt 让 halo 更明显。涟漪圈与柔光同基准方（scale 动画向外扩散）
             let inset: CGFloat = 0.5
-            let side = min(bounds.width, bounds.height) - inset * 2 + 3
+            // 外扩量 3.6pt（2026-09-16 用户指定）：原值 3、中途为排查蒙版裁切临时放到 8，
+            // 修好后依次试过 3 → 5 → **3.6** 定稿
+            let side = min(bounds.width, bounds.height) - inset * 2 + 3.6
             // 视觉补偿上移 1pt 已移除（2026-09-01 用户要求去掉状态层向上偏移）
             let rect = CGRect(x: (bounds.width - side) / 2,
                               y: (bounds.height - side) / 2,
@@ -1943,6 +2109,108 @@ extension BalancePanelView {
                 ring2.isHidden = true
             }
             restartAnimationsIfNeeded()
+            // 中心挖空蒙版（「无边框图标」模式下用 PNG 图标形状挖掉状态层）随布局重算
+            refreshCarveMask()
+        }
+
+        // MARK: 状态层中心挖空（2026-09-16 用户要求）
+
+        /// 状态层的**形状蒙版源**：卡片在「无边框图标」模式下 icon 是裸 SVG logo，而状态层
+        /// （柔光 / 涟漪 / 扫描）是比 icon 外扩的圆角方块 —— 需要在图标位置让位。
+        /// 故用 **PNG 版图标**（带 squircle 底板，与 icon 同心同尺寸）的轮廓作**挖空区**：
+        /// 蒙版 = 白底 + 该轮廓挖空 ⇒ 状态层**只保留圆角图标轮廓之外的外圈**，中心不显示。
+        /// nil = 不裁（默认 PNG icon 模式：icon 自身就是 squircle，状态层与它同形，无需让位）。
+        var carveMaskImage: NSImage? {
+            didSet {
+                guard oldValue !== carveMaskImage else { return }
+                carveRetries = 0        // 形状源换了 → 重试预算重置
+                needsLayout = true
+            }
+        }
+        /// 蒙版形状的**位置源**（weak）：每次 layout 按它实时换算 icon 在本视图里的 frame，
+        /// 避免建卡阶段布局未定时算出的坐标被冻结（字号 / 行高变化后仍跟得上）
+        weak var carveIconView: NSImageView? {
+            didSet { needsLayout = true }
+        }
+        /// 上次建蒙版用的键（maskRect + 图标 frame + 图对象 + scale）：不变则不重绘
+        private var carveMaskKey: String?
+
+        /// 蒙版范围在视图 bounds 之外的外扩量（见 refreshCarveMask）：
+        /// 状态层会溢出 ring，蒙版覆盖不到的地方会被一并裁掉。取 24pt —— 覆盖涟漪最大
+        /// scale 扩散（外溢约 10pt）+ 扫描模糊弥散 + 余量。
+        private static let carvePad: CGFloat = 24
+
+        /// ⚠️ 建卡/换图与 icon 落位**不在同一轮布局**里（异步建卡更明显）：首次 `layout()` 时
+        /// icon 的 frame 还是 0 → 算出无效 icon frame 只能放弃，而 ring 自身尺寸没变、不会再有
+        /// 下一次 layout ⇒ 蒙版永远挂不上（2026-09-16 实测到的「状态层没被裁」）。
+        /// 故失败后安排下一拍重试（有限次，非静默降级：每次都会重新尝试挂载）。
+        private var carveRetries = 0
+
+        private func scheduleCarveRetry() {
+            guard carveRetries < 20 else { return }   // 20 × 0.25s = 5s 覆盖建卡到首帧
+            carveRetries += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.needsLayout = true
+            }
+        }
+
+        /// 构建/更新形状蒙版：**白底 + 用 PNG 图标轮廓挖空**（`destinationOut` 按源 alpha 挖）。
+        /// 蒙版挂 `layer.mask`（最外层）⇒ 柔光 / 涟漪 / 扫描连同各自的高斯模糊弥散一起被裁，
+        /// 不会「形状裁了、糊边留下」。坐标系：视图与位图 context 同为 y 向上、原点左下，
+        /// icon frame 直传即可（已离线验证不上下翻转）。
+        private func refreshCarveMask() {
+            guard let img = carveMaskImage, let iv = carveIconView,
+                  bounds.width > 1, bounds.height > 1 else {
+                if layer?.mask != nil { layer?.mask = nil }
+                carveMaskKey = nil
+                return
+            }
+            let iconFrame = iv.convert(iv.bounds, to: self)
+            guard iconFrame.width > 1, iconFrame.height > 1 else {
+                // icon 尚未落位（见 scheduleCarveRetry 注释）：下一拍再试，别就此放弃
+                scheduleCarveRetry()
+                return
+            }
+            let scale = window?.backingScaleFactor ?? 2
+            // ⚠️ 蒙版范围必须**超出视图 bounds**：状态层会溢出 ring（柔光外扩、涟漪 scale 扩散、
+            // 扫描模糊弥散），落在 mask 覆盖范围之外的内容同样会被裁掉（2026-09-16 用户
+            // 「外圈被裁剪」的根因）。故四周各留 carvePad，白底铺满整个蒙版范围。
+            let maskRect = bounds.insetBy(dx: -Self.carvePad, dy: -Self.carvePad)
+            let key = "\(maskRect)|\(iconFrame)|\(ObjectIdentifier(img))|\(scale)"
+            if key == carveMaskKey { return }
+            let pw = Int((maskRect.width * scale).rounded())
+            let ph = Int((maskRect.height * scale).rounded())
+            guard pw > 0, ph > 0,
+                  let ctx = CGContext(data: nil, width: pw, height: ph, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+                  let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                return
+            }
+            ctx.scaleBy(x: scale, y: scale)
+            // 把原点挪到蒙版范围原点，之后「视图坐标」直接可用（iconFrame 即视图坐标系）
+            ctx.translateBy(x: Self.carvePad, y: Self.carvePad)
+            // 白 = 全保留（蒙版只取 alpha，RGB 无所谓）—— ⚠️ 必须铺满**整个 maskRect**：
+            // 只铺 `bounds` 或 `origin: .zero` 起算都不行（后者只覆盖「视图原点往右上」那一块，
+            // 左下两侧的外扩带会漏成透明 → 光晕被**单侧**裁掉，2026-09-16 用户「光晕不完整」）。
+            // maskRect 本身就定义在视图坐标系里，直接拿来铺即对齐。
+            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(maskRect)
+            // destinationOut：按源 alpha 挖掉目标 —— PNG 的 squircle 区即「不显示状态层」的区
+            ctx.setBlendMode(.destinationOut)
+            ctx.draw(cg, in: iconFrame)
+            ctx.setBlendMode(.normal)
+            guard let out = ctx.makeImage() else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            let mask = layer?.mask ?? CALayer()
+            mask.frame = maskRect
+            mask.contentsScale = scale
+            mask.contents = out
+            if layer?.mask !== mask { layer?.mask = mask }
+            CATransaction.commit()
+            carveRetries = 0
+            carveMaskKey = key
         }
 
         override func viewDidChangeEffectiveAppearance() {
@@ -1954,6 +2222,8 @@ extension BalancePanelView {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             restartAnimationsIfNeeded()
+            // 面板显示（视图挂窗）时补一次蒙版：首次 layout 时 icon 可能还没落位
+            refreshCarveMask()
         }
 
         /// 重铺全部动画（按态分流）：
