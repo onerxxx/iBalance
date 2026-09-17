@@ -747,8 +747,9 @@ final class UsageDots: NSView {
     ///（与竖态点阵同向：低进度端较亮、高进度端最暗；浅色档位表方向与深色相反，
     /// level 4 = 峰值 ×0.33 才是最暗端）。原「两端均峰值色」单色条已作废。
     /// 返回 sRGB 0–255 元组：横态层渐变共用（竖线模式已随 09-13 开关移除）。
-    /// 档位序列本身在 `PanelHeatRamp.progressLevels`（SettingsUI）—— 「主题预设」图卡的进度条
-    /// 读同一份，免得两处各写一遍方向（图卡渐变方向反过一次就是这条）
+    /// 档位序列本身在 `PanelHeatRamp.progressLevels`（SettingsUI）—— 「主题预设」图卡的色阶图例
+    /// 读同一份 `PanelHeatRamp`，免得两处各写一遍方向（图卡渐变方向反过一次就是这条；
+    /// 图卡那根进度条本身已于 2026-09-17 删除，本方法是 `progressLevels` 唯一消费点）
     private static func progressStops(dark: Bool) -> [(r: CGFloat, g: CGFloat, b: CGFloat)] {
         PanelHeatRamp.progressLevels(dark: dark).map { level in
             let c = Palette.heatLevelColor(level, dark: dark).usingColorSpace(.sRGB) ?? .black
@@ -908,7 +909,8 @@ extension BalancePanelView {
                                     topInset: usageRowTopInset,
                                     bottomInset: usageRowBottomInset)
         hoverRow.hoverGradientColors = Palette.hoverGradient
-        // 发丝边框：与余额卡片 HoverCard 同款（hoverBorderNormal 18% ↔ Bright，1.2pt，0.22s）
+        // 发丝边框：与余额卡片 HoverCard 同款（hoverBorderNormal 18% ↔ Bright，
+        // 线宽 = Palette.cardBorderWidth（现 1.0pt），0.22s）
         hoverRow.enablesHoverBorder = true
         // 行 hover 交给列表共享材质宿主（usageContentStack 上安装）：渐变背景+描边
         // 行间整块滑动，与卡片连续效果同源；上两行自带视觉随之停用（保留以便回退）

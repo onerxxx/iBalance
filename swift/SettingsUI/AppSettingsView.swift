@@ -9,14 +9,15 @@ import SwiftUI
 /// 同日「主题调教」「平台开关」由面板右上角分段控件 / 玻璃弹窗迁入。
 /// 2026-09-13 用户要求：「主题外观」提到最前、打开默认第一项；「设置」项撤销 ——
 /// 自动签到并入「签到」、自动检查更新迁「关于」，由「签到」顶替其位；
-/// 同日「WB 同步」并入「账号」。侧栏顺序 = 枚举声明序）
+/// 同日「WB 同步」并入「账号」。
+/// 2026-09-17 用户要求：弹跳参数固化（见 `MenuBarBounceSettings.fixed`）→ 原「菜单栏」项整页移除；
+/// 同日「3D 硬币放侧边栏第二个」→ `coinDemo` 挪到 `appearance` 之后（侧栏顺序 = 枚举声明序）。
 public enum SettingsSidebarItem: String, CaseIterable, Identifiable, Hashable {
     case appearance
+    case coinDemo
     case checkin
     case platforms
     case accounts
-    case coinDemo
-    case animation
     case about
 
     public var id: String { rawValue }
@@ -27,7 +28,6 @@ public enum SettingsSidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .accounts: "账号"
         case .checkin: "签到"
         case .coinDemo: "3D 硬币"
-        case .animation: "菜单栏"
         case .about: "关于"
         }
     }
@@ -41,9 +41,6 @@ public enum SettingsSidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .accounts: "person.crop.circle.badge.plus"
         case .checkin: "checkmark.seal"
         case .coinDemo: "rotate.3d"
-        // 菜单栏（原 `circle.dotted`，2026-09-13 用户「icon 换掉」）：换成系统那张菜单栏示意图，
-        // 与 pane 名「菜单栏」同义
-        case .animation: "menubar.rectangle"
         case .about: "info.circle"
         }
     }
@@ -96,7 +93,6 @@ public struct AppSettingsView: View {
                 case .coinDemo:
                     HostedPane(model: model, item: .coinDemo,
                                fallbackIcon: .symbol("rotate.3d"), fallbackTitle: "3D 硬币")
-                case .animation: AnimationPane(model: model)
                 case .about: AboutPane(model: model)
                 }
             }
@@ -296,129 +292,11 @@ private struct AboutPane: View {
     }
 }
 
-// MARK: - 菜单栏 pane（菜单栏「进行中」蓝点的小球弹跳参数；侧栏项原叫「动画」，2026-09-13 定名「菜单栏」）
-
-/// 菜单栏状态点弹跳参数：顶部实时预览 + 五项滑杆。改动即时生效并落盘
-/// （与「设置」pane 的刷新间隔同口径：不留「保存」按钮）。
-/// 2026-09-13 用户要求：侧栏项「动画」→「菜单栏」（图标一并换成 `menubar.rectangle`）、
-/// 预览段标题「预览」→「进行中状态动画」、并去掉下方「恢复默认」按钮及其整张 Section 卡。
-private struct AnimationPane: View {
-    let model: AppSettingsModel
-
-    var body: some View {
-        Form {
-            Section {
-                BouncePreview(settings: model.snapshot.bounce)
-                    .frame(height: 92)
-            } header: {
-                Text("进行中状态动画")
-            } footer: {
-                Text("菜单栏图标前的「进行中」蓝点，按当前参数实时演算。")
-            }
-            Section {
-                sliderRow("弹跳高度", \.amplitude, MenuBarBounceSettings.amplitudeRange, 0.1, "%.1f pt")
-                sliderRow("弹跳周期", \.period, MenuBarBounceSettings.periodRange, 0.05, "%.2f s")
-                sliderRow("腾空占比", \.airRatio, MenuBarBounceSettings.airRatioRange, 0.01, "%.2f")
-                sliderRow("触地压扁", \.squashMin, MenuBarBounceSettings.squashRange, 0.01, "%.2f")
-                sliderRow("顶点拉伸", \.stretchMax, MenuBarBounceSettings.stretchRange, 0.01, "%.2f")
-            } footer: {
-                Text("「腾空占比」越小，落地压扁驻留越久；「触地压扁 / 顶点拉伸」是纵向形变，横向按体积守恒自动反向补偿。参数只影响「进行中」蓝点。")
-            }
-        }
-    }
-
-    /// 滑杆行：标签居左，滑杆 + 数值读数居右（数值用等宽数字，拖动时不抖）
-    private func sliderRow(_ title: String,
-                           _ keyPath: WritableKeyPath<MenuBarBounceSettings, Double>,
-                           _ range: ClosedRange<Double>,
-                           _ step: Double,
-                           _ format: String) -> some View {
-        LabeledContent {
-            HStack(spacing: 10) {
-                Slider(value: snapped(binding(keyPath), in: range, step: step), in: range)
-                    .frame(width: 190)
-                Text(String(format: format, model.snapshot.bounce[keyPath: keyPath]))
-                    .font(.footnote)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(width: 56, alignment: .trailing)
-            }
-        } label: {
-            Text(title)
-        }
-    }
-
-    private func binding(_ keyPath: WritableKeyPath<MenuBarBounceSettings, Double>) -> Binding<Double> {
-        Binding(
-            get: { model.snapshot.bounce[keyPath: keyPath] },
-            set: { value in
-                var next = model.snapshot.bounce
-                next[keyPath: keyPath] = value
-                model.setBounce(next)
-            })
-    }
-}
-
-/// 小球弹跳预览：直接调 `MenuBarBounceSettings.solve(at:)`（与宿主同一套解算），
-/// 样式（本体常亮 + 高斯模糊光晕 + 余弦呼吸）走 `MenuBarStatusDotStyle` 同一规格，
-/// 全部 pt 量纲按 `scale` 等比放大 —— 菜单栏那枚点直径仅 ~5pt，1:1 根本看不出形变。
-/// `TimelineView(.animation)` 每帧重画即可：这里是普通窗口，不走菜单栏多屏镜像，
-/// 不必受「只能写模型值」那条约束（见 MenuBarGlow 的 breathStep 注释）。
-private struct BouncePreview: View {
-    let settings: MenuBarBounceSettings
-
-    private static let scale: Double = 4          // 预览放大倍数（所有 pt 量纲同乘，观感与实物等比）
-    private static let dotDiameter: Double = 5    // 与 MenuBarStatusGlowController 的圆点口径一致
-    /// 光晕位图：与宿主同一烘焙管线（剪影 → 高斯模糊 → alpha 增益），按放大倍数烘；
-    /// 参数只随倍数变，进程内烘一次复用（Canvas 每帧重画不能现烤）
-    private static let glowImage = MenuBarStatusDotStyle.glowBitmap(
-        color: MenuBarStatusDotStyle.runningColor,
-        dotDiameter: dotDiameter * scale, visualScale: scale)
-    private static let dotColor = Color(nsColor: MenuBarStatusDotStyle.runningColor)
-    private static let dotOpacity = Double(MenuBarStatusDotStyle.dotOpacity)
-
-    var body: some View {
-        TimelineView(.animation) { context in
-            Canvas { gc, size in
-                let t = context.date.timeIntervalSinceReferenceDate
-                let b = settings.solve(at: t)
-                let d = Self.dotDiameter * Self.scale
-                let w = d * b.sx
-                let h = d * b.sy
-                let cx = size.width / 2
-                let groundY = size.height - 22
-                // 静止位底缘抬升 dy（与宿主同口径：底缘为形变支点，压扁贴地、拉伸向上长）
-                let baseBottomY = groundY - b.dy * Self.scale
-                let baseCenterY = baseBottomY - d / 2
-
-                gc.stroke(Path { p in
-                    p.move(to: CGPoint(x: 16, y: groundY))
-                    p.addLine(to: CGPoint(x: size.width - 16, y: groundY))
-                }, with: .color(.secondary.opacity(0.22)), lineWidth: 0.5)
-
-                // 光晕：宿主同款烘焙位图（柔和高斯晕，非实心圆），呼吸同公式同参数；
-                // 尺寸恒定、只跟随位移（与宿主 updateBounce 同口径）
-                if let cg = Self.glowImage {
-                    gc.opacity = MenuBarStatusDotStyle.breathOpacity(at: t)
-                    gc.draw(gc.resolve(Image(decorative: cg, scale: MenuBarStatusDotStyle.bitmapScale)),
-                            at: CGPoint(x: cx, y: baseCenterY))
-                    gc.opacity = 1
-                }
-
-                // 本体：常亮透明度（与宿主 dotOpacity 同源）、底缘支点形变
-                gc.fill(Path(ellipseIn: CGRect(x: cx - w / 2, y: baseBottomY - h,
-                                               width: w, height: h)),
-                        with: .color(Self.dotColor.opacity(Self.dotOpacity)))
-            }
-        }
-    }
-}
-
 // MARK: - 主题外观 pane（原面板右上角「主题调教」玻璃弹窗的 SwiftUI 原生版）
 
 /// 主题预设 + 用量色 + 面板 / 卡片外观。
 /// 除顶部「主题预设」的「保存」按钮外全部即时生效 ——
-/// 与「菜单栏」「关于」等 pane 同口径：写入转交宿主动作（落盘 + 触发重绘）后
+/// 与「关于」等 pane 同口径：写入转交宿主动作（落盘 + 触发重绘）后
 /// 由模型 `sync()` 回读真实配置，所以这里用闭包 Binding 而不是 keyPath。
 private struct ThemePane: View {
     /// 顶部「预设名称」输入框要写回模型草稿 → 需要 `$model.xxx` 取 Binding
@@ -434,37 +312,24 @@ private struct ThemePane: View {
     var body: some View {
         Form {
             // ── 「主题预设」（2026-09-15 用户要求：本页最上方）──
-            // 「保存」= 把本页**当前全部参数**固化成一枚预设（快照里该页那几项，见
-            // ThemePreset(name:snapshot:)）；每枚预设是一张**迷你面板**图卡（见 `presetThumb`，
-            // 2026-09-16 用户要求：预设不再是一行文字摘要，改成把该组参数画出来）。
-            // 预设列表存宿主 UserDefaults（ThemePresetStore），窗口每次打开由 sync() 回读
+            // 每枚预设是一张**迷你面板**图卡（见 `presetThumb`，2026-09-16 用户要求：
+            // 预设不再是一行文字摘要，改成把该组参数画出来）。
+            // 2026-09-17 用户改版：① 现有六枚**固定为出厂内置**（`ThemePreset.builtIns`，
+            // 随包发布、不可删不可改名）；② 新增走**页脚那个「新增主题」**（用户否掉了
+            // 「加号浮在图卡上」那一版：「加号似乎不能放在卡片上，不符合逻辑」）；
+            // ③ 原「名称 + 保存」那一行整体删除。
+            // 用户预设存宿主 UserDefaults（ThemePresetStore），窗口每次打开由 sync() 回读
             Section {
-                presetSaveRow
-                if model.snapshot.themePresets.isEmpty {
-                    Text("还没有预设。把下面的参数调成想要的样子，点「保存」固化一组。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } else {
-                    presetGrid
-                }
+                presetGrid
             } header: {
                 Text("主题预设")
             } footer: {
-                Text("「保存」把本页当前全部参数（用量色 / 面板背景色 + 顶端不透明度 / 次背景色 / 底端不透明度 / 浅色主题 / 图标深浅互换 / 无边框图标 / 长进度卡片 / 主标题字号 / Sharp Grotesk 字体）连同 3D 硬币的视觉身份（Preset / Style 两档 + 币面色 + 色场色）固化成一组，名字与已有预设重复时会先问是否覆盖；每张图卡就是该组参数的**可视预览**（底色遮罩两端不透明度 / 次背景色 / 用量色 / 主标题字号与字体 / 硬币视觉身份都画在上面），**点图卡即应用**、逐项原样写回（不做任何派生翻转），随时可切回来，蓝框那枚就是当前生效的一组。硬币的尺寸 / 厚度 / 边纹 / 姿态 / 自旋与上传的 logo 不属于主题，不随预设走。")
+                // ⚠️ 页脚文案控在**两行以内**（2026-09-17 用户「主题外观页面的所有 forms 下的介绍描述，
+                // 简化到两行以内」）—— 默认窗口下页脚一行 ≈39 个汉字，超过 ~75 字就会溢成三行。
+                // 改这几段时先数字数，别再堆细节（细节看代码注释，这里只留「一眼看懂」）
+                Text("点图卡即应用，蓝框那枚是当前生效的一组；内置预设只读，点列表末尾「新增主题」把当前参数存成一枚自己的预设（可改名、可删）。")
             }
             Section {
-                // 用量色（原「主题色」，2026-09-15 用户改名 —— 它只管用量类可视化那一支色阶，
-                // 与同组的「面板背景色 / 次背景色」不是一类，叫「主题色」会让人以为动它改整面板外观）。
-                // 2026-09-14 用户要求：原色相/饱和度/亮度三根滑杆 + 标题色样一起撤掉，
-                // 收成「面板」组里的一行系统色盘）——
-                // 拾色后由模型分解回 HSB 三参落值（下游点阵档位/卡片边框仍读 HSB，口径不变）；
-                // 用量色不含透明语义，故不透出不透明度滑杆
-                LabeledContent {
-                    ColorPicker("用量色", selection: themeColor, supportsOpacity: false)
-                        .labelsHidden()
-                } label: {
-                    Text("用量色")
-                }
                 // 面板底色（2026-09-14 用户要求：原「高对比背景」强度滑杆改制）——
                 // 行尾色块即系统色盘入口，点击弹出系统颜色面板（含「不透明度」滑杆，
                 // 即原「强度」语义）；拾色即时落盘重绘，不留「保存」按钮
@@ -484,6 +349,31 @@ private struct ThemePane: View {
                 } label: {
                     Text("次背景色")
                 }
+                // 主前景色（2026-09-17 用户「设置里 面板里 开放主前景色参数」）：卡片文字色。
+                // 色盘**不透出不透明度**（文字色带 alpha 没意义，宿主按 alpha = 1 落值）。
+                // 色盘显示的当前色 = 自选值 ?? 内置两档里「本页浅色主题档」那一支（见 Binding 注释）
+                LabeledContent {
+                    ColorPicker("主前景色", selection: panelForegroundColor, supportsOpacity: false)
+                        .labelsHidden()
+                } label: {
+                    Text("主前景色")
+                }
+                // 用量色（原「主题色」，2026-09-15 用户改名 —— 它只管用量类可视化那一支色阶，
+                // 与「面板背景色 / 次背景色 / 主前景色」不是一类，叫「主题色」会让人以为动它改整面板外观）。
+                // 2026-09-14 用户要求：原色相/饱和度/亮度三根滑杆 + 标题色样一起撤掉，
+                // 收成「面板」组里的一行系统色盘。
+                // ⚠️ **2026-09-17 用户「用量色排在面板的第四行」**：从本 Section 的**首行**挪到
+                // 「主前景色」之后 ⇒ 四行颜色排成 背景色 / 次背景 / 前景色 / 用量色，
+                // 上方三行是"面板本体"的四支色，用量色（只管可视化色阶）收在颜色组末尾，不与它们混排；
+                // 下面紧跟两条不透明度滑杆 + 浅色主题开关。挪位置只动这一段，其它行不动。
+                // 拾色后由模型分解回 HSB 三参落值（下游点阵档位/卡片边框仍读 HSB，口径不变）；
+                // 用量色不含透明语义，故不透出不透明度滑杆
+                LabeledContent {
+                    ColorPicker("用量色", selection: themeColor, supportsOpacity: false)
+                        .labelsHidden()
+                } label: {
+                    Text("用量色")
+                }
                 // 遮罩上下两端的不透明度（2026-09-14 用户要求：删掉原「底端 = alpha × 0.65」的自动递减，
                 // 两端各给一个滑杆）。顶部滑杆与色盘的不透明度是同一字段的两个入口
                 percentSliderRow("顶部不透明度",
@@ -497,7 +387,7 @@ private struct ThemePane: View {
             } header: {
                 Text("面板")
             } footer: {
-                Text("「用量色」= 用量强弱的色阶基色（原「主题色」，2026-09-15 改名）——卡片竖向点阵 / 长进度卡片进度条 / Token 热力图 / 卡片边框都从它派生出各档；「面板背景色」= 面板底色遮罩（色盘给颜色，其不透明度即顶端值）；「次背景色」= 面板内第二层背景（无用量底点 / 进度条轨道底 / 骨架行 / Token 印章底 / 卡片 hover 材质块同源，2026-09-15 由原「点阵背景色」与「hover 背景色」合并）；「顶部/底部不透明度」= 遮罩纵向两端各管一档，两者相同即纯色、0% 露原生玻璃；「浅色主题」= 强制浅色外观，打开时仅在底色明度 ≤ 50% 时翻转其明度（已是亮底则保持）。")
+                Text("「用量色」派生出点阵 / 进度条 / 热力图 / 卡片边框的色阶；「面板背景色」是底色遮罩；「次背景色」是面板内第二层背景；「浅色主题」强制浅色外观。")
             }
             Section {
                 Toggle("图标深浅互换", isOn: toggle(\.iconThemeSwap, model.setIconThemeSwap))
@@ -519,108 +409,205 @@ private struct ThemePane: View {
             } header: {
                 Text("卡片")
             } footer: {
-                Text("「主标题字号」= 余额卡平台名（数值字号不变）；「Sharp Grotesk 字体」用本机安装版本（固定 Book20），开启后面板内全部文字（卡片 / 用量表 / Token 板块 / 悬浮子面板）统一换用它，中文自动兜底苹方，未安装该字体时回落系统字体。主副标题行距系数已固化（系统字体 ×0.30 / SG ×0.90），不再开放调节。「hover 背景色」已并入「面板 → 次背景色」。")
+                Text("「主标题字号」只管平台名（数值字号不变）；「Sharp Grotesk」开启后面板内文字统一换用，中文兜底苹方、未安装则回落系统字体。")
             }
             // ── 动效（2026-09-16 用户要求：位数变化时整组左右平移的时长口径两种都落地）──
-            // 原先平移时长恒等于滚动预算 1.2s、与位移量无关 —— 位数增减时明显拖在滚字后面
-            Section {
-                // 动效曲线（2026-09-16 用户要求开放为设置项）：原先硬写死 ease-in cubic。
-                // 三档并排可比，故走 segmented（滑移时长只有两档且文案长，走 radioGroup）
-                Picker("动效曲线", selection: rollCurve) {
-                    ForEach(RollCurveOption.allCases) { opt in
-                        Text(opt.title).tag(opt.rawValue)
-                    }
-                }
-                .pickerStyle(.segmented)
-                Picker("滑移时长", selection: rollSlideTiming) {
-                    ForEach(RollSlideTimingOption.allCases) { opt in
-                        Text(opt.title).tag(opt.rawValue)
-                    }
-                }
-                .pickerStyle(.radioGroup)
-            } header: {
-                Text("动效")
-            } footer: {
-                Text("「动效曲线」= 数值滚动的时间曲线（车轮位置 / 槽宽 / 位数变化平移三条量共用同一条，改一处即整体变）：从慢到快 = 起滚慢、末段最快、落定干脆；从快到慢 = 起手快、收尾长；慢-快-慢 = 两端减速、中段最快。单位换值时字符的滚入 / 滚出仍是另一条 ease-out，不随此项变。\n「滑移时长」= 位数增减（如 999.9 → 1,000.1）时**整组数字左右平移**的时长。原先是固定 1.2s、与移动距离无关。「跟随滚字」= 取本轮数字滚动的实际落定时刻（下限 0.30s），平移与滚字同拍收尾；「跟随位移」= 按实际移动距离在 0.30–0.60s 之间取，挪得少就快、挪得多也封顶。仅影响 Token 总计大数字的周期 / 平台切换；余额卡位数变化仍直接落值。\n两项都是动效参数，不进「主题预设」。")
-            }
+            // ⚠️ **2026-09-17 用户「动效的参数固化，移除参数开放」：整个 Section 已删除** ——
+            // 「动效曲线」定稿「从快到慢」、「滑移时长」定稿「跟随位移」，两个 config 键
+            //（roll_curve / roll_slide_timing）、两个单选控件、快照字段 / 动作 / 宿主 setter
+            // 与运行镜像一并移除，真值写进 `RollingNumberView.rollEase(_:)` 与 `slideTime()`
+            //（与「主副标题行距系数」固化成常量的做法一致）。要改口径去那两个函数。
         }
     }
 
-    // MARK: 主题预设（顶部「保存」+ 逐枚「应用 / 删除」）
-
-    /// 「保存」行：预设名称 + 保存按钮。按钮必须包在 HStack + Spacer 里才靠右 ——
-    /// grouped Form 里的裸 `Button` 恒独占一行且左对齐（同「关于」pane 的两个动作按钮）
-    private var presetSaveRow: some View {
-        HStack(spacing: 10) {
-            TextField("预设名称（可留空）", text: $model.themePresetName)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 220)
-            Spacer(minLength: 8)
-            Button("保存") { model.saveThemePreset() }
-        }
-    }
+    // MARK: 主题预设（逐枚「应用 / + 新增 / 改名 / 删除」）
 
     /// 预设图卡网格（2026-09-16 用户要求：预设从「一行文字摘要」改成「一张迷你面板」；
-    /// 同日「图卡太大」→ 收成**竖版长方形**）。
-    /// 列宽自适应 108…132：默认 680pt 窗口（内容区 ~430）三列、每列 ≈132pt（缩略图 ≈124pt 宽），
-    /// 最小窗口三列 ≈122pt。min 取 108 是为了锁住列数 —— 再小就凑出四列、卡片内那句主标题会挤
+    /// 同日「图卡太大」→ 收成**竖版长方形**；2026-09-17 用户「卡片宽度缩小 10%」）。
+    /// ⚠️ **恒定一行三张**（2026-09-17 用户「固定一行显示三个卡片」）：列 = **3 个固定数量的
+    /// `GridItem(.flexible(minimum: <106>, maximum: <121>))`**（都是 `s(...)` 出来的，见下方 thumbScale），
+    /// 不再是 `.adaptive` —— adaptive 的列数随可用宽浮动（窗口一宽就凑出第四列、一窄就掉到两列），
+    /// 用户要的是恒定三列。
+    /// - 上限 = **基准 110 = 面板基准宽 100 + 两侧选中框占位 2×5**（2026-09-17 用户
+    ///   「mini 面板 宽度缩小 10pt」：面板基准 109 → 100；更早那一刀是「宽度缩 10%」：132 × 0.9 = 119）
+    /// - 下限只负责窗口缩到最小档时三列不被挤爆
+    /// - 富余宽度**均分到两侧**、整块水平居中（2026-09-17 用户「红框区域所有预设要水平方向居中」）：
+    ///   ⚠️ 居中必须落在**网格自己的 `alignment`** 上 —— `LazyVGrid` 会吃满被提议的宽度，
+    ///   列宽到上限后富余宽度留在网格内部，由 `alignment` 决定列往哪靠；留 `.leading` 就是
+    ///   「贴左、右边空一大片」（.19 那一版就是这么错的）。外层 `frame(maxWidth: .infinity)`
+    ///   负责让网格拿到整行宽度（否则它只按内容宽量），两者缺一不可。
+    private static let presetColumnCount = 3
     private var presetGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 108, maximum: 132), spacing: 12)],
-                  alignment: .leading, spacing: 16) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: Self.s(96),
+                                                              maximum: Self.s(110)),
+                                                     spacing: Self.s(12)),
+                                 count: Self.presetColumnCount),
+                  alignment: .center, spacing: Self.s(16)) {
             ForEach(model.snapshot.themePresets) { preset in
                 presetCard(preset)
             }
+            // 「新增主题」当**最后一张图卡**排进网格（2026-09-17 用户「需要设计为 mini 面板一样宽高的大按钮形式」）：
+            // 与预设卡共用一个列宽，所以它与左右邻卡逐行对齐、同宽同高
+            presetAddTile
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, Self.s(8))
+        .frame(maxWidth: .infinity)      // 网格拿满整行宽度，列由上面的 .center 居中
     }
 
-    /// 单枚预设 = 迷你面板缩略图（**点它 = 应用**）+ 名字行（行尾垃圾桶 = 删除）。
+    /// 单枚预设 = 迷你面板缩略图（**点它 = 应用**）+ 名字行（可改名的名字 / 行尾垃圾桶 = 删除）。
     /// 命名与交互照 macOS 系统设置「外观」那套：图缩略图即选项、名字居中在图下、
     /// 当前生效那枚加一圈系统蓝描边（见 `presetThumb` 的 isActive）。
+    ///
+    /// 2026-09-17 用户改版 —— **出厂内置那几枚只读、用户自建的可删可改名**：
+    /// - 内置：名字行不给垃圾桶、名字点不动（`ThemePreset.builtInIDs` 判断），右侧照样留同宽占位保居中
+    /// - 自建：点名字 → 就地变成输入框（Enter 提交 / Esc 放弃，都走模型 `commitPresetRename`
+    ///   / `cancelPresetRename`）；行尾垃圾桶 = 删除
+    /// - **新增入口在 Section 页脚那个「新增主题」**（`ThemePane.body` 里），**不在这张卡上** ——
+    ///   用户否掉了「加号浮在图卡右上角」那一版：「加号似乎不能放在卡片上，不符合逻辑」
+    ///   （卡是「应用」语义，上面再挂一个「新增」确实两件事混在一起）
+    ///
     /// ⚠️ 垃圾桶不能压在缩略图上做 overlay —— 外层是 Button，overlay 里再放 Button 命中判定不可靠；
-    /// 放在名字行里，并用同宽占位保持名字居中。
+    /// 放在名字行里，并用同宽占位保持名字居中
     private func presetCard(_ preset: ThemePreset) -> some View {
         let isActive = preset.matches(model.snapshot)
-        return VStack(spacing: 6) {
+        let isBuiltIn = ThemePreset.builtInIDs.contains(preset.id)
+        // 图卡前景色 = **这枚预设自己记的主前景色**（nil = 内置两档，2026-09-17 随参数开放接入预设）。
+        // 提到 presetCard 算好再往下传（而不是让 presetThumb 自己读全局）：参数变化 →
+        // 这里的值跟着变 → SwiftUI 重渲染子树，图卡上的文字色才能实时跟上色盘
+        let appearanceDark = !preset.lightThemeEnabled
+        let fg = Color(nsColor: PanelForegroundColor.resolved(dark: appearanceDark,
+                                                              override: preset.panelForegroundColor))
+        return VStack(spacing: Self.s(6)) {
             Button { model.applyThemePreset(preset) } label: {
-                presetThumb(preset, isActive: isActive)
+                presetThumb(preset, isActive: isActive, appearanceDark: appearanceDark, fg: fg)
             }
             .buttonStyle(.plain)
             .help("应用这组预设")
-            HStack(spacing: 4) {
-                Color.clear.frame(width: 16, height: 1)
-                Text(preset.name)
-                    .font(.callout)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: .infinity)
-                Button(role: .destructive) { model.deleteThemePreset(id: preset.id) } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color.red)
+            HStack(spacing: Self.s(4)) {
+                Color.clear.frame(width: Self.s(16), height: 1)
+                presetNameText(preset, isBuiltIn: isBuiltIn)
+                if isBuiltIn {
+                    Color.clear.frame(width: Self.s(16), height: 1)
+                } else {
+                    Button(role: .destructive) { model.deleteThemePreset(id: preset.id) } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: Self.s(11)))
+                            .foregroundStyle(Color.red)
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(width: Self.s(16))
+                    .help("删除这组预设")
                 }
-                .buttonStyle(.borderless)
-                .frame(width: 16)
-                .help("删除这组预设")
             }
         }
     }
 
-    /// 迷你面板缩略图（**竖版：约 124×152pt**，2026-09-16 用户「图卡太大 → 改竖版长方形」）：
-    /// 把该组预设**看得见的参数**画成一张小面板，自外向内三层 ——
+    /// 「新增主题」= 与一枚预设**同宽同高的大按钮**（2026-09-17 用户
+    /// 「需要设计为 mini 面板一样宽高的大按钮形式」），排在网格末尾当最后一张卡：
+    /// 上半 = 与 mini 面板等尺寸的虚线框（内含「+」与「新增主题」），下半 = 与预设名字行等高的占位 ——
+    /// 于是它与左右邻卡**逐行对齐**，读起来就是「这儿可以再加一枚」。
+    /// ⚠️ 尺寸全部走 `Self.s(...)`（同 `presetThumb`）：图卡放大缩小时它跟着走，不会掉队。
+    /// ⚠️ 曾试过放进 Section 的 footer（`.buttonStyle(.link)`），**整个不渲染** —— 见 MEMORY 那条坑
+    private var presetAddTile: some View {
+        VStack(spacing: Self.s(6)) {
+            Button { model.addThemePresetFromCurrent() } label: {
+                VStack(spacing: Self.s(8)) {
+                    Image(systemName: "plus")
+                        .font(.system(size: Self.s(18), weight: .light))
+                    Text("新增主题")
+                        .font(.body)
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .frame(height: Self.s(138))        // 与 mini 面板同高（同日「缩小容器高度」152 → 140 → 138）
+                .background {
+                    RoundedRectangle(cornerRadius: Self.s(10))
+                        .fill(Color.primary.opacity(0.04))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: Self.s(10))
+                        .strokeBorder(style: StrokeStyle(lineWidth: Self.s(1),
+                                                         dash: [Self.s(5), Self.s(4)]))
+                        .foregroundStyle(Color.secondary.opacity(0.45))
+                }
+                // 与图卡那圈选中框占位同宽 ⇒ 虚线框的实际宽度 = mini 面板宽度（逐列对齐）
+                .padding(Self.s(5))
+            }
+            .buttonStyle(.plain)
+            .help("按当前参数新增一组预设")
+            // 名字行占位：与预设卡那行同字号同高（透明），保证整块高度也一致
+            Text("新增主题").font(.body).opacity(0)
+        }
+    }
+
+    /// 图卡下方那行名字：**内置只读文本 / 自建可点改**（点它就地变成输入框）。
+    /// 字号 = `.body`（13pt，与表单正文同规格）—— 详见方法内注释
+    @ViewBuilder
+    private func presetNameText(_ preset: ThemePreset, isBuiltIn: Bool) -> some View {
+        // 与**表单正文同字号**（2026-09-17 用户「mini 面板下的名称字号改为 forms 相同字号」）：
+        // macOS 上表单/控件默认正文 = `.body` = 13pt = `NSFont.systemFontSize`
+        //（⚠️ 原 `.callout` 是 **12pt**，实测 `NSFont.preferredFont(forTextStyle:)`；
+        //  「12 还是 13」靠猜必错，这一条是量出来的）。
+        // ⚠️ 名字行**不参与 `thumbScale` 等比**（其余几何照旧跟着缩）：它对齐的是设置窗口
+        // 自己的正文，不跟随图卡尺寸
+        let font = Font.body
+        if isBuiltIn {
+            Text(preset.name)
+                .font(font)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity)
+                .help("内置预设，不可改名")
+        } else if model.renamingPresetID == preset.id {
+            TextField("", text: $model.renameDraft)
+                .textFieldStyle(.roundedBorder)
+                .font(font)
+                .frame(maxWidth: .infinity)
+                .onSubmit { model.commitPresetRename() }
+                .onExitCommand { model.cancelPresetRename() }   // Esc = 放弃
+                .help("回车确认，Esc 取消")
+        } else {
+            Text(preset.name)
+                .font(font)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())        // 整格可点（文字本身的命中区只有墨迹）
+                .onTapGesture { model.beginPresetRename(preset) }
+                .help("点击改名")
+        }
+    }
+
+    /// 迷你面板缩略图（**竖版**：基准 100×**138**pt ×`thumbScale`；2026-09-16 用户「图卡太大 → 改竖版长方形」、
+    /// 2026-09-17「卡片宽度缩小 10%」→ 同日「宽度缩小 10pt」再收窄一刀、同日「等比放大」整体 ×`thumbScale`、
+    /// 同日「缩小 mini 面板的容器高度」高度基准 152 → 140 → 138）：
+    /// 把该组预设**看得见的参数**画成一张小面板，自上而下三块 ——
     /// ① 底色遮罩（**铺满整张图卡**：顶端 = `panelBackgroundColor.alpha`、底端 =
     ///    `panelBackgroundBottomAlpha` 的竖直渐变）。卡外**不加任何底**（2026-09-16 用户
     ///    「不要加这层东西 透明就行」）—— 遮罩 alpha < 1 处直接透出设置窗口自己的底，
     ///    所以图卡上那道渐变就是面板真实的「一端实、一端透」；
-    /// ② 次背景色卡片（内含卡片 icon + 主标题：**字号 / Sharp Grotesk / 主前景色**都体现在这行字上，
-    ///    主前景色按预设的「浅色主题」开关解档 —— 开 = 面板走浅色外观，字就是那档的深色）；
-    /// ③ 用量色进度条（轨道仍是次背景色、填充读 `PanelHeatRamp` 与主面板同一条色阶，
-    ///    「长进度卡片」开关改它的长度）；
-    /// 卡片与进度条贴顶排，**底端居中**另落一枚硬币（见 `miniCoin`），中间那条带即底色遮罩本身。
-    /// 高度写死、宽度吃列宽：列宽被网格钉在 108…132，所以恒为竖版长方形。
+    /// ② 板块大标题「API」（**左缘与卡片 icon 同列** = 卡内 16pt）+ **两行平台卡**
+    ///    （2026-09-17 用户「mini 卡片去掉背景色，第二行显示 mini 卡片的 hover 状态」→
+    ///    「第二行改为 zcode 平台」）：第 1 行 = DeepSeek **常态**（不画底 —— 面板里卡片容器
+    ///    底色恒 clear），第 2 行 = ZCode **hover 态**（次背景色材质块 + 亮边框，见 `miniCardRow`）。
+    ///    卡的 icon 与主标题把**字号 / Sharp Grotesk / 主前景色**都带出来，
+    ///    主前景色 = 这枚预设记的那一份（nil = 内置两档，2026-09-17 随参数开放进预设），
+    /// ③ 底端一行 = **硬币贴卡左缘**（2026-09-17 用户「硬币的容器去掉内缩进，靠左摆放」，
+    ///    本行不留 leading 内缩进）+ 右侧一列两样东西：Token 总计大数字（主面板 Token 板块
+    ///    那串千分位数字，字号比主标题再大一档）+ **五格色阶图例**（首格 = 次背景色 =
+    ///    面板「无用量底点」那档，其后 L1…L4 逐档取 `PanelHeatRamp` 的压暗系数）；
+    ///    中间那条带即底色遮罩本身。
+    /// ⚠️ 原 ② 与 ③ 之间那根**用量色进度条 2026-09-17 按用户要求整根删除**（连带
+    ///    `progressStops`；「长进度卡片」开关从此只在主面板里看得见）。
+    /// 高度写死、宽度吃列宽：列宽被网格钉在 108…119，所以恒为竖版长方形。
     /// 选中态 = 系统蓝描边（外扩 5pt、线宽 2.5 ⇒ 与面板留 2.5pt 缝；内容不重叠，
     /// 有无描边都不改缩略图尺寸 ⇒ 网格不跳）。
-    private func presetThumb(_ preset: ThemePreset, isActive: Bool) -> some View {
+    /// - Parameters:
+    ///   - fg: 图卡前景色，**由 `presetCard` 按这枚预设记的主前景色算好传入** ——
+    ///     放参数而非函数内读全局，色盘一改这里就能驱动重渲染（见 `presetCard`）
+    ///   - appearanceDark: 该预设的「浅色主题」开关解出来的外观档（色阶图例方向 / hover 边框用）
+    private func presetThumb(_ preset: ThemePreset, isActive: Bool,
+                             appearanceDark: Bool, fg: Color) -> some View {
         // 面板外观档：**只由预设自己的「浅色主题」开关决定**（开 = 浅色外观，关 = 深色外观）。
         // ⚠️ 2026-09-16 用户「主题预设的各种主题，需要对当前的深浅色设置做隔离」：
         // 原先写的是 `!lightThemeEnabled && colorScheme == .dark` —— 系统/窗口翻深浅、
@@ -630,17 +617,20 @@ private struct ThemePane: View {
         // 只有改预设本身的参数才会变。（真实面板确实跟随系统外观，图卡必须挑一档 ——
         // 挑「关 = 深色」这一档，与用户日常看到的观感一致）
         let appearanceDark = !preset.lightThemeEnabled
-        let fg = Color(nsColor: PanelForegroundColor.resolved(dark: appearanceDark))
+        // fg 由 `presetCard` 算好传进来（= 这枚预设自己记的主前景色，nil 回落内置两档）——
+        // 放参数里是为了让「色盘改前景色」能驱动图卡重渲染（全局读取 SwiftUI 看不见变化）
         let bg = preset.panelBackgroundColor
         let maskTop = Color(nsColor: bg.nsColor)
         let maskBottom = Color(nsColor: bg.withAlpha(preset.panelBackgroundBottomAlpha).nsColor)
         let secondary = Color(nsColor: preset.secondaryBackgroundColor.nsColor)
         return ZStack {
             // 面板本体 = 底色遮罩，铺满整张图卡（外面那层「玻璃底」2026-09-16 用户要求删除）
-            RoundedRectangle(cornerRadius: 10)
+            RoundedRectangle(cornerRadius: Self.s(10))
                 .fill(LinearGradient(colors: [maskTop, maskBottom],
                                      startPoint: .top, endPoint: .bottom))
-            VStack(alignment: .leading, spacing: 9) {
+            // VStack 段间距 9 → **7**（2026-09-17 用户圈出「API 标题 ↔ 第一张平台卡」那道缝，「缩小 2pt」）：
+            // 它是「API 标题」与下面「两行平台卡」这一整块之间的间距，只此一处
+            VStack(alignment: .leading, spacing: Self.s(7)) {
                 // 板块大标题（= 主面板每个板块头顶那行「API / Token / Usage / Agent」）：
                 // 字号与卡片主标题**同一档**（板块标题跟随 `cardTitleFontSize`，这是预设里那个
                 // 字号参数的四个消费点之一，图卡得把它们画出来）；
@@ -650,74 +640,162 @@ private struct ThemePane: View {
                     .font(Self.titleFont(preset))
                     .foregroundStyle(fg.opacity(0.62))
                     .lineLimit(1)
-                // 余额卡（次背景色）：icon + **平台名**（主面板里那张卡的标题是平台名，
-                // 板块大标题才是「API」；icon 用 DeepSeek 当例子，名字就对应用 DeepSeek）
-                HStack(spacing: 6) {
-                    miniCardIcon(preset, appearanceDark: appearanceDark)
-                    Text("DeepSeek")
-                        .font(Self.titleFont(preset))
-                        .foregroundStyle(fg)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)   // 16pt + SG 时这名字最宽，别截断
+                    // ⚠️ 标题要与下面那排卡片的 **icon 左缘**对齐（2026-09-17 用户「大标题 API 对齐 icon 最左」）——
+                    // 主面板里两者同列：标题 = root.leading + 8（`apiTitle` 约束），卡片内容 = root.leading
+                    // + 卡内缩进 8（`addCard(horizontalPadding: 8)`，卡容器与 root 同宽）⇒ 都落在 root + 8。
+                    // 图卡里 root = 本 VStack 那层缩进，所以标题还要再让 8pt（恒定 = 卡片行自身的内缩进）
+                    // 才落回卡片内容那一列 —— ⚠️ 改 VStack 那层缩进**不用**动这里，两者相加
+                    .padding(.leading, Self.s(8))
+                // 同一张平台卡画两行：常态在上、hover 态在下（2026-09-17 用户要求）——
+                // 两行**各是一个平台**（2026-09-17 用户「第二行改为 zcode 平台」），
+                // 与主面板 API 板块的真实内容一致：DeepSeek 常态 / ZCode hover
+                VStack(alignment: .leading, spacing: Self.s(2)) {
+                    miniCardRow(preset, icon: "deepseek", name: "DeepSeek",
+                                appearanceDark: appearanceDark, fg: fg,
+                                secondary: secondary, hovered: false)
+                    miniCardRow(preset, icon: "zhipu", name: "ZCode",
+                                appearanceDark: appearanceDark, fg: fg,
+                                secondary: secondary, hovered: true)
+                }
+                Spacer(minLength: 0)
+            }
+            // 面板内容左右缩进 12 → 8（2026-09-16 用户「mini 面板的左右内缩进缩小」）→ **6**
+            //（2026-09-17 用户「缩小 mini 面板的左右缩进」）：图卡是窄竖版，两边一挤版心就显瘦。
+            // 这层是**面板级**缩进（≈主面板 root 的 7），卡片行自己那 8 是**卡内**缩进，两层别混
+            .padding(.horizontal, Self.s(6))
+            .padding(.vertical, Self.s(10))
+            // 底端一行 = 主面板 **Token 板块**的缩影（硬币 + 总计大数字 + 色阶图例）。
+            // 硬币**贴卡左缘**：本行不留 leading 内缩进（2026-09-17 用户「硬币的容器去掉内缩进，
+            // 靠左摆放」）—— 币前的 8pt 内缩进一去掉，币就压在卡片自己的左边界上。
+            // 这一行的定尺寸**随卡片宽度同比缩过**（2026-09-17 用户「卡片宽度缩小 10%」）：
+            // 币 54 → 49、色格 6.6/3.5 → 5.9/3.2。（色格**间隔**当日再单独收到 2.4，
+            // 见下面色阶图例处 —— 那一次只动间隙、没动点边长。）
+            // 列间距 6.3 → 2 → **0**（2026-09-17 用户「间距缩小一些」→「改为0」）：币的渲染方框
+            // 自带 ~4pt 空边，任何参数都会叠加在这 4pt 上 —— 取 0 后目视间距就是那 4pt 本身。
+            // ⚠️ 2026-09-17 再收 2pt（用户圈出「币 ↔ 数值列」那道缝）时**不能再靠 spacing**（已经是 0），
+            // 改成在币那一侧挂 **-2pt 的负内边距**：方框重叠 2pt，而图形离方框边缘还有空边 ⇒ 不会碰字。
+            // 目视 4 → 2pt 就是这么来的（这个「目视 ≈ spacing + 4」是调它的口径）。
+            //（色格恒比文字窄一档，故列宽由上面那串大数字决定）
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                HStack(alignment: .center, spacing: 0) {
+                    miniCoin(preset, box: Self.s(49))
+                        .padding(.trailing, -Self.s(2))
+                    VStack(alignment: .leading, spacing: Self.s(5)) {
+                        // Token 总计大数字 = 主面板 Token 板块行首那串（硬币右边、逐位滚动的
+                        // 千分位数字，格式同 `ZcodeTokenStore.totalDisplay`）。
+                        // 面板那边它是**整块面板最大的字**（23.4pt vs 卡片主标题 13pt ≈ 1.8×），
+                        // 图卡缩完若与主标题同档就丢了这层主次 —— 故再乘 `tokenValueScale`
+                        //（2026-09-17 用户「字号放大」）。⚠️ 列宽只剩 ~50pt（基准 = 面板 100 − 币 49），
+                        // 系数再大就会被 `minimumScaleFactor` 缩回去，那是假放大
+                        Text(Self.tokenValueSample)
+                            .font(Self.titleFont(preset, scale: Self.tokenValueScale))
+                            .foregroundStyle(fg)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                        // 色阶图例 = 主面板竖排点阵那几格，**首格是次背景色**（档 0 = 「无用量底点」，
+                        // 与 `Palette.heatLevelColor` 0 档同源；2026-09-17 用户「进度色前面加上次背景色」），
+                        // 其后 L1…L4 逐档取 `PanelHeatRamp`（峰值 × 压暗系数）。
+                        // **恒 5 格全亮**（图卡没有 ratio 可依，画的不是「用了多少」而是「这组的档位色」），
+                        // 低档在左。边长 5.9 = 主面板竖排点阵的形状口径（点 4.56 : 隙 2.42）。
+                        // ⚠️ **2026-09-17 用户「缩小 mini 面板里的进度点阵间隔」：间隔 3.2 → 2.4**
+                        //（只收间隙、点边长 5.9 不动；基准值口径照旧，随 `thumbScale` 一起缩放）
+                        HStack(spacing: Self.s(2.4)) {
+                            RoundedRectangle(cornerRadius: Self.s(1.2))
+                                .fill(secondary)
+                                .frame(width: Self.s(5.9), height: Self.s(5.9))
+                            ForEach(1...4, id: \.self) { level in
+                                RoundedRectangle(cornerRadius: Self.s(1.2))
+                                    .fill(Self.rampColor(preset, level: level, dark: appearanceDark))
+                                    .frame(width: Self.s(5.9), height: Self.s(5.9))
+                            }
+                        }
+                    }
                     Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(secondary))
-                // 进度条宽度要按可用宽算（长进度卡片 = 占满），只能借 GeometryReader
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(secondary)
-                        Capsule()
-                            .fill(LinearGradient(colors: Self.progressStops(preset, dark: appearanceDark),
-                                                 startPoint: .leading, endPoint: .trailing))
-                            .frame(width: geo.size.width * (preset.longProgressCard ? 1 : 0.62))
-                    }
-                }
-                .frame(height: 5)
-                Spacer(minLength: 0)
+                // 硬币行下缘到卡片下边缘的留白（2026-09-17 用户「缩小标注的间距」）：10 → **8**
+                .padding(.bottom, Self.s(8))
             }
-            // 左右内缩进 12 → 8（2026-09-16 用户「mini 面板的左右内缩进缩小」）：
-            // 图卡是窄竖版，12pt 两边一挤版心只剩 ~98pt，卡片显得又瘦又空
-            .padding(.horizontal, 8)
-            .padding(.vertical, 10)
-            // 硬币落底居中（竖版：上面卡片 + 进度条，中间留出底色遮罩那条带，底下一枚币）
-            VStack {
-                Spacer(minLength: 0)
-                miniCoin(preset, box: 56)
-            }
-            .padding(.bottom, 10)
         }
-        .frame(height: 152)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        // 面板高度基准 152 → **140**（2026-09-17 用户「缩小 mini 面板的容器高度」）→ **138**
+        //（同日再「缩小 2pt」）：上下两块内容之间的富余（两个 `Spacer` 各吃一半）随之收窄 ——
+        // 那正是用户圈出的「ZCode 卡片 ↔ 硬币行」那道空隙。⚠️ 别压到内容贴死：两块内容的固定高之和
+        //（API 行 + 间距 7 + 两行平台卡 + 间距 2 + 上下 padding 20 ＋ 硬币行 49）约 134 基准 pt，
+        // 138 是「明显变矮但仍留一点缝」的值；再往下调要先算这个和。
+        .frame(height: Self.s(138))
+        .clipShape(RoundedRectangle(cornerRadius: Self.s(10)))
         // 面板自身那道细描边跟着面板走（外圈透明后它就是图卡的边界）。
         // 色取**预设自己那档主前景色**（不是 `Color.primary`）—— 与面板同源，也不吃窗口深浅
         .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(fg.opacity(0.18), lineWidth: 1)
+            RoundedRectangle(cornerRadius: Self.s(10))
+                .strokeBorder(fg.opacity(0.18), lineWidth: Self.s(1))
         }
-        .shadow(color: .black.opacity(0.30), radius: 2.5, y: 1)
+        // 「+」曾于 2026-09-17 短暂画在这里（hover 该卡时浮出）—— 用户当天否掉：
+        // 「加号似乎不能放在卡片上，不符合逻辑」，新增入口改到 Section 页脚那个「新增主题」
+        .shadow(color: .black.opacity(0.30), radius: Self.s(2.5), y: Self.s(1))
         // 选中框：外扩 5pt、线宽 2.5（`strokeBorder` 是内描 ⇒ 与面板之间留 **2.5pt**）。
         // 常量占位，有无描边都不改缩略图尺寸 ⇒ 网格不跳
-        .padding(5)
+        .padding(Self.s(5))
         .overlay {
             if isActive {
-                RoundedRectangle(cornerRadius: 15)
-                    .strokeBorder(Color.accentColor, lineWidth: 2.5)
+                RoundedRectangle(cornerRadius: Self.s(15))
+                    .strokeBorder(Color.accentColor, lineWidth: Self.s(2.5))
             }
         }
     }
 
-    /// 卡片品牌 icon 的示例（图卡统一用 **DeepSeek** 的图标当例子）：**两条来源跟预设走** ——
+    /// 迷你面板里那行「平台卡片」（icon + 平台名）：**一个实现画两个状态** ——
+    /// - `hovered = false`（常态）**不画任何底**：面板里卡片容器底色恒 clear
+    ///   （`Palette.cardBackground`），常态卡片本来就没有背景；
+    /// - `hovered = true`（hover 态）画上 hover 材质，与宿主 `HoverMaterialHost` 同源：
+    ///   填充 = **次背景色**（`Palette.hoverGradient` 两档同值就是它）、边框 = 最亮档用量色
+    ///   （`hoverBorderBright` = `heatLevelColor(4)`）；线宽按图卡比例从面板的 1.2pt 收到 0.7。
+    /// `icon` / `name` 逐行给（= `CardStyle.icon` / `CardStyle.name` 那对取值），
+    /// **图卡画的必须是真平台**：名字对了图标才不会是「另一个平台的图」。
+    /// ⚠️ ZCode 与 ZhiPu **共用 "zhipu" 这张图**（`CardStyle.zcode.icon`），名字仍是 "ZCode"
+    private func miniCardRow(_ preset: ThemePreset, icon: String, name: String,
+                             appearanceDark: Bool, fg: Color,
+                             secondary: Color, hovered: Bool) -> some View {
+        HStack(spacing: Self.s(6)) {
+            miniCardIcon(preset, key: icon, appearanceDark: appearanceDark)
+            // 主面板里那张卡的标题就是**平台名**（板块大标题才是「API」）
+            Text(name)
+                .font(Self.titleFont(preset))
+                .foregroundStyle(fg)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)   // 16pt + SG 时这名字最宽，别截断
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Self.s(8))
+        .padding(.vertical, Self.s(6))
+        .background {
+            if hovered {
+                RoundedRectangle(cornerRadius: Self.s(6))
+                    .fill(secondary)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.s(6))
+                            .strokeBorder(Self.rampColor(preset, level: 4, dark: appearanceDark),
+                                          lineWidth: Self.s(0.7))
+                    }
+            }
+        }
+    }
+
+    /// 卡片品牌 icon（按行给的 `key` = `CardStyle.icon` 那个图标名）：**两条来源跟预设走** ——
     /// - 「无边框图标」开 = 同名 **SVG 原图**（去 Icon Composer 底板），主机给 template 图，
     ///   这里按该档主前景色着色（与面板 `contentTintColor` 同一档：外观 ⊕ 图标深浅互换）；
     /// - 关 = Icon Composer **PNG**（自带底板，原色直画）。
     /// 深浅档 = 面板外观是否深色 **异或**「图标深浅互换」，与宿主 `brandIconDark` 同一条式子。
     /// 宿主没注入图标（预览环境）时回退成示意方块。
+    /// ⚠️ 图标名与资源名不一致的两处（`brandSVGShrink` 注释同源）：ZCode 卡共用 "zhipu"、
+    /// TRAE 卡是 "trae-color" —— 图卡传的就是这个图标名，不是平台名
     @ViewBuilder
-    private func miniCardIcon(_ preset: ThemePreset, appearanceDark: Bool) -> some View {
+    private func miniCardIcon(_ preset: ThemePreset, key: String, appearanceDark: Bool) -> some View {
         let iconDark = appearanceDark != preset.iconThemeSwap
-        let req = BrandIconRequest(key: "deepseek", dark: iconDark, borderless: preset.iconNoBorder)
+        // 着色档主前景色 = **这枚预设记的那一份**（nil 回落内置两档）—— 与文字色同一来源
+        let iconTint = PanelForegroundColor.resolved(dark: iconDark,
+                                                     override: preset.panelForegroundColor)
+        let req = BrandIconRequest(key: key, dark: iconDark, borderless: preset.iconNoBorder)
         if let img = model.iconProvider?(req) {
             if preset.iconNoBorder {
                 // template 图：着色取该档主前景色（`PanelForegroundColor` 与宿主同一解算体）。
@@ -726,19 +804,20 @@ private struct ThemePane: View {
                 Image(nsImage: img)
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundStyle(Color(nsColor: PanelForegroundColor.resolved(dark: iconDark)))
-                    .frame(width: 14, height: 14)
+                    .foregroundStyle(Color(nsColor: iconTint))
+                    .frame(width: Self.s(14), height: Self.s(14))
             } else {
-                Image(nsImage: img).resizable().scaledToFit().frame(width: 14, height: 14)
+                Image(nsImage: img).resizable().scaledToFit()
+                    .frame(width: Self.s(14), height: Self.s(14))
             }
         } else {
             ZStack {
-                RoundedRectangle(cornerRadius: 3).fill(Color.black.opacity(0.45))
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(Color(nsColor: PanelForegroundColor.resolved(dark: iconDark)))
-                    .frame(width: 6, height: 6)
+                RoundedRectangle(cornerRadius: Self.s(3)).fill(Color.black.opacity(0.45))
+                RoundedRectangle(cornerRadius: Self.s(1))
+                    .fill(Color(nsColor: iconTint))
+                    .frame(width: Self.s(6), height: Self.s(6))
             }
-            .frame(width: 14, height: 14)
+            .frame(width: Self.s(14), height: Self.s(14))
         }
     }
 
@@ -792,17 +871,38 @@ private struct ThemePane: View {
         .frame(width: size, height: size)
     }
 
-    /// 缩略图里那两句主标题的字体档（板块大标题 + 卡片标题共用）：主面板字号 **× 0.7** ——
+    /// **图卡几何的统一缩放**（2026-09-17 用户「所有预设等比放大15%」→ 同日「改为放大 10%」）：
+    /// 图卡（含名字行与网格本身）上**每一个定尺寸**都写成 `Self.s(基准值)`，
+    /// ⚠️ **改放大率只动这一个数**，别再去逐处改字面量。
+    /// 基准值 = 1.0 时那张图卡的尺寸，**刻意保持与主面板 pt 一一对应**
+    ///（8 = root 内缩进、6 = 卡内上下缩进、49 = Token 行硬币方框、5.9/2.4 = 竖排点阵的点与隙…），
+    /// 所以**基准值别改**（改了就与面板对不上号，注释里的「对应关系」全废），要变大变小调 thumbScale。
+    /// ⚠️ 唯一的例外是色格**间隔**（2.4，原 3.2）：2026-09-17 用户点名要更紧，就它一个基准值与面板不同源
+    /// 字号也跟着走：`thumbnailTypeScale` = 0.7 × thumbScale，所以文字与几何**同比例**（真「等比」）。
+    private static let thumbScale: CGFloat = 1.1
+    private static func s(_ base: CGFloat) -> CGFloat { base * thumbScale }
+
+    /// 缩略图里各档文字的字体入口（板块大标题 + 卡片标题 + Token 大数字共用）：
+    /// 主面板字号 **× 0.7 × scale（= `thumbScale`）** ——
     /// 图卡宽 ≈ 主面板的一半（122 vs 264），文字按比例缩才读得出「这是面板的缩影」；
     /// 原样 13.5pt 塞进 122pt 宽的卡里又大又挤。系数先试过 0.5（2026-09-16 用户「太小了 70%吧」）
     /// —— 0.7 比严格半比例大一档，是**可读性**换来的：13.5 → 9.45pt，档差（10/16pt → 7/11.2pt）更明显。
     /// SG 开关 → 本机 PostScript 名（未装自动回落系统字体），否则系统字体。
     /// ⚠️ 字体名是**字面量**（`PanelFont` 在宿主 target，本 target 引不到）；
     /// 宿主改了 `PanelFont.sgPostScriptName` 就得同步这里。
-    /// ⚠️ **只缩字号**：icon 恒 14pt = 主面板图标列 27.75pt 的严格半比例，不跟这个系数走
-    private static let thumbnailTypeScale: CGFloat = 0.7
-    private static func titleFont(_ preset: ThemePreset) -> Font {
-        let pt = CGFloat(preset.cardTitleFontSize) * thumbnailTypeScale
+    /// ⚠️ **只缩字号**：icon 恒 `s(14)` = 主面板图标列 27.75pt 的严格半比例 × 缩放，不跟这个系数走
+    private static var thumbnailTypeScale: CGFloat { 0.7 * thumbScale }
+    /// Token 总计大数字在图卡里的**额外**放大倍率（2026-09-17 用户「字号放大」）：
+    /// 主面板里它是整块面板最大的字（23.4pt vs 卡片主标题 13pt ≈ 1.8×），图卡若与主标题同档
+    /// 就只剩「一行普通文字」的观感，层级丢了。1.3 是**列宽换来的上限** —— 硬币 49 之后
+    /// 只剩 ~50pt（基准），再大就只能靠 `minimumScaleFactor` 缩回去（假放大）。
+    private static let tokenValueScale: CGFloat = 1.3
+    /// 图卡里那串 Token 数字的示例值：主面板 Token 板块的**真实格式**
+    /// （`ZcodeTokenStore.totalDisplay` 的千分位完整数字档），**定 5 位数**
+    ///（2026-09-17 用户「mini 面板 token 数值改为 5 位数」—— 位宽直接决定底端右列的量感）
+    private static let tokenValueSample = "12,846"
+    private static func titleFont(_ preset: ThemePreset, scale: CGFloat = 1) -> Font {
+        let pt = CGFloat(preset.cardTitleFontSize) * thumbnailTypeScale * scale
         return preset.cardTitleSharpGrotesk
             ? .custom("SharpGrotesk-Book20", size: pt)
             : .system(size: pt, weight: .medium)
@@ -815,18 +915,14 @@ private struct ThemePane: View {
                             brightness: CGFloat(preset.heatBrightness))
     }
 
-    /// 图卡进度条的渐变两端：**与主面板「长进度卡片」同一条色阶**（档位序列 + 压暗系数都读
-    /// `PanelHeatRamp`）—— 深色 = 左暗端（峰值 ×0.62）→ 右峰值；浅色 = 左峰值 → 右最暗（×0.33）。
-    /// ⚠️ 2026-09-16 用户「进度条的渐变颜色还是相反了」：原来是 `[峰值, 峰值@50%]`，
-    /// 左强右弱（与面板反向），且右端靠 alpha 朝底色发灰 —— 浅底上那一端反而更亮。
-    /// 压暗必须走「峰值 RGB × 系数」，不能叠透明度。
-    private static func progressStops(_ preset: ThemePreset, dark: Bool) -> [Color] {
+    /// 「五个色阶图例」里 L1…L4 那四格共用的一格色：**档位坡** 上那一档（峰值 RGB × 系数）。
+    /// 与宿主 `Palette.heatLevelColor` 同一条算式（那边是「峰值 × 系数」，0 档才取次背景色
+    /// —— 图卡首格就是直接取次背景色，见 `presetThumb` 底端那行）；hover 态卡片的边框也读它（档 4）
+    private static func rampColor(_ preset: ThemePreset, level: Int, dark: Bool) -> Color {
         let peak = peakRGB(preset)
-        return PanelHeatRamp.progressLevels(dark: dark).map { level in
-            let f = PanelHeatRamp.factor(level: level, dark: dark)
-            return Color(nsColor: NSColor(calibratedRed: peak.red * f, green: peak.green * f,
-                                          blue: peak.blue * f, alpha: 1))
-        }
+        let f = PanelHeatRamp.factor(level: level, dark: dark)
+        return Color(nsColor: NSColor(calibratedRed: peak.red * f, green: peak.green * f,
+                                      blue: peak.blue * f, alpha: 1))
     }
 
     /// 预设里的硬币颜色串（`#RRGGBB`，宿主 `CoinRGB` 的落串）→ Color。
@@ -877,17 +973,19 @@ private struct ThemePane: View {
                 set: { model.setSecondaryBackgroundColor(PanelBackgroundColor(swiftUIColor: $0)) })
     }
 
-    /// 数值滚动滑移时长口径绑定（单选，跨 target 传 rawValue 字符串）：
-    /// 快照读写，写入转交宿主动作（落盘 + 同步 RollingNumberView 静态镜像）后回读
-    private var rollSlideTiming: Binding<String> {
-        Binding(get: { model.snapshot.rollSlideTiming },
-                set: { model.setRollSlideTiming($0) })
-    }
-
-    /// 数值滚动时间曲线档位绑定（同滑移时长口径：rawValue 字符串跨 target）
-    private var rollCurve: Binding<String> {
-        Binding(get: { model.snapshot.rollCurve },
-                set: { model.setRollCurve($0) })
+    /// **主前景色绑定**（2026-09-17 开放）。快照里是 `PanelBackgroundColor?`（nil = 用内置两档）：
+    /// - get：nil 时显示「本页浅色主题档」下内置的那支（`builtIn(dark: !lightThemeEnabled)`）
+    ///   —— 与图卡同一套深浅档口径，对设置窗口自身的深浅免疫（同文件头注的隔离铁律）
+    /// - set：拾到的色原样交给宿主（alpha = 1，色盘本来就不透出不透明度），
+    ///   一经拾色即为「自选」，此后深浅两档共用这个值
+    private var panelForegroundColor: Binding<Color> {
+        Binding(get: {
+            let s = model.snapshot
+            let current = s.panelForegroundColor
+                ?? PanelBackgroundColor(nsColor: PanelForegroundColor.builtIn(dark: !s.lightThemeEnabled))
+            return current.swiftUIColor
+        },
+        set: { model.setPanelForegroundColor(PanelBackgroundColor(swiftUIColor: $0)) })
     }
 
     /// 字号滑杆行（pt，步进 0.5）：布局同其他滑杆行，读数为整数不补小数、
@@ -1206,8 +1304,6 @@ private struct AppSettingsPreviews: PreviewProvider {
                 .previewDisplayName("账号")
             AppSettingsView(model: .preview(selection: .appearance))
                 .previewDisplayName("主题外观")
-            AppSettingsView(model: .preview(selection: .animation))
-                .previewDisplayName("状态栏")
         }
     }
 }

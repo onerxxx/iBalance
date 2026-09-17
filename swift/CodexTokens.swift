@@ -13,6 +13,8 @@ enum CodexTokenStore {
     static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
+    /// 每轮缓存重建完成后的通知（宿主刷面板用；见 `TokenStoreCache.onRefresh`）
+    static func onRefresh(_ f: @escaping (TokenSummary?) -> Void) { cache.onRefresh = f }
     /// 已构建缓存的同步只读（nil = 尚未构建过）：卡片副标题 tok/s 用
     static func cachedSummary() -> TokenSummary? { cache.cachedIfBuilt }
 

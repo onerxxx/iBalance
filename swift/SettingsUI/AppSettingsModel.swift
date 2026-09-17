@@ -8,15 +8,28 @@ import CoreImage
 import SwiftUI
 
 /// 主前景色（卡片文字色）的**唯一解算体**：宿主 `Palette.cardForeground`（动态色）与
-/// `Palette.resolvedCardForeground(dark:)`（静态档），以及设置窗口「主题预设」图标的右下圆，
+/// `Palette.resolvedCardForeground(dark:)`（静态档），以及设置窗口「主题预设」图卡，
 /// 都读这一份 —— 跨 target 共用同一个色号，免得两处各写一遍后漂移。
-/// 深色外观 #EBEBEB / 浅色外观 0.13 黑灰（2026-09-15 从宿主 Panel.swift 上收，
+/// 内置两档：深色外观 #EBEBEB / 浅色外观 0.13 黑灰（2026-09-15 从宿主 Panel.swift 上收，
 /// 与 `PanelThemeColor` 同一条「取值域放 SettingsUI、宿主引用」的共存口径）。
+///
+/// ⚠️ **2026-09-17 用户「面板里开放主前景色参数」**：解算体多了一个**可选覆盖**
+///（`override`，即 `PanelBackgroundColor?`）—— nil = 用内置两档（老行为），
+/// 有值 = 用户自选色，**两档共用同一个值**（用户挑的就是这一支色，不再按外观分档）。
+/// 覆盖值来源三处：面板运行镜像（宿主 `Palette.foregroundActive`）、
+/// 「主题预设」里记的那一项、以及快照里当前生效值。
+/// 仍然是**纯函数**（不持状态）—— 运行态住在宿主，免得两个 target 抢同一份全局。
 public enum PanelForegroundColor {
-    public static func resolved(dark: Bool) -> NSColor {
+    /// 内置两档（未自选时的出厂解算）
+    public static func builtIn(dark: Bool) -> NSColor {
         dark
             ? NSColor(calibratedRed: 0xEB/255.0, green: 0xEB/255.0, blue: 0xEB/255.0, alpha: 1)
             : NSColor(calibratedWhite: 0.13, alpha: 1)
+    }
+
+    /// 按指定深浅档 + 可选覆盖解析主前景色
+    public static func resolved(dark: Bool, override: PanelBackgroundColor? = nil) -> NSColor {
+        override?.nsColor ?? builtIn(dark: dark)
     }
 }
 
@@ -65,19 +78,23 @@ public enum PanelThemeColor {
         return (hue, saturation, brightness)
     }
 
-    /// 内置默认用量色的 HSB 三参（各 0…1）：峰值基准亮黄绿 (225, 254, 119) 的分解 ——
-    /// hue=(2+(B−R)/Δ)/6、sat=Δ/max、V=max/255。**宿主 `Palette.heatPeakDefault*`
-    /// 直接引用这三个常量**（不再各写一份算式），「主题预设」缺项兜底同源。
-    public static let defaultHue: CGFloat = (2 + (119 - 225) / 135) / 6
-    public static let defaultSaturation: CGFloat = 135.0 / 254.0
-    public static let defaultBrightness: CGFloat = 254.0 / 255.0
+    /// 内置默认用量色的 HSB 三参（各 0…1）：**宿主 `Palette.heatPeakDefault*` 直接引用这三个
+    /// 常量**（不再各写一份算式），「主题预设」缺项兜底同源。
+    /// ⚠️ 2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」：
+    /// 从原「峰值亮黄绿 (225, 254, 119) 的分解」改为**按当时面板参数固化**（灼橙黄）。
+    /// 旧算式备查：hue=(2+(B−R)/Δ)/6、sat=Δ/max、V=max/255 ⇒ (0.2024691, 0.5314960, 0.9960784)；
+    /// 反过来这三个新值对应的 RGB ≈ (255, 157, 0) 一族。
+    public static let defaultHue: CGFloat = 0.1330642513005204
+    public static let defaultSaturation: CGFloat = 0.4570954442024231
+    public static let defaultBrightness: CGFloat = 1
 }
 
 /// 用量色的**档位坡**（峰值色 × 压暗系数）：用量类可视化色阶的唯一实现。
-/// 2026-09-16 从宿主 `Palette.heatLevelColor` 上收 —— 「主题预设」图卡那根进度条必须画
+/// 2026-09-16 从宿主 `Palette.heatLevelColor` 上收 —— 「主题预设」图卡的色阶图例必须画
 /// **与主面板「长进度卡片」完全同一条**两端（深色 左暗端→右峰值 / 浅色 左峰值→右最暗），
 /// 各写一份必然漂移；**「图卡的渐变颜色正好相反」那次就是这么来的**。
-/// 消费点三处读同一份：卡片竖排点阵 4 档、长进度卡片进度条渐变、主题预设图卡进度条。
+/// 消费点三处读同一份：卡片竖排点阵 4 档、长进度卡片进度条渐变、主题预设图卡的五格色阶图例
+/// （2026-09-17 图卡那根进度条已整根删除，图例仍在；`progressLevels` 只剩主面板进度条一个消费点）。
 public enum PanelHeatRamp {
     /// 深色档压暗系数（1…4 档，档 4 = 峰值；2026-09-15 用户「提亮两个较暗的」定稿）
     public static let darkFactors: [CGFloat] = [0.62, 0.76, 0.88, 1.0]
@@ -132,6 +149,22 @@ public struct PanelBackgroundColor: Equatable, Codable {
     /// 2026-09-14 起上下两端各自独立（`panel_background_bottom_alpha`），此值只作各处属性的初值；
     /// 旧配置的迁移值见 `Config` 解码（取与顶端同值）
     public static let defaultBottomAlpha: Double = 0.70
+
+    // ── 出厂默认（2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」）──
+    // 按当时的面板参数固化（= 「宝特蓝」那套深邃蓝底 + 蓝调次背景 + 85% 底端不透明度）。
+    // ⚠️ **刻意不复用 `.default` / `.secondaryBackgroundDefault`**：那两个常量的语义是
+    // 「老配置迁移到新键时的观感兜底」（近黑 @70% / 深灰 #292929），与「新装默认」不是一回事 ——
+    // 混用会让迁移口径跟着出厂默认一起漂移（旧配置一升级就变成蓝底）。
+    // 新装 / 清偏好后的初始外观 = 这三条；宿主 `AppConfig` 与 `AppSettingsSnapshot` 同源引用。
+
+    /// 出厂默认面板底色（蓝，不透明）
+    public static let factoryPanelBackground = PanelBackgroundColor(hue: 0.577778, saturation: 1.0,
+                                                                   brightness: 0.846221, alpha: 1.0)
+    /// 出厂默认次背景色（蓝调第二层背景，alpha 23.4%）
+    public static let factorySecondaryBackground = PanelBackgroundColor(hue: 0.577778, saturation: 0.232355,
+                                                                      brightness: 0.858658, alpha: 0.233976)
+    /// 出厂默认遮罩**底端**不透明度（顶端 = `factoryPanelBackground` 自身的 alpha = 1.0）
+    public static let factoryPanelBottomAlpha: Double = 0.85
 
     /// 遮罩是否生效（alpha ≤ 1% 视为关 → 露出容器原生毛玻璃）
     public var isEffective: Bool { alpha > 0.01 }
@@ -348,6 +381,12 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
     /// 遮罩底端不透明度（顶端 = `panelBackgroundColor.alpha`，两者独立）
     public var panelBackgroundBottomAlpha: Double
     public var secondaryBackgroundColor: PanelBackgroundColor
+    /// **主前景色**（卡片文字色；2026-09-17 与设置窗口一起开放）。
+    /// ⚠️ **可选**：nil = 「用内置两档」，即参数开放前的老行为 ——
+    /// 老预设（JSON 里根本没这个键）解出来就是 nil，**应用它不会去改用户当前的前景色**（原样还原）；
+    /// 内置那几枚也留在 nil（它们定稿时这个参数还不存在）。
+    /// 有值 = 用户自选色（两档共用），新存 / 新应用的预设会带上它，于是「改这一项 → 所有图卡落选」照旧成立
+    public var panelForegroundColor: PanelBackgroundColor?
     public var lightThemeEnabled: Bool
     public var iconThemeSwap: Bool
     /// 无边框图标（卡片品牌 icon 直接用 SVG 原图，不套 Icon Composer 底板）
@@ -369,19 +408,22 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
     public var coinMaterialColor: String
     public var coinFieldColor: String
 
-    /// 硬币四项的出厂默认（= 宿主 `CoinSettings.initial`，即 `CoinMaterial.sgho` 那套手工挑的
-    /// 色 token 落到 sRGB 的 hex）。两个颜色常量在这里是**字面值**：本 target 引不到
-    /// `CoinRGB` / `CoinMaterial`，所以宿主侧改了 sgho 预设就得同步这里 —— 一处兜底，别再多写
-    public static let defaultCoinPreset = 1                  // CoinPreset.sgho
+    /// 硬币四项的出厂默认（= 宿主 `CoinSettings.initial`）。两个颜色常量在这里是**字面值**：
+    /// 本 target 引不到 `CoinRGB` / `CoinMaterial`，所以宿主侧改了默认就得同步这里 —— 一处兜底。
+    /// ⚠️ 2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」：
+    /// 由原来的「sgho 绿 + 紫」（1 / #00DC00 / #9E91FF）改为**按当时硬币参数固化**
+    /// （GHO + 黄 `#FFC644` + 色场 `#FFE2A1`）。改宿主 `CoinSettings.initial` 时这两边一起改。
+    public static let defaultCoinPreset = 0                  // CoinPreset.gho
     public static let defaultCoinAppearance = 0              // CoinAppearance.default
-    public static let defaultCoinMaterialColor = "#00DC00"   // CoinMaterial.sgho.faceBase
-    public static let defaultCoinFieldColor = "#9E91FF"      // CoinMaterial.sgho.field
+    public static let defaultCoinMaterialColor = "#FFC644"   // 币面色（2026-09-17 固化）
+    public static let defaultCoinFieldColor = "#FFE2A1"      // 色场色（2026-09-17 固化）
 
     public init(id: String = UUID().uuidString, name: String,
                 heatHue: Double, heatSaturation: Double, heatBrightness: Double,
                 panelBackgroundColor: PanelBackgroundColor,
                 panelBackgroundBottomAlpha: Double,
                 secondaryBackgroundColor: PanelBackgroundColor,
+                panelForegroundColor: PanelBackgroundColor? = nil,
                 lightThemeEnabled: Bool, iconThemeSwap: Bool, iconNoBorder: Bool = false,
                 longProgressCard: Bool,
                 cardTitleFontSize: Double, cardTitleSharpGrotesk: Bool,
@@ -397,6 +439,7 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
         self.panelBackgroundColor = panelBackgroundColor
         self.panelBackgroundBottomAlpha = panelBackgroundBottomAlpha
         self.secondaryBackgroundColor = secondaryBackgroundColor
+        self.panelForegroundColor = panelForegroundColor
         self.lightThemeEnabled = lightThemeEnabled
         self.iconThemeSwap = iconThemeSwap
         self.iconNoBorder = iconNoBorder
@@ -418,6 +461,7 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
                   panelBackgroundColor: s.panelBackgroundColor,
                   panelBackgroundBottomAlpha: s.panelBackgroundBottomAlpha,
                   secondaryBackgroundColor: s.secondaryBackgroundColor,
+                  panelForegroundColor: s.panelForegroundColor,
                   lightThemeEnabled: s.lightThemeEnabled,
                   iconThemeSwap: s.iconThemeSwap,
                   iconNoBorder: s.iconNoBorder,
@@ -429,6 +473,146 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
                   coinMaterialColor: s.coinMaterialColor,
                   coinFieldColor: s.coinFieldColor)
     }
+
+    /// 六枚内置预设的**主前景色固化值**（2026-09-17 用户「六个重写，区分深浅前景色」）：
+    /// 暗色预设 → 内置深色档 `#EBEBEB`，浅色预设 → 内置浅色档 13% 黑。
+    ///
+    /// ⚠️ **必须走 `PanelBackgroundColor(nsColor:)` 转换，不能手抄分量**：内置档是 calibrated 空间的
+    /// `NSColor(calibratedRed:…)`，而预设被应用时 override 走 `PanelBackgroundColor.nsColor`（**sRGB**）——
+    /// 两个空间下同一视觉色的分量不同（实测 calibrated 0.9216 → sRGB 0.937312 = `#EFEFEF`；
+    /// calibratedWhite 0.13 → sRGB 0.173407 = `#2C2C2C`）。手抄 0.9216 / 0.13 会让「应用预设」
+    /// 与「用内置档」差出几级灰（`#EBEBEB` vs `#EFEFEF`）。这里交给转换 = 渲染同一色。
+    /// 取值后仍由 `theme_presets` 走 `hsv:H,S,V,A` 落盘，与其它色同格式。
+    private static let builtInFgDark = PanelBackgroundColor(
+        nsColor: PanelForegroundColor.builtIn(dark: true))
+    private static let builtInFgLight = PanelBackgroundColor(
+        nsColor: PanelForegroundColor.builtIn(dark: false))
+
+    /// ── 出厂内置预设（2026-09-17 用户要求：把现有六枚「固定为默认提供的预设」）──
+    /// 随包发布：**写死在代码里**，新装机器 / 清空 UserDefaults 也照样有这六枚；
+    /// 用户用图卡右上角「+」新增的那些仍存 UserDefaults（宿主 `ThemePresetStore`）。
+    /// 分工：视图显示的是 `builtIns + ThemePresetStore.load()`（宿主装配快照时拼）。
+    /// - `id` 沿用当初存进 UserDefaults 的那六个 UUID ⇒ 宿主 `load()` 按 `builtInIDs` 过滤时，
+    ///   老数据里的同 id 条目**自然被去重**（升级后不会出现两份同名卡）
+    /// - 这六枚**只读**：图卡上不给删除按钮、名字也不可点改（视图按 `builtInIDs` 判断）
+    /// - 参数 = 2026-09-17 定稿那刻存储里的原值（脚本从 `defaults read` 直出，未手抄）
+    public static let builtIns: [ThemePreset] = [
+        ThemePreset(id: "4186C421-8893-4B04-BD01-061EB177FD2D", name: "宝特蓝",
+                    heatHue: 0.13306425130052044, heatSaturation: 0.4570954442024231,
+                    heatBrightness: 1,
+                    panelBackgroundColor: PanelBackgroundColor(hue: 0.577778, saturation: 1.0,
+                                                              brightness: 0.846221, alpha: 1.0),
+                    panelBackgroundBottomAlpha: 0.8500000000000001,
+                    secondaryBackgroundColor: PanelBackgroundColor(hue: 0.577778, saturation: 0.232355,
+                                                              brightness: 0.858658, alpha: 0.233976),
+                    panelForegroundColor: ThemePreset.builtInFgDark,
+                    lightThemeEnabled: false,
+                    iconThemeSwap: false,
+                    iconNoBorder: true,
+                    longProgressCard: false,
+                    cardTitleFontSize: 13.5,
+                    cardTitleSharpGrotesk: true,
+                    // 硬币四项 2026-09-17 晚按当时「3D 硬币」pane 的参数刷新过一次
+                    // （用户「按照现在的硬币参数更新宝特蓝主题」）：
+                    // coinPreset 1(sGHO) → **0(GHO)**、coinMaterialColor "#FFDBA0" → **"#FFC644"**；
+                    // appearance / fieldColor 与原值相同，未动。只改这四项，主题外观那几个参数保持出厂值。
+                    coinPreset: 0, coinAppearance: 0,
+                    coinMaterialColor: "#FFC644",
+                    coinFieldColor: "#FFE2A1"),
+        ThemePreset(id: "FD579FDC-01C4-42C9-A464-F6BE60A27DEB", name: "天空蓝",
+                    heatHue: 0.13306425130052044, heatSaturation: 0.4570954442024231,
+                    heatBrightness: 1,
+                    panelBackgroundColor: PanelBackgroundColor(hue: 0.577778, saturation: 0.366417,
+                                                              brightness: 1.0, alpha: 1.0),
+                    panelBackgroundBottomAlpha: 0.9,
+                    secondaryBackgroundColor: PanelBackgroundColor(hue: 0.577778, saturation: 0.100579,
+                                                              brightness: 1.0, alpha: 0.615168),
+                    panelForegroundColor: ThemePreset.builtInFgLight,
+                    lightThemeEnabled: true,
+                    iconThemeSwap: true,
+                    iconNoBorder: false,
+                    longProgressCard: false,
+                    cardTitleFontSize: 13.5,
+                    cardTitleSharpGrotesk: false,
+                    coinPreset: 0, coinAppearance: 1,
+                    coinMaterialColor: "#1A1508",
+                    coinFieldColor: "#FFC691"),
+        ThemePreset(id: "996E04FE-9F43-4398-B99D-C3E710874943", name: "便签黄",
+                    heatHue: 0.12758800881739935, heatSaturation: 0.17937410569636067,
+                    heatBrightness: 0.5532302260398865,
+                    panelBackgroundColor: PanelBackgroundColor(hue: 0.141667, saturation: 0.483684,
+                                                              brightness: 1.0, alpha: 1.0),
+                    panelBackgroundBottomAlpha: 0.8500000000000001,
+                    secondaryBackgroundColor: PanelBackgroundColor(hue: 0.0, saturation: 0.0,
+                                                              brightness: 0.433647, alpha: 0.153486),
+                    panelForegroundColor: ThemePreset.builtInFgLight,
+                    lightThemeEnabled: true,
+                    iconThemeSwap: false,
+                    iconNoBorder: true,
+                    longProgressCard: false,
+                    cardTitleFontSize: 13.5,
+                    cardTitleSharpGrotesk: true,
+                    coinPreset: 0, coinAppearance: 1,
+                    coinMaterialColor: "#122EA7",
+                    coinFieldColor: "#9E91FF"),
+        ThemePreset(id: "37ACA08B-FE26-4365-BA17-0B2F857DD40D", name: "暗",
+                    heatHue: 0.12988709916816707, heatSaturation: 0.06157517433166504,
+                    heatBrightness: 1,
+                    panelBackgroundColor: PanelBackgroundColor(hue: 0.577778, saturation: 0.366417,
+                                                              brightness: 0.027105, alpha: 0.45),
+                    panelBackgroundBottomAlpha: 0.9500000000000001,
+                    secondaryBackgroundColor: PanelBackgroundColor(hue: 0.0, saturation: 0.0,
+                                                              brightness: 0.331393, alpha: 0.411777),
+                    panelForegroundColor: ThemePreset.builtInFgDark,
+                    lightThemeEnabled: false,
+                    iconThemeSwap: false,
+                    iconNoBorder: true,
+                    longProgressCard: false,
+                    cardTitleFontSize: 13.5,
+                    cardTitleSharpGrotesk: false,
+                    coinPreset: 0, coinAppearance: 1,
+                    coinMaterialColor: "#FFE253",
+                    coinFieldColor: "#FFC691"),
+        ThemePreset(id: "B0BAE155-A71A-47EF-AF8B-535F1B05AAE7", name: "灰",
+                    heatHue: 0.12988709916816707, heatSaturation: 0.06157517433166504,
+                    heatBrightness: 1,
+                    panelBackgroundColor: PanelBackgroundColor(hue: 0.0, saturation: 0.0,
+                                                              brightness: 0.278061, alpha: 1.0),
+                    panelBackgroundBottomAlpha: 0.9500000000000001,
+                    secondaryBackgroundColor: PanelBackgroundColor(hue: 0.0, saturation: 0.0,
+                                                              brightness: 0.134301, alpha: 0.340003),
+                    panelForegroundColor: ThemePreset.builtInFgDark,
+                    lightThemeEnabled: false,
+                    iconThemeSwap: false,
+                    iconNoBorder: true,
+                    longProgressCard: false,
+                    cardTitleFontSize: 13.5,
+                    cardTitleSharpGrotesk: false,
+                    coinPreset: 1, coinAppearance: 0,
+                    coinMaterialColor: "#FFB169",
+                    coinFieldColor: "#FFD3AB"),
+        ThemePreset(id: "7B3F48EA-9CDA-41AB-BE21-A2D096A629A2", name: "亮",
+                    heatHue: 0.12269021629647862, heatSaturation: 0.041579144738212725,
+                    heatBrightness: 0.6523087024688721,
+                    panelBackgroundColor: PanelBackgroundColor(hue: 0.0, saturation: 0.0,
+                                                              brightness: 1.0, alpha: 1.0),
+                    panelBackgroundBottomAlpha: 0.8,
+                    secondaryBackgroundColor: PanelBackgroundColor(hue: 0.0, saturation: 0.0,
+                                                              brightness: 0.841093, alpha: 0.340003),
+                    panelForegroundColor: ThemePreset.builtInFgLight,
+                    lightThemeEnabled: true,
+                    iconThemeSwap: false,
+                    iconNoBorder: true,
+                    longProgressCard: false,
+                    cardTitleFontSize: 13.5,
+                    cardTitleSharpGrotesk: false,
+                    coinPreset: 1, coinAppearance: 0,
+                    coinMaterialColor: "#FFB169",
+                    coinFieldColor: "#FFD3AB")
+    ]
+
+    /// 内置预设的 id 集合：视图隐藏删除 / 改名入口、宿主 `ThemePresetStore` 去重，共用这一份
+    public static let builtInIDs: Set<String> = Set(builtIns.map(\.id))
 
     /// 这枚预设是否**就是当前生效的那组参数**（「主题预设」图卡选中描边的唯一依据）。
     ///
@@ -443,11 +627,36 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
             eq(a.hue, b.hue) && eq(a.saturation, b.saturation)
                 && eq(a.brightness, b.brightness) && eq(a.alpha, b.alpha)
         }
+        /// 主前景色的**分组等价**判定（2026-09-17 补「nil ↔ 显式内置档」这一条）。
+        ///
+        /// 语义：`nil` = 「不设自选色，用内置两档」（随深浅主题自适应）；预设里显式写着
+        /// **恰好就是内置档** 的那个色（内置 6 枚现在都这么写，见 `builtInFgDark/Light`）= **同一组** ——
+        /// 两者渲染出来一模一样，没理由判成两组。
+        ///
+        /// ⚠️ 不补这条会踩「默认主题选不中」：出厂默认 `panelForegroundColor` 是 **nil**
+        /// （刻意保留 —— 固化成单色会让浅色主题默认字读不出来），而宝特蓝预设写的是
+        /// `builtInFgDark`（= 内置深色档的 sRGB 分量）⇒ `nil ≠ 该值` ⇒ **新装打开时宝特蓝不亮蓝框**。
+        /// 判定口径 = 「这个自选色是否恰好落在内置两档上」（两档任一命中即可，色值比对，
+        /// 与 `PanelBackgroundColor(nsColor:)` 的转换同源，故不会误伤真正的自选色）。
+        func isBuiltInTone(_ c: PanelBackgroundColor) -> Bool {
+            [true, false].contains { dark in
+                eqColor(c, PanelBackgroundColor(nsColor: PanelForegroundColor.builtIn(dark: dark)))
+            }
+        }
+        func eqFg(_ a: PanelBackgroundColor?, _ b: PanelBackgroundColor?) -> Bool {
+            switch (a, b) {
+            case (nil, nil): return true                  // 两边都是「用内置两档」
+            case let (x?, y?): return eqColor(x, y)
+            case let (x?, nil): return isBuiltInTone(x)   // 显式写着内置档 ≡ 没写
+            case let (nil, y?): return isBuiltInTone(y)
+            }
+        }
         return eq(heatHue, s.heatHue) && eq(heatSaturation, s.heatSaturation)
             && eq(heatBrightness, s.heatBrightness)
             && eqColor(panelBackgroundColor, s.panelBackgroundColor)
             && eq(panelBackgroundBottomAlpha, s.panelBackgroundBottomAlpha)
             && eqColor(secondaryBackgroundColor, s.secondaryBackgroundColor)
+            && eqFg(panelForegroundColor, s.panelForegroundColor)
             && lightThemeEnabled == s.lightThemeEnabled
             && iconThemeSwap == s.iconThemeSwap
             && iconNoBorder == s.iconNoBorder
@@ -482,6 +691,10 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
         secondaryBackgroundColor = try c.decodeIfPresent(PanelBackgroundColor.self,
                                                          forKey: .secondaryBackgroundColor)
             ?? d.secondaryBackgroundColor
+        // 主前景色：**缺项即 nil**（= 用内置两档）。`try?` 兜住「键在但值坏了」—— 这一项是可选语义，
+        // 不该让一条坏值把整份预设列表带崩（列表级兜底见 `ThemePresetStore.load()`）
+        panelForegroundColor = (try? c.decodeIfPresent(PanelBackgroundColor.self,
+                                                      forKey: .panelForegroundColor)) ?? nil
         lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? d.lightThemeEnabled
         iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? d.iconThemeSwap
         iconNoBorder = try c.decodeIfPresent(Bool.self, forKey: .iconNoBorder) ?? d.iconNoBorder
@@ -500,34 +713,34 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
     }
 }
 
-/// 菜单栏「进行中」状态点的小球弹跳参数（设置窗口「菜单栏」pane 可调）。
-/// 刻意放在 SettingsUI 里：**宿主与设置界面共用同一份取值域与默认值** ——
-/// 宿主 `MenuBarStatusGlowController` 按这份参数逐帧算小球帧，界面按同一份画实时预览，
-/// 两边各写一份常量迟早会漂移。落盘读写见宿主侧的 `MenuBarBounceSettings.load()/save()`。
+/// 菜单栏「进行中」状态点的小球弹跳参数 —— **2026-09-17 用户定稿固化，不再是设置项**。
+/// 历史：原为设置窗口「菜单栏」pane 的五项滑杆（弹跳高度 / 弹跳周期 / 腾空占比 /
+/// 触地压扁 / 顶点拉伸），逐项落盘 UserDefaults、拖动即时生效、界面按同一份参数画实时预览。
+/// 同日用户要求「固化这些参数，然后在设置里移除这一页」—— 于是取值域 / `clamped()` /
+/// `load()` / `save()` / 滑杆绑定全部删除，只留 `fixed` 这一组常量，
+/// 宿主 `MenuBarStatusGlowController` 按它逐帧算小球帧。
+/// 仍留在 SettingsUI 的原因：它与 `MenuBarStatusDotStyle`（同一枚圆点的绘制规格）成对，
+/// 两者合起来才是「菜单栏状态点长什么样」的唯一事实源（见下方 solve/halfSpan）。
 public struct MenuBarBounceSettings: Equatable {
     /// 弹跳高度（pt）：静止位 → 顶点
-    public var amplitude: Double
+    public let amplitude: Double
     /// 一次完整弹跳周期（秒，含触地驻留）
-    public var period: Double
+    public let period: Double
     /// 周期中「腾空」占比（余下为触地压扁驻留）
-    public var airRatio: Double
+    public let airRatio: Double
     /// 触地最扁时的纵向比例（<1 = 压扁）
-    public var squashMin: Double
+    public let squashMin: Double
     /// 顶点最长时的纵向比例（>1 = 拉伸）
-    public var stretchMax: Double
+    public let stretchMax: Double
 
-    public static let amplitudeRange: ClosedRange<Double> = 1...6
-    public static let periodRange: ClosedRange<Double> = 0.4...1.6
-    public static let airRatioRange: ClosedRange<Double> = 0.6...1
-    public static let squashRange: ClosedRange<Double> = 0.6...1
-    public static let stretchRange: ClosedRange<Double> = 1...1.3
+    /// 唯一取值：2026-09-17 用户在设置窗口把这五项调到这一组后定稿（截图存档值）
+    public static let fixed = MenuBarBounceSettings(amplitude: 4.0, period: 1.0,
+                                                    airRatio: 0.87, squashMin: 0.89,
+                                                    stretchMax: 1.01)
 
-    public static let initial = MenuBarBounceSettings(amplitude: 3, period: 0.8,
-                                                      airRatio: 0.86, squashMin: 0.78,
-                                                      stretchMax: 1.08)
-
-    public init(amplitude: Double, period: Double, airRatio: Double,
-                squashMin: Double, stretchMax: Double) {
+    /// 私有：固化后没有第二份取值，外部只能读 `fixed`
+    private init(amplitude: Double, period: Double, airRatio: Double,
+                 squashMin: Double, stretchMax: Double) {
         self.amplitude = amplitude
         self.period = period
         self.airRatio = airRatio
@@ -535,17 +748,13 @@ public struct MenuBarBounceSettings: Equatable {
         self.stretchMax = stretchMax
     }
 
-    /// 夹回取值域：老落盘值、或将来范围收窄后都不会把滑杆顶歪
-    public func clamped() -> MenuBarBounceSettings {
-        func c(_ v: Double, _ r: ClosedRange<Double>) -> Double {
-            min(max(v, r.lowerBound), r.upperBound)
-        }
-        return MenuBarBounceSettings(
-            amplitude: c(amplitude, Self.amplitudeRange),
-            period: c(period, Self.periodRange),
-            airRatio: c(airRatio, Self.airRatioRange),
-            squashMin: c(squashMin, Self.squashRange),
-            stretchMax: c(stretchMax, Self.stretchRange))
+    /// 活动区间半高（pt）：行中线 → 静止位底缘的距离，也等于行中线 → 顶点球顶的距离。
+    /// 宿主 `MenuBarStatusGlowController.updateBounce` 用 `半高 − 圆点半径` 把静止位整体下移，
+    /// 使活动区间上下对称跨在行中线上（2026-09-17 用户要求）。
+    /// ⚠️ 与 `solve(at:)` 同一条共存铁律：算帧与半高必须共用本函数，两边各写一份迟早漂移。
+    /// - Parameter dotDiameter: 圆点直径（pt，= 宿主静止帧边长）
+    public func halfSpan(dotDiameter: Double) -> Double {
+        (amplitude + dotDiameter * stretchMax) / 2
     }
 
     /// 给定「弹跳相位内已过时间」解算这一帧的形变：
@@ -563,9 +772,9 @@ public struct MenuBarBounceSettings: Equatable {
 }
 
 /// 菜单栏状态点（任务指示圆点）的**绘制规格**：本体常亮圆 + 状态色高斯模糊光晕 + 余弦呼吸。
-/// 菜单栏宿主（`MenuBarStatusGlowController`）与设置窗口「菜单栏」pane 的实时预览共用本规格
-/// —— 预览把所有 pt 量纲乘 `visualScale` 等比放大，其余参数（透明度 / 模糊增益 / 呼吸）
-/// 逐值同源；与 `MenuBarBounceSettings.solve(at:)` 同一条「两边各画一份迟早漂移」的共存铁律。
+/// 菜单栏宿主（`MenuBarStatusGlowController`）按本规格起图层（2026-09-17 前设置窗口
+/// 「菜单栏」pane 的实时预览也读它，预览随该 pane 一并移除）；与
+/// `MenuBarBounceSettings.solve(at:)` 同一条「两边各画一份迟早漂移」的共存铁律。
 public enum MenuBarStatusDotStyle {
     /// 本体常亮透明度（弹跳只动 frame，本体不闪烁）
     public static let dotOpacity: CGFloat = 0.9
@@ -595,13 +804,10 @@ public enum MenuBarStatusDotStyle {
     }
 
     /// 光晕位图烘焙（状态色圆点剪影 → 高斯模糊 → alpha 增益 → 裁回画布）。
-    /// - Parameters:
-    ///   - dotDiameter: 圆点直径的**最终视觉值**（pt）
-    ///   - visualScale: 相对菜单栏实物的观感倍数（宿主 1；预览 = 放大倍数）——
-    ///     画布外扩与模糊 σ 等比跟随，放大后光晕观感与实物同构
-    public static func glowBitmap(color: NSColor, dotDiameter: CGFloat,
-                                  visualScale: CGFloat = 1) -> CGImage? {
-        let padding = glowPadding * visualScale
+    /// 1:1 菜单栏口径（原设置窗口预览用的 `visualScale` 放大倍数已随该页移除）。
+    /// - Parameter dotDiameter: 圆点直径（pt，= 宿主静止帧边长）
+    public static func glowBitmap(color: NSColor, dotDiameter: CGFloat) -> CGImage? {
+        let padding = glowPadding
         let side = dotDiameter + padding * 2
         let px = max(1, Int(side * bitmapScale))
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
@@ -619,11 +825,11 @@ public enum MenuBarStatusDotStyle {
         guard let base = rep.cgImage else { return nil }
 
         // 高斯模糊 + alpha 增益（模糊拉低峰值）+ 裁回画布（模糊 extent 外扩，不裁会破坏 frame 对位）；
-        // σ 随观感倍数放大（菜单栏 σ=5px@3x ≈ 1.7pt，等比放大后视觉同构）
+        // σ = blurSigmaPx（菜单栏 σ=5px@3x ≈ 1.7pt 视觉值）
         var ci = CIImage(cgImage: base)
         if let blur = CIFilter(name: "CIGaussianBlur") {
             blur.setValue(ci, forKey: kCIInputImageKey)
-            blur.setValue(blurSigmaPx * visualScale, forKey: kCIInputRadiusKey)
+            blur.setValue(blurSigmaPx, forKey: kCIInputRadiusKey)
             ci = blur.outputImage ?? ci
         }
         if let boost = CIFilter(name: "CIColorMatrix") {
@@ -682,55 +888,6 @@ public struct SavedAccountEntry: Equatable, Identifiable {
     }
 }
 
-/// 数值滚动「滑移」（位数变化时的整组左右平移）时长口径 —— 设置窗口
-/// 「主题外观 → 动效」单选。
-///
-/// 宿主那侧的 `RollSlideTiming` 在可执行 target 里，本 target 引不到，故快照与动作
-/// 只传 **rawValue 字符串**（同 CoinPreset 的处境），两侧 rawValue 逐字对齐。
-public enum RollSlideTimingOption: String, CaseIterable, Identifiable {
-    /// 跟随滚字：取本轮数字轮里最长的滚动时长（= 滚字实际落定时刻，下限 0.30s）——
-    /// 平移与滚字同拍收尾，不拖在滚字后面
-    case wheelTail
-    /// 跟随位移：按整组位移量缩放，钳制在 0.30…0.60s——位移小就快，位移大也封顶
-    case distance
-
-    public var id: String { rawValue }
-
-    /// 单选控件的行内显示名
-    public var title: String {
-        switch self {
-        case .wheelTail: return "跟随滚字"
-        case .distance:  return "跟随位移"
-        }
-    }
-}
-
-/// 数值滚动的**时间曲线**档位 —— 设置窗口「主题外观 → 动效」单选。
-///
-/// 宿主那侧的 `RollCurve` 在可执行 target 里，本 target 引不到，故快照与动作
-/// 只传 **rawValue 字符串**（同 `RollSlideTimingOption` 的处境），两侧逐字对齐。
-/// 只管数字滚动族（车轮位置 / 槽宽 / 位数变化平移三条量同曲线）；
-/// 单位换值的槽内滚字另有自己的 ease-out，不随之变。
-public enum RollCurveOption: String, CaseIterable, Identifiable {
-    /// 从慢到快（ease-in cubic）：起滚慢、末段最快，落定干脆
-    case easeIn
-    /// 从快到慢（ease-out cubic）：起手快、收尾长
-    case easeOut
-    /// 慢-快-慢（ease-in-out cubic）：两端减速、中段最快
-    case easeInOut
-
-    public var id: String { rawValue }
-
-    /// 单选控件的行内显示名
-    public var title: String {
-        switch self {
-        case .easeIn:    return "从慢到快"
-        case .easeOut:   return "从快到慢"
-        case .easeInOut: return "慢-快-慢"
-        }
-    }
-}
-
 /// 设置窗口各项的当前值快照：宿主从真实状态（config / 面板快照）装配，预览给静态值。
 public struct AppSettingsSnapshot: Equatable {
     /// 刷新间隔（秒）：60 / 180 / 300，存量异常值由宿主归一到 300
@@ -739,46 +896,50 @@ public struct AppSettingsSnapshot: Equatable {
     /// 今日签到统计文案（如 "9-12 3成功 1失败"），空 = 今天尚未产生签到结果
     public var autoCheckinSub: String = ""
     public var autoUpdateCheck: Bool = false
-    /// 菜单栏状态点小球弹跳参数（「菜单栏」pane）
-    public var bounce: MenuBarBounceSettings = .initial
+    // 菜单栏状态点小球弹跳参数（原快照字段 `bounce`）2026-09-17 随参数固化移除：
+    // 真值是常量 `MenuBarBounceSettings.fixed`，没有需要下发给界面的可变状态
     /// ── 「主题外观」pane：以下各项（原「主题调教」玻璃弹窗内容）──
-    /// 面板底色遮罩色（2026-09-14 由「高对比背景」强度滑杆改制：颜色 + alpha 由色盘给）
-    public var panelBackgroundColor: PanelBackgroundColor = .default
+    /// 面板底色遮罩色（2026-09-14 由「高对比背景」强度滑杆改制：颜色 + alpha 由色盘给）。
+    /// ⚠️ 2026-09-17 出厂默认改为「按当时面板参数固化」那一套（见 `PanelBackgroundColor.factory*`），
+    /// 与宿主 `AppConfig` 的属性默认值必须同源
+    public var panelBackgroundColor: PanelBackgroundColor = .factoryPanelBackground
     /// 遮罩**底端**不透明度（0…1；顶端 = panelBackgroundColor 的 alpha，两端各自独立，
     /// 取代原「alpha × 0.65」自动递减）
-    public var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
+    public var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha
     /// 浅色主题开关（强制浅色外观，即使系统是深色主题）
     public var lightThemeEnabled = false
     /// 品牌 icon 深浅版互换
     public var iconThemeSwap = false
     /// 无边框图标（卡片品牌 icon 直接用 SVG 原图，不套 Icon Composer 底板）
-    public var iconNoBorder = false
+    public var iconNoBorder = true
     /// 长进度卡片（整行进度条 + 副标题下移）
     public var longProgressCard = false
     /// 卡片主标题字号（pt，10…16、步进 0.5）
-    public var cardTitleFontSize: Double = 13
+    public var cardTitleFontSize: Double = 13.5
     /// 卡片主标题 Sharp Grotesk（本机安装的商业字体；未装该字重回落系统字体）
-    public var cardTitleSharpGrotesk = false
-    /// 数值滚动滑移（位数变化时的整组左右平移）时长口径的 rawValue（2026-09-16 用户
-    /// 要求两种口径都落地）：见 `RollSlideTimingOption`。**不进主题预设**（动效参数，
-    /// 不属于外观身份）
-    public var rollSlideTiming: String = RollSlideTimingOption.wheelTail.rawValue
-    /// 数值滚动时间曲线档位的 rawValue（2026-09-16 用户要求开放为设置项）：见
-    /// `RollCurveOption`。同样**不进主题预设**
-    public var rollCurve: String = RollCurveOption.easeIn.rawValue
+    public var cardTitleSharpGrotesk = true
+    // 数值滚动的「滑移时长口径」与「时间曲线档位」2026-09-17 用户「动效的参数固化，移除参数开放」：
+    // 快照字段、两个选项枚举、动作与 setter、设置窗口「动效」整段一并移除 ——
+    // 定稿值（跟随位移 / 从快到慢）写死在 `RollingNumberView.slideTime()` 与 `rollEase(_:)`
     // 主标题↔副标题行距的字体系数（SF/SG 两档）2026-09-15 已固化：快照字段、滑杆与宿主
     // setter 全部移除，真值见 BalancePanelView.cardTitleGapScaleSFFixed / SGFixed
     /// 用量色（HSB 三参 0…1）：设置窗口「面板 → 用量色」系统色盘拾色后分解落值
-    /// （下游点阵档位色与卡片边框仍按 HSB 口径取值）
-    public var heatHue: Double = 0
+    /// （下游点阵档位色与卡片边框仍按 HSB 口径取值）。默认 = `PanelThemeColor.default*`
+    ///（2026-09-17 随「出厂默认」一并按当时参数固化，不再是亮黄绿 225/254/119）
+    public var heatHue: Double = Double(PanelThemeColor.defaultHue)
     /// 点阵主题饱和度（0…1）
-    public var heatSaturation: Double = 0
+    public var heatSaturation: Double = Double(PanelThemeColor.defaultSaturation)
     /// 点阵主题峰值明度（0…1）
-    public var heatBrightness: Double = 0
+    public var heatBrightness: Double = Double(PanelThemeColor.defaultBrightness)
     /// **次背景色**（无用量底点 / 进度条轨道底 / 骨架行 / 卡片 hover 材质块 / Token 印章底）：
     /// 2026-09-15 由「点阵背景色」+「hover 背景色」两个参数**合并**而来（用户要求），
     /// 归到设置窗口「面板」栏 —— 两个消费点从此读同一个值
-    public var secondaryBackgroundColor: PanelBackgroundColor = .secondaryBackgroundDefault
+    public var secondaryBackgroundColor: PanelBackgroundColor = .factorySecondaryBackground
+    /// **主前景色**（卡片文字色；2026-09-17 用户「设置里 面板里 开放主前景色参数」）：
+    /// nil = 用内置两档（深色 #EBEBEB / 浅色 0.13 黑 —— 即参数开放前的老行为），
+    /// 有值 = 用户自选，**两档共用同一个值**（用户挑的就是这一支色，不再按外观分档）。
+    /// 色盘显示的当前色 = `self ?? PanelForegroundColor.builtIn(dark: !lightThemeEnabled)`（视图里的 Binding）
+    public var panelForegroundColor: PanelBackgroundColor?
     /// ── 3D 硬币的**视觉身份**四项（2026-09-16）：本页没有对应控件，纯为「主题预设」代读 ——
     /// 宿主装配快照时从 `CoinSettings.load()` 取，`ThemePreset(name:snapshot:)` 再固化进预设，
     /// 应用预设时宿主写回 UserDefaults 并回灌硬币 pane / 主面板内嵌小硬币。
@@ -787,8 +948,9 @@ public struct AppSettingsSnapshot: Equatable {
     public var coinAppearance: Int = ThemePreset.defaultCoinAppearance
     public var coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor
     public var coinFieldColor: String = ThemePreset.defaultCoinFieldColor
-    /// 「主题预设」列表（该页顶部）：宿主从 UserDefaults 读（`ThemePresetStore.load()`），
-    /// 保存 / 应用 / 删除都先交宿主动作落盘再回读本条
+    /// 「主题预设」列表（该页顶部）= **内置（`ThemePreset.builtIns`，代码里，只读）
+    /// + 用户自建（宿主 `ThemePresetStore.load()`，UserDefaults）**，宿主装配快照时拼起来，
+    /// 内置恒排在前；新增 / 应用 / 改名 / 删除都先交宿主动作落盘再回读本条
     public var themePresets: [ThemePreset] = []
     /// DeepSeek API Key（真实值来自钥匙串；空 = 未配置）
     public var apiKey: String = ""
@@ -803,21 +965,21 @@ public struct AppSettingsSnapshot: Equatable {
 
     public init(refreshInterval: Int = 300, autoCheckin: Bool = false,
                 autoCheckinSub: String = "", autoUpdateCheck: Bool = false,
-                bounce: MenuBarBounceSettings = .initial,
                 apiKey: String = "", commonQuota: Double = 0,
                 zhipuToken: String = "", qwenTicket: String = "",
                 savedAccountGroups: [SavedAccountGroup] = [],
-                panelBackgroundColor: PanelBackgroundColor = .default,
-                panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha,
+                panelBackgroundColor: PanelBackgroundColor = .factoryPanelBackground,
+                panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha,
                 lightThemeEnabled: Bool = false,
                 iconThemeSwap: Bool = false,
-                iconNoBorder: Bool = false,
+                iconNoBorder: Bool = true,
                 longProgressCard: Bool = false,
-                cardTitleFontSize: Double = 13, cardTitleSharpGrotesk: Bool = false,
-                rollSlideTiming: String = RollSlideTimingOption.wheelTail.rawValue,
-                rollCurve: String = RollCurveOption.easeIn.rawValue,
-                heatHue: Double = 0, heatSaturation: Double = 0, heatBrightness: Double = 0,
-                secondaryBackgroundColor: PanelBackgroundColor = .secondaryBackgroundDefault,
+                cardTitleFontSize: Double = 13.5, cardTitleSharpGrotesk: Bool = true,
+                heatHue: Double = Double(PanelThemeColor.defaultHue),
+                heatSaturation: Double = Double(PanelThemeColor.defaultSaturation),
+                heatBrightness: Double = Double(PanelThemeColor.defaultBrightness),
+                secondaryBackgroundColor: PanelBackgroundColor = .factorySecondaryBackground,
+                panelForegroundColor: PanelBackgroundColor? = nil,
                 coinPreset: Int = ThemePreset.defaultCoinPreset,
                 coinAppearance: Int = ThemePreset.defaultCoinAppearance,
                 coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor,
@@ -827,7 +989,6 @@ public struct AppSettingsSnapshot: Equatable {
         self.autoCheckin = autoCheckin
         self.autoCheckinSub = autoCheckinSub
         self.autoUpdateCheck = autoUpdateCheck
-        self.bounce = bounce
         self.apiKey = apiKey
         self.commonQuota = commonQuota
         self.zhipuToken = zhipuToken
@@ -841,12 +1002,11 @@ public struct AppSettingsSnapshot: Equatable {
         self.longProgressCard = longProgressCard
         self.cardTitleFontSize = cardTitleFontSize
         self.cardTitleSharpGrotesk = cardTitleSharpGrotesk
-        self.rollSlideTiming = rollSlideTiming
-        self.rollCurve = rollCurve
         self.heatHue = heatHue
         self.heatSaturation = heatSaturation
         self.heatBrightness = heatBrightness
         self.secondaryBackgroundColor = secondaryBackgroundColor
+        self.panelForegroundColor = panelForegroundColor
         self.coinPreset = coinPreset
         self.coinAppearance = coinAppearance
         self.coinMaterialColor = coinMaterialColor
@@ -882,11 +1042,6 @@ public struct AppSettingsActions {
     /// 无边框图标（宿主：落盘 + 就地换卡片 icon，不重建卡片）
     public var setIconNoBorder: (Bool) -> Void = { _ in }
     public var setLongProgressCard: (Bool) -> Void = { _ in }
-    /// 数值滚动滑移时长口径（宿主：按 rawValue 落 config + 同步 RollingNumberView
-    /// 静态镜像；传的是 `RollSlideTimingOption.rawValue`）
-    public var setRollSlideTiming: (String) -> Void = { _ in }
-    /// 数值滚动时间曲线档位（宿主：按 rawValue 落 config + 同步 RollingNumberView 镜像）
-    public var setRollCurve: (String) -> Void = { _ in }
     /// 「主题外观」pane 用量色（HSB 三参 0…1，**一把写**；2026-09-14 由三根滑杆改为
     /// 系统色盘拾色 —— 色盘给的是一个颜色，分解回 HSB 后一次落值、只重绘一次）。
     /// 宿主：落 UserDefaults + 就地重绘点阵与卡片边框
@@ -894,20 +1049,26 @@ public struct AppSettingsActions {
     /// **次背景色**（2026-09-15 合并自「点阵背景色」+「hover 背景色」；宿主：写 config +
     /// 落盘 + 镜像 + 就地重绘 —— 底点/轨道/骨架/材质块都是自绘或烘色位图，须整树重绘）
     public var setSecondaryBackgroundColor: (PanelBackgroundColor) -> Void = { _ in }
+    /// **主前景色**（2026-09-17 开放）：写 config + 运行时镜像 + 面板就地重刷文字色
+    ///（标签里的动态色要在重绘时重解算；卡片 icon 的着色与菜单栏圆点是定格值，宿主另做）。
+    /// 只提供「设为自选色」这一个入口 —— 参数一旦调过就是自选，没有「恢复内置两档」的按钮
+    public var setPanelForegroundColor: (PanelBackgroundColor) -> Void = { _ in }
     /// 「主题外观」pane **顶部「主题预设」**（2026-09-15 用户要求）：该页顶部一组预设，
-    /// 「保存」把页面当前全部参数固化成一组、「应用」原样写回、「删除」移除一枚。
-    /// 宿主：预设列表存 UserDefaults（`ThemePresetStore`，JSON 串单键）+ 应用时逐项落值重绘。
-    /// ⚠️ **返回 false = 没存下去**（重名时用户在同名覆盖确认里选了「取消」）→
-    /// 命名草稿保留，用户可以直接改个名字再按一次保存
-    public var saveThemePreset: (ThemePreset) -> Bool = { _ in false }
+    /// 「应用」原样写回、「删除」移除一枚；新增走**图卡右上角的「+」**（2026-09-17 用户要求，
+    /// 取代原「名称 + 保存」那一行）。
+    /// 宿主：用户预设存 UserDefaults（`ThemePresetStore`，JSON 串单键）+ 应用时逐项落值重绘。
+    /// ⚠️ 出厂那六枚（`ThemePreset.builtIns`）**不在这里**：它们只读，宿主也不往存储里写
+    public var saveThemePreset: (ThemePreset) -> Void = { _ in }
     public var applyThemePreset: (ThemePreset) -> Void = { _ in }
-    /// 删除一枚预设（按 id 命中；移除后其余顺序不变）
+    /// 删除一枚预设（按 id 命中；移除后其余顺序不变）—— 只对用户自建的那些开放
     public var deleteThemePreset: (String) -> Void = { _ in }
+    /// 改名（点图卡下方的名字就地改）：按 id 找到用户自建的那枚、换名字后落盘。
+    /// 内置六枚没有改名入口，宿主也不需要额外挡 —— 存储里根本不含它们的 id
+    public var renameThemePreset: (String, String) -> Void = { _, _ in }
     public var manualCheckin: () -> Void = {}
     public var showCheckinHistory: () -> Void = {}
     public var shareWbHistory: () -> Void = {}
-    /// 菜单栏小球弹跳参数变更（宿主：写内存 + 落盘 + 推给 MenuBarStatusGlowController）
-    public var setBounce: (MenuBarBounceSettings) -> Void = { _ in }
+    // 菜单栏小球弹跳参数的 setter 2026-09-17 随参数固化移除（见 MenuBarBounceSettings）
     /// 卡片主标题字号 / Sharp Grotesk 开关（「主题外观 → 卡片」；
     /// 宿主：写 config + 落盘 + syncPanel，面板快照比对变化后就地重刷标题）
     public var setCardTitleFontSize: (Double) -> Void = { _ in }
@@ -1071,9 +1232,13 @@ public final class AppSettingsModel {
     public var coinThumbnailProvider: ((CoinVisualIdentity, CGFloat) -> NSImage?)?
     /// Key/额度表单的编辑草稿（窗口打开时按真实配置重置，见 `beginSession`）
     public var keyQuotaDraft = KeyQuotaDraft()
-    /// 「主题预设」的命名草稿（顶部输入框；保存后清空、关窗丢弃）——
-    /// 走模型属性而不是 `@State`：本 target 只有属性包装器可用（见文件头注）
-    public var themePresetName = ""
+    /// ── 「主题预设」的三处**界面状态**，都刻意住模型而不是视图 ──
+    /// 本 target 只有属性包装器可用（`@State` 在新 SDK 里是宏，CLT 工具链报
+    /// "StateMacro could not be found"，见文件头注），模型是 `@Observable` 类，照样驱动刷新。
+    /// 1) 正在改名的预设 id（nil = 没在改名）：点图卡下方的名字进入，Enter 提交、Esc 放弃
+    public var renamingPresetID: String?
+    /// 2) 改名草稿（进入改名时填入原名）
+    public var renameDraft = ""
 
     /// pane 导航历史（系统设置同款后退/前进）；初始 = [初始 pane]，两侧按钮初始均禁用
     private var history: [SettingsSidebarItem] = [.appearance]
@@ -1111,7 +1276,8 @@ public final class AppSettingsModel {
     public func beginSession() {
         sync()
         resetKeyQuotaDraft()
-        themePresetName = ""
+        renamingPresetID = nil
+        renameDraft = ""
         for sections in hostedPanes.values {
             for content in sections { content.refresh?() }
         }
@@ -1135,11 +1301,7 @@ public final class AppSettingsModel {
         actions.toggleAutoUpdateCheck(on)
         sync()
     }
-    /// 小球弹跳参数：滑杆逐次拖动都会走这里（实时生效 + 落盘），再回读一次
-    public func setBounce(_ s: MenuBarBounceSettings) {
-        actions.setBounce(s)
-        sync()
-    }
+    /// 小球弹跳参数：2026-09-17 固化（见 MenuBarBounceSettings）→ 滑杆与 setter 一并移除
 
     // ── 「主题外观」pane：开关 + 色盘，全部即时生效（改完 sync() 回读真实配置）──
 
@@ -1177,18 +1339,6 @@ public final class AppSettingsModel {
         actions.setLongProgressCard(on)
         sync()
     }
-    /// 数值滚动滑移时长口径（2026-09-16 用户要求两种口径都落地）：先交宿主动作
-    ///（落盘 + 静态镜像），随后回读快照
-    public func setRollSlideTiming(_ raw: String) {
-        actions.setRollSlideTiming(raw)
-        sync()
-    }
-    /// 数值滚动时间曲线档位（2026-09-16 用户要求开放）：先交宿主动作
-    ///（落盘 + 静态镜像），随后回读快照
-    public func setRollCurve(_ raw: String) {
-        actions.setRollCurve(raw)
-        sync()
-    }
     /// 用量色拾取（色盘）：先交宿主动作（落 UserDefaults + 就地重绘），随后回读快照
     public func setThemeColor(hue: Double, saturation: Double, brightness: Double) {
         actions.setHeatColor(hue, saturation, brightness)
@@ -1199,25 +1349,31 @@ public final class AppSettingsModel {
         actions.setSecondaryBackgroundColor(color)
         sync()
     }
+    /// 主前景色拾取（色盘，2026-09-17）：宿主落盘 + 镜像 + 面板整树重刷（含图标着色 / 菜单栏圆点），
+    /// 随后回读快照 —— 该页所有控件（包括预设图卡的文字色）随之刷新
+    public func setPanelForegroundColor(_ color: PanelBackgroundColor) {
+        actions.setPanelForegroundColor(color)
+        sync()
+    }
 
     // ── 「主题预设」（该页顶部）：固化 / 应用 / 删除 ──
 
-    /// 保存一组预设：把**页面当前全部参数**（快照里该页那几项）固化下来 ——
-    /// 草稿名为空时自动补「预设 N」（N = 现有枚数 + 1）。
-    /// 同名由宿主弹确认（覆盖 / 取消）：**取消时不落盘、命名草稿也不清**，
-    /// 用户能就着手改个名字再存（清掉等于让他重敲一遍）。
+    /// **用当前页面参数新增一枚预设**（2026-09-17 用户要求：图卡右上角的「+」，
+    /// 用户明确要「取设置页当前参数」——不是复制被 hover 的那张卡）。
+    /// 名字自动给「预设 N」（N = **用户自建**的枚数 + 1，出厂那六枚不计数），进去后点名字可改。
+    /// 不去重名：名字重了也各自是一条（id 才是身份），旧那套「重名先问是否覆盖」随
+    /// 「名称输入框」一起删掉了。
     ///
     /// ⚠️ 固化前**先回读一次真实状态**（2026-09-16）：硬币那四项不在本页、也不走本模型的
     /// setter（「3D 硬币」是内嵌 AppKit 面板，改一次落一次盘，全程不经过这里）——
     /// 只靠开窗那次 sync 的话，中途在 3D pane 改过的币面色 / 档位会按**开窗时**的旧值存进预设。
-    /// `sync()` 只是本地读盘 + 读预设列表，无网络代价，每次保存都来一遍
-    public func saveThemePreset() {
+    /// `sync()` 只是本地读盘 + 读预设列表，无网络代价，每次新增都来一遍
+    public func addThemePresetFromCurrent() {
         sync()
-        let name = themePresetName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let preset = ThemePreset(name: name.isEmpty ? "预设 \(snapshot.themePresets.count + 1)" : name,
-                                 snapshot: snapshot)
-        let saved = actions.saveThemePreset(preset)
-        if saved { themePresetName = "" }
+        commitPresetRename()   // 正在改名的那条先落地，别让草稿丢在半路
+        let count = snapshot.themePresets.filter { !ThemePreset.builtInIDs.contains($0.id) }.count
+        let preset = ThemePreset(name: "预设 \(count + 1)", snapshot: snapshot)
+        actions.saveThemePreset(preset)
         sync()
     }
 
@@ -1227,10 +1383,38 @@ public final class AppSettingsModel {
         sync()
     }
 
-    /// 删除一枚预设（不二次确认：非破坏性数据，删错了重存一组即可）
+    /// 删除一枚预设（不二次确认：非破坏性数据，删错了重加一组即可）—— 只对用户自建的那些开放
     public func deleteThemePreset(id: String) {
+        if renamingPresetID == id { renamingPresetID = nil; renameDraft = "" }
         actions.deleteThemePreset(id)
         sync()
+    }
+
+    // MARK: 预设改名（点图卡下方的名字就地改）
+
+    /// 进入改名：草稿填当前名。⚠️ 先把上一次没提交的改名落地（点另一张卡的名字时不该丢草稿）
+    public func beginPresetRename(_ preset: ThemePreset) {
+        guard !ThemePreset.builtInIDs.contains(preset.id) else { return }
+        commitPresetRename()
+        renamingPresetID = preset.id
+        renameDraft = preset.name
+    }
+
+    /// 提交改名（Enter / 点别处都走这里）：草稿去空白后为空 = 放弃，保留原名
+    public func commitPresetRename() {
+        guard let id = renamingPresetID else { return }
+        let name = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        renamingPresetID = nil
+        renameDraft = ""
+        guard !name.isEmpty else { return }
+        actions.renameThemePreset(id, name)
+        sync()
+    }
+
+    /// 放弃改名（Esc）
+    public func cancelPresetRename() {
+        renamingPresetID = nil
+        renameDraft = ""
     }
     /// 草稿是否有未落盘的改动（提交点的守卫：脏才写，避免空提交反复刷网络）
     public var keyQuotaDirty: Bool {

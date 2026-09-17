@@ -70,16 +70,21 @@ enum CoinMetrics {
     /// Coin Size 滑杆范围（上限同时决定弹窗内容区高度，见 `Coin3DView.contentHeight`）。
     /// 上限 192 → **170**（2026-09-13 用户要求「coin size 上限为 170」）；
     /// 落盘值超过上限的由 `CoinSettings.load` 的夹取自动收进 170。
-    static let defaultSize = 160.0
+    /// ⚠️ 2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」：
+    /// 出厂默认由参考盒 160 改为当时 pane 的 **140**
+    static let defaultSize = 140.0
     static let sizeRange: ClosedRange<Double> = 96...170
     /// 「Panel coin size」默认值与滑杆范围（pt）：主面板 Token 板块里那枚内嵌硬币的直径。
     /// 与弹窗的 `size` 相互独立 —— 弹窗是「浮在舞台上的大币」，内嵌是「贴着数字的记号」
     /// （2026-09-12 用户指定可单独调）。厚度 / 浮雕深度仍按内嵌直径 ÷ 弹窗直径等比缩放。
-    static let defaultPanelSize = 32.0
+    /// ⚠️ 2026-09-17 同「出厂默认固化」：32 → **35**
+    static let defaultPanelSize = 35.0
     static let panelSizeRange: ClosedRange<Double> = 16...48
-    /// 厚度默认值 = size × 0.10（Mintform.tsx `thickness ?? size * 0.1`）。
+    /// 厚度默认值（Mintform.tsx 口径是 `thickness ?? size * 0.1` = 16；**已不沿用**）。
     /// 运行时可调，见 `Coin3DView.thickness`；滑杆范围见 `thicknessRange`。
-    static let defaultThickness = 16.0
+    /// ⚠️ 2026-09-17 同「出厂默认固化」：按当时 pane 的取值改为 **51**（≈ 140 币径的 36%，
+    /// 比参考实现的 10% 厚得多 —— 要回到薄币把这里改小即可，滑杆范围 10…70 涵盖）
+    static let defaultThickness = 51.0
     /// Edge 面板的厚度滑杆范围（用户指定 10…70）
     static let thicknessRange: ClosedRange<Double> = 10...70
     /// 侧壁分段数（**固定值，不随 size 变化**；2026-09-12 用户指定）。
@@ -106,9 +111,12 @@ enum CoinMetrics {
     /// mark 的 clip-path: circle(61.5px at center)
     static let markClipRadius = 61.5
     /// mark 立体化：Logo 厚度 = 沿**盖面法线**把平面轮廓挤出的深度（单位同 160 参考盒 px）。
-    /// 0 = 保持参考实现的平贴观感；范围上限取到硬币半厚（16/2）以内，超了就不像浮雕了。
-    static let defaultMarkDepth = 4.0
-    static let markDepthRange: ClosedRange<Double> = 0...12
+    /// 原出厂默认 4（0…12 档的中段）；2026-09-17 用户「logo depth 范围改为 1到5」：整体收窄，
+    /// 0（平贴）档取消、最低 1 即有浮雕，最高 5（原上限 12 的 42%）。存量超界值由 `load()` 钳回；
+    /// 归一化消费点（`depthT = markDepth / upperBound`）自动跟随新上限，不用另改。
+    /// ⚠️ 同日「出厂默认固化」再按当时 pane 取值落到 **2**
+    static let defaultMarkDepth = 2.0
+    static let markDepthRange: ClosedRange<Double> = 1...5
     /// 侧壁明暗：沿挤出方向往材质面阴影里压多少 —— **只是一档浅压暗**（把斜面与材质分开），
     /// 顶面边缘取 `markWallShadeTop`，扫掠外缘取 `markWallShadeEdge`，中间线性过渡
     /// （与币面 inset 阴影同口径：越靠边界越深）。
@@ -149,8 +157,11 @@ enum CoinMetrics {
     /// 出厂默认：spread 8（参考实现量级）；opacity 70 = 旧定值 markRimShadowAlpha 0.45
     /// （2026-09-11 用户「初始阴影再深一些」）× N=2 遍合成 ≈ 0.6975 取整 —— 2026-09-14
     /// 「加深 svg 带来的阴影」后以此为新基线开放调参。
-    static let defaultMarkShadowSpread = 8.0
-    static let defaultMarkShadowOpacity = 70.0
+    /// ⚠️ 2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」：
+    /// 按当时 pane 的取值固化为 **spread 7 / opacity 68**（上面那两个参考值只作历史备查）。
+    /// `SettingsUI.ThemePreset.defaultCoin*` 与 `CoinSettings.initial` 都引用本常量，一处改全局跟随
+    static let defaultMarkShadowSpread = 7.0
+    static let defaultMarkShadowOpacity = 68.0
     /// 边界阴影的**叠画遍数**：同一轮廓把带影填充重复 N 次，影逐遍 source-over 合成
     /// 1−(1−a)^N，抬起单遍 0.5 的可见峰值上限 —— 只加深，模糊半径与轮廓形态不变。
     /// ⚠️ 遍数**随滑杆值自适应**（`markRimShadowPasses(forPeak:)`）：合成封顶 1−0.5^N，
@@ -214,8 +225,9 @@ enum CoinMetrics {
     static let idleBounceDuration = 3.0
     /// 弹簧（profile = reference：stiffness 15；damping = 2√k → 临界阻尼、不过冲）
     static let springStiffness = 15.0
-    /// rendering.motion.spinDegrees：一次点按**一圈**的度数，实际转 `turns` 圈（Turns 滑杆 1…3）
-    static let spinDegrees = 360.0
+    /// rendering.motion.spinDegrees：turns 的**单位角度** —— 2026-09-17 用户「turns 步进改为 0.5，
+    /// 0.5 为 180 度」⇒ 1 档 = 180°，实际转 turns × 180°（Turns 滑杆 1…3、步进 0.5）
+    static let spinDegrees = 180.0
     /// motion.pitchArc：点按过程中的额外俯仰，进度中点为峰值、结束回零
     static let pitchArc = 18.0
     /// 拖动灵敏度（Mintform.tsx DRAG_*）
@@ -229,15 +241,17 @@ enum CoinMetrics {
     static let pitchLimit = 45.0
     /// 弹簧静止阈值（runtime/useMintformMotion.ts）
     static let restEpsilon = 0.02
-    /// 默认静止朝向（yaw，度）：CoinSettings.restingRotation 的出厂默认（45）。
-    /// 用户 2026-09-11 指定（参考实现出生是 0 = 纯正面）；实际出生姿态走 Coin3DView 的
+    /// 默认静止朝向（yaw，度）：CoinSettings.restingRotation 的出厂默认。
+    /// 用户 2026-09-11 指定 45（参考实现出生是 0 = 纯正面）；实际出生姿态走 Coin3DView 的
     /// restingRotation / restingTilt 属性，由弹窗与内嵌实例各自灌值。
-    static let defaultRestingRotation = 45.0
+    /// ⚠️ 2026-09-17「出厂默认固化」：45 → **33**（按当时 pane 取值）
+    static let defaultRestingRotation = 33.0
     /// Motion 区滑杆范围（用户 2026-09-11 指定）：静止俯仰 / 静止朝向 ±180（可翻到背面），
-    /// 点按自旋圈数。
-    /// ⚠️ Turns 原为 **1…5**，2026-09-17 用户要求收到 **1…3**（「转太多圈看着晕」）——
-    /// 老配置的 4 / 5 由 `CoinSettings.load()` 夹回 3，不会把滑杆顶歪。点按与
-    /// 「平台切换换 logo」的自旋**共用这一个范围**（`spin()` 只有 `turns` 一个口径）
+    /// 点按自旋档位。
+    /// ⚠️ Turns 原为 **1…5**，2026-09-17 用户要求收到 **1…3**（「转太多圈看着晕」）；同日
+    /// 「turns 步进改为 0.5，0.5 为 180 度」：档位 = 1 / 1.5 / 2 / 2.5 / 3，每档 180°
+    ///（见 `spinDegrees`），步进由 Turns 滑杆的 `step: 0.5` + 刻度只允许停档钳住。
+    /// 点按与「平台切换换 logo」的自旋**共用这一个范围**（`spin()` 只有 `turns` 一个口径）
     static let restingTiltRange: ClosedRange<Double> = -180...180
     static let restingRotationRange: ClosedRange<Double> = -180...180
     static let turnsRange: ClosedRange<Double> = 1...3
@@ -402,7 +416,10 @@ struct CoinMaterial: Equatable {
         faceBase: CoinRGB(p3: 0.31, 0.85, 0.24),
         faceMid: CoinRGB(p3: 0.28, 0.75, 0.29),
         faceShadow: CoinRGB(p3: 0.22, 0.61, 0.22),
-        faceHighlight: CoinRGB(p3: 0.42, 0.98, 0.78),
+        // 高光（Default style 盖面渐变的顶部那档）2026-09-17 用户「把默认的高光提高」：
+        // 原 (0.42, 0.98, 0.78) 偏青、亮度不够 —— 向白推一档（B 0.78 → 0.90、R 0.42 → 0.52），
+        // sheen 更亮更显
+        faceHighlight: CoinRGB(p3: 0.52, 1.0, 0.90),
         faceDepthHighlight: CoinRGB(p3: 0.19, 0.72, 0.44),
         edgeBase: CoinRGB(p3: 0.31, 0.85, 0.24),
         edgeAccent: CoinRGB(p3: 0.28, 0.75, 0.29),
@@ -428,8 +445,17 @@ struct CoinMaterial: Equatable {
             faceBase: base,
             faceMid: mid,
             faceShadow: shade(h + 3, s * 0.7, l - 13),
-            faceHighlight: shade(h + 31, s + 17, l + 16),
-            faceDepthHighlight: shade(h + 30, s - 10, l - 9),
+            // 高光（Default style 盖面渐变顶部档）2026-09-17 用户「把默认的高光提高」：
+            // 亮度抬升 16 → 26（`shade()` 内部钳到 94，不会爆）—— sheen 更亮更显
+            // ⚠️ **色相不再偏移**（原参考实现 `h + 31` / `h + 30`，备查）：
+            //    第 3 档的 +30 会把基色的色相往下推 30° —— 黄底（h ≈ 42）→ h 72 = 黄绿，
+            //    而盖面 surface 三停的**下端**正好取这一档 ⇒ 盘面下半部整片发绿
+            //    （2026-09-17 用户截图报「下方那块偏色」，实测截图 62° = 规范算出的 62.2°）。
+            //    绿底（sgho h ≈ 137 → 167 青绿）看不出来，黄底才暴露。
+            //    现在顶/底两端**都锁基色色相**，只在明度上分居两侧（上下对称）——
+            //    亮端 sheen、暗端 depth 都还是本色，不再换色系。
+            faceHighlight: shade(h, s + 17, l + 26),
+            faceDepthHighlight: shade(h, s - 10, l - 9),
             edgeBase: base,
             edgeAccent: mid,
             field: sgho.field,
@@ -607,8 +633,12 @@ struct CoinGeometry {
             normalList.append(CoinVec(x: sin(angle), y: -cos(angle), z: 0))
             // 环角 → 竖直位置：0 号在顶（vp=0），半圈即物理底部（vp=1）
             let vertical = (1 - cos(angle)) / 2
-            strengthList.append(end <= start ? (vertical >= end ? 1 : 0)
-                                             : min(max((vertical - start) / (end - start), 0), 1))
+            // 色场关断（gho：transparentAt == opaqueAt = 100 ⇒ end <= start）→ **全程 0**。
+            // ⚠️ 原式 `vertical >= end ? 1 : 0` 有边界 bug：end = 1 时最底部那一圈
+            // （angle = π，vertical 恰为 1）会命中 1 ⇒ gho 预设下侧壁底部混进一条色场色
+            //（2026-09-17 用户截图报的「硬币下边混入别的颜色」就是它）
+            strengthList.append(end <= start ? 0
+                             : min(max((vertical - start) / (end - start), 0), 1))
         }
 
         segments = count
@@ -1014,8 +1044,8 @@ final class Coin3DView: NSView {
             tiltVelocity = 0
         }
     }
-    /// 点按自旋圈数（Motion 区 Turns 滑杆 1…3）：spin() 一次转 turns × 360°
-    var turns = 1
+    /// 点按自旋档位（Motion 区 Turns 滑杆 1…3、步进 0.5）：spin() 一次转 turns × 180°
+    var turns: Double = 1
 
     /// 自旋**转过 90°**（盖面侧对观众、图案几乎看不见）时执行一次的动作 —— 一次性，
     /// 触发后自动清空。用途：平台切换换 logo —— 正对观众时换图是一次「闪变」，
@@ -1288,7 +1318,7 @@ final class Coin3DView: NSView {
         }
     }
 
-    /// 点按自旋：方向顺时针、`turns` 圈（Motion 区 Turns 滑杆 1…3，默认 1）。
+    /// 点按自旋：方向顺时针、转 `turns × 180°`（Motion 区 Turns 滑杆 1…3、步进 0.5，默认 1）。
     /// 圈数就是 `turns` 一个来源 —— 点按与「平台切换换 logo」共用它，没有第二条口径
     func spin() {
         usesPitchArc = true
@@ -1298,7 +1328,7 @@ final class Coin3DView: NSView {
                                                   arc: CoinMetrics.pitchArc)
         pitchOrigin = rotation
         edgeStartRotation = rotation          // 「转过 90°」从这一刻算起
-        target += Double(turns) * CoinMetrics.spinDegrees
+        target += turns * CoinMetrics.spinDegrees
         pitchTarget = target
         startTicker()
     }
@@ -2026,24 +2056,30 @@ struct CoinSettings {
     /// 上传的 SVG 文件名（Logo 行里显示）；空 = 内置 GHO 预设
     var logoName: String
 
-    /// 出厂默认（= 参考实现 mintform 的 props 默认值）
-    static let initial = CoinSettings(preset: .sgho,
+    /// 出厂默认。**2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」**：
+    /// 从原先「照抄参考实现 mintform 的 props 默认值」（sGHO + 绿/紫 + 薄币正立）整套改为
+    /// **按当时「3D 硬币」pane 的实际取值固化** —— 也就是"新装即是这枚币"。逐项对照见右侧注释。
+    /// ⚠️ 这套值是「出厂默认」的三处之一：本处（几何/工艺/运动）+ `CoinMetrics.default*` 常量
+    ///（尺寸/厚度/浮雕/阴影/姿态）+ `SettingsUI.ThemePreset.defaultCoin*`（预设四项兜底，两处必须同步）。
+    /// ⚠️ logo **不在其中**：`logoSVG` / `logoName` 保持空 = 新装用内置 GHO 预设。上传件是"内容"、
+    /// 不是参数，而且是第三方品牌图，只属于本机配置（存量用户的 codex.svg 照样读得到，不受影响）。
+    static let initial = CoinSettings(preset: .gho,                    // 原 .sgho（色场开）→ GHO（色场关）
                                       appearance: .default,
-                                      materialColor: CoinMaterial.sgho.faceBase,
-                                      fieldColor: CoinMaterial.sgho.field,
-                                      size: CoinMetrics.defaultSize,
-                                      panelSize: CoinMetrics.defaultPanelSize,
-                                      thickness: CoinMetrics.defaultThickness,
-                                      logoScalePercent: 100,
-                                      markDepth: CoinMetrics.defaultMarkDepth,
-                                      markShadowOpacity: CoinMetrics.defaultMarkShadowOpacity,
-                                      markShadowSpread: CoinMetrics.defaultMarkShadowSpread,
-                                      finish: .reeded,
-                                      restingTilt: 0,
-                                      restingRotation: CoinMetrics.defaultRestingRotation,
-                                      turns: 1,
-                                      outlineLevel: 1,
-                                      outlineWidth: 1,
+                                      materialColor: CoinRGB(hex: "#FFC644")!,  // 原 sgho.faceBase 绿
+                                      fieldColor: CoinRGB(hex: "#FFE2A1")!,     // 原 sgho.field 紫
+                                      size: CoinMetrics.defaultSize,            // 140
+                                      panelSize: CoinMetrics.defaultPanelSize,  // 35
+                                      thickness: CoinMetrics.defaultThickness,  // 51
+                                      logoScalePercent: 70,                     // 原 100
+                                      markDepth: CoinMetrics.defaultMarkDepth,  // 2
+                                      markShadowOpacity: CoinMetrics.defaultMarkShadowOpacity,  // 68
+                                      markShadowSpread: CoinMetrics.defaultMarkShadowSpread,    // 7
+                                      finish: .uniform,                         // 原 .reeded（齿纹交替）
+                                      restingTilt: 28,                          // 原 0（正立）
+                                      restingRotation: CoinMetrics.defaultRestingRotation,       // 33
+                                      turns: 3,                                 // 原 1
+                                      outlineLevel: 4,                          // 原 1（仅 Outline 外观用）
+                                      outlineWidth: 5,                          // 原 1（仅 Outline 外观用）
                                       logoInverted: false,
                                       logoSVG: "",
                                       logoName: "")
@@ -2354,18 +2390,22 @@ final class CoinSliderRowView: CoinFormRowView {
     private let format: (Double) -> String
     /// 原生刻度数（0 = 无刻度，默认）
     private let tickCount: Int
+    /// **步进吸附**（pt；默认 1 = 历史口径的整数档）：拖动/点刻度后把值吸到 step 网格上
+    ///（如 Turns 的 0.5 —— 0.5 为 180°）。`allowsTickMarkValuesOnly` 只管点刻度，拖拽仍需这里钳
+    private let step: Double
     /// 无刻度 / 有刻度两种滑杆高度（行框 rowH = 36，刻度版下缘要留给刻度线）
     private var sliderHeight: CGFloat { tickCount > 0 ? 32 : 20 }
     var onValueChange: ((Double) -> Void)?
 
     init(label title: String, range: ClosedRange<Double>, value initialValue: Double,
-         format: @escaping (Double) -> String, ticks: Int = 0) {
+         ticks: Int = 0, step: Double = 1, format: @escaping (Double) -> String) {
         label = NSTextField(labelWithString: title)
         slider = NSSlider(value: initialValue, minValue: range.lowerBound,
                           maxValue: range.upperBound, target: nil, action: nil)
         valueLabel = NSTextField(labelWithString: "")
         self.format = format
         self.tickCount = ticks
+        self.step = max(step, 0.001)
         super.init(frame: .zero)
         label.font = .systemFont(ofSize: 13)
         label.textColor = .secondaryLabelColor
@@ -2416,7 +2456,8 @@ final class CoinSliderRowView: CoinFormRowView {
     }
 
     @objc private func sliderDragged() {
-        let value = slider.doubleValue.rounded()
+        // 步进吸附：值钳到 step 网格（step = 1 时等价于旧的 .rounded() 整数口径）
+        let value = (slider.doubleValue / step).rounded() * step
         slider.doubleValue = value
         valueLabel.stringValue = format(value)
         onValueChange?(value)
@@ -2926,10 +2967,14 @@ final class CoinMotionSectionView: CoinFormSectionView {
         restingRotationRow = CoinSliderRowView(label: "Resting rotation",
                                                range: CoinMetrics.restingRotationRange,
                                                value: settings.restingRotation) { "\(Int($0))°" }
+        // Turns：1…3、**步进 0.5**（0.5 = 180°，见 CoinMetrics.spinDegrees）——
+        // 刻度 5 档（1 / 1.5 / 2 / 2.5 / 3）+ step 吸附；格式半档带一位小数
         turnsRow = CoinSliderRowView(label: "Turns",
                                      range: CoinMetrics.turnsRange,
                                      value: settings.turns,
-                                     ticks: 3) { "\(Int($0))" }
+                                     ticks: 5, step: 0.5) {
+            $0.truncatingRemainder(dividingBy: 1) == 0 ? "\(Int($0))" : String(format: "%.1f", $0)
+        }
         super.init(title: CoinMotionSectionView.sectionTitle, bare: bare)
         addRow(restingTiltRow)
         addRow(restingRotationRow)
@@ -3058,7 +3103,7 @@ final class CoinDemoPanelView: NSView {
         coin.logoInverted = settings.logoInverted
         coin.restingTilt = settings.restingTilt
         coin.restingRotation = settings.restingRotation
-        coin.turns = Int(settings.turns.rounded())
+        coin.turns = settings.turns
 
         // 参数 → 硬币 + 内存快照 + 通知（每个回调都走 `apply`，出口只有一处）
         control.onPresetChange = { [weak self] in self?.apply(preset: $0) }
@@ -3158,8 +3203,7 @@ final class CoinDemoPanelView: NSView {
         notifyLiveChange()
     }
 
-    private func apply(size: Double) {
-        settings.size = size
+    private func apply(size: Double) {        settings.size = size
         coin.size = size
         syncStageHeight()
         notifyLiveChange()
@@ -3256,9 +3300,10 @@ final class CoinDemoPanelView: NSView {
     }
 
     /// 自旋圈数（1…3，滑杆已整数步进）：spin() 一次转 turns × 360°
+    /// 自旋档位（1…3、步进 0.5）：spin() 一次转 turns × 180°
     private func apply(turns: Double) {
         settings.turns = turns
-        coin.turns = Int(turns.rounded())
+        coin.turns = turns
         notifyLiveChange()
     }
 

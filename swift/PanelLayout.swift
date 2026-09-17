@@ -919,24 +919,20 @@ extension BalancePanelView {
         iv.superview?.subviews.compactMap { $0 as? CardMenuBarGlowView }.forEach {
             $0.maskImage = drawn
         }
-        // 状态层「中心挖空」同步（同「附属物随图更新」的口径）：形状恒取 **PNG 版**
-        //（见 statusRingCarveImage）。切开关 / 换深浅版 / 外观变化三条换图路径都经这里。
-        // ⚠️ 建卡路径首次落图时状态层还没建出来，那一处由 balanceContentRow 建好后补设
-        iv.superview?.subviews.compactMap { $0 as? CardTaskStatusRingView }.forEach {
-            $0.carveIconView = iv
-            $0.carveMaskImage = statusRingCarveImage(iconName: iconName, appearance: appearance)
-        }
+        // 状态层「中心让位」同步（同「附属物随图更新」的口径）：切开关 / 换深浅版 / 外观变化
+        // 三条换图路径都经这里（建卡路径由 balanceContentRow 建好后补设同一入口）
+        syncStatusRingCarve(iv)
         return true
     }
 
-    /// 状态层**形状蒙版**用图（2026-09-16 用户要求）：卡片以 **SVG 原图**当 icon（无边框模式）时
-    /// 返回**同名 PNG 版**（Icon Composer 底板 = squircle，与 icon 同心同尺寸），供
-    /// `CardTaskStatusRingView.carveMaskImage` 按该轮廓**挖空**状态层（只保留外圈）；
-    /// 其余情况 nil（默认 PNG icon 模式不需要挖空）。深浅取版只为命中同一份资产（外轮廓相同）
-    func statusRingCarveImage(iconName: String, appearance: NSAppearance) -> NSImage? {
-        guard iconNoBorderEnabled else { return nil }
-        return Self.cardBrandImage(iconName, dark: brandIconDark(for: appearance),
-                                   appearanceIsDark: appearance.isDark)
+    /// 状态层「中心让位」的唯一入口（建卡处与换图处共用，别两处各写一份）：
+    /// 形状源 = 「无边框图标」开关（SVG 原图 ⇒ `.circle`：圆形轨迹 + 与 icon 内切的圆形挖空；
+    /// PNG 底板 ⇒ `.squircle`：不挖），位置源 = iconView（frame 每次 layout 现算）。
+    func syncStatusRingCarve(_ iv: NSImageView) {
+        iv.superview?.subviews.compactMap { $0 as? CardTaskStatusRingView }.forEach {
+            $0.carveIconView = iv
+            $0.shape = iconNoBorderEnabled ? .circle : .squircle
+        }
     }
 
     /// 余额卡片内容行：左大 icon + 中间纵向（标题/签到信息）+ 右纵向（额度值/点阵）
@@ -1047,10 +1043,8 @@ extension BalancePanelView {
                 // 统一图标列宽（不再随各平台 iconSize 变化）：所有卡标题严格左对齐
                 iconContainer.widthAnchor.constraint(equalToConstant: iconColumnWidth),
             ])
-            // 状态层「中心挖空」（SVG 模式）：形状 = PNG 版图标、位置 = iconView
-            //（frame 每次 layout 现算，见 CardTaskStatusRingView.refreshCarveMask）
-            ring.carveIconView = iconView
-            ring.carveMaskImage = statusRingCarveImage(iconName: iconName, appearance: brandAppearance)
+            // 状态层「中心让位」：SVG 原图 icon ⇒ 圆形轨迹 + 圆形挖空（见 syncStatusRingCarve）
+            syncStatusRingCarve(iconView)
             ringRef(ring)
         } else {
             iconContainer.addSubview(iconView)
@@ -2056,17 +2050,25 @@ extension BalancePanelView {
                                  width: boxSide, height: boxSide)
             glow.frame = boxRect
             // 圆角：进行中 7pt / 完成 7pt（各自独立常量）；中断态 boxSide×0.22
-            //（随放大底数走，形状比例与未放大时一致）
-            glow.cornerCurve = .continuous
-            glow.cornerRadius = taskState == .running ? Self.runningCornerRadius
-                : taskState == .completed ? Self.completedCornerRadius
-                : boxSide * 0.22
+            //（随放大底数走，形状比例与未放大时一致）。
+            // ⚠️ 形状 = 圆（`.circle`，SVG 原图 icon，2026-09-17 用户要求）时：半径恒取**半边长**
+            //（圆角方 → 正圆），曲线同时从 `.continuous` 回落到 `.circular` —— 超椭圆在
+            // 半径 = 半边长处虽也退化，但连续曲率会在临界处留一点点方感，显式给圆更稳。
+            let isCircle = shape == .circle
+            glow.cornerCurve = isCircle ? .circular : .continuous
+            glow.cornerRadius = isCircle ? boxSide / 2
+                : (taskState == .running ? Self.runningCornerRadius
+                   : taskState == .completed ? Self.completedCornerRadius
+                   : boxSide * 0.22)
+            // 涟漪圈与柔光同基准方；圆态用 `side` 的半边（它比 boxRect 少一层状态放大）
+            let ringRadius = isCircle ? side / 2
+                : (taskState == .running ? Self.runningCornerRadius
+                   : taskState == .completed ? Self.completedCornerRadius
+                   : boxSide * 0.22)
             for layer in [ring1, ring2] {
                 layer.frame = rect
-                layer.cornerCurve = .continuous
-                layer.cornerRadius = taskState == .running ? Self.runningCornerRadius
-                    : taskState == .completed ? Self.completedCornerRadius
-                    : boxSide * 0.22
+                layer.cornerCurve = isCircle ? .circular : .continuous
+                layer.cornerRadius = ringRadius
             }
             CATransaction.commit()
             // 中断态 icon 光晕增加 2pt 模糊（1pt → 3pt）；无状态/其它状态恢复基础值。
@@ -2081,8 +2083,9 @@ extension BalancePanelView {
                 // 光束圆盘按对角线放大 √2，自转扫到四角不留空洞
                 sweepBlur.frame = boxRect.insetBy(dx: -6, dy: -6)
                 sweepClip.frame = CGRect(x: 6, y: 6, width: boxSide, height: boxSide)
-                sweepClip.cornerCurve = .continuous
-                sweepClip.cornerRadius = Self.runningCornerRadius
+                // 扫描裁切框与柔光同形：圆态 = 正圆（光束在圆内扫），方态 = 进行中圆角常量
+                sweepClip.cornerCurve = isCircle ? .circular : .continuous
+                sweepClip.cornerRadius = isCircle ? boxSide / 2 : Self.runningCornerRadius
                 let discSide = boxSide * 1.4142
                 sweepDisc.frame = CGRect(x: (boxSide - discSide) / 2, y: (boxSide - discSide) / 2,
                                          width: discSide, height: discSide)
@@ -2113,20 +2116,24 @@ extension BalancePanelView {
             refreshCarveMask()
         }
 
-        // MARK: 状态层中心挖空（2026-09-16 用户要求）
+        // MARK: 状态层形状与中心挖空
 
-        /// 状态层的**形状蒙版源**：卡片在「无边框图标」模式下 icon 是裸 SVG logo，而状态层
-        /// （柔光 / 涟漪 / 扫描）是比 icon 外扩的圆角方块 —— 需要在图标位置让位。
-        /// 故用 **PNG 版图标**（带 squircle 底板，与 icon 同心同尺寸）的轮廓作**挖空区**：
-        /// 蒙版 = 白底 + 该轮廓挖空 ⇒ 状态层**只保留圆角图标轮廓之外的外圈**，中心不显示。
-        /// nil = 不裁（默认 PNG icon 模式：icon 自身就是 squircle，状态层与它同形，无需让位）。
-        var carveMaskImage: NSImage? {
+        /// 状态层形状（2026-09-17 用户要求）：默认 `.squircle` = 圆角方 —— 与 **PNG icon**
+        /// （Icon Composer 底板 = squircle）同形，icon 底板自己就盖住了中心，无需挖空；
+        /// `.circle` = 卡片 icon 走 **SVG 原图**（「无边框图标」模式）时用：
+        /// 轨迹（柔光 / 双涟漪 / 扫描裁切框）一律成正圆，中心也不再按图标轮廓挖，
+        /// 直接挖一个**与 icon 内切的同心圆**（裸 SVG logo 没有可比的底板轮廓，
+        /// 方形挖空会留一圈「方角套着圆标」的错位感）。
+        enum Shape { case squircle, circle }
+
+        var shape: Shape = .squircle {
             didSet {
-                guard oldValue !== carveMaskImage else { return }
-                carveRetries = 0        // 形状源换了 → 重试预算重置
+                guard oldValue != shape else { return }
+                carveRetries = 0        // 形状换了 → 重试预算重置
                 needsLayout = true
             }
         }
+
         /// 蒙版形状的**位置源**（weak）：每次 layout 按它实时换算 icon 在本视图里的 frame，
         /// 避免建卡阶段布局未定时算出的坐标被冻结（字号 / 行高变化后仍跟得上）
         weak var carveIconView: NSImageView? {
@@ -2139,6 +2146,12 @@ extension BalancePanelView {
         /// 状态层会溢出 ring，蒙版覆盖不到的地方会被一并裁掉。取 24pt —— 覆盖涟漪最大
         /// scale 扩散（外溢约 10pt）+ 扫描模糊弥散 + 余量。
         private static let carvePad: CGFloat = 24
+
+        /// 中心挖空开关（2026-09-17 用户「去掉蒙版试试」⇒ **停用**）：
+        /// `false` = 状态层画满整圈（柔光 / 涟漪 / 扫描完整可见，logo 叠在其上）；
+        /// `true` = 用与 icon 内切的同心圆挖掉中心（2026-09-16 至 09-17 的旧行为）。
+        /// 改回 `true` 即恢复挖空，其余代码不用动（`.squircle` 模式本来就从不挖）。
+        private static let carvesIconCenter = false
 
         /// ⚠️ 建卡/换图与 icon 落位**不在同一轮布局**里（异步建卡更明显）：首次 `layout()` 时
         /// icon 的 frame 还是 0 → 算出无效 icon frame 只能放弃，而 ring 自身尺寸没变、不会再有
@@ -2154,12 +2167,13 @@ extension BalancePanelView {
             }
         }
 
-        /// 构建/更新形状蒙版：**白底 + 用 PNG 图标轮廓挖空**（`destinationOut` 按源 alpha 挖）。
+        /// 构建/更新形状蒙版：**白底 + 中心圆形挖空**（`destinationOut` 按源 alpha 挖）。
+        /// 只在 `.circle`（SVG 原图 icon）下挂载 —— `.squircle` 模式 icon 自带底板，无需让位。
         /// 蒙版挂 `layer.mask`（最外层）⇒ 柔光 / 涟漪 / 扫描连同各自的高斯模糊弥散一起被裁，
         /// 不会「形状裁了、糊边留下」。坐标系：视图与位图 context 同为 y 向上、原点左下，
         /// icon frame 直传即可（已离线验证不上下翻转）。
         private func refreshCarveMask() {
-            guard let img = carveMaskImage, let iv = carveIconView,
+            guard Self.carvesIconCenter, shape == .circle, let iv = carveIconView,
                   bounds.width > 1, bounds.height > 1 else {
                 if layer?.mask != nil { layer?.mask = nil }
                 carveMaskKey = nil
@@ -2176,15 +2190,20 @@ extension BalancePanelView {
             // 扫描模糊弥散），落在 mask 覆盖范围之外的内容同样会被裁掉（2026-09-16 用户
             // 「外圈被裁剪」的根因）。故四周各留 carvePad，白底铺满整个蒙版范围。
             let maskRect = bounds.insetBy(dx: -Self.carvePad, dy: -Self.carvePad)
-            let key = "\(maskRect)|\(iconFrame)|\(ObjectIdentifier(img))|\(scale)"
+            // 挖空圆 = **与 icon 内切**的同心圆（直径取 icon frame 的短边）：圆环带宽度与
+            // 方形时代同口径（外圈 − icon 边长）/2，只是把方角收成圆
+            let carveDiameter = min(iconFrame.width, iconFrame.height)
+            let carveCircle = CGRect(x: iconFrame.midX - carveDiameter / 2,
+                                     y: iconFrame.midY - carveDiameter / 2,
+                                     width: carveDiameter, height: carveDiameter)
+            let key = "circle|\(maskRect)|\(carveCircle)|\(scale)"
             if key == carveMaskKey { return }
             let pw = Int((maskRect.width * scale).rounded())
             let ph = Int((maskRect.height * scale).rounded())
             guard pw > 0, ph > 0,
                   let ctx = CGContext(data: nil, width: pw, height: ph, bitsPerComponent: 8,
                                       bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
-                  let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
                 return
             }
             ctx.scaleBy(x: scale, y: scale)
@@ -2196,9 +2215,9 @@ extension BalancePanelView {
             // maskRect 本身就定义在视图坐标系里，直接拿来铺即对齐。
             ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
             ctx.fill(maskRect)
-            // destinationOut：按源 alpha 挖掉目标 —— PNG 的 squircle 区即「不显示状态层」的区
+            // destinationOut：按源 alpha 挖掉目标 —— 圆内即「不显示状态层」的区（logo 让位）
             ctx.setBlendMode(.destinationOut)
-            ctx.draw(cg, in: iconFrame)
+            ctx.fillEllipse(in: carveCircle)
             ctx.setBlendMode(.normal)
             guard let out = ctx.makeImage() else { return }
             CATransaction.begin()

@@ -53,10 +53,19 @@ final class TokenStoreCache {
         timer = t
     }
 
+    /// 每轮后台重建完成后的通知（**主线程**回调）。
+    /// 存在的理由（2026-09-17）：卡片副标题的 tok/s 是走 `cachedIfBuilt` 的**同步只读**，
+    /// 缓存重建完若没人叫面板重画，那一格要等到下一次面板刷新才跟上 —— 观感就是
+    ///「刚打开时 tok/s 半天不出来」。宿主在预热处注册它，回调里刷面板。
+    var onRefresh: ((TokenSummary?) -> Void)?
+
     /// 后台重建缓存并补发挂起回调（构建失败也落缓存，防反复重扫）
     private func refresh() {
         let s = build()
         cached = (s, Date())
+        if let notify = onRefresh {
+            DispatchQueue.main.async { notify(s) }
+        }
         guard !pending.isEmpty else { return }
         let callbacks = pending
         pending.removeAll()
@@ -508,6 +517,8 @@ enum ZcodeTokenStore {
     static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
+    /// 每轮缓存重建完成后的通知（宿主刷面板用；见 `TokenStoreCache.onRefresh`）
+    static func onRefresh(_ f: @escaping (TokenSummary?) -> Void) { cache.onRefresh = f }
     /// 已构建缓存的同步只读（nil = 尚未构建过）：卡片副标题 tok/s 用
     static func cachedSummary() -> TokenSummary? { cache.cachedIfBuilt }
 
@@ -627,8 +638,11 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     private var inlineCoinSettingsArt: CoinLogoArt = CoinSVG.ghoPreset
     /// 总计占位 loading：数据未到时替代「—」横杆（2026-09-09 用户指定）
     private let totalSpinner = NSProgressIndicator()
-    /// 大数字基准字号（2026-09-16 用户指定由 26 缩 10%）与字距增量（em，加宽，同日指定）
-    private static let totalBaseSize: CGFloat = 26 * 0.9
+    /// 大数字基准字号与字距增量（em，加宽，同日指定）。
+    /// 沿革：26 →（2026-09-16「缩 10%」）23.4 →（2026-09-17「字号增加 5%」）24.57 → **直接定 24.6**
+    ///（用户「26 * 0.9 * 1.05 改为 24.6pt」：算式换算来的值以后要按字面量维护，别再叠系数）。
+    /// ⚠️ 只动**主面板**这一档；设置窗口图卡里那串示例值走 `AppSettingsView.tokenValueScale`，是另一条口径
+    private static let totalBaseSize: CGFloat = 24.6
     private static let totalTrackingEm: CGFloat = 0.02
     /// 大数字当前字号（超宽逐级缩 基准→15；字号变化才重新 configure）
     private var totalNumberSize: CGFloat = TokensPanelView.totalBaseSize
@@ -1012,7 +1026,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         inlineCoin.logoInverted = s.logoInverted
         inlineCoin.restingTilt = s.restingTilt
         inlineCoin.restingRotation = s.restingRotation
-        inlineCoin.turns = Int(s.turns.rounded())
+        inlineCoin.turns = s.turns
         inlineCoin.isHidden = false
         needsLayout = true
     }
@@ -1138,8 +1152,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         var size = Self.totalBaseSize
         // 度量须用实际渲染字体（PanelFont 与 totalRollView 同源）：Sharp Grotesk /
         // 等宽数字档按比例系统字体测宽会低估，超宽数字溢出版心；字距增量按当前档
-        // 字号折算一并计入（advance 度量不含 tracking），系统 SF 档的 −0.01em 紧缩
-        // 不抵扣（保守侧：宁早缩不溢出）
+        // 字号折算一并计入（advance 度量不含 tracking），系统 SF 档的紧缩
+        // （`RollingNumberView.sfSlotTrackingEm`，现 −0.02em）不抵扣（保守侧：宁早缩不溢出）
         while size > 15,
               text.size(withAttributes: [.font: PanelFont.font(size: size, weight: .semibold, monoDigits: true)]).width
                 + CGFloat(max(0, text.count - 1)) * size * Self.totalTrackingEm > availWidth {
@@ -1738,12 +1752,15 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     // MARK: 词元活动热力图
 
-    /// 词元活动：标题 + 每日/每周切换 + 圆角方块点阵（用量越多越亮）。
+    /// 区块标题 + 每日/每周切换 + 圆角方块点阵（用量越多越亮）。
     /// 每日 = 7 行（周一→周日）× 26 周列；每周 = 单行 26 点（每周合计）。
-    /// topY/gridTop 由锚点链传入（activityTitleTop/activityGridTop），与 intrinsic 同源
+    /// topY/gridTop 由锚点链传入（activityTitleTop/activityGridTop），与 intrinsic 同源。
+    /// ⚠️ 标题文案 2026-09-17 用户连改三次：`词元活动` → `Token activity` → `Token活动` → **`Token 活动`**
+    ///（最后一次是「中间加间隔」= 补一个半角空格，与同一行右侧的「每日 / 每周」同一语言；
+    ///  标题左对齐、切换器右对齐，改文案不会互相顶到）
     private func drawActivitySection(topY: CGFloat, gridTop gridTopAnchor: CGFloat, labelFont: NSFont,
                                      labelColor: NSColor, titleColor: NSColor) {
-        drawText("词元活动", at: NSPoint(x: insets.left, y: topY),
+        drawText("Token 活动", at: NSPoint(x: insets.left, y: topY),
                  font: makeTitleFont(), color: titleColor)
 
         // 右上角切换：选中 = 主前景，未选中 = 次级灰
@@ -2345,12 +2362,13 @@ extension BalancePanelView {
             var switched = false
             if view.source != source {
                 view.beginSwitchTransition()   // 启动平台切换动效
+                // ⚠️ 这一行赋值**本身就会转一次币**：`source` 的 didSet → `swapInlineCoinLogoOnSpin()`
+                // → `inlineCoin.spin()`（转过 90° 才换 logo，转的就是 Motion 区 Turns 那个 `turns`）。
+                // 所以这里**不许再补一发 `spinInlineCoin()`** —— 2026-09-17 用户报「硬币转动 turns
+                // 要遵循设置参数」的根因就是两发叠在一起：转出来是 2×turns（turns=1 转两圈、
+                // turns=3 转六圈）。换平台的转动**只有 didSet 那一个来源**。
                 view.source = source
                 switched = true
-                // 换数据（hover Agent 卡片 / 离开回落）落地这一拍：大数字左边的小硬币也自转一圈
-                //（用户 2026-09-11 指定）。放在这里而不是 confirmTokensHover：只有**真的换了平台**
-                // 才转——同平台重复确认、取数期间来回 hover 都不会乱转。
-                view.spinInlineCoin()
                 // 注意：不在此清 summary——大数字要从旧平台值滚动到新值（slideNextTotalRoll），
                 // 先清会落 "—" 使滚动起点丢失。无数据的收尾清理由下方 guard else 分支接管
             }

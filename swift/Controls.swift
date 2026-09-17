@@ -573,7 +573,7 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
     /// hover 时是否对灰色文本/tint 做提亮（false = 仅背景变化，用于用量行等）
     var enablesTextBrightening: Bool = true
     /// hover 时是否绘制发丝边框（与余额卡片 HoverCard 同一套 Palette：常态 hoverBorderNormal、
-    /// hover 提亮到 hoverBorderBright，统一 1.2pt borderWidth，0.22s 渐变）。仅用量行启用，
+    /// hover 提亮到 hoverBorderBright，线宽统一读 `Palette.cardBorderWidth`（现 1.0pt），0.22s 渐变）。仅用量行启用，
     /// 设置卡片行保持纯平态。开启时预设 borderColor 避免首帧从黑边渐变。
     var enablesHoverBorder: Bool = false {
         didSet {
@@ -773,7 +773,7 @@ final class HoverRowView: NSView, PanelScrollHoverSync {
             if layer?.borderColor == nil {
                 layer?.borderColor = Palette.borderCGColor(Palette.hoverBorderNormal, in: self)
             }
-            // 与余额卡片 HoverCard 同款：统一 1.2pt + hoverBorderBright 描边
+            // 与余额卡片 HoverCard 同款：线宽统一读 `Palette.cardBorderWidth` + hoverBorderBright 描边
             animateLayerKey(layer, keyPath: "borderWidth", to: Palette.cardBorderWidth)
             animateLayerKey(layer, keyPath: "borderColor",
                             to: Palette.borderCGColor(Palette.hoverBorderBright, in: self))

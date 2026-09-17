@@ -58,13 +58,15 @@ struct PanelSnapshot: Equatable {
     var lastCheckinTime: String?
     var refreshIntervalSeconds: Int = 300
     /// 面板底色遮罩色（同步自配置；alpha = 0 即无遮罩，露出原生玻璃）
-    var panelBackgroundColor: PanelBackgroundColor = .default
+    /// ⚠️ 下面的初值 = `PanelBackgroundColor.factory*`（2026-09-17 出厂默认固化那套）；
+    /// 实际值由 `update(config:)` 同步覆盖，初值只兜「尚未同步」的那一瞬
+    var panelBackgroundColor: PanelBackgroundColor = .factoryPanelBackground
     /// 遮罩**底端**不透明度（同步自配置；顶端用 panelBackgroundColor 自身的 alpha，两端各自独立）
-    var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
+    var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha
     /// 浅色主题开关（同步自配置；开启时强制浅色外观，优先级高于渐变开关）
     var lightThemeEnabled = false
     /// 卡片主标题字号（pt，同步自配置；设置窗口「主题外观 → 卡片」开放，10…16 步进 0.5）
-    var cardTitleFontSize: Double = 13
+    var cardTitleFontSize: Double = 13.5
     /// 卡片主标题 Sharp Grotesk（本机安装的商业字体；未装该字重回落系统字体）。
     /// 字重×宽度**已固定** Book20（见 cardTitleSGPostScriptName），不再开放档位。
     /// ⚠️ 主副标题行距系数（SF/SG）**已固化**（2026-09-15 用户）：不再是快照字段，
@@ -80,12 +82,8 @@ struct PanelSnapshot: Equatable {
     var iconNoBorder = false
     /// 自动检查更新开关（GitHub Releases 启动静默检查）
     var updateAutoCheckEnabled = true
-    /// 数值滚动「滑移」时长口径（同步自配置；设置窗口「主题外观 → 动效」单选）。
-    /// 消费点 = `RollingNumberView.slideTiming` 静态镜像（本面板 update 处落值）
-    var rollSlideTiming: RollSlideTiming = .wheelTail
-    /// 数值滚动时间曲线档位（同步自配置；设置窗口「主题外观 → 动效」单选）。
-    /// 消费点 = `RollingNumberView.curve` 静态镜像（本面板 update 处落值）
-    var rollCurve: RollCurve = .easeIn
+    // 数值滚动的滑移时长口径 / 时间曲线档位两字段 2026-09-17 随「动效的参数固化」移除：
+    // 定稿值在 `RollingNumberView.slideTime()` 与 `rollEase(_:)` 里，不再随配置同步
 }
 
 /// 副标题右侧 meta 的变化方向（2026-09-13）：up/down 选上下箭头；
@@ -224,11 +222,17 @@ enum Palette {
     static let cardForeground = NSColor(name: nil) { appearance in
         resolvedCardForeground(dark: appearance.isDark)
     }
+    /// **主前景色的运行时镜像**（2026-09-17 随参数开放新增，nil = 内置两档）：
+    /// 写入点 = AppDelegate 启动载入配置、设置窗口色盘落值、预设应用三处（同 `panelBackgroundActive` 模式）。
+    /// `cardForeground` 的 provider 绘制时读它 ⇒ 落值后让视图重绘即换色
+    static var foregroundActive: PanelBackgroundColor?
+
     /// 按**指定深浅档**取主前景色（静态色，不随绘制环境变）：供「无边框图标」的 SVG 模板着色用 ——
     /// 那里要的是「图标深浅互换」解出来的档，可能与视图当前生效外观相反，动态色做不到这件事。
-    /// 色号单一定义在 `PanelForegroundColor`（SettingsUI），设置窗口的预设图标读同一份
+    /// 色号单一定义在 `PanelForegroundColor`（SettingsUI），设置窗口的预设图标读同一份；
+    /// 解算时带上**当前生效的自选色**（nil = 内置两档）
     static func resolvedCardForeground(dark: Bool) -> NSColor {
-        PanelForegroundColor.resolved(dark: dark)
+        PanelForegroundColor.resolved(dark: dark, override: foregroundActive)
     }
     /// 非当前账号前景色：深色石墨灰（用户定稿 0.61）/ 浅色 0.42
     static let cardForegroundDimmed = NSColor(name: nil) { appearance in
@@ -447,7 +451,8 @@ enum Palette {
     /// 当前生效的「面板背景色」遮罩（config 的运行时镜像）：副前景色按它解算对比度，
     /// 与主面板 applyGradient 画的是同一份取值。**写入点只有两个**（与 lightThemeActive 同处）：
     /// AppDelegate 启动载入配置处、设置窗口色盘落值 / 浅色主题翻转处。
-    static var panelBackgroundActive: PanelBackgroundColor = .default
+    /// ⚠️ 初值 = 出厂默认那套（`factoryPanelBackground`，2026-09-17 固化）；实际值由启动载入覆盖
+    static var panelBackgroundActive: PanelBackgroundColor = .factoryPanelBackground
     /// 自建顶层窗口的统一外观（nil = 跟随系统），与 panelAppearance 同口径
     static var topLevelWindowAppearance: NSAppearance? {
         panelAppearance(lightTheme: lightThemeActive)
@@ -532,8 +537,9 @@ enum Palette {
     /// 2026-09-07 由 #262626 提亮）；浅色主题开关会把明度翻转。
     /// 值来自运行镜像（Config 装载 / 色盘落值时写），动态色只在绘制时解算 ⇒
     /// 改值后靠 `Panel.refreshDotMatrixAndHoverMaterials()` 整树重绘落屏。
-    /// ⚠️ 用户改的颜色一律**原样**用（用户选什么就是什么，不再按外观分档）
-    static var secondaryBackgroundActive: PanelBackgroundColor = .secondaryBackgroundDefault
+    /// ⚠️ 用户改的颜色一律**原样**用（用户选什么就是什么，不再按外观分档）。
+    /// 初值 = 出厂默认那套（`factorySecondaryBackground`，2026-09-17 固化）；实际值由启动载入覆盖
+    static var secondaryBackgroundActive: PanelBackgroundColor = .factorySecondaryBackground
     static let secondaryBackground = NSColor(name: nil) { _ in secondaryBackgroundActive.nsColor }
     /// Token 热力图 hover 高亮环（深 白@90% / 浅 黑@70%）
     static let heatDotRing = NSColor(name: nil) { appearance in
@@ -616,9 +622,11 @@ enum Palette {
             ? NSColor.white.withAlphaComponent(0.16)
             : NSColor.black.withAlphaComponent(0.15)
     }
-    /// 卡片边框宽度 1.2pt（2026-09-12 用户定稿：1pt → 1.2pt → 1.7pt → 1.5pt → 1.2pt；
-    /// 由共享 hover 材质描边 / 拖拽 ghost / 各预设点统一引用）
-    static let cardBorderWidth: CGFloat = 1.2
+    /// 卡片边框宽度（hover 态那圈发丝描边）：2026-09-12 定稿 1.2pt（沿革 1 → 1.2 → 1.7 → 1.5 → 1.2），
+    /// **2026-09-17 用户「卡片 hover 时边框宽度缩小 0.2pt」→ 1.0pt**。
+    /// 由共享 hover 材质描边 / 拖拽 ghost / 用量行 / 各预设点统一引用 —— 改这一个数，全站 hover 边框一起走。
+    /// ⚠️ `AppSettingsView.presetThumb` 里那圈**图卡**描边不读这里（按图卡尺寸单独折算，见该处注释）
+    static let cardBorderWidth: CGFloat = 1.0
     /// 卡片主标题字号：2026-09-13 起由设置窗口「主题外观 → 卡片」开放（config.cardTitleFontSize，
     /// 默认 13pt），经 registerCardTitle/applyCardTitleFont 就地下发，不再走本常量；
     /// 数值字号仍固定 13pt（balanceContentRow 内 registerRollingNumber 字面量）。
@@ -693,13 +701,48 @@ enum PanelFont {
     /// SG 档运行镜像（与 `Palette.lightThemeActive` 同款全局状态）。
     /// 静态上下文（`SmallTable` / 自绘层）也要能解析字体，故不放视图实例上。
     /// 写入点两处：AppDelegate 启动载入配置处、`BalancePanelView.update` 同步快照处
-    static var sharpGroteskActive = false
+    /// （开关翻成 true 时顺手注册随包字体，见 `ensureSGRegistered`）
+    static var sharpGroteskActive = false {
+        didSet { if sharpGroteskActive { ensureSGRegistered() } }
+    }
     /// 固定档 PostScript 名（Book20）：字重与宽度档已固定，不再开放（见
     /// `BalancePanelView.cardTitleSGPostScriptName` 注释）
     static let sgPostScriptName = "SharpGrotesk-Book20"
     /// 解析缓存：键 = 字号 | 字重（含 descriptor 属性合并，值得缓存）。
     /// 组合数 = 面板用到的字号 × 3 档字重，量级几十，不需要淘汰
     private static var cache: [String: NSFont] = [:]
+
+    /// SG 随包字体是否已注册（幂等标记）
+    private static var sgRegistered = false
+
+    /// **把 SG 字体注册进本进程**（首次取 SG 字体时调一次）。
+    ///
+    /// 2026-09-17 用户「SG字体需要打包进App里」：此前字体只在**本机字体库装过它的机器**上命中
+    ///（`NSFont(name:)` 直接查系统字体库），没装的机器静默回落系统字体 —— 换个机器 SG 开关就失效。
+    /// 现在字体文件随包走：`swift/fonts/SharpGrotesk-Book20.otf` → `build.sh` 的 `fonts/*.otf`
+    /// 拷贝规则带进 `Resources/` → 这里 `CTFontManagerRegisterFontsForURL(.process)` 注册。
+    ///
+    /// ⚠️ 与隔壁 `MonoFontProvider.register()` 同一套做法（那里也是 `font()` 里懒调用）：
+    /// 放在 `font()` 里而不是启动处，是为了「不开 SG 就不读这份字体」。
+    /// ⚠️ 商用字体（Commercial Type 的 Sharp Grotesk）：**随包发布等于再分发**，
+    /// 对外发版前确认授权范围（JetBrainsMono 那份是 OFL，无此问题）。
+    ///
+    /// 调用点两处：`sharpGroteskActive` 的 didSet（开关翻 true）+ 启动时的无条件一次
+    ///（`AppDelegate` 启动流程）—— 后者是为了**设置窗口的预设图卡**：它按预设自己记的 SG 开关画字，
+    /// 与主面板那个开关无关，只靠 didSet 会在「主面板关着 SG、图卡要画 SG」时命中不了。
+    static func ensureSGRegistered() {
+        guard !sgRegistered else { return }
+        sgRegistered = true
+        guard let url = Bundle.main.url(forResource: sgPostScriptName, withExtension: "otf")
+            ?? Bundle.main.url(forResource: sgPostScriptName, withExtension: "ttf") else {
+            Logger.log(.layout, "[Font] SG 字体不在 bundle 里（fonts/*.otf 没打进 Resources？）")
+            return
+        }
+        var err: Unmanaged<CFError>?
+        let ok = CTFontManagerRegisterFontsForURL(url as CFURL, .process, &err)
+        Logger.log(.layout, "[Font] SG 注册 \(ok ? "成功" : "失败")：\(url.lastPathComponent)"
+                   + (ok ? "" : " — \(err.map { String(describing: $0.takeRetainedValue()) } ?? "未知错误")"))
+    }
 
     /// 系统档字体（原 `BalancePanelView.uiFont` 口径；SG 关闭 / 本机未装 SG 时也走这里）
     static func system(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
@@ -723,7 +766,12 @@ enum PanelFont {
     /// `monoDigits` 只在系统档有意义 —— SG 的数字是**比例数字**（实测 "0" 9.035 /
     /// "1" 5.863，且 tnum 特性档不存在），等宽列靠各自右对齐保证对齐
     static func font(size: CGFloat, weight: NSFont.Weight = .regular, monoDigits: Bool = false) -> NSFont {
-        guard sharpGroteskActive, let base = NSFont(name: sgPostScriptName, size: size) else {
+        guard sharpGroteskActive else {
+            return system(size: size, weight: weight, monoDigits: monoDigits)
+        }
+        // 随包字体先注册（幂等；此前只在装了该字体的机器上能命中，见 ensureSGRegistered）
+        ensureSGRegistered()
+        guard let base = NSFont(name: sgPostScriptName, size: size) else {
             return system(size: size, weight: weight, monoDigits: monoDigits)
         }
         let key = "\(size)|\(weight.rawValue)"
@@ -1682,10 +1730,11 @@ final class BalancePanelView: NSView {
     var usageRowTopInset: CGFloat { SmallTable.rowInset }
     var usageRowBottomInset: CGFloat { SmallTable.rowInset }
 
-    /// 面板底色遮罩色状态（update 同步；VC 读取决定遮罩配色）
-    private(set) var panelBackgroundColor: PanelBackgroundColor = .default
+    /// 面板底色遮罩色状态（update 同步；VC 读取决定遮罩配色）。
+    /// 初值 = 出厂默认（`factoryPanelBackground`，2026-09-17 固化），实际值由 update(config:) 覆盖
+    private(set) var panelBackgroundColor: PanelBackgroundColor = .factoryPanelBackground
     /// 遮罩底端不透明度（update 同步；顶端用 panelBackgroundColor.alpha，两端各自独立）
-    private(set) var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
+    private(set) var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha
     /// 浅色主题开关状态（update 同步；优先级高于渐变——开启即强制浅色外观）
     private(set) var lightThemeEnabled = false
     // ── 主副标题行距系数「固化档」（2026-09-15 用户：「固化这两个参数 然后在 forms 里隐藏调教」）──
@@ -1919,11 +1968,7 @@ final class BalancePanelView: NSView {
         cardTitleFontSize = s.cardTitleFontSize
         cardTitleSharpGrotesk = s.cardTitleSharpGrotesk
         PanelFont.sharpGroteskActive = s.cardTitleSharpGrotesk
-        // 滑移时长口径运行镜像（与 PanelFont.sharpGroteskActive 同款模式）：
-        // RollingNumberView 实例不自持设置，rebuild 时静态读本镜像
-        RollingNumberView.slideTiming = s.rollSlideTiming
-        // 滚动时间曲线档位镜像（同上）：逐帧静态解析，切档对下一次滚动立即生效
-        RollingNumberView.curve = s.rollCurve
+        // 滑移时长口径 / 时间曲线档位两处运行镜像 2026-09-17 已随「动效的参数固化」移除
         if titleFontChanged {
             applyCardTitleFont()
             applyPanelFonts()
@@ -3497,6 +3542,25 @@ final class BalancePanelView: NSView {
             stack.append(contentsOf: v.subviews)
         }
     }
+    /// **主前景色变更后的就地重刷**（2026-09-17 随参数开放新增，与上面的 `refreshSecondaryForeground`
+    /// 同一条整树标脏思路）：
+    /// - 绝大多数消费点是**动态色**（`Palette.cardForeground` 在绘制时经 provider 重解算
+    ///   `PanelForegroundColor.resolved(dark:override:)`，读的就是运行镜像）⇒ 标 `needsDisplay` 即换色；
+    /// - 两处是**定格值**，必须显式重灌：① 菜单栏显隐圆点（`CardMenuBarDotView` 的 layer 底色
+    ///   cgColor 在 layout 时落 → 标 `needsLayout`）；② 卡片品牌 icon 的着色
+    ///   （`resolvedCardForeground` 静态档 → `swapBrandIconsInPlace()` 整树换图）
+    func refreshCardForeground() {
+        var stack: [NSView] = [self]
+        while let v = stack.popLast() {
+            // 数字带（卡片余额数值 / Token 总计）是**烘色位图**，标脏不够 → 显式重建
+            if let r = v as? RollingNumberView { r.refreshForegroundColor() }
+            v.needsDisplay = true
+            v.needsLayout = true
+            stack.append(contentsOf: v.subviews)
+        }
+        swapBrandIconsInPlace()
+    }
+
     /// 点阵色相/饱和度/明度变化就地重绘：热力图印章/淡变位图与卡片点阵均烘色，须清缓存重绘
     ///（同外观切换钩子口径）；UsageDots 两形态（横条层/竖点阵）统一走
     /// refreshHeatColors（2026-09-07 长进度卡片进度色泛化后含层路径）。

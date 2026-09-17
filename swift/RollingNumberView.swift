@@ -12,8 +12,9 @@
 //   - 所有槽宽取字形精确 advance（不 ceil）——逐槽连续排布 == 连续文本排版，
 //     消除逐槽取整累积出的额外字距（实测 "1,234.56" Inter 13pt：精确 54.5pt vs 逐槽 ceil 60pt）；
 //   - 默认字体（系统 SF）下槽间另施固定负字距 slotTracking（2026-09-13 用户要求
-//     字距收一点；Mono / Sharp Grotesk 不施）：槽宽本身仍 = advance，收紧只发生在
-//     排布推进量上，数字轮裁剪窗口与右缘 advance 对齐口径均不受影响；
+//     字距收一点 → 2026-09-17「减小默认字体下数值滚动的字体间距」再收到 **−0.02em**，
+//     唯一旋钮 `sfSlotTrackingEm`；Mono / Sharp Grotesk 不施）：槽宽本身仍 = advance，
+//     收紧只发生在排布推进量上，数字轮裁剪窗口与右缘 advance 对齐口径均不受影响；
 //   - 数字位槽宽 = **当前显示数字的真实 advance**（非 tabular 统一位宽）：
 //     比例数字字体（Inter 默认数字 "1"=5.5 vs "0"=8.58）下静止排版与单 label 完全一致；
 //     滚动时槽宽由车轮的连续滚动位置推导（与滚动同参数插值）——右缘固定、
@@ -39,11 +40,10 @@
 // rollDuration 预算；行进距离不同的位到达时刻天然错开（异步落定，里程表观感：
 // 各轮转到自己的数字就停，不等别的轮）。每轮再有 ±6% 确定性相位抖动，
 // 打破「行进距离恰好相同」的车轮之间的同步。
-// 时间曲线 = 设置窗口「主题外观 → 动效 → 动效曲线」单选的三档之一
-// （默认 ease-in cubic「从慢到快」；2026-09-16 用户要求开放为设置项）：
+// 时间曲线 = **定稿「从快到慢」ease-out cubic**（2026-09-16 开放为设置项，2026-09-17
+// 用户「动效的参数固化，移除参数开放」后固定回常量）：
 // 位 / 宽度 / 滑移三条量必须共用同一条曲线（不同形会在中段错速，
-// 让宽度低于可见宽数字的 advance 造成裁剪）。解析唯一入口 `rollEase(_:)`，
-// 运行镜像 `RollingNumberView.curve`（宿主在配置装载 / 面板快照同步处落值）。
+// 让宽度低于可见宽数字的 advance 造成裁剪）。解析唯一入口 `rollEase(_:)`。
 // 中途改目标（新数据打断未完的滚动）时，从所在的连续位置重新规划 tween，天然续接。
 // 滚动期间每帧重排 slots（数字右缘固定、左缘随槽宽插值平移——比例数字字体下的
 // 自然滚动观感）。槽宽由「过渡中贴住较宽数字」的 C¹ 曲线唯一推导：滚过的数值
@@ -65,9 +65,11 @@ private func smoothstep(_ x: Double) -> Double {
     return c * c * (3 - 2 * c)
 }
 
-/// 数字滚动的**时间曲线解析唯一入口**（2026-09-16 用户要求开放为设置项，
-/// 此前硬写死 ease-in cubic）。档位由设置窗口「主题外观 → 动效 → 动效曲线」选，
-/// 运行镜像 = `RollingNumberView.curve`（与 `slideTiming` 同址落值）。
+/// 数字滚动的**时间曲线解析唯一入口**。
+/// ⚠️ 2026-09-17 用户「动效的参数固化，移除参数开放」：档位**固定为「从快到慢」（ease-out cubic）**——
+/// 定稿值 = 固化那一刻配置里的选择（`roll_curve` = easeOut），于是 config 键、设置窗口「动效曲线」
+/// 单选、运行镜像 `RollingNumberView.curve` 一并移除（与「主副标题行距系数」同一条固化做法）。
+/// 备选口径的算式留在函数里当注释，要换就改 return 那一行。
 ///
 /// ⚠️ 四条量必须共用本函数：`DigitWheelView.advance`（车轮位置）/
 /// `delayedWidthPos`（宽度专用位置）/ `updateLayoutWidth`（排布理想宽）/
@@ -76,12 +78,10 @@ private func smoothstep(_ x: Double) -> Double {
 /// 单位换值的槽内滚字 / 横向位移另有自己的 ease-out（另一条动效语言，不随之改）。
 private func rollEase(_ x: Double) -> Double {
     let c = max(0, min(1, x))
-    switch RollingNumberView.curve {
-    case .easeIn:    return c * c * c                          // 从慢到快（单加速段）
-    case .easeOut:   return 1 - pow(1 - c, 3)                  // 从快到慢（单减速段）
-    case .easeInOut: return c < 0.5 ? 4 * c * c * c            // 慢-快-慢（标准对称式）
-                                     : 1 - pow(-2 * c + 2, 3) / 2
-    }
+    return 1 - pow(1 - c, 3)                    // 从快到慢（单减速段）：起手快、收尾长
+    // 备用口径（固化前由设置窗口「动效曲线」选）：
+    //   c * c * c                                            —— 从慢到快（单加速段）
+    //   c < 0.5 ? 4 * c * c * c : 1 - pow(-2 * c + 2, 3) / 2 —— 慢-快-慢（对称）
 }
 
 /// 像素网格对齐（2x 屏 = 0.5pt 步进）：位图槽/图层落在亚像素处会被合成器
@@ -333,6 +333,14 @@ final class DigitWheelView: NSView {
         appearance.performAsCurrentDrawingAppearance {
             self.renderStripBitmap()
         }
+    }
+
+    /// 主前景色镜像变化后的**强制重渲**（2026-09-17 随参数开放新增）：
+    /// 数字带是烘色位图，颜色在渲染时定格；而颜色源 `Palette.cardForeground` 是同一个
+    /// 动态色实例 —— `textColor` 的 didSet 相等守卫拦得住它，切主前景色时**不会自己重渲**，
+    /// 必须由 `Panel.refreshCardForeground()` 的整树遍历显式调到这里
+    func refreshForegroundColor() {
+        rebuildStrip()
     }
 
     private func renderStripBitmap() {
@@ -714,16 +722,9 @@ final class RollingNumberView: NSView {
 
     typealias FontProvider = (CGFloat, NSFont.Weight, Bool) -> NSFont
 
-    /// 滑移时长口径运行镜像（与 `PanelFont.sharpGroteskActive` 同款全局状态）：
-    /// 实例不自持设置，`rebuild` 时静态读它；写入点 = 面板快照同步处
-    /// （`BalancePanelView.update`）与 AppDelegate 启动载入配置处。
-    /// 只影响走 `slideOnRebuild: true` 的位数增减场景（Token 总计大数字的
-    /// 周期 / 平台切换），余额卡位数变化仍直接落值
-    static var slideTiming: RollSlideTiming = .wheelTail
-
-    /// 滚动时间曲线档位运行镜像（同 `slideTiming` 的机制）：`rollEase(_:)` 静态读它。
-    /// 每条 tween 在运行时逐帧按当前档位解析，所以切档**立刻生效**（下一次滚动即新曲线）
-    static var curve: RollCurve = .easeIn
+    // 自旋时长口径 / 时间曲线档位两处运行镜像（`slideTiming` / `curve`）2026-09-17 已随
+    // 「动效的参数固化」整体移除：真值改由本文件的 `slideTime()` 与 `rollEase(_:)` 两个常量口径
+    // 唯一提供，不再有全局可写状态（与「主副标题行距系数」固化成 `BalancePanelView` 常量同一条做法）
 
     // —— 字体策略（由面板注入；configure 时恒被宿主覆盖，默认档只作未 configure 的占位）——
     private var specSize: CGFloat = 13
@@ -773,6 +774,11 @@ final class RollingNumberView: NSView {
     /// （2026-09-13）。随 refreshFont 按主字体重算；Mono / Sharp Grotesk 恒 0 保持
     /// 字体自带度量（fontName 带 "." 前缀 = 系统私有 SF 家族）
     private var slotTracking: CGFloat = 0
+    /// 系统 SF 档的槽间紧缩量（em，负 = 收紧）—— **收字距的唯一旋钮**。
+    /// 2026-09-13 首定 −0.01（用户「字距收一点」）；2026-09-17 用户「减小默认字体下
+    /// 数值滚动的字体间距」→ **−0.02**（13pt 下每槽多收 0.13pt，7 位数字串合计再紧 ~0.8pt）。
+    /// 与实例级 `trackingEm`（Token 总计大数字用来**加宽**）相加后乘字号，见 `refreshFont()`。
+    private static let sfSlotTrackingEm: CGFloat = -0.02
     /// 全数字最小左空档（lsb，随 refreshFont 重算）：数字轮护栏的固定扣除量之一
     private var minNeighborInkCache: CGFloat = 0
 
@@ -1018,7 +1024,8 @@ final class RollingNumberView: NSView {
         lineH = ceil(mainFont.ascender - mainFont.descender + mainFont.leading)
         prefixLineH = ceil(prefixFont.ascender - prefixFont.descender + prefixFont.leading)
         digitWidth = DigitWheelView.tabularWidth(mainFont)
-        slotTracking = mainFont.pointSize * (trackingEm + (mainFont.fontName.hasPrefix(".") ? -0.01 : 0))
+        slotTracking = mainFont.pointSize
+            * (trackingEm + (mainFont.fontName.hasPrefix(".") ? Self.sfSlotTrackingEm : 0))
         // 全数字最小左空档（lsb）：邻槽字形最坏的起笔位置；与 slotTracking 一起构成
         // 数字轮「排布宽需扣除的固定量」（护栏判据用，见 DigitWheelView.visibleInkGuard）
         minNeighborInkCache = (0...9).map {
@@ -1252,6 +1259,19 @@ final class RollingNumberView: NSView {
         }
     }
 
+    /// **主前景色镜像变化后的就地重渲**（2026-09-17 随参数开放新增）：
+    /// 数字带是烘色位图（颜色渲染时定格），且颜色源 `Palette.cardForeground` 是同一个
+    /// 动态色实例 —— `setTextColor` 那条路的 didSet 相等守卫不会触发，必须显式重建。
+    /// 卡片余额数值与 Token 总计大数字都是本类实例，调用点 = `Panel.refreshCardForeground()`
+    /// 的整树遍历（`refreshSecondaryForeground` 那种"标脏就行"对它们无效）
+    func refreshForegroundColor() {
+        for s in slots {
+            if let w = s.view as? DigitWheelView { w.refreshForegroundColor() }
+            else if let t = s.view as? TextSlotView { t.needsDisplay = true }
+        }
+        needsDisplay = true
+    }
+
     // —— 内部 ——
 
     /// 重建槽位（结构变化）。slideOnRebuild=false：直接落值（打开/后台刷新口径）。
@@ -1437,32 +1457,26 @@ final class RollingNumberView: NSView {
     private var slideElapsed: CFTimeInterval = 0
     private var slideDuration: CFTimeInterval = 0
 
-    /// 滑移时长（2026-09-16 用户「钳制」需求，本文件唯一计算入口）。
-    /// 原先恒取 `rollDuration`（默认 1.2s）而**与位移量无关** → 位数变化时整组平移
-    /// 明显拖在滚字后面（用户反馈）。口径由设置窗口「主题外观 → 动效」单选：
-    /// - `.wheelTail`：取本轮**数字轮里最长的 tween 时长**（共享角速度下最晚的落定
-    ///   时刻，已含各轮的实例相位抖动），下限 `Motion.rollSlideMin` —— 平移与滚字
-    ///   同拍收尾，不再拖在滚字之后；无轮滚动（纯位数变化）时走下限；
-    /// - `.distance`：按整组位移量 `|slideDelta|` 缩放，钳制在
-    ///   `rollSlideMin … rollSlideMax`（位移 ≤1 个数字宽取下限，≥3 个取上限）。
+    /// 滑移时长（唯一计算入口）。原先恒取 `rollDuration`（默认 1.2s）而**与位移量无关** →
+    /// 位数变化时整组平移明显拖在滚字后面（用户反馈），2026-09-16 落地两档口径；
+    /// ⚠️ **2026-09-17 用户「动效的参数固化，移除参数开放」：定稿为「跟随位移」**
+    ///（`roll_slide_timing` = distance），设置窗口的单选与 config 键随之移除。
+    /// 现行口径：按整组位移量 `|slideDelta|` 缩放，钳制在 `rollSlideMin … rollSlideMax`
+    /// （位移 ≤1 个数字宽取下限，≥3 个取上限；位移小就快、位移大也封顶）。
+    /// 固化前的另一档 `.wheelTail`（取本轮数字轮里最长的 tween 时长、与滚字同拍收尾）
+    /// 算式见下方注释 —— 要换回来把那几行接回去即可。
     /// 两档都不再看 `rollDuration` —— 它是滚字预算，与平移距离无关。
     private func slideTime() -> CFTimeInterval {
-        switch Self.slideTiming {
-        case .wheelTail:
-            var longest = 0.0
-            for s in slots {
-                if let w = s.view as? DigitWheelView {
-                    longest = max(longest, w.activeTweenDuration)
-                }
-            }
-            return max(Motion.rollSlideMin, longest)
-        case .distance:
-            // 一个数字宽的近似值：比例数字档实测 ≈0.62em（等宽档差异不影响量级）
-            let digitWidth = max(1, mainFont.pointSize * 0.62)
-            let steps = abs(slideDelta) / digitWidth
-            let p = min(1, max(0, (steps - 1) / 2))   // 1 个宽 → 0；≥3 个宽 → 1
-            return Motion.rollSlideMin + (Motion.rollSlideMax - Motion.rollSlideMin) * Double(p)
-        }
+        // 一个数字宽的近似值：比例数字档实测 ≈0.62em（等宽档差异不影响量级）
+        let digitWidth = max(1, mainFont.pointSize * 0.62)
+        let steps = abs(slideDelta) / digitWidth
+        let p = min(1, max(0, (steps - 1) / 2))   // 1 个宽 → 0；≥3 个宽 → 1
+        return Motion.rollSlideMin + (Motion.rollSlideMax - Motion.rollSlideMin) * Double(p)
+        // 备用口径（固化前由设置窗口「滑移时长」选）：
+        //   var longest = 0.0
+        //   for s in slots { if let w = s.view as? DigitWheelView {
+        //       longest = max(longest, w.activeTweenDuration) } }
+        //   return max(Motion.rollSlideMin, longest)
     }
 
     /// 滑移进度 0→1（曲线与数字滚动统一，同走 `rollEase`；

@@ -40,9 +40,33 @@ enum WBTokenStore {
     private static var fileCache: [String: FileContribution] = [:]
     private static var diskCacheLoaded = false
 
-    /// 增量缓存落盘位置（App Support/wb-tokens-filecache-v3.json）；
-    /// v3 = FileContribution 增加 outputTokens 字段后换名，旧缓存解码失败自动全量重建一次
+    /// 并发解析的收集器：`DispatchQueue.concurrentPerform` 要跨线程写同一份结果，
+    /// 而 Swift 6 不允许并发闭包捕获可变局部量 ⇒ 用带锁的引用类型（每次 parse 后取一次锁，开销可忽略）
+    private final class ParseBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [String: FileContribution] = [:]
+        private var count = 0
+        func add(_ path: String, _ c: FileContribution) {
+            lock.lock(); items[path] = c; count += 1; lock.unlock()
+        }
+        var parsed: Int { lock.lock(); defer { lock.unlock() }; return count }
+        func merged(into base: [String: FileContribution]) -> [String: FileContribution] {
+            lock.lock(); defer { lock.unlock() }
+            return base.merging(items) { _, new in new }
+        }
+    }
+
+    /// 增量缓存落盘位置（App Support/wb-tokens-filecache-v4.json）；
+    /// v3 = FileContribution 增加 outputTokens 字段后换名；**v4 = 无 token 的 trace 也缓存**
+    ///（见 `parse` 的注释：那批文件此前每轮都被重读重解析，是 2026-09-17 那次「卡片 tok/s 出得慢」的根因）。
+    /// 换名 → 老缓存解码失败 → 自动全量重建一次（并发解析，见 query）
     private static var diskCacheURL: URL {
+        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v4.json")
+    }
+
+    /// v3 缓存路径：**只读回退**。v4 与 v3 的 `FileContribution` 结构逐字相同，v4 只是多缓存了
+    /// "无 token 的空贡献" ⇒ 升级时先吃掉老缓存，免得为了换名白读一遍 1.9 GB
+    private static var legacyDiskCacheURL: URL {
         AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v3.json")
     }
 
@@ -50,8 +74,13 @@ enum WBTokenStore {
     private static func loadDiskCacheIfNeeded() {
         guard !diskCacheLoaded else { return }
         diskCacheLoaded = true
-        guard let data = try? Data(contentsOf: diskCacheURL) else { return }
-        fileCache = (try? JSONDecoder().decode([String: FileContribution].self, from: data)) ?? [:]
+        for url in [diskCacheURL, legacyDiskCacheURL] {
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode([String: FileContribution].self, from: data)
+            else { continue }
+            fileCache = decoded
+            return
+        }
     }
 
     /// 缓存有变化时写盘（JSONDecoder/Encoder 对 ~1700 条为毫秒级，仅在增量扫描后触发）
@@ -65,20 +94,24 @@ enum WBTokenStore {
     static func fetch(completion: @escaping (TokenSummary?) -> Void) {
         cache.fetch(completion: completion)
     }
+    /// 每轮缓存重建完成后的通知（宿主刷面板用；见 `TokenStoreCache.onRefresh`）
+    static func onRefresh(_ f: @escaping (TokenSummary?) -> Void) { cache.onRefresh = f }
     /// 已构建缓存的同步只读（nil = 尚未构建过）：卡片副标题 tok/s 用
     static func cachedSummary() -> TokenSummary? { cache.cachedIfBuilt }
 
     private static func query() -> TokenSummary? {
+        let t0 = CACurrentMediaTime()
         loadDiskCacheIfNeeded()
         let dir = NSHomeDirectory() + "/.workbuddy/traces"
         guard let walker = FileManager.default.enumerator(
             at: URL(fileURLWithPath: dir),
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { return nil }
 
-        // 增量解析：签名未变的文件沿用缓存贡献，其余现场解析；扫描后重建缓存（顺带清已删文件）。
-        // 只有解析过新文件或有文件消失才算变化，避免每轮刷新空写盘
+        // 第一遍（串行、只 stat）：签名命中的直接沿用缓存贡献；**空贡献同样命中** ——
+        // 那是本轮修复的关键：无 token 的 trace 过去永远进不了缓存，每轮都被重读重解析。
+        // 未命中的攒进 pending，第二遍并发解析。
         var fresh: [String: FileContribution] = [:]
-        var changed = false
+        var pending: [(path: String, mtime: Date, size: Int)] = []
         for case let url as URL in walker {
             guard url.lastPathComponent.hasPrefix("trace_"), url.pathExtension == "json" else { continue }
             let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
@@ -88,12 +121,23 @@ enum WBTokenStore {
                 fresh[path] = c
                 continue
             }
-            if let c = parse(path: path, mtime: mtime, size: size) {
-                fresh[path] = c
-                changed = true
+            pending.append((path, mtime, size))
+        }
+        // 第二遍：**并发解析**。IO 与 JSON 解析都能并行，首轮全量（首次安装 / 换缓存版本）
+        // 时收益最大（本机 2820 文件 / 1.9 GB）；64KB 以下的碎文件占大头，并行度按核数自动分。
+        let box = ParseBox()
+        if !pending.isEmpty {
+            DispatchQueue.concurrentPerform(iterations: pending.count) { i in
+                let item = pending[i]
+                if let c = parse(path: item.path, mtime: item.mtime, size: item.size) {
+                    box.add(item.path, c)
+                }
+                // parse 返回 nil = 读盘失败（文件正在写）：本轮不入缓存，下轮签名仍未命中 → 自动重试
             }
         }
-        changed = changed || fresh.count != fileCache.count
+        let parsedCount = box.parsed
+        fresh = box.merged(into: fresh)
+        let changed = parsedCount > 0 || fresh.count != fileCache.count
         fileCache = fresh
         saveDiskCacheIfNeeded(changed)
 
@@ -114,6 +158,9 @@ enum WBTokenStore {
         var periodProjectTokens: [TokenPeriod: [String: Int64]] = [:]
         var periodModelTokens: [TokenPeriod: [String: Int64]] = [:]
         for c in fresh.values {
+            // 空贡献（无 token 的 trace）**不进任何聚合**：它们入缓存只是为了"签名命中、别再重读"。
+            // 少了这一句会白建一堆 `models[""]` / `projects["(未知项目)"]` 的零值键（后面虽被 filter 掉）
+            guard c.tokens > 0 else { continue }
             let key = c.model.lowercased()
             var agg = models[key] ?? ModelAgg()
             agg.tokens += c.tokens
@@ -150,6 +197,12 @@ enum WBTokenStore {
             .map { TokenSummary.ProjectUsage(name: $0.key, tokens: $0.value,
                                                   path: projectPaths[$0.key]) }
             .sorted { $0.tokens > $1.tokens }
+        // 构建耗时落日志（这类"数据仓慢"的问题不好复现，留一条常驻记录；本机 2820 文件基准：
+        // 缓存全命中 ≈ 200ms，全量首建（并发）≈ 1.5～3s）
+        Logger.log(.refresh, String(format: "[WBToken] build %.0fms 文件 %d（本轮解析 %d）模型 %d 项目 %d 总计 %lld",
+                                    (CACurrentMediaTime() - t0) * 1000, fresh.count, parsedCount,
+                                    models.count, projectRows.count,
+                                    projectRows.reduce(Int64(0)) { $0 + $1.tokens }))
         guard !projectRows.isEmpty else { return nil }
         // 最近 10 次会话均速（tok/s，卡片副标题 meta）：**一次对话 = 同一 sessionId 的全部
         // trace**（trace 只是一次 agent 运行，一次对话含多次运行；按 trace 切会把分母缩成
@@ -157,7 +210,7 @@ enum WBTokenStore {
         // 时长 = 会话首 trace 起点 → 末 trace mtime（含对话中的空闲，口径对齐 ZCode
         // session.time_created→time_updated）；sessionId 缺失的 trace 各自成会话，均值口径归 recentSessionSpeed
         var bySession: [String: (start: TimeInterval, end: TimeInterval, output: Int64)] = [:]
-        for (path, c) in fresh {
+        for (path, c) in fresh where c.outputTokens > 0 || c.startedAt != nil {
             guard let started = c.startedAt else { continue }
             let key = c.sessionId.isEmpty ? path : c.sessionId
             let end = c.mtime.timeIntervalSince1970
@@ -214,9 +267,26 @@ enum WBTokenStore {
             Logger.log(.refresh, "[WbTokDbg] workbuddy.db 不存在")
             return [:]
         }
-        if let out = querySessionMap(path: path, immutable: false) { return out }
-        return querySessionMap(path: path, immutable: true) ?? [:]
+        // ⚠️ 2026-09-17：这张表**每轮 query 都要读一遍**（本机 sessions 上万行，实测是 1s 里的大头），
+        // 而会话映射几乎不变 ⇒ 按库文件签名缓存。签名必须**把 -wal 也算上**：WB 运行时新会话先落
+        // WAL 增量，只看主库 mtime 会让新会话的归属一直读旧映射
+        var parts: [String] = []
+        for p in [path, path + "-wal"] {
+            guard let a = try? FileManager.default.attributesOfItem(atPath: p),
+                  let m = a[.modificationDate] as? Date, let s = a[.size] as? Int else { continue }
+            parts.append("\(p):\(Int(m.timeIntervalSince1970)):\(s)")
+        }
+        let stamp = parts.joined(separator: "|")
+        if let c = sessionMapCache, c.stamp == stamp { return c.map }
+        let map = querySessionMap(path: path, immutable: false)
+            ?? querySessionMap(path: path, immutable: true) ?? [:]
+        sessionMapCache = (stamp, map)
+        return map
     }
+
+    /// sessionId → cwd 的缓存（按 workbuddy.db + -wal 的 (mtime,size) 失效）。
+    /// ⚠️ 只在 `WbTokens` 自己的串行队列上读写（每仓一个 `TokenStoreCache` queue）⇒ 无需加锁
+    private static var sessionMapCache: (stamp: String, map: [String: String])?
 
     /// 单次「打开 + 查询」尝试；打开或 prepare 任一失败返回 nil（供外层回落 immutable）
     private static func querySessionMap(path: String, immutable: Bool) -> [String: String]? {
@@ -252,16 +322,25 @@ enum WBTokenStore {
         return out
     }
 
-    /// 解析单个 trace 文件；结构不符或无用量返回 nil（该文件不进缓存）
+    /// 解析单个 trace 文件。
+    ///
+    /// ⚠️ **无用量也返回"空贡献"（tokens 0）并进缓存** —— 这是 2026-09-17 的性能修复：
+    /// 此前 `tokens > 0` 不成立就 `return nil`，那批文件（结构不符 / 只有工具调用没有 token）
+    /// **永远进不了缓存**，于是每轮 60s 刷新都拿不到签名命中、把它们的整份内容重读重解析一遍
+    ///（本机实测：2820 个 trace / 1.9 GB，其中 ~1900 个是这类无 token 文件 ⇒ **每轮白读 1.4 GB**、
+    /// 十几秒），卡片副标题的 tok/s 因此迟迟不出来。
+    /// 现在只有**读盘失败**才返回 nil（本轮不入缓存、下轮重试；文件正在写时可能命中这条）。
     private static func parse(path: String, mtime: Date, size: Int) -> FileContribution? {
-        guard let data = FileManager.default.contents(atPath: path),
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+        guard let data = FileManager.default.contents(atPath: path) else { return nil }
+        let empty = FileContribution(mtime: mtime, size: size, model: "", sessionId: "",
+                                     tokens: 0, outputTokens: 0, calls: 0,
+                                     startedAt: nil, dayStart: nil)
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let trace = root["trace"] as? [String: Any],
-              let mi = trace["modelInfo"] as? [String: Any] else { return nil }
+              let mi = trace["modelInfo"] as? [String: Any] else { return empty }
         let input = (mi["totalInputTokens"] as? NSNumber)?.int64Value ?? 0
         let output = (mi["totalOutputTokens"] as? NSNumber)?.int64Value ?? 0
         let tokens = input + output
-        guard tokens > 0 else { return nil }
         let model = (mi["models"] as? [Any])?.compactMap { $0 as? String }.first ?? "unknown"
         let sid = trace["sessionId"] as? String ?? ""
         let calls = (mi["callCount"] as? NSNumber)?.int64Value ?? 0
@@ -274,8 +353,11 @@ enum WBTokenStore {
     }
 
     /// ISO8601 → 原始时间戳（秒）。容忍毫秒位有无：截前 19 位补 Z 再解析。
+    /// ⚠️ `DateFormatter` **不是线程安全的**，而 `query()` 现在并发解析（见那里）⇒ 这里必须加锁。
+    private static let isoLock = NSLock()
     private static func isoTimestamp(iso: String) -> TimeInterval? {
         guard iso.count >= 19 else { return nil }
+        isoLock.lock(); defer { isoLock.unlock() }
         return Self.isoParser.date(from: String(iso.prefix(19)) + "Z")?.timeIntervalSince1970
     }
 

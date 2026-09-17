@@ -274,11 +274,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // `PanelFont` 是全局解析器，任何视图首次构建就要按它取字体，
         // 不能等到第一次 `panel.update` 才同步（否则首帧按系统字体构建）
         PanelFont.sharpGroteskActive = config.cardTitleSharpGrotesk
-        // 数值滚动滑移时长口径镜像（同上处落值）：`RollingNumberView` 静态读它，
-        // 不能等到第一次 panel.update 才同步（否则首个位数变化按默认档算时长）
-        RollingNumberView.slideTiming = config.rollSlideTiming
-        // 滚动时间曲线档位镜像（同上处落值）：同上，首个滚动就要按用户档位走
-        RollingNumberView.curve = config.rollCurve
+        // SG 随包字体：这里**无条件注册一次**（2026-09-17 用户「SG字体需要打包进App里」）——
+        // `PanelFont.font()` 里那次是懒注册（开关 true 才走），但设置窗口的**预设图卡**按每枚预设
+        // 自己记的 SG 开关画字，与主面板这个开关无关 ⇒ 主面板关着 SG 时图卡会命中不了字体。
+        // 幂等，重复调用无成本。
+        PanelFont.ensureSGRegistered()
+        // 数值滚动的滑移时长 / 时间曲线两处镜像 2026-09-17 随「动效的参数固化」移除：
+        // 定稿值就在 `RollingNumberView.slideTime()` 与 `rollEase(_:)` 里，不需要镜像落值
         // 副前景色的底色来源：同上，任何视图构建前必须先落值（首次绘制就要按它解算）
         Palette.panelBackgroundActive = config.panelBackgroundColor
         // 遮罩底端不透明度镜像：与底色镜像同处写入（containerColors 读它，各调用点不必传参）
@@ -286,6 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 次背景色的运行镜像（2026-09-15 由「点阵背景色」+「hover 背景色」合并为一个参数）：
         // 与底色同处落值 —— 任何视图首次绘制就要按它解算 dynamic color
         Palette.secondaryBackgroundActive = config.secondaryBackgroundColor
+        // 主前景色的运行镜像（2026-09-17 随参数开放新增，nil = 内置两档）：任何视图首次绘制前落值
+        Palette.foregroundActive = config.panelForegroundColor
         // Codex 登录态来自本机 auth.json；启动时自动纳入账号列表，按钮仍可手动重新导入/更新凭据。
         if case .success(let account) = CodexService.importCurrentAccount(),
            !config.codexAccounts.contains(where: { $0.uid == account.uid }) {
@@ -428,6 +432,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 三仓齐预热（ZCode / WB / Codex）：Agent 标题 hover 聚合视图并发收集三仓，
         // 缺一仓缓存则聚合挂起等该仓后台 build 完成才出数——Codex 原先漏预热，
         // 首次 hover 聚合会延迟（甚至面板未开过时聚合卡住等 build）。
+        //
+        // ⚠️ 2026-09-17 补**到位即刷面板**：卡片副标题那格 tok/s 是从「已建好的缓存」同步只读
+        //（`cachedSummary()`），缓存没好时是空的 —— 原先 completion 是空实现，那一格要等下一次
+        // 面板刷新（或重开面板）才补上，观感就是「刚打开时 WB 卡片的 token 速度半天不出来」。
+        // 现在每轮重建完成都回来刷一次（主线程），卡片那格最迟 60s 内一定跟上。
+        ZcodeTokenStore.onRefresh { [weak self] _ in self?.syncPanel() }
+        WBTokenStore.onRefresh { [weak self] _ in self?.syncPanel() }
+        CodexTokenStore.onRefresh { [weak self] _ in self?.syncPanel() }
         ZcodeTokenStore.fetch { _ in }
         WBTokenStore.fetch { _ in }
         CodexTokenStore.fetch { _ in }
@@ -505,21 +517,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let c = MenuBarStatusGlowController(stateProvider: { [weak self] in self?.menuBarGlowState(for: $0) })
         // 圆点出现/消失改变标题排版 → 重烘焙标题位图（状态点预留间距随存亡增删）
         c.onDotPresenceChanged = { [weak self] in self?.updateTitle(tag: "dotPresence") }
-        // 小球弹跳参数（设置窗口「菜单栏」pane 落盘的那份）
-        c.setBounce(dotBounce)
+        // 小球弹跳参数 2026-09-17 起固化（原设置窗口「菜单栏」pane 已移除）：
+        // 控制器自带 `MenuBarBounceSettings.fixed`，宿主不再注入
         return c
     }()
-
-    /// 菜单栏状态点小球弹跳参数：唯一事实源（设置窗口滑杆写它、快照读它、光晕控制器按它算帧）。
-    /// 启动时从 UserDefaults 还原，改动即时落盘
-    private var dotBounce = MenuBarBounceSettings.load()
-
-    /// 设置窗口「菜单栏」pane 改参：写内存 → 落盘 → 推给光晕控制器（立即重算当前帧，拖动跟手）
-    private func applyDotBounce(_ s: MenuBarBounceSettings) {
-        dotBounce = s
-        s.save()
-        menuBarGlow.setBounce(s)
-    }
 
     /// 获取菜单栏图标形状（惰性加载并缓存）：
     /// PDF/SVG 栅格化为黑形位图（矢量直接设 isTemplate 不生效，会渲染成黑色）；PNG 品牌色原样（烘焙进 template 后只取其 alpha 形状）
@@ -1409,11 +1410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.longProgressCard = config.longProgressCard
         s.iconThemeSwap = config.iconThemeSwap
         s.iconNoBorder = config.iconNoBorder
-        // 数值滚动滑移时长口径（设置窗口「主题外观 → 动效」单选；消费点 = 面板
-        // update 里落到 RollingNumberView.slideTiming 静态镜像）
-        s.rollSlideTiming = config.rollSlideTiming
-        // 滚动时间曲线档位（同上：内部 `syncPanel` 落到 RollingNumberView 静态镜像）
-        s.rollCurve = config.rollCurve
+        // 数值滚动的滑移时长 / 时间曲线（2026-09-16 新增）2026-09-17 已固化：不再进快照
         return s
     }
 
@@ -1532,6 +1529,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         actions.setPanelBackgroundBottomAlpha = { [weak self] v in
             self?.applyPanelBackgroundBottomAlpha(v)
         }
+        // 主前景色（2026-09-17 开放）：落盘 + 运行时镜像 + 面板就地重刷
+        actions.setPanelForegroundColor = { [weak self] color in
+            self?.applyPanelForegroundColor(color)
+        }
         actions.setLightTheme = { [weak self] want in
             guard let self, want != config.lightThemeEnabled else { return }
             onToggleLightTheme()
@@ -1565,24 +1566,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self, want != config.longProgressCard else { return }
             onToggleLongProgressCard()
         }
-        // 数值滚动滑移时长口径（2026-09-16 用户要求两种口径都落地）：
-        // 写 config 后 syncPanel → 面板 update 把值落到 `RollingNumberView.slideTiming`
-        // 静态镜像（与 Sharp Grotesk 档同一条路径，消费点在下次 rebuild）
-        actions.setRollSlideTiming = { [weak self] raw in
-            guard let self, let mode = RollSlideTiming(rawValue: raw),
-                  mode != config.rollSlideTiming else { return }
-            config.rollSlideTiming = mode
-            ConfigStore.save(config)
-            syncPanel()
-        }
-        // 数值滚动时间曲线档位（同一条路径：写 config → syncPanel → 面板 update 落镜像）
-        actions.setRollCurve = { [weak self] raw in
-            guard let self, let curve = RollCurve(rawValue: raw),
-                  curve != config.rollCurve else { return }
-            config.rollCurve = curve
-            ConfigStore.save(config)
-            syncPanel()
-        }
+        // 数值滚动的滑移时长口径（`roll_slide_timing`）与时间曲线档位（`roll_curve`）
+        // 2026-09-17 用户「动效的参数固化，移除参数开放」：两个 config 键、设置窗口「动效」整段、
+        // 两个 setter 与静态镜像一并移除 —— 定稿值（跟随位移 / 从快到慢）写进
+        // `RollingNumberView.slideTime()` 与 `rollEase(_:)`
         // 用量色（色盘拾色）：分解出的 HSB 三参一把落值 → 面板就地重绘点阵与卡片边框
         actions.setHeatColor = { [weak self] hue, saturation, brightness in
             self?.panelView?.applyHeatColor(hue: CGFloat(hue),
@@ -1593,12 +1580,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         actions.setSecondaryBackgroundColor = { [weak self] color in
             self?.applySecondaryBackgroundColor(color)
         }
-        // 「主题预设」（2026-09-15 用户要求，「主题外观」页顶部）：固化 / 应用 / 删除 ——
-        // 列表存 UserDefaults（ThemePresetStore），应用见 applyThemePreset 的逐项落值说明
-        actions.saveThemePreset = { [weak self] preset in self?.saveThemePreset(preset) ?? false }
+        // 「主题预设」（2026-09-15 用户要求，「主题外观」页顶部）：新增 / 应用 / 改名 / 删除 ——
+        // **内置那几枚在代码里**（`ThemePreset.builtIns`，只读、不落盘），
+        // 用户自建的走 UserDefaults（ThemePresetStore）；应用见 applyThemePreset 的逐项落值说明
+        actions.saveThemePreset = { [weak self] preset in self?.saveThemePreset(preset) }
         actions.applyThemePreset = { [weak self] preset in self?.applyThemePreset(preset) }
         actions.deleteThemePreset = { [weak self] id in self?.deleteThemePreset(id: id) }
-        actions.setBounce = { [weak self] in self?.applyDotBounce($0) }
+        actions.renameThemePreset = { [weak self] id, name in
+            self?.renameThemePreset(id: id, name: name)
+        }
         actions.about = { [weak self] in self?.onAbout() }
         // 「关于」pane 备份：导出打当前 config 全量；导入只走磁盘（覆盖写回后重启生效），
         // 不碰内存态 —— 重启后由 ConfigStore.load 统一装载
@@ -1680,7 +1670,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             autoCheckin: s.traeAutoCheckin || s.wbAutoCheckin,
             autoCheckinSub: s.lastCheckinTime ?? "",
             autoUpdateCheck: s.updateAutoCheckEnabled,
-            bounce: dotBounce,
             apiKey: config.deepseekApiKey,
             commonQuota: config.deepseekCommonQuota,
             zhipuToken: config.bigmodelTokenOverride,
@@ -1694,17 +1683,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             longProgressCard: config.longProgressCard,
             cardTitleFontSize: config.cardTitleFontSize,
             cardTitleSharpGrotesk: config.cardTitleSharpGrotesk,
-            rollSlideTiming: config.rollSlideTiming.rawValue,
-            rollCurve: config.rollCurve.rawValue,
             heatHue: Double(Palette.heatPeakHue),
             heatSaturation: Double(Palette.heatPeakSaturation),
             heatBrightness: Double(Palette.heatPeakBrightness),
             secondaryBackgroundColor: config.secondaryBackgroundColor,
+            panelForegroundColor: config.panelForegroundColor,
             coinPreset: coin.preset.rawValue,
             coinAppearance: coin.appearance.rawValue,
             coinMaterialColor: coin.materialColor.hex,
             coinFieldColor: coin.fieldColor.hex,
-            themePresets: ThemePresetStore.load())
+            // 预设列表 = **内置（代码里，只读）+ 用户自建（UserDefaults）**，内置恒在前面
+            //（`ThemePresetStore.load()` 已把老数据里的内置条目过滤掉，见该处迁移注释）
+            themePresets: ThemePreset.builtIns + ThemePresetStore.load())
     }
 
     /// 面板「面板背景色」（设置窗口色盘拾色 / 顶部不透明度滑杆）：写配置并经快照同步重绘遮罩
@@ -1725,6 +1715,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         syncPanel()
     }
 
+    /// **主前景色**（设置窗口色盘，2026-09-17 开放）：写配置 + 运行时镜像 + 面板就地重刷。
+    /// 动态色（`Palette.cardForeground`）在重绘时经 provider 读 `Palette.foregroundActive` 重解算；
+    /// 定格值（icon 着色 / 菜单栏圆点 layer）由 `refreshCardForeground` 显式重灌
+    private func applyPanelForegroundColor(_ color: PanelBackgroundColor) {
+        guard color != config.panelForegroundColor else { return }
+        // 文字色不带透明度语义：色盘也不透出，这里再钳一道（写盘的值即所画的值）
+        config.panelForegroundColor = color.withAlpha(1)
+        ConfigStore.save(config)
+        Palette.foregroundActive = config.panelForegroundColor
+        syncPanel()
+        panelView?.refreshCardForeground()
+    }
+
     /// **次背景色**（设置窗口「面板 → 次背景色」色盘，2026-09-15 由「点阵背景色」+
     /// 「hover 背景色」合并而来）：写配置 + 同步镜像 + 就地重绘
     ///（无用量底点/轨道底/骨架行是自绘或烘色位图，卡片 hover 材质块是 .cgColor 落 layer 的，
@@ -1739,40 +1742,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - 主题预设（设置窗口「主题外观」页顶部）
 
-    /// 保存一组主题预设：把「主题外观」页当前的全部参数固化成一枚。
-    /// **重名先弹确认**（2026-09-15 用户追加）：
-    /// · 「覆盖」= 原地替换那一枚（保留原 `id` 与在列表里的位置，其余预设不受影响）
-    /// · 「取消」= 整体不写，返回 false（界面侧据此保留命名草稿，用户改个名再存）
-    /// 名字不与已有重名时直接追加（不去重、不限条数）
-    @discardableResult
-    private func saveThemePreset(_ preset: ThemePreset) -> Bool {
-        var list = ThemePresetStore.load()
-        guard let index = list.firstIndex(where: { $0.name == preset.name }) else {
-            ThemePresetStore.save(list + [preset])
-            return true
-        }
-        guard confirmOverwriteThemePreset(name: preset.name) else { return false }
-        var replaced = preset
-        // 沿用原条目的 id：这一条是「被更新」，不是「删了再插一条」
-        //（`ForEach` 按 id 对齐，位置与选中态都不会跳）
-        replaced.id = list[index].id
-        list[index] = replaced
-        ThemePresetStore.save(list)
-        return true
+    /// 新增一组主题预设（图卡右上角「+」）：把「主题外观」页当前的全部参数固化成一枚，**追加**到列表末尾。
+    /// 2026-09-17 用户改版后不再有「名称输入框」，名字由模型自动给「预设 N」，**也就不再做重名检查** ——
+    /// 同名只是显示重了（id 才是身份），旧那套「覆盖确认」弹窗随输入框一起删除。
+    private func saveThemePreset(_ preset: ThemePreset) {
+        ThemePresetStore.save(ThemePresetStore.load() + [preset])
     }
 
-    /// 同名预设的覆盖确认（模态，返回 true = 覆盖）。
-    /// 按钮排布照「删除账号」二次确认的成例：取消带 Esc、覆盖标破坏性（旧参数会被顶掉）且不占 Return，
-    /// 免得顺手回车就把存过的参数冲掉
-    private func confirmOverwriteThemePreset(name: String) -> Bool {
-        let shell = DialogShell()
-        shell.addTitle("覆盖主题预设")
-        shell.addInfo("已存在名为「\(name)」的主题预设。\n\n"
-            + "覆盖 = 用当前页面上的参数替换它的内容，它在列表里的位置不变；取消 = 这次不保存。")
-        _ = shell.addButton("取消", keyEquivalent: "\u{1b}")
-        let idxOverwrite = shell.addButton("覆盖", keyEquivalent: "")
-        shell.markDestructive(idxOverwrite)
-        return shell.present() == idxOverwrite
+    /// 改名一枚主题预设（点图卡下方的名字就地改，模型侧 Enter 才调到这里）：
+    /// 按 id 找到用户自建的那条、换名后整表写回；id 不在（内置 / 已被删）什么都不做
+    private func renameThemePreset(id: String, name: String) {
+        var list = ThemePresetStore.load()
+        guard let index = list.firstIndex(where: { $0.id == id }) else { return }
+        list[index].name = name
+        ThemePresetStore.save(list)
     }
 
     /// 删除一组主题预设（按 id 命中；不存在时什么都不做）
@@ -1795,6 +1778,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         config.panelBackgroundColor = preset.panelBackgroundColor
         config.panelBackgroundBottomAlpha = preset.panelBackgroundBottomAlpha
         config.secondaryBackgroundColor = preset.secondaryBackgroundColor
+        // 主前景色（2026-09-17 随参数开放进预设）：**原样写回可选值** ——
+        // 预设是「固化那一刻的照片」，逐项还原才对得上「点图卡即应用」；
+        // nil（内置预设 / 老预设）= 回落内置两档
+        config.panelForegroundColor = preset.panelForegroundColor
         config.lightThemeEnabled = preset.lightThemeEnabled
         config.iconThemeSwap = preset.iconThemeSwap
         config.iconNoBorder = preset.iconNoBorder
@@ -1808,6 +1795,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         Palette.panelBackgroundActive = config.panelBackgroundColor
         Palette.panelBackgroundBottomAlphaActive = config.panelBackgroundBottomAlpha
         Palette.secondaryBackgroundActive = config.secondaryBackgroundColor
+        // 主前景色镜像（nil = 内置两档）：面板侧动态色在重绘时重解算，
+        // 定格值（icon 着色 / 菜单栏圆点）由下面的 refreshCardForeground 补
+        Palette.foregroundActive = config.panelForegroundColor
         updateProgressWinRef?.applyThemeAppearance()
         // popover 窗口外观（含箭头）必须同步重设，否则停在上一档主题
         popoverController?.appearance = Palette.panelAppearance(lightTheme: config.lightThemeEnabled)
@@ -1816,6 +1806,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 自绘 / 烘色位图），由下面这一次整树重绘补齐 —— 同一个入口清缓存 + 重解算材质
         syncPanel()
         panelView?.refreshDotMatrixAndHoverMaterials()
+        // 主前景色的定格值消费点（icon 着色 / 菜单栏圆点）也要跟上：整树标脏 + 换图标
+        panelView?.refreshCardForeground()
         applyCoinIdentity(from: preset)
     }
 
@@ -2146,7 +2138,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 version: "999.0.0",
                 current: UpdateService.currentVersion(),
                 notes: notes,
-                glowTuning: true,       // 演示窗口附「发光参数」调试区（可拖动实时预览）
                 onInstall: { [weak self] in
                     Task { @MainActor in await self?.runInstallDemo() }
                 },

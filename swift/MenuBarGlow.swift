@@ -32,8 +32,8 @@ final class MenuBarStatusGlowController {
     // （SettingsUI，设置窗口预览共用同一份），这里只按用途起别名
     private static let glowPadding = MenuBarStatusDotStyle.glowPadding // 光晕画布外扩（点），须容纳模糊扩散
     // 小球弹跳（仅「进行中」蓝点；光晕亮度仍走上面的呼吸，只跟随位移）
-    // 参数改由设置窗口「菜单栏」pane 开放（落盘 + 实时生效），取值域/默认值/解算
-    // 统一在 MenuBarBounceSettings（SettingsUI），本文件只负责把帧画出来
+    // 参数 2026-09-17 起固化（原设置窗口「菜单栏」pane 的五项滑杆已随该页移除），
+    // 取值与解算统一在 MenuBarBounceSettings.fixed（SettingsUI），本文件只负责把帧画出来
 
     /// 状态点平台在标题烘焙时插入的预留空隙（点左侧间距）。点出现才插入、消失即随
     /// 重烘焙回收——标题排版由 updateTitleImpl 的指纹（含点存亡）驱动增删。
@@ -48,8 +48,8 @@ final class MenuBarStatusGlowController {
 
     private let stateProvider: (String) -> AgentTaskState?
 
-    /// 小球弹跳参数（设置窗口「菜单栏」pane 写入；见 `setBounce`）
-    private var bounce = MenuBarBounceSettings.initial
+    /// 小球弹跳参数：固化常量（2026-09-17 起不可调，见 MenuBarBounceSettings.fixed）
+    private let bounce = MenuBarBounceSettings.fixed
 
     private weak var button: NSStatusBarButton?
     private var entries: [EntryIcon] = []
@@ -72,13 +72,6 @@ final class MenuBarStatusGlowController {
 
     func attach(button: NSStatusBarButton) {
         self.button = button
-    }
-
-    /// 设置窗口「菜单栏」pane 改参后调用：立刻按新参数重算当前帧（不必等下一拍出帧），
-    /// 拖动滑杆时菜单栏是跟手的。无进行中圆点时是空操作。
-    func setBounce(_ s: MenuBarBounceSettings) {
-        bounce = s
-        updateBounce(at: CACurrentMediaTime())
     }
 
     /// 标题位图重烘焙后调用；异步延迟到下一 runloop——status item 尺寸重排
@@ -425,7 +418,7 @@ final class MenuBarStatusGlowController {
     }
 
     /// 余弦呼吸当前 alpha（breathStep 与排序画布共用，保证光晕亮度跨动画连续）；
-    /// 公式与参数 = MenuBarStatusDotStyle.breathOpacity（设置窗口预览同源）
+    /// 公式与参数 = MenuBarStatusDotStyle.breathOpacity（同一份规格）
     private func currentBreathAlpha() -> Float {
         Float(MenuBarStatusDotStyle.breathOpacity(at: CACurrentMediaTime() - breathStart))
     }
@@ -450,7 +443,7 @@ final class MenuBarStatusGlowController {
     /// 光晕同幅上下跟随（亮度仍由呼吸驱动，观感不变）。与呼吸同理走模型值逐帧提交——
     /// CA 动画属 presentation 瞬态，不随菜单栏多屏镜像传播（见 breathStep 注释）。
     /// 排序滑动期间跳过：帧由 reorderStep 独占插值，收尾 sync 后再交还本函数。
-    /// 形变解算在 `MenuBarBounceSettings.solve(at:)`（设置窗口预览共用同一函数，两边不会漂）。
+    /// 形变解算在 `MenuBarBounceSettings.solve(at:)`（唯一实现，别再在宿主里另写一份）。
     private func updateBounce(at now: CFTimeInterval) {
         guard !isReordering, !dotBaseFrames.isEmpty else { return }
         CATransaction.begin()
@@ -466,13 +459,23 @@ final class MenuBarStatusGlowController {
             // solve() 的 dy 语义（视觉向上）不变——设置预览宿主是翻转视图、+dy 即向上；
             // 这里取负应用，支点 = base.maxY（视觉底缘）：dy=0 底缘贴地压扁，
             // dy=amplitude 整球上浮顶点拉伸。
+            //
+            // 活动区间在「行高」内垂直居中（2026-09-17 用户要求）：静止帧圆心 = 图标中心
+            // = 行中线（见 sync 的 dotFrame），而弹跳只向上位移——整段活动区间会整体浮在
+            // 行中线之上。故把静止位整体下移 lift，让活动区间上下对称跨在行中线上：
+            //   下极值 = 静止位底缘（触地压扁那一帧）
+            //   上极值 = 顶点球顶（底缘 − amplitude − 圆点直径 × stretchMax）
+            // 两极值到行中线的距离都等于「区间半高」，故 lift = 半高 − 圆点半径。
+            // 半高的定义在 MenuBarBounceSettings.halfSpan（唯一实现，
+            // 且带 stretchMax 项——「顶点拉伸」调大后仍精确对称）。
+            let lift = CGFloat(bounce.halfSpan(dotDiameter: Double(base.height))) - base.height / 2
             dot.frame = NSRect(x: base.midX - w / 2,
-                               y: base.maxY - CGFloat(b.dy) - h,
+                               y: base.maxY + lift - CGFloat(b.dy) - h,
                                width: w, height: h)
             dot.cornerRadius = h / 2
             if let glow = glowLayers[id] {
                 glow.frame = base.insetBy(dx: -Self.glowPadding, dy: -Self.glowPadding)
-                    .offsetBy(dx: 0, dy: -CGFloat(b.dy))
+                    .offsetBy(dx: 0, dy: lift - CGFloat(b.dy))
             }
         }
         CATransaction.commit()
@@ -493,7 +496,7 @@ final class MenuBarStatusGlowController {
     private func glowImage(state: AgentTaskState, diameter: CGFloat) -> CGImage? {
         let key = "dot|\(state)|\(Int(diameter * 10))"
         if let c = glowCache[key] { return c }
-        // 烘焙管线在 MenuBarStatusDotStyle（设置预览同源）；菜单栏 1:1，visualScale 缺省 1
+        // 烘焙管线在 MenuBarStatusDotStyle（唯一实现）；菜单栏 1:1，visualScale 缺省 1
         guard let out = MenuBarStatusDotStyle.glowBitmap(color: Self.color(for: state),
                                                          dotDiameter: diameter) else { return nil }
         glowCache[key] = out
@@ -508,36 +511,5 @@ final class MenuBarStatusGlowController {
         dotLayers.removeAll()
         dotBaseFrames.removeAll()
         bounceStart.removeAll()
-    }
-}
-
-// MARK: - 小球弹跳参数的落盘（设置窗口「菜单栏」pane）
-
-/// 取值域/默认值/解算都在 `MenuBarBounceSettings`（SettingsUI），这里只补 UserDefaults 读写。
-/// 逐项独立落盘、逐次改动即写（滑杆拖动过程中也在写）—— 用户调完即是最终值，
-/// 不设「保存」按钮，与「设置」pane 的刷新间隔同口径。
-/// 读回一律夹回取值域：将来收窄范围时老值不会把滑杆顶歪。
-extension MenuBarBounceSettings {
-    static func load() -> MenuBarBounceSettings {
-        let defaults = UserDefaults.standard
-        func value(_ key: String, _ fallback: Double) -> Double {
-            defaults.object(forKey: key) == nil ? fallback : defaults.double(forKey: key)
-        }
-        return MenuBarBounceSettings(
-            amplitude: value(UDKey.menuBarBounceAmplitude, initial.amplitude),
-            period: value(UDKey.menuBarBouncePeriod, initial.period),
-            airRatio: value(UDKey.menuBarBounceAirRatio, initial.airRatio),
-            squashMin: value(UDKey.menuBarBounceSquashMin, initial.squashMin),
-            stretchMax: value(UDKey.menuBarBounceStretchMax, initial.stretchMax)
-        ).clamped()
-    }
-
-    func save() {
-        let defaults = UserDefaults.standard
-        defaults.set(amplitude, forKey: UDKey.menuBarBounceAmplitude)
-        defaults.set(period, forKey: UDKey.menuBarBouncePeriod)
-        defaults.set(airRatio, forKey: UDKey.menuBarBounceAirRatio)
-        defaults.set(squashMin, forKey: UDKey.menuBarBounceSquashMin)
-        defaults.set(stretchMax, forKey: UDKey.menuBarBounceStretchMax)
     }
 }

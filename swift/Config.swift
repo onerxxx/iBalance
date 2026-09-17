@@ -6,21 +6,31 @@ import SettingsUI
 
 /// 「主题预设」的落盘：UserDefaults **单键存 JSON 串**（键名 `UDKey.themePresets`），
 /// 结构体本身（`ThemePreset`）在 SettingsUI —— 宿主只管读写，与
-/// `MenuBarBounceSettings.load()/save()` 同一条分工。
+/// `ThemePresetStore` 之外那些「值放 SettingsUI、读写留宿主」的参数同一条分工。
 ///
 /// 为什么放 UserDefaults 不放 config.json：① 一组预设里的**用量色**本来就存在
 /// UserDefaults（`heat_dot_*`），放同域读写一次到位；② 备份（BackupService）导出的
 /// 是「config + UserDefaults 持久域整包」，放这里预设自动跟着备份走，config 不用加字段。
 ///
+/// ⚠️ **这里只存用户自建的那些**（2026-09-17 起）：出厂那几枚（`ThemePreset.builtIns`）
+/// 写死在代码里随包发布，不进存储 —— 视图显示的是「内置 + 本 store」两份拼起来
+///（拼接点在 `BalancePanelView` 装配快照那一行）。
+///
 /// 只存一份列表（不限条数）：整表紧凑 JSON，几十条也就几 KB。
 enum ThemePresetStore {
     /// 读：缺键 / 结构异常一律返回空列表（不静默留半份）；单条结构异常由
-    /// `ThemePreset.init(from:)` 的逐项兜底吸收，不会连坐整份列表
+    /// `ThemePreset.init(from:)` 的逐项兜底吸收，不会连坐整份列表。
+    ///
+    /// **顺带做一次迁移**：老版本把内置那几枚也存在这里（升级前就是这个状态），
+    /// 按 `builtInIDs` 过滤掉后若与盘上的内容不等，直接写回 —— 于是「内置」这个身份
+    /// 从「存储里的一条」变成「代码里的一条」，不会出现同 id 的两份。
     static func load() -> [ThemePreset] {
         guard let raw = UserDefaults.standard.string(forKey: UDKey.themePresets),
               let data = raw.data(using: .utf8),
               let list = try? JSONDecoder().decode([ThemePreset].self, from: data) else { return [] }
-        return list
+        let userOnly = list.filter { !ThemePreset.builtInIDs.contains($0.id) }
+        if userOnly.count != list.count { save(userOnly) }
+        return userOnly
     }
 
     static func save(_ presets: [ThemePreset]) {
@@ -160,38 +170,6 @@ struct CodexAccount: Codable, Equatable {
 
 // MARK: - 应用配置
 
-/// 数值滚动「滑移」（位数变化时的整组左右平移）时长口径 —— 设置窗口
-/// 「主题外观 → 动效」单选，2026-09-16 用户要求两种口径都落地。
-/// 只影响走 `setText(slideOnRebuild: true)` 的位数增减场景（目前是 Token 总计大数字
-/// 的周期 / 平台切换）；余额卡位数变化仍走直接落值，不受影响。
-///
-/// 跨 target 只传 rawValue（SettingsUI 不引本类型，同 CoinPreset 的处境）
-enum RollSlideTiming: String, CaseIterable {
-    /// 跟随滚字：取本轮数字轮里最长的 tween 时长（= 滚字实际落定时刻），下限
-    /// `Motion.rollSlideMin`。平移与滚字同拍收尾，不拖在滚字后面
-    case wheelTail
-    /// 距离驱动：按实际位移量 `|slideDelta|` 缩放，钳制在
-    /// `Motion.rollSlideMin … Motion.rollSlideMax`——位移小就快，位移大也封顶
-    case distance
-}
-
-/// 数值滚动的**时间曲线**档位 —— 设置窗口「主题外观 → 动效」单选，
-/// 2026-09-16 用户要求开放（此前是硬写死的 ease-in cubic）。
-/// 只管数字滚动这一族：车轮位置 / 槽宽 / 滑移三条量**必须共用同一条**
-/// （不同形会在中段错速，让宽度低于可见宽数字的 advance 造成裁剪），
-/// 解析唯一入口 `rollEase(_:)`（RollingNumberView.swift）。
-/// 单位换值的槽内滚字 / 横向位移另有自己的 ease-out（不随之改）。
-///
-/// 跨 target 只传 rawValue（同 CoinPreset 的处境）
-enum RollCurve: String, CaseIterable {
-    /// 从慢到快（ease-in cubic）——起滚慢、末段最快，落定干脆
-    case easeIn
-    /// 从快到慢（ease-out cubic）——起手快、收尾长，更「顺滑落位」
-    case easeOut
-    /// 慢-快-慢（ease-in-out cubic）——两端减速，中段最快
-    case easeInOut
-}
-
 struct AppConfig: Codable {
     var deepseekApiKey: String = ""
     var deepseekCommonQuota: Double = 0  // DeepSeek 常用充值额度（0=未设置，不显示点阵）
@@ -214,18 +192,29 @@ struct AppConfig: Codable {
     var traeAutoCheckin: Bool = true
     var hideWbNickname: Bool = false  // 已固化为默认显示（悬停时淡入），保留字段兼容旧配置
     /// 面板底色遮罩色（2026-09-14 由「高对比背景」强度改制）：整条遮罩就是这个颜色本身，
-    /// alpha 由设置窗口系统色盘直接给（0 = 无遮罩，露出原生毛玻璃）；落盘 `#RRGGBBAA`
-    var panelBackgroundColor: PanelBackgroundColor = .default
+    /// alpha 由设置窗口系统色盘直接给（0 = 无遮罩，露出原生毛玻璃）；落盘 `#RRGGBBAA`。
+    /// ⚠️ 2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」：
+    /// 出厂默认改为 `PanelBackgroundColor.factoryPanelBackground`（当时那套蓝底）——
+    /// 与 `SettingsUI.AppSettingsSnapshot` 的属性默认必须同源
+    var panelBackgroundColor: PanelBackgroundColor = .factoryPanelBackground
     /// **次背景色**（面板内第二层背景的统一色：无用量底点 / 进度条轨道底 / 骨架行 /
     /// 卡片 hover 材质块 / Token 印章底，落盘 `hsv:H,S,V,A`）。
     /// 2026-09-15 由原「点阵背景色」(`heat_dot_empty_color`) + 「hover 背景色」
     /// (`card_hover_background_color`) 两个参数**合并**而来（用户要求：合并、改名「次背景色」、
-    /// 归到设置窗口「面板」栏）；两个旧键仍可读（迁移取值见解码），不再写出
-    var secondaryBackgroundColor: PanelBackgroundColor = .secondaryBackgroundDefault
+    /// 归到设置窗口「面板」栏）；两个旧键仍可读（迁移取值见解码），不再写出。
+    /// ⚠️ 2026-09-17 出厂默认改 `.factorySecondaryBackground`（当时那套蓝调次背景），
+    /// 与 `SettingsUI.AppSettingsSnapshot` 同源。`.secondaryBackgroundDefault`（#292929）
+    /// 退回「老配置迁移兜底」单一语义
+    var secondaryBackgroundColor: PanelBackgroundColor = .factorySecondaryBackground
+    /// **主前景色**（卡片文字色；2026-09-17 用户「设置里 面板里 开放主前景色参数」）：
+    /// **可选** —— nil（键不存在）= 用内置两档（深色 #EBEBEB / 浅色 0.13 黑），
+    /// 有值 = 用户自选色，**两档共用**（不再按外观分档）。落盘 `hsv:H,S,V,A` 同其他色。
+    /// 运行镜像 = `Palette.foregroundActive`（启动载入 / 色盘落值 / 预设应用三处写）
+    var panelForegroundColor: PanelBackgroundColor?
     /// 面板底色遮罩**底端**的不透明度（0…1，2026-09-14 用户要求上下两端各自可调）：
     /// 顶端用 `panelBackgroundColor` 自身的 alpha，底端用本键；两者同值 = 纯色遮罩。
     /// 取代原先「底端 = alpha × 0.65」的自动递减（该残留已删）
-    var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.defaultBottomAlpha
+    var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha
     /// 浅色主题开关：true = 强制浅色外观（即使系统是深色主题）；优先级高于渐变开关
     /// （浅色生效时不用深色遮罩，走原生浅色玻璃 + Palette 浅色分支）
     var lightThemeEnabled: Bool = false
@@ -240,31 +229,29 @@ struct AppConfig: Codable {
     var longProgressCard: Bool = false
     /// 图标深浅互换开关：true = 余额卡片品牌 icon 的 ClearDark/ClearLight 版本互换
     ///（深色外观取浅色版、浅色外观取深色版；仅影响卡片 icon，面板外观不动）。
-    /// 2026-09-07 用户定稿默认开启（旧配置无此键时解码兜底同为 true）
-    var iconThemeSwap: Bool = true
+    /// 2026-09-07 用户定稿默认开启；⚠️ 2026-09-17 随「出厂默认固化」改回 **false**
+    ///（按当时面板的实际取值固化 —— 那台机器上是关闭的）
+    var iconThemeSwap: Bool = false
     /// 无边框图标开关：true = 余额卡片品牌 icon **直接用同名 SVG 原图**（裸 logo、透明底、原色，
     /// 不套 Icon Composer 的 squircle 底板）；false = 用 ictool 导出的 PNG
     ///（macOS Default/Dark rendition，自带底板）——`cardBrandImage` 那条既有路径。
     /// 仅影响卡片 icon；缺 SVG 或解析失败时仍回退 PNG / 系统符号。
-    /// 2026-09-15 用户要求新增，默认关闭（保持既有 PNG 口径）
-    var iconNoBorder: Bool = false
+    /// 2026-09-15 用户要求新增；⚠️ 2026-09-17 随「出厂默认固化」改为 **true**
+    ///（按当时面板的实际取值固化 —— 那台机器上开着 SVG 原图）
+    var iconNoBorder: Bool = true
     /// 卡片主标题字号（pt，10…16、步进 0.5）：设置窗口「主题外观 → 卡片」开放
-    ///（2026-09-13 开放；2026-09-15 用户把区间由 10…18 收到 10…16、步进细到 0.5）
-    var cardTitleFontSize: Double = 13
+    ///（2026-09-13 开放；2026-09-15 用户把区间由 10…18 收到 10…16、步进细到 0.5）。
+    /// ⚠️ 2026-09-17 随「出厂默认固化」由 13 改为 **13.5**
+    var cardTitleFontSize: Double = 13.5
     /// 卡片主标题启用 Sharp Grotesk（用户本机 ~/Library/Fonts 安装的商业字体；
-    /// 未装对应字重时 NSFont(name:) 落空，自动回落系统字体）
-    var cardTitleSharpGrotesk: Bool = false
-    /// 数值滚动「滑移」时长口径（2026-09-16 用户要求两种都落地，设置窗口
-    /// 「主题外观 → 动效」单选）。原先滑移时长恒等于 `rollDuration`（默认 1.2s，
-    /// 与位移量无关）——用户反馈「位数左右移动花的时间太长」，改由本键选择口径，
-    /// 计算见 `RollingNumberView.slideTime(rollDuration:)`
-    var rollSlideTiming: RollSlideTiming = .wheelTail
-    /// 数值滚动的时间曲线档位（2026-09-16 用户要求开放为设置项）：
-    /// 原先硬写死 ease-in cubic，现由本键选 `RollCurve`
-    var rollCurve: RollCurve = .easeIn
-    // 主副标题行距系数（SF/SG）2026-09-15 用户「固化这两个参数」：config 键、设置窗口滑杆
-    // 与宿主 setter 一并移除，真值改由 `BalancePanelView.cardTitleGapScaleSFFixed / SGFixed`
-    // 两个常量唯一提供（不再落盘）
+    /// 未装对应字重时 NSFont(name:) 落空，自动回落系统字体）。
+    /// ⚠️ 2026-09-17 随「出厂默认固化」由 false 改为 **true**
+    var cardTitleSharpGrotesk: Bool = true
+    // 数值滚动的「滑移时长口径」与「时间曲线档位」2026-09-17 用户「动效的参数固化，移除参数开放」：
+    // 两个 config 键（roll_slide_timing / roll_curve）、`RollSlideTiming` / `RollCurve` 两个枚举、
+    // 设置窗口「主题外观 → 动效」整段、宿主两个 setter 与运行镜像一并移除 ——
+    // 定稿值改由 `RollingNumberView.slideTime()`（跟随位移）与 `rollEase(_:)`（从快到慢）唯一提供，
+    // 不再落盘（与「主副标题行距系数」固化成 `BalancePanelView` 常量同一条做法）
     var cockpitAppId: String = "com.jlcodes.cockpit-tools"
     var workbuddyAutoCheckin: Bool = true
     var workbuddyAccounts: [WBAccount] = []
@@ -307,6 +294,7 @@ struct AppConfig: Codable {
         case hideWbNickname = "hide_wb_nickname"
         case panelBackgroundColor = "panel_background_color"
         case secondaryBackgroundColor = "secondary_background_color"
+        case panelForegroundColor = "panel_foreground_color"
         // 合并前的两个旧键（2026-09-15 合并为 secondary_background_color）：
         // 只用于**解码迁移**，不再写出（`heatDotEmptyColor` / `cardHoverBackgroundColor` 两个属性已删）
         case legacyHeatDotEmptyColor = "heat_dot_empty_color"
@@ -319,8 +307,6 @@ struct AppConfig: Codable {
         case iconNoBorder = "icon_no_border"
         case cardTitleFontSize = "card_title_font_size"
         case cardTitleSharpGrotesk = "card_title_sharp_grotesk"
-        case rollSlideTiming = "roll_slide_timing"
-        case rollCurve = "roll_curve"
         case updateAutoCheck = "update_auto_check"
         case cockpitAppId = "cockpit_app_id"
         case workbuddyAutoCheckin = "workbuddy_auto_checkin"
@@ -398,6 +384,11 @@ struct AppConfig: Codable {
                   let parsed = PanelBackgroundColor(configValue: raw) {
             secondaryBackgroundColor = parsed
         }
+        // 主前景色（2026-09-17 新增）：键不存在 = 用内置两档（参数开放前的老行为，保持 nil）
+        if let raw = try c.decodeIfPresent(String.self, forKey: .panelForegroundColor),
+           let parsed = PanelBackgroundColor(configValue: raw) {
+            panelForegroundColor = parsed
+        }
         // 底端不透明度（2026-09-14 新增，上下两端各自可调）：新键直读；无该键时初值取
         // **与顶端同值**（= 两端同值 ⇒ 纯色遮罩，正是用户反馈的「拉满就该纯色」）——
         // 想要上下层次把底部滑杆往下拉即可。（原先的「底端 = 顶端 × 0.65」自动递减已删）
@@ -414,19 +405,14 @@ struct AppConfig: Codable {
             ?? decoder.container(keyedBy: LegacyKeys.self)
                 .decodeIfPresent(Bool.self, forKey: .balanceCardNewMode)
             ?? false
-        iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? true
-        iconNoBorder = try c.decodeIfPresent(Bool.self, forKey: .iconNoBorder) ?? false
+        // ⚠️ 以下四项的**解码兜底**必须与属性默认值逐字一致（2026-09-17 出厂默认固化那次一并改的）——
+        // 兜底写在 init 里、属性默认写在声明处，两处一旦漂移，「旧配置缺键」与「新装」就会长得不一样
+        iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? false
+        iconNoBorder = try c.decodeIfPresent(Bool.self, forKey: .iconNoBorder) ?? true
         // 主标题字号：夹回取值域（滑杆同域 10…16），旧值/越界值不会顶歪滑杆
-        cardTitleFontSize = min(max(try c.decodeIfPresent(Double.self, forKey: .cardTitleFontSize) ?? 13, 10), 16)
-        cardTitleSharpGrotesk = try c.decodeIfPresent(Bool.self, forKey: .cardTitleSharpGrotesk) ?? false
-        // 滑移时长口径（2026-09-16 新增）：旧配置无此键 → 默认「跟随滚字」
-        //（= 新键引入当刻用户选定的那档）
-        rollSlideTiming = RollSlideTiming(
-            rawValue: try c.decodeIfPresent(String.self, forKey: .rollSlideTiming) ?? "") ?? .wheelTail
-        // 滚动时间曲线（2026-09-16 新增）：旧配置无此键 → 默认「从慢到快」
-        //（= 新键引入当刻的硬编码口径，行为不变）
-        rollCurve = RollCurve(
-            rawValue: try c.decodeIfPresent(String.self, forKey: .rollCurve) ?? "") ?? .easeIn
+        cardTitleFontSize = min(max(try c.decodeIfPresent(Double.self, forKey: .cardTitleFontSize) ?? 13.5, 10), 16)
+        cardTitleSharpGrotesk = try c.decodeIfPresent(Bool.self, forKey: .cardTitleSharpGrotesk) ?? true
+        // 滑移时长口径 / 滚动时间曲线（2026-09-16 新增）2026-09-17 已固化：配置不再读写
         // 主副标题行距系数（SF/SG）已固化（2026-09-15）：真值在 BalancePanelView 的常量里，配置不再读写
         cockpitAppId = try c.decodeIfPresent(String.self, forKey: .cockpitAppId) ?? "com.jlcodes.cockpit-tools"
         cockpitAppId = cockpitAppId.isEmpty ? "com.jlcodes.cockpit-tools" : cockpitAppId
@@ -478,6 +464,8 @@ struct AppConfig: Codable {
         try c.encode(hideWbNickname, forKey: .hideWbNickname)
         try c.encode(panelBackgroundColor.configValue, forKey: .panelBackgroundColor)
         try c.encode(secondaryBackgroundColor.configValue, forKey: .secondaryBackgroundColor)
+        // 主前景色：**只在用户设过时才写**（nil = 内置两档，键保持不存在 ⇒ 新装机器走内置）
+        try c.encodeIfPresent(panelForegroundColor?.configValue, forKey: .panelForegroundColor)
         try c.encode(panelBackgroundBottomAlpha, forKey: .panelBackgroundBottomAlpha)
         try c.encode(lightThemeEnabled, forKey: .lightThemeEnabled)
         try c.encode(valueScrollPreviewEnabled, forKey: .valueScrollPreviewEnabled)
@@ -487,8 +475,7 @@ struct AppConfig: Codable {
         try c.encode(iconNoBorder, forKey: .iconNoBorder)
         try c.encode(cardTitleFontSize, forKey: .cardTitleFontSize)
         try c.encode(cardTitleSharpGrotesk, forKey: .cardTitleSharpGrotesk)
-        try c.encode(rollSlideTiming.rawValue, forKey: .rollSlideTiming)
-        try c.encode(rollCurve.rawValue, forKey: .rollCurve)
+        // 滑移时长 / 时间曲线已固化（2026-09-17）：不再落盘（与行距系数同款）
         try c.encode(cockpitAppId, forKey: .cockpitAppId)
         try c.encode(workbuddyAutoCheckin, forKey: .workbuddyAutoCheckin)
         try c.encode(menuBarVisible, forKey: .menuBarVisible)
@@ -743,18 +730,9 @@ enum UDKey {
     static var updateLastCheckDate: String { "update_last_check_date" }
     static var updateSnoozeDate: String { "update_snooze_date" }
 
-    // 菜单栏状态点「小球弹跳」（设置窗口「菜单栏」pane）：
-    // 逐项独立落盘，读写与取值域见 MenuBarBounceSettings.load()/save()
-    /// 弹跳高度（Double，pt，MenuBarBounceSettings.amplitudeRange）
-    static var menuBarBounceAmplitude: String { "menubar_bounce_amplitude" }
-    /// 弹跳周期（Double，秒，periodRange）
-    static var menuBarBouncePeriod: String { "menubar_bounce_period" }
-    /// 腾空占比（Double，airRatioRange）
-    static var menuBarBounceAirRatio: String { "menubar_bounce_air_ratio" }
-    /// 触地压扁（Double，squashRange）
-    static var menuBarBounceSquashMin: String { "menubar_bounce_squash_min" }
-    /// 顶点拉伸（Double，stretchRange）
-    static var menuBarBounceStretchMax: String { "menubar_bounce_stretch_max" }
+    // 菜单栏状态点「小球弹跳」的五个键（menubar_bounce_*）2026-09-17 随参数固化一并移除：
+    // 真值改由常量 `MenuBarBounceSettings.fixed` 给出，不再读写 UserDefaults。
+    // 老版本落盘的残留值留在 defaults 里不读也不再写，无害。
 }
 
 /// 余额数值快照的磁盘缓存（cache-then-refresh）：启动时先显示上次数值再等网络刷新。
