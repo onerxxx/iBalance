@@ -304,7 +304,7 @@ enum WbShareSync {
 extension AppDelegate {
 
     /// 同步共享：确认弹窗 → 杀 WorkBuddy → 转移会话归属 + 广播记忆 → 重启 WorkBuddy → 结果弹窗。
-    /// 磁贴入口（操作卡片「同步共享」）。
+    /// 入口：设置窗口（原面板操作卡片「同步共享」磁贴 2026-09-13 随操作板块退场）。
     /// 整段必须包在 keepPanelAliveDuring 内（含首个确认弹窗）：否则 .transient popover 会把
     /// 「与弹窗的交互」判为点击面板外 → popoverDidClose 里 NSApp.hide 连弹窗一起隐藏
     /// （表现即「弹窗一出现就消失」，与 API Key 等弹窗同一坑，见 main.swift 注释）。

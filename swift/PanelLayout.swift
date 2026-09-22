@@ -1,5 +1,5 @@
 // PanelLayout.swift — iBalance
-// 面板布局构建:build() 主装配 + 卡片/操作磁贴等行构建器
+// 面板布局构建:build() 主装配 + 卡片/区块行构建器
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 //
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
@@ -291,8 +291,8 @@ extension BalancePanelView {
         NSLayoutConstraint.activate([
             // 左右正文缩进 7pt（原始口径）。满尺寸内容下被系统吃掉的左右边距带由
             // VC 容器层统一补回（BalancePanelViewController.contentHorizontalInset
-            // = 9（2026-09-03 四次调整 16→8→13→9），scrollView 左右约束），9+7=16pt
-            // 视觉口径，本层不重复承担边距替代。
+            // = 11（2026-09-03 四次调整 16→8→13→9；09-06 晚再 -2 → 11），scrollView 左右约束），
+            // 11+7=18pt 视觉口径，本层不重复承担边距替代。
             root.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
             // header 总高度吃 BalancePanelView.headerHeight（2026-09-10 由用户指定 30→33）；
@@ -588,30 +588,27 @@ extension BalancePanelView {
     }
 
     /// 卡片容器：NSVisualEffectView（自动适配深浅色）+ 圆角 + 内边距，宽度撑满 root。
-    /// title 非空时在顶部加一行小标题；spacing 为行距（设置/操作卡片用 12，余额卡片用默认 6）。
-    /// 有点击、右键或拖拽回调时卡片使用 HoverCard；设置/操作卡片用普通 NSView。
-    /// bottomPadding: 卡片底部内边距（默认 7，操作卡片可减小以消除与 footer 间的空白）
+    /// title 非空时在顶部加一行小标题；spacing 为行距（设置卡片用 12，余额卡片用默认 6）。
+    /// 有点击、右键或拖拽回调时卡片使用 HoverCard；设置卡片用普通 NSView。
+    /// bottomPadding: 卡片底部内边距（默认 7，Token/用量卡片给 2 以收紧与相邻板块的间距；原
+    /// `stretchRows: false` 的「不满一行」特例随操作磁贴行 2026-09-13 退场，行内恒定撑满整宽）
     @discardableResult
-    func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, onDragStarted: ((NSPoint) -> Void)? = nil, onDragChanged: ((NSPoint) -> Void)? = nil, onDragEnded: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, trailingPadding: CGFloat? = nil, titleColor: NSColor = Palette.secondaryForeground, cardBackground: NSColor? = kCardBackground, stretchRows: Bool = true, centerRows: Bool = false) -> NSView {
+    func addCard(rows: [NSView], to root: NSStackView, title: String? = nil, spacing: CGFloat = 6, onClick: (() -> Void)? = nil, onRightClick: ((NSEvent) -> Void)? = nil, onDragStarted: ((NSPoint) -> Void)? = nil, onDragChanged: ((NSPoint) -> Void)? = nil, onDragEnded: (() -> Void)? = nil, topPadding: CGFloat = 7, bottomPadding: CGFloat = 7, horizontalPadding: CGFloat = 8, trailingPadding: CGFloat? = nil, titleColor: NSColor = Palette.secondaryForeground, cardBackground: NSColor? = kCardBackground) -> NSView {
         var all = rows
         if let t = title {
             all.insert(sectionTitleRow(name: t, color: titleColor), at: 0)
         }
         let stack = NSStackView(views: all)
         stack.orientation = .vertical
-        stack.alignment = centerRows ? .centerX : .leading
+        stack.alignment = .leading
         stack.distribution = .fill
         stack.spacing = spacing
         stack.translatesAutoresizingMaskIntoConstraints = false
-        // 子行横向撑满，数值靠行内 spacer 推到右端；
-        // stretchRows=false 的行（如操作磁贴行）按内容宽度靠左排：
-        // 不满一行的磁贴行若被拉到全宽，行内 .fill 会打破固定宽约束把末尾磁贴撑满
-        if stretchRows {
-            all.forEach { $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
-        }
+        // 子行横向撑满，数值靠行内 spacer 推到右端（面板里已无「行内元素各自定宽、按内容排」的行）
+        all.forEach { $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
 
         // 卡片透明背景（露出 popover 原生玻璃），仅保留圆角 + 细边框区分
-        // 余额卡片使用 HoverCard 获得 hover 高亮 + 点击回调；设置/操作卡片用普通 NSView
+        // 余额卡片使用 HoverCard 获得 hover 高亮 + 点击回调；设置卡片用普通 NSView
         let card: NSView
         if onClick != nil || onRightClick != nil || onDragStarted != nil {
             let hc = HoverCard()
@@ -1483,54 +1480,75 @@ extension BalancePanelView {
 
     /// 字符化开关（MonoCharSwitch）切换时的模糊→清晰过渡，
     /// 模拟 CSS `filter: blur()` transition：入场/退场时从模糊聚焦成形，仅作用于控件自身。
-    /// ⚠️ 只能用 layer.filters（作用于自身内容，macOS 有效）；
-    /// backgroundFilters 在 macOS 被渲染服务端忽略（勿再尝试）。
-    /// 每帧重建 CIFilter 实例——改 inputRadius 不触发 CA 重合成，必须换实例。
+    ///
+    /// ⚠️ **2026-09-17 改自绘**：原先走 `layerUsesCoreImageFilters + layer.filters` 逐帧换
+    /// `CIGaussianBlur` 实例——那条路会拉起一整包 179 MB 的图层 CI 着色器库且常驻卸载不掉
+    /// （见 TRAPS「内存占用归因」）。现在改成「**一次快照 + CPU 三遍盒式模糊覆盖层**」：
+    /// 起手把目标视图渲染成位图，逐帧由 `SoftBlur.boxBlur` 出模糊图盖在目标之上（原视图
+    /// 用 alpha 藏起，不用 isHidden —— NSStackView 里隐藏会把占位空间收掉、布局会跳），
+    /// 曲线与时长逐字保留（ease-out cubic / 0.35s / 上限 4 设备像素）。
     /// Mono 开关与 Agent 卡「点阵↔其余账号条」互换共用（internal 供 Panel.swift 调用）。
     func playCharBlurTransition(on views: [NSView]) {
         guard !shouldReduceMotion else { return }
-        var layers: [CALayer] = []
-        for v in views {
-            v.wantsLayer = true
-            v.layerUsesCoreImageFilters = true
-            if let l = v.layer { layers.append(l) }
+        // 先收干净上一轮：ticker 为多调用方共享，新调用接管时必须把旧覆盖层撤掉、
+        // 原视图恢复（否则旧目标永远停在「被覆盖」状态）
+        finishCharBlurTransition()
+        charBlurOverlays = views.compactMap { v in
+            guard v.superview != nil, v.bounds.width > 1, v.bounds.height > 1,
+                  let snapshot = charBlurSnapshot(of: v) else { return nil }
+            let overlay = NSImageView(frame: v.frame)
+            overlay.image = NSImage(cgImage: snapshot, size: v.bounds.size)
+            overlay.imageScaling = .scaleAxesIndependently
+            overlay.autoresizingMask = v.autoresizingMask
+            v.superview?.addSubview(overlay, positioned: .above, relativeTo: v)
+            v.alphaValue = 0
+            return (overlay, v, snapshot)
         }
-        guard !layers.isEmpty else { return }
-        // 接管共享 timer：上一轮过渡被打断在中间模糊半径。同一图层集重启（点阵↔条
-        // 快速进出）无需清理（新 timer 立即重新模糊）；不同图层集（Mono 开关 ↔ 卡片
-        // 互换互相打断）必须清旧集滤镜——它的 timer 已被夺走，无人收尾会永久停在模糊态
-        let sameSet = charBlurLayers.map(ObjectIdentifier.init) == layers.map(ObjectIdentifier.init)
-        if !sameSet {
-            for l in charBlurLayers { l.filters = nil }
-        }
-        charBlurLayers = layers
-        charBlurTicker?.stop()
+        guard !charBlurOverlays.isEmpty else { return }
         let duration = 0.35
         let maxRadius: Double = 4
         let start = CACurrentMediaTime()
         // 出帧源 = 显示器刷新率（DisplayTicker，非 60Hz 定频）：模糊半径逐帧收敛
         let ticker = DisplayTicker(host: self) { [weak self] in
+            guard let self else { return false }
             let p = min(1, (CACurrentMediaTime() - start) / duration)
             // ease-out cubic：前段快速收拢，尾段缓慢聚焦
             let eased = 1 - pow(1 - p, 3)
             let radius = max(0, maxRadius * (1 - eased))
-            for layer in layers {
-                if radius > 0.05 {
-                    let f = CIFilter(name: "CIGaussianBlur") ?? CIFilter()
-                    f.setValue(radius, forKey: "inputRadius")
-                    layer.filters = [f]
-                } else {
-                    layer.filters = nil
-                }
+            for item in self.charBlurOverlays {
+                let image: CGImage? = radius > 0.05
+                    ? SoftBlur.boxBlur(item.snapshot, sigmaPx: radius) : item.snapshot
+                item.overlay.image = NSImage(cgImage: image ?? item.snapshot, size: item.target.bounds.size)
             }
             if p >= 1 {
-                self?.charBlurTicker = nil
+                self.finishCharBlurTransition()
                 return false
             }
             return true
         }
         charBlurTicker = ticker
         ticker.start()
+    }
+
+    /// 收尾 / 打断：撤掉覆盖层、恢复原视图，并停表（幂等）
+    private func finishCharBlurTransition() {
+        charBlurTicker?.stop()
+        charBlurTicker = nil
+        guard !charBlurOverlays.isEmpty else { return }
+        for item in charBlurOverlays {
+            item.overlay.removeFromSuperview()
+            item.target.alphaValue = 1
+        }
+        charBlurOverlays.removeAll()
+    }
+
+    /// 目标视图的静态快照（与拖拽幽灵同口径：先提交布局/绘制，再 cacheDisplay）
+    private func charBlurSnapshot(of view: NSView) -> CGImage? {
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        view.cacheDisplay(in: view.bounds, to: rep)
+        return rep.cgImage
     }
 
     /// 在同一容器内交叉淡入淡出两个控件，避免 Mono 开关切换时控件瞬间跳变。
@@ -1723,8 +1741,8 @@ extension BalancePanelView {
         BalancePanelViewController.contentHorizontalInset + 10.6
     }
     /// 槽间距：由「左右缩进相同」**反解**出来的量，不是手填常量 ——
-    /// 可用宽 = panelWidth − 左右缩进 = 264 − 2×21.6 = 220.8，9 颗占 9×22 = 198，
-    /// 余 22.8 平分给 8 个槽间距 → 2.85pt。
+    /// 可用宽 = panelWidth − 左右缩进 = 254 − 2×21.6 = 210.8，9 颗占 9×22 = 198，
+    /// 余 12.8 平分给 8 个槽间距 → 1.6pt（2026-09-22 面板 264→254 后收窄，仍是正间距）。
     /// 增删槽位或改 panelWidth 时这里自动跟着变，不需要回来手改数字。
     static var headerButtonSlotGap: CGFloat {
         let available = BalancePanelViewController.panelWidth - headerSlotStripLeading * 2

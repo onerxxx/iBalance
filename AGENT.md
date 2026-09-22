@@ -24,13 +24,13 @@
 
 > 千问（Qianwen）平台已于 2026-08 下线，相关代码与配置字段已全部移除。
 
-交互方式：**左键**点菜单栏图标弹出详情面板（NSPopover，余额卡片 + 日/周用量 + 设置 + 操作）；**右键**弹出传统 NSMenu（兜底入口，选项与面板同步）。余额卡片支持**拖拽排序**（平台组顺序持久化，菜单栏条目顺序与面板共用同一份 UserDefaults）。
+交互方式：**左键**点菜单栏图标弹出详情面板（NSPopover，余额卡片[API / Token / Agent 三组] + 日/周用量；面板内的「设置」板块 2026-09-12、「操作」板块 2026-09-13 已整体移除，设置项与工具入口只走设置窗口 / 状态栏菜单）；**右键**弹出传统 NSMenu（兜底入口，选项与面板同步）。余额卡片支持**拖拽排序**（平台组顺序持久化，菜单栏条目顺序与面板共用同一份 UserDefaults）。
 
 应用为纯菜单栏应用（`LSUIElement = true`，无 Dock 图标，也因此不出现在 ⌘⌥Esc「强制退出」面板——系统机制使然，已拍板保持此形态），编译目标 `arm64-apple-macos26`（macOS 26+ Liquid Glass 适配基线）。
 
 ### App 内自动更新（2026-08-27 上线）
 
-- **检查入口**：操作区「检查更新」磁贴（手动）+ 设置卡「自动检查更新」开关（默认开；启动 20s 后静默检查，每自然日至多一次，「稍后再说」当日 snooze 不再打扰）。
+- **检查入口**：状态栏右键菜单「检查更新…」（手动，面板操作磁贴 2026-09-13 随操作板块退场）+ 设置窗口「自动检查更新」开关（默认开；启动 20s 后静默检查，每自然日至多一次，「稍后再说」当日 snooze 不再打扰）。
 - **更新链路**（`swift/UpdateService.swift`，自研非 Sparkle）：GET `api.github.com/repos/onerxxx/iBalance/releases/latest` → 版本数值逐段比较（tag `v<CFBundleVersion>`）→ URLSession 流式下载 zip → SHA256 校验（asset.digest 优先、正文 `SHA256:` 行兜底，缺失拒装）→ `codesign --verify --deep --strict` → ditto 暂存新 app 到旧 bundle 同卷同级隐藏目录 → spawn 独立 sh（等进程退净 + pkill 兜底防 open 激活旧实例）→ NSApp.terminate 自动重启。
 - **前提**：仓库必须保持**公开**（Releases 匿名可拉）；签名身份必须恒为 `iBalance Local Sign`（TCC 授权/登录项跨版本连续的根），私钥 `.p12` 已知丢失过一次（见陷阱 #2），务必备份。
 
@@ -61,7 +61,7 @@
 │   ├── CheckinManager.swift # 签到域（AppDelegate 扩展）：错峰自动签到 / 手动签到 / 签到历史 / 定时器（~820 行）
 │   ├── AccountSwitcher.swift# 多账号采集与切换（AppDelegate 扩展）：WB OAuth / TRAE·Codex·ZCode 导入 / performAccountSwitch（~380 行）
 │   ├── PinWindow.swift      # 面板置顶浮窗（AppDelegate 扩展）：popover ↔ 无边框 NSPanel 内容转移（~120 行）
-│   ├── Controls.swift       # 自绘控件：MiniSwitch / HoverCard / ActionTileButton / QuietScrollView 等（~1900 行）
+│   ├── Controls.swift       # 自绘控件：MiniSwitch / HoverCard / HoverIconButton / QuietScrollView 等（~1900 行）
 │   ├── UsagePanel.swift     # 用量板块：UsageRowSnapshot / 趋势图与子弹窗 / UsageDots + BalancePanelView 用量扩展（~860 行）
 │   ├── PanelDrag.swift      # 卡片拖拽排序（BalancePanelView 扩展）：拖动状态机 / 幽灵卡片 / 重排动画（~290 行）
 │   ├── PanelLayout.swift    # 布局构建（BalancePanelView 扩展）：build() 主装配 + 各类行构建器（~1150 行）
@@ -72,7 +72,8 @@
 │   ├── KeychainStore.swift  # 凭据保险库（CredentialVault）：7 个敏感字段钥匙串读写迁移
 │   ├── Logger.swift         # 统一日志（取代各 Service 私有 appendLog）
 │   ├── ProcessUtil.swift    # Electron 应用切号共用进程工具（找主进程/温和杀/强杀/等待退出）
-│   ├── RollingNumberView.swift # 余额数值「里程表」逐位滚动视图（数字轮独立 tween 自驱动）
+│   ├── RollingNumberView.swift # 余额数值「里程表」逐位滚动视图（数字轮独立 tween 自驱动；可切原生引擎）
+│   ├── NativeRollingEngine.swift # 数值滚动「原生引擎」：RN nitro-rolling-number 的 C++ 状态机用 Swift 重写（共享时长 / 方向最短路径 / ease·spring / 环绕）
 │   ├── Services/
 │   │   ├── DeepSeek.swift   # DeepSeek 余额查询
 │   │   ├── BigModelService.swift # Zhipu 余额查询（浏览器 Cookie 采集）
@@ -161,14 +162,14 @@ open iBalance.app             # 运行（或双击）
 | 昵称（副标题右侧）字号 | `PanelLayout.balanceContentRow` | 10 |
 | 昵称（含签到徽章）最大宽 | `NickBadgeTextField` 构建处（Panel.swift） | ≤ 90 |
 | 设置行副标题最大宽 | `statusDebugSub`（Panel.swift） | ≤ 90 |
-| popover 面板宽度 | `updateContentSize`（Panel.swift） | `max(230, fittingSize.width - 20)` |
+| popover 面板宽度 | `BalancePanelViewController.panelWidth`（Panel.swift） | **254**（2026-09-22：264 → 254）；document 宽 = 它 − 缩进 11×2 = 232 |
 | 浮窗（pin）宽度 | `PinWindow` + config `floating_panel_width` | `max(config, 转移时面板宽)`，clamp [240, 480] |
 
 规则：
 - **有常量的改常量**，改完顺手把散落的数字一起换掉（别留两份）；没有常量的高频数值（如某行距被反复调）就地提炼成常量。
 - 数值类注释**不要写行号**（行号必漂移），写符号名，用 grep 定位。
 - 面板坐标系有实测翻转语义等一堆坑，见 `.workbuddy/memory/MEMORY.md`。
-- **面板宽度类改动的隐藏坑（2026-09-01 实测）**：popover 宽度按 `fittingSize` 拟合，但 fittingSize 按**理想宽**算——hidden 视图的约束照样参与（Codex 卡隐藏时其邮箱昵称 195pt 仍把面板撑到 250）、长文本 label 布局时被截断但 fittingSize 仍按完整宽。对策：长 label 一律加 `widthAnchor ≤ N` 上限约束。详见 `.workbuddy/memory/MEMORY.md` 的 fittingSize 虚高陷阱。
+- **面板宽度类改动的隐藏坑（2026-09-01 实测）**：（前提已废 —— 2026-09-03 起宽度由 `panelWidth` 直给、不再由 fittingSize 反推；下面的 `≤ N` 上限规则仍有效，因为高度仍走 fittingSize）popover 宽度按 `fittingSize` 拟合，但 fittingSize 按**理想宽**算——hidden 视图的约束照样参与（Codex 卡隐藏时其邮箱昵称 195pt 仍把面板撑到 250）、长文本 label 布局时被截断但 fittingSize 仍按完整宽。对策：长 label 一律加 `widthAnchor ≤ N` 上限约束。详见 `.workbuddy/memory/MEMORY.md` 的 fittingSize 虚高陷阱。
 
 ## ⚠️ 关键陷阱（必读）
 
@@ -241,7 +242,7 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | `zcode_accounts`                                          | ZCode 多号账号列表：`[{uid, token, nickname}]`（JSON 导入）                          |
 | `codex_accounts`                                          | Codex 多号账号列表：`[{uid, token, email, refreshToken, idToken}]`（本机 auth.json 导入；旧配置缺 refresh/id token 时兼容仅 access token） |
 | `menubar_visible`                                         | 菜单栏条目显隐表：`{条目id: bool}`（右键卡片「在菜单栏显示」开关持久化）                               |
-| `update_auto_check`                                       | 自动检查更新开关（默认 true；启动 20s 后静默检查 GitHub Releases，每日一次；关闭不影响手动「检查更新」磁贴）      |
+| `update_auto_check`                                       | 自动检查更新开关（默认 true；启动 20s 后静默检查 GitHub Releases，每日一次；关闭不影响手动「检查更新…」）      |
 | `cockpit_app_id`                                          | Cockpit Tools 的 Bundle ID                                                 |
 
 > 已弃用并移除：`workbuddy_report_url`、`workbuddy_account`、`cockpit_url`、`deepseek_decimals`、`qianwen_*`、`hide_main_icon`（旧版遗留，新代码不再读写、不再落盘）。
@@ -252,12 +253,13 @@ layer-backed 视图经 Auto Layout 布局时 `anchorPoint` 会被 AppKit 重置�
 | ---------------------------------- | ------------------------------------------------------------------ |
 | `main.swift`                       | `@NSApplicationMain` 入口 + `@MainActor AppDelegate`：菜单栏 UI、面板生命周期、菜单构建与回调、刷新定时器与四服务并行刷新、`PanelSnapshot` 组装、标题位图渲染、通用工具（DateFormatter / 通知） |
 | `Panel.swift`                      | 详情面板主体：`PanelSnapshot` / `AccountCardSnapshot` 快照类型、`Motion` / `Palette` 设计 token、字体 provider、`BalancePanelView` 类体（回调 / 存储属性 / 字体策略 / 数据更新 / 多号卡片通用实现）、`BalancePanelViewController`、`NumberRollAnimator`（2026-08-27 起仅保留数值文本解析 parse；滚动驱动已移交 RollingNumberView 自驱） |
-| `RollingNumberView.swift`          | 余额数值逐位滚动视图（2026-08-27 重构为自驱动）：`DigitWheelView` 数字轮（12 格预渲染条带图层，每帧仅合成器平移零重绘）+ `TextSlotView` 静态字符槽 + 右对齐槽位排版（非等宽字体按真实 advance 连续插值）。终值一次下发 `setText(animated:rollDuration:)`，各轮独立 tween 到自己的目标数字后停下（异步落定，行进 d 格耗时 = rollDuration × d/10，实例级 ±6% 相位抖动打破同距同步）；displayLink 在面板隐藏时冻结挂起、回窗口续滚 |
+| `RollingNumberView.swift`          | 余额数值逐位滚动视图（2026-08-27 重构为自驱动）：`DigitWheelView` 数字轮（12 格预渲染条带图层，每帧仅合成器平移零重绘）+ `TextSlotView` 静态字符槽 + 右对齐槽位排版（非等宽字体按真实 advance 连续插值）。终值一次下发 `setText(animated:rollDuration:)`，各轮独立 tween 到自己的目标数字后停下（异步落定，行进 d 格耗时 = rollDuration × d/10，实例级 ±6% 相位抖动打破同距同步）；displayLink 在面板隐藏时冻结挂起、回窗口续滚。**2026-09-20 起另有一条引擎驱动路径**：设置「主题外观 → 卡片 → 原生滚动数字」打开后（`nativeEngineEnabled` 静态镜像），同结构数值变化改由 `NativeRollingEngine` 驱动 —— 位置/方向/环绕由引擎给（**方向恒走"变化侧最短路径"**），渲染公式不变，只换推进者；**节奏仍是面板原口径**（每轮时长 = 行程 × 0.3s × ±6% 相位、曲线恒 ease-out）——引擎原版「整串一段共享时长」与面板「每格 0.3s」不可兼得（实测：按最长给 → 低行程轮 0.09pt/帧爬行；按最短给 → 高行程轮 10.2pt/帧频闪），故**引擎一个轮一个**。结构变化 / 单位换值 / 未动画仍走原自驱路径，切换不重建卡片 |
+| `NativeRollingEngine.swift`        | 数值滚动的**原生引擎**（2026-09-20）：`ronickg/react-native-nitro-rolling-number` 的 `cpp/RollingEngine.{hpp,cpp}`（Nitro Modules 的 iOS/Android 共用状态机）用 Swift 重写的**滚动那一半** —— Target 解算（幅值 / 位数 / 每轮目标数字）、Wheel 连续位置（含 10 环绕与出现/消失轮）、Transition（时长 + 每轮 stagger + 方向：变化侧最短路径 + ease/easeFromMotion/spring）、`tick` 推进与落定、`plannedTravels`（只询行程，容器据此折算每格节奏）。未移植：jackpot reveal（count/spin、里程碑）与 loading shimmer（主面板没有这两个用法）。入口收**显示口径的整数幅值**（不经 Double），负号不进引擎（iBalance 的 "-" 是静态槽）。用法：`DigitWheelView` **一个轮一个**实例（原版的"整串一段共享时长"与面板每格 0.3s 的固化节奏不可兼得，见那边注释的实测）；**观感调参只有两处**：曲线恒 `.easeOut`、时长 = `行程 × secondsPerCell × 实例相位` |
 | `Dialogs.swift`                    | 弹窗统一封装（自 main.swift 拆出）：`DialogShell` 布局系统、`InputDialog`、DeepSeek 设置、平台自动化开关等业务弹窗 |
 | `CheckinManager.swift`             | 签到域（AppDelegate 扩展）：WB/TRAE 错峰自动签到（60s 轮询 + 每号随机就绪时刻）、手动签到编排、签到结果/历史弹窗、签到定时器、`CheckinRecord` 落库 |
 | `AccountSwitcher.swift`            | 多账号采集与切换（AppDelegate 扩展）：WB OAuth 采集与轮询、TRAE storage 采集、Codex/ZCode JSON 导入、`performAccountSwitch` 统一切号编排 + 四平台切号入口 |
 | `PinWindow.swift`                  | 面板置顶浮窗（AppDelegate 扩展）：pin 时 popover 内容转移至无边框 NSPanel、浮窗尺寸恢复、unpin 预建下一轮 popover |
-| `Controls.swift`                   | 自绘控件（自 Panel.swift 拆出）：`MiniSwitch` / `MonoCharSwitch` / `MonoSegmentedControl` / `HoverRowView` / `HoverIconButton` / `RefreshIconButton` / `HoverCard` / `ActionTileButton` / `TintedVisualEffectView` / `QuietScrollView` / `ScrollFadeHint` / `PanelResizeHandle` 等 |
+| `Controls.swift`                   | 自绘控件（自 Panel.swift 拆出）：`MiniSwitch` / `MonoCharSwitch` / `MonoSegmentedControl` / `HoverRowView` / `HoverIconButton` / `RefreshIconButton` / `RefreshPieButton` / `HoverCard` / `TintedVisualEffectView` / `QuietScrollView` / `ScrollFadeHint` / `PanelResizeHandle` 等（`ActionTileButton` 已随操作磁贴 2026-09-13 删除） |
 | `UsagePanel.swift`                 | 用量板块（自 Panel.swift 拆出）：`UsageRowSnapshot`、`UsageHistoryChartView` 一周趋势图 + 子弹窗控制器、`UsageDots` 点阵、`BalancePanelView` 用量扩展（表头/行构建、子弹窗开关） |
 | `PanelDrag.swift`                  | 卡片拖拽排序（`BalancePanelView` 扩展）：拖动状态机、幽灵卡片快照、兄弟卡让位、drop highlight、重排动画 |
 | `PanelLayout.swift`                | 布局构建（`BalancePanelView` 扩展）：`build()` 主装配、`addCard` / `balanceContentRow` / `collapsibleSectionTitle` / `switchRow` 等行构建器、字符模糊过渡 |

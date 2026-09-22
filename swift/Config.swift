@@ -210,23 +210,34 @@ struct AppConfig: Codable {
     /// **可选** —— nil（键不存在）= 用内置两档（深色 #EBEBEB / 浅色 0.13 黑），
     /// 有值 = 用户自选色，**两档共用**（不再按外观分档）。落盘 `hsv:H,S,V,A` 同其他色。
     /// 运行镜像 = `Palette.foregroundActive`（启动载入 / 色盘落值 / 预设应用三处写）
-    var panelForegroundColor: PanelBackgroundColor?
+    /// ⚠️ 2026-09-22 随「便签黄」出厂默认固化：默认不再是 nil，而是当时那支深灰
+    /// hsv(0, 0, 0.173407)。**副作用**：有值时两档共用 ⇒ 深色主题正文也用它（要与 `SettingsUI`
+    /// 的 `AppSettingsSnapshot.panelForegroundColor` 同源改，改回 nil 即可恢复内置两档）
+    var panelForegroundColor: PanelBackgroundColor? = PanelBackgroundColor(hue: 0, saturation: 0,
+                                                                          brightness: 0.173407, alpha: 1)
     /// 面板底色遮罩**底端**的不透明度（0…1，2026-09-14 用户要求上下两端各自可调）：
     /// 顶端用 `panelBackgroundColor` 自身的 alpha，底端用本键；两者同值 = 纯色遮罩。
     /// 取代原先「底端 = alpha × 0.65」的自动递减（该残留已删）
     var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha
     /// 浅色主题开关：true = 强制浅色外观（即使系统是深色主题）；优先级高于渐变开关
     /// （浅色生效时不用深色遮罩，走原生浅色玻璃 + Palette 浅色分支）
-    var lightThemeEnabled: Bool = false
+    /// ⚠️ 2026-09-22 随「便签黄」出厂默认固化为 **true**
+    var lightThemeEnabled: Bool = true
     /// 数值滚动预览开关：true = 余额卡片数值周期随机变化，演示逐位滚动动画
     ///（替换原「调试用量样例数据」功能；关闭后恢复真实数值）
     var valueScrollPreviewEnabled: Bool = false
-    /// 自动检查更新（GitHub Releases 启动静默检查；手动「检查更新」磁贴不受此开关限制）
+    /// 自动检查更新（GitHub Releases 启动静默检查；手动「检查更新…」不受此开关限制）
     var updateAutoCheck: Bool = true
     /// 长进度卡片（原「新卡片模式」，2026-09-06 改名）：true = 余额卡片进度条独占整行
     ///（左缘=主标题最左）+ 副标题下移一行（design/balance-card-mode.html 口径）；
     /// false = 现行副标题+窄进度条同行
     var longProgressCard: Bool = false
+    /// 原生滚动数字开关（2026-09-20 用户要求）：true = 数值滚动交给 `NativeRollingEngine`
+    ///（RN nitro-rolling-number 原生引擎的 Swift 移植，见 swift/NativeRollingEngine.swift）——
+    /// 位图位置由引擎给（方向恒走「变化侧最短路径」、环绕/曲线都是它的），**节奏仍是面板固化的
+    /// 每格 0.3s**（引擎一个轮一个，各按自己的行程跑）；false = 既有口径（各位独立 tween、
+    /// 最近等价位方向）。默认关 = 不改现观感
+    var nativeRollingNumber: Bool = false
     /// 图标深浅互换开关：true = 余额卡片品牌 icon 的 ClearDark/ClearLight 版本互换
     ///（深色外观取浅色版、浅色外观取深色版；仅影响卡片 icon，面板外观不动）。
     /// 2026-09-07 用户定稿默认开启；⚠️ 2026-09-17 随「出厂默认固化」改回 **false**
@@ -303,6 +314,7 @@ struct AppConfig: Codable {
         case lightThemeEnabled = "light_theme_enabled"
         case valueScrollPreviewEnabled = "value_scroll_preview_enabled"
         case longProgressCard = "long_progress_card"
+        case nativeRollingNumber = "native_rolling_number"
         case iconThemeSwap = "icon_theme_swap"
         case iconNoBorder = "icon_no_border"
         case cardTitleFontSize = "card_title_font_size"
@@ -397,7 +409,8 @@ struct AppConfig: Codable {
         } else {
             panelBackgroundBottomAlpha = min(max(panelBackgroundColor.alpha, 0), 1)
         }
-        lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? false
+        // ⚠️ 2026-09-22 随「便签黄」出厂默认固化：缺省由 false 改 true（与属性默认同源）
+        lightThemeEnabled = try c.decodeIfPresent(Bool.self, forKey: .lightThemeEnabled) ?? true
         valueScrollPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .valueScrollPreviewEnabled) ?? false
         updateAutoCheck = try c.decodeIfPresent(Bool.self, forKey: .updateAutoCheck) ?? true
         // 新键 long_progress_card；旧键 balance_card_new_mode 兼容读取（改名不丢已存开关值）
@@ -405,6 +418,8 @@ struct AppConfig: Codable {
             ?? decoder.container(keyedBy: LegacyKeys.self)
                 .decodeIfPresent(Bool.self, forKey: .balanceCardNewMode)
             ?? false
+        // 结构未变时数值滚动是否交给原生引擎（2026-09-20 新增）：老配置缺键 → 关（既有观感）
+        nativeRollingNumber = try c.decodeIfPresent(Bool.self, forKey: .nativeRollingNumber) ?? false
         // ⚠️ 以下四项的**解码兜底**必须与属性默认值逐字一致（2026-09-17 出厂默认固化那次一并改的）——
         // 兜底写在 init 里、属性默认写在声明处，两处一旦漂移，「旧配置缺键」与「新装」就会长得不一样
         iconThemeSwap = try c.decodeIfPresent(Bool.self, forKey: .iconThemeSwap) ?? false
@@ -471,6 +486,7 @@ struct AppConfig: Codable {
         try c.encode(valueScrollPreviewEnabled, forKey: .valueScrollPreviewEnabled)
         try c.encode(updateAutoCheck, forKey: .updateAutoCheck)
         try c.encode(longProgressCard, forKey: .longProgressCard)
+        try c.encode(nativeRollingNumber, forKey: .nativeRollingNumber)
         try c.encode(iconThemeSwap, forKey: .iconThemeSwap)
         try c.encode(iconNoBorder, forKey: .iconNoBorder)
         try c.encode(cardTitleFontSize, forKey: .cardTitleFontSize)
@@ -664,9 +680,10 @@ enum UDKey {
     static func traeStatusRetry(_ uid: String) -> String { "trae_status_retry_\(uid)" }
     static var traeStatusFillDate: String { "trae_status_fill_date" }
 
-    // 面板区块折叠状态（Bool，操作/用量标题胶囊点击切换）
-    // ⚠️ 原 settingsSectionCollapsed 随面板「设置」板块 2026-09-12 移除（设置项都在设置窗口）
-    static var actionsSectionCollapsed: String { "panel_actions_section_collapsed" }
+    // 面板区块折叠状态（Bool，用量标题胶囊点击切换）
+    // ⚠️ 原 settingsSectionCollapsed 随面板「设置」板块 2026-09-12 移除、原 actionsSectionCollapsed
+    // （"panel_actions_section_collapsed"）随「操作」板块 2026-09-13 移除 —— 两个键的定义与读写点都已删净，
+    // 只余用量一块，故本组只剩它一个（UserDefaults 里的历史值留着无害）
     static var usageSectionCollapsed: String { "panel_usage_section_collapsed" }
     /// 余额平台卡片的显示顺序（[String]，由面板拖拽更新）
     static var balancePlatformOrder: String { "panel_balance_platform_order" }
@@ -679,8 +696,12 @@ enum UDKey {
     /// 「主题预设」列表（String = [ThemePreset] 的 JSON 串，设置窗口「主题外观」页顶部
     /// 「保存」写入；读写见 ThemePresetStore）
     static var themePresets: String { "theme_presets" }
+    /// 最后一次「应用」的主题预设 id（2026-09-22 新增）：判断「当前这枚预设被改过没有」——
+    /// 当前外观仍与该预设逐项相等 = 干净；不再相等 = 卡片显示「已修改」并给更新/重置入口。
+    /// 只记 id（值以 `theme_presets` / 内置常量为准），切号 / 换机不影响它
+    static var appliedThemePresetID: String { "applied_theme_preset_id" }
 
-    // 3D 硬币弹窗（CoinDemo）：整页参数自动保存，下次打开还原（读写见 CoinSettings）
+    // 3D 硬币（CoinDemo）：设置窗口「3D 硬币」pane 整页参数自动保存，下次打开还原（读写见 CoinSettings）
     /// Preset（Int = CoinPreset.rawValue：0 = GHO 无色场 / 1 = sGHO 启用色场）
     static var coinPreset: String { "coin_preset" }
     /// Appearance（Int = CoinAppearance.rawValue：0 = Default 材质渲染 / 1 = Outline 线稿）
@@ -721,6 +742,10 @@ enum UDKey {
     static var coinOutlineWidth: String { "coin_outline_width" }
     /// Logo 反色（Bool）：把 logo 与硬币面互为负形显示（原为 false，未写过即关闭）
     static var coinLogoInverted: String { "coin_logo_inverted" }
+    /// 硬币是否走 GPU 渲染（Bool）。**Phase 5 的临时总开关**：Phase 2/3 的离线判据尚未通过，
+    /// 所以**默认关**（走 CG 自绘）。想开不用重编：
+    /// `defaults write com.local.ibalance coin_render_metal -bool true` 后重启。
+    static var coinRenderMetal: String { "coin_render_metal" }
     /// 上传的 logo SVG 原文（空 = 内置 GHO 预设）
     static var coinLogoSVG: String { "coin_logo_svg" }
     /// 上传的 logo 文件名（行内展示用，空 = 内置 GHO 预设）

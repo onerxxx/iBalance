@@ -394,6 +394,11 @@ private struct ThemePane: View {
                 // 无边框图标（2026-09-15 用户要求）：卡片品牌 icon 直接用同名 SVG 原图
                 Toggle("无边框图标", isOn: toggle(\.iconNoBorder, model.setIconNoBorder))
                 Toggle("长进度卡片", isOn: toggle(\.longProgressCard, model.setLongProgressCard))
+                // 原生滚动数字（2026-09-20 用户要求）：把克隆来的 react-native-nitro-rolling-number
+                // 的核心（cpp/RollingEngine 的状态机）用 Swift 重写后接上数值滚动 ——
+                // 打开后数字的滚动方向/环绕/曲线都走引擎（方向恒走「变化侧最短路径」，与既有的
+                //「最近等价位」不同）；节奏仍是面板原样（每格 0.3s、各位异步落定）
+                Toggle("原生滚动数字", isOn: toggle(\.nativeRollingNumber, model.setNativeRollingNumber))
                 // 主标题字号（2026-09-15 用户：区间收到 10…16、步进 0.5 —— 半档用于微调标题墨迹高，
                 // 读数同档显示小数）
                 ptSliderRow("主标题字号",
@@ -409,7 +414,7 @@ private struct ThemePane: View {
             } header: {
                 Text("卡片")
             } footer: {
-                Text("「主标题字号」只管平台名（数值字号不变）；「Sharp Grotesk」开启后面板内文字统一换用，中文兜底苹方、未安装则回落系统字体。")
+                Text("「主标题字号」只管平台名；「原生滚动数字」改用原生引擎驱动数值滚动（方向走变化侧最短路径）；「Sharp Grotesk」开启后全面板换字体。")
             }
             // ── 动效（2026-09-16 用户要求：位数变化时整组左右平移的时长口径两种都落地）──
             // ⚠️ **2026-09-17 用户「动效的参数固化，移除参数开放」：整个 Section 已删除** ——
@@ -471,6 +476,10 @@ private struct ThemePane: View {
     private func presetCard(_ preset: ThemePreset) -> some View {
         let isActive = preset.matches(model.snapshot)
         let isBuiltIn = ThemePreset.builtInIDs.contains(preset.id)
+        // 「已修改」（2026-09-22）= 这枚就是**最后应用过**的那枚，但当前外观已经跟它对不上。
+        // ⚠️ 不能只用 `!isActive` 判：那样每枚"当前值恰好不等于它"的卡都会亮已修改 ——
+        // 必须同时命中 `appliedPresetID`（宿主记的、跨窗口/重启保持）
+        let isModified = !isActive && preset.id == model.snapshot.appliedPresetID
         // 图卡前景色 = **这枚预设自己记的主前景色**（nil = 内置两档，2026-09-17 随参数开放接入预设）。
         // 提到 presetCard 算好再往下传（而不是让 presetThumb 自己读全局）：参数变化 →
         // 这里的值跟着变 → SwiftUI 重渲染子树，图卡上的文字色才能实时跟上色盘
@@ -478,11 +487,40 @@ private struct ThemePane: View {
         let fg = Color(nsColor: PanelForegroundColor.resolved(dark: appearanceDark,
                                                               override: preset.panelForegroundColor))
         return VStack(spacing: Self.s(6)) {
-            Button { model.applyThemePreset(preset) } label: {
-                presetThumb(preset, isActive: isActive, appearanceDark: appearanceDark, fg: fg)
+            // 图卡本体仍是「点 = 应用」，但外层不再直接是 Button —— 右上方的图标按钮要**叠在缩略图上**，
+            // 而「同一 Button 里再嵌 Button」的命中判定不可靠（垃圾桶当年就是为这个挪进名字行的）。
+            // 这里改成 ZStack 里两个平级 Button：上层的图标按钮天然先拿到点击，其余区域落回应用按钮
+            ZStack(alignment: .top) {
+                Button { model.applyThemePreset(preset) } label: {
+                    presetThumb(preset, isActive: isActive, appearanceDark: appearanceDark, fg: fg)
+                }
+                .buttonStyle(.plain)
+                .help(isModified ? "应用这组预设（会丢弃当前修改）" : "应用这组预设")
+                if isModified {
+                    HStack(spacing: Self.s(4)) {
+                        Text("已修改")
+                            .font(.system(size: Self.s(9), weight: .medium))
+                            .foregroundStyle(fg)
+                            .padding(.horizontal, Self.s(5))
+                            .padding(.vertical, Self.s(2))
+                            .background(Capsule().fill(Color(nsColor: .controlBackgroundColor).opacity(0.75)))
+                        Spacer(minLength: 0)
+                        // 更新：只有用户自建的能写回（内置六枚写死在代码里，存储里没有它们的条目）
+                        if !isBuiltIn {
+                            presetIconButton("square.and.arrow.down", fg: fg,
+                                             help: "把当前外观更新到这组预设") {
+                                model.updateThemePreset(id: preset.id)
+                            }
+                        }
+                        presetIconButton("arrow.counterclockwise", fg: fg,
+                                         help: "重置为这组预设的值（丢弃当前修改）") {
+                            model.applyThemePreset(preset)
+                        }
+                    }
+                    .padding(.horizontal, Self.s(6))
+                    .padding(.top, Self.s(6))
+                }
             }
-            .buttonStyle(.plain)
-            .help("应用这组预设")
             HStack(spacing: Self.s(4)) {
                 Color.clear.frame(width: Self.s(16), height: 1)
                 presetNameText(preset, isBuiltIn: isBuiltIn)
@@ -500,6 +538,21 @@ private struct ThemePane: View {
                 }
             }
         }
+    }
+
+    /// 图卡右上方的小图标按钮（2026-09-22「更新预设 / 重置预设」）：
+    /// 圆形半透明底 + 预设自己的前景色 —— 跟着图卡的深浅档走，不用系统强调色（图卡是自绘面板缩影）
+    private func presetIconButton(_ icon: String, fg: Color, help: String,
+                                  action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: Self.s(10), weight: .semibold))
+                .foregroundStyle(fg)
+                .frame(width: Self.s(18), height: Self.s(18))
+                .background(Circle().fill(Color(nsColor: .controlBackgroundColor).opacity(0.75)))
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     /// 「新增主题」= 与一枚预设**同宽同高的大按钮**（2026-09-17 用户
@@ -884,7 +937,7 @@ private struct ThemePane: View {
 
     /// 缩略图里各档文字的字体入口（板块大标题 + 卡片标题 + Token 大数字共用）：
     /// 主面板字号 **× 0.7 × scale（= `thumbScale`）** ——
-    /// 图卡宽 ≈ 主面板的一半（122 vs 264），文字按比例缩才读得出「这是面板的缩影」；
+    /// 图卡宽 ≈ 主面板的一半（122 vs 254），文字按比例缩才读得出「这是面板的缩影」；
     /// 原样 13.5pt 塞进 122pt 宽的卡里又大又挤。系数先试过 0.5（2026-09-16 用户「太小了 70%吧」）
     /// —— 0.7 比严格半比例大一档，是**可读性**换来的：13.5 → 9.45pt，档差（10/16pt → 7/11.2pt）更明显。
     /// SG 开关 → 本机 PostScript 名（未装自动回落系统字体），否则系统字体。

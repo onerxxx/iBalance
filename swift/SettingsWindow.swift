@@ -16,7 +16,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     /// 为什么必须持续守卫见 `installSplitResizeGuard`）
     private var splitResizeObserver: NSObjectProtocol?
     private var guardedSplitViewID: ObjectIdentifier?
-    /// 「3D 硬币」pane 内嵌的面板（与 GlassModalShell 弹窗同款组件，保活复用——
+    /// 「3D 硬币」pane 内嵌的面板（保活复用——
     /// pane 切走再回来不丢未保存调参；关闭整个窗口也不释放，下次打开续用）
     private var coinDemoPanel: CoinDemoPanelView?
     /// 「平台」pane 的开关表格（保活；每次开窗由 refresh 回读真实配置、丢弃未保存勾选）
@@ -137,8 +137,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         model.coinThumbnailProvider = coinThumbnail
     }
 
-    /// - Parameter pane: 打开后定位到的 pane（缺省 = 侧栏第一项「主题外观」）；面板「Key / 额度」磁贴、
-    ///   右键「Key / 额度设置…」用它直达目标 pane。
+    /// - Parameter pane: 打开后定位到的 pane（缺省 = 侧栏第一项「主题外观」）；
+    ///   右键「Key / 额度设置…」（面板无对应入口）用它直达目标 pane。
     func open(pane: SettingsSidebarItem? = nil) {
         isSessionActive = true
         // 窗口是保活复用的（关闭只收起、视图不重建）：beginSession 回读真实状态
@@ -216,7 +216,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     /// 全局外观（浅色主题开关）变化后重染窗口。
     /// 本窗口的 appearance 只在首次建窗时设过一次，而「主题外观」pane 就在这个窗口里 ——
     /// 不重染的话当场翻「浅色主题」这个窗口毫无反应，要关掉重开才变。
-    /// 由面板侧的 `applyPanelAppearance` 与 `GlassModalShell.refreshActiveNonModalAppearance` 同点调用。
+    /// 由面板侧的 `applyPanelAppearance` 调用（原同点还有一个非阻塞玻璃弹窗的重染入口，
+    /// 已随 3D 硬币弹窗 2026-09-22 删除）。
     func refreshAppearance() {
         window?.appearance = Palette.topLevelWindowAppearance
     }

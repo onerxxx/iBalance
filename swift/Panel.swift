@@ -21,7 +21,6 @@
 // ⚠️ 本文件 = 面板视图层（快照类型 + BalancePanelView + VC）。
 //    弹窗在 Dialogs.swift，签到在 CheckinManager.swift，账号切换在 AccountSwitcher.swift。
 import Cocoa
-import CoreImage
 import SettingsUI
 
 /// 面板数据快照（由 AppDelegate 从各服务缓存 + 设置状态构建）
@@ -76,6 +75,9 @@ struct PanelSnapshot: Equatable {
     var valueScrollPreviewEnabled = false
     /// 长进度卡片开关（开启后余额卡片进度条独占整行 + 副标题下移一行）
     var longProgressCard = false
+    /// 原生滚动数字开关（开启后数值滚动交给 `NativeRollingEngine` ——
+    /// RN nitro-rolling-number 原生引擎的 Swift 移植；见 swift/NativeRollingEngine.swift）
+    var nativeRollingNumber = false
     /// 图标深浅互换开关（开启后卡片品牌 icon ClearDark/ClearLight 版本互换）
     var iconThemeSwap = false
     /// 无边框图标开关（开启后卡片品牌 icon 直接用同名 SVG 原图，不套 Icon Composer 底板）
@@ -362,13 +364,9 @@ enum Palette {
     static let cardBackground = NSColor.clear
     /// 卡片 hover 提亮色 #333333 @ 30%
     static let cardBackgroundHover = NSColor(calibratedWhite: 51.0 / 255.0, alpha: 0.3)
-    /// hover 底色（2026-09-12 用户定稿，色井设定已移除改固定值）：
-    /// 深色 = 黑@30%（「固定30%深灰」，与用量色脱钩——中间态点阵最暗档实色已废）/
-    /// 浅色 = 白@90%
-    static let hoverCardDefaultDark = NSColor.black.withAlphaComponent(0.30)
-    static let hoverCardDefaultLight = NSColor.white.withAlphaComponent(0.90)
 
-    /// 统一 hover 渐变背景（余额卡片/操作磁贴/折叠标题条/用量条目共用）：
+    /// 统一 hover 渐变背景（余额卡片/折叠标题条/用量条目共用；首个色停 `hoverGradientBright`
+    /// 另被 header 图标按钮 hover 底直接取用，见 `HoverIconButton.hoverBackgroundColor`）：
     /// 默认深色 = 黑@30%、浅色 = 白@90%；2026-09-15 起改由**次背景色**统一提供 ——
     /// 当天用户要求把原「hover 背景色」与「点阵背景色」合并成一个参数（「次背景色」，归到设置
     /// 窗口「面板」栏）⇒ 两档同值、**不再按外观分档**（浅色主题开关会把明度翻转）。
@@ -379,15 +377,10 @@ enum Palette {
     static let hoverGradientDark = NSColor(name: nil) { _ in secondaryBackgroundActive.nsColor }
     /// 渐变端点数组（CAGradientLayer.colors 直接可用）
     static let hoverGradient: [NSColor] = [hoverGradientBright, hoverGradientDark]
-    /// 拖拽幽灵背景定调色（2026-09-06 两段式幽灵：只背景加模糊、叠 hover 强背景色）。
-    /// 幽灵底保持半透明——backgroundFilters 的磨砂模糊靠它透出，实色会盖死：
-    /// 深色 = 同卡片 hover 底（hoverCardDefaultDark）、浅色 = 点阵峰值色 @0.7。
-    /// （原平台卡 hover 强背景/烘焙位图管线已于 2026-09-08 删除，仅幽灵仍用此色）
-    static let cardHoverStrongBright = NSColor(name: nil) { appearance in
-        appearance.isDark
-            ? hoverCardDefaultDark
-            : heatPeakColor.withAlphaComponent(0.7)
-    }
+    /// ⚠️ 拖拽幽灵的定调色**不再单独定义**：2026-09-17 用户「拖动卡片时沿用卡片 hover 的背景色」
+    /// ⇒ 幽灵背景直接叠上面这档 hover 底色（`hoverGradientBright` = 次背景色）。
+    /// 原 `cardHoverStrongBright`（深色 = 黑@30% / 浅色 = 点阵峰值色 @0.7）连同它依赖的
+    /// `hoverCardDefaultDark/Light` 一并删除（那三档当时只有幽灵在用，已无使用点）。
     /// 渐变视觉角度：水平向右为 0°，顺时针偏移
     static let hoverGradientAngleDeg: CGFloat = 60
 
@@ -806,15 +799,18 @@ final class NoHorizontalScrollClipView: NSClipView {
     }
 }
 
-/// 面板内容控制器：把 BalancePanelView 挂进 popover，宽度 260（主面板宽度增加 20pt），高度受屏幕可用空间限制；
+/// 面板内容控制器：把 BalancePanelView 挂进 popover，宽度 = `panelWidth`（唯一值），高度受屏幕可用空间限制；
 /// 内容超高时通过纵向滚动查看底部设置、操作和更新时间。
 final class BalancePanelViewController: NSViewController {
     /// 面板宽度唯一值（用户口中的「面板宽度」即此值）：popover 总宽，含容器左右缩进。
     /// document 宽 = panelWidth − 容器缩进×2，内容按约束压缩/截断自适应承接，
     /// 不再由内容固有宽（fittingSize）反推宽度。用户改宽度只动这一个数。
-    /// 操作磁贴行固定宽 4×56+3×2=230：现行 document=242（264 − 11×2，2026-09-06 晚
-    /// 268→264、缩进 13→11 同轮调整，内容宽与 268/13 时代完全一致）实测可用。
-    static let panelWidth: CGFloat = 264
+    /// **宽度下限由 header 槽位条反解**（操作磁贴行 2026-09-13 已随操作板块整体退场，不再是约束）：
+    /// 槽位条左右缩进固定 21.6、九颗各 22pt 固定 ⇒ 槽间距 = (panelWidth − 43.2 − 198) / 8，
+    /// 即 panelWidth 必须 > **241.2**，再窄间距转负、九颗按钮开始叠压。
+    /// 现行 254 ⇒ document = **232**（254 − 11×2）、槽间距 1.6pt。
+    /// 宽度沿革：268 →（2026-09-06 晚）264 →（2026-09-22 用户「主面板容器减少10pt」）254。
+    static let panelWidth: CGFloat = 254
     /// 满尺寸内容（hasFullSizeContent）下容器铺满整个 popover 窗口，系统原有的
     /// 左右边距带不再存在：由容器层（scrollView 左右约束）统一补回的缩进。
     /// root/footer 自身保留原 7pt 正文缩进，11+7=18pt（2026-09-03 四次调整：
@@ -1281,9 +1277,8 @@ final class BalancePanelViewController: NSViewController {
             Logger.log(.layout, probe)
         }
         // 自建顶层窗口不挂在本视图树上、拿不到容器 appearance，翻渐变/浅色开关时按全局
-        // 镜像重染：非阻塞弹窗（3D 硬币）+ 设置窗口（「主题外观」pane 就在那，不重染的话
-        // 当场翻「浅色主题」这个窗口毫无反应，要关掉重开才变）
-        GlassModalShell.refreshActiveNonModalAppearance()
+        // 镜像重染：设置窗口（「主题外观」pane 就在那，不重染的话当场翻「浅色主题」这个
+        // 窗口毫无反应，要关掉重开才变）
         SettingsWindowController.shared.refreshAppearance()
     }
 
@@ -1576,6 +1571,8 @@ final class BalancePanelView: NSView {
     weak var draggingCard: NSView?
     weak var draggingGhostSourceView: NSView?
     weak var draggingGhostView: NSView?
+    /// 幽灵的「模糊底」层（整面板烘焙图，见 PanelDrag.bakedGhostBackdrop）：随幽灵移动反向平移
+    var draggingGhostBackdrop: CALayer?
     var draggingGhostOffset = NSPoint.zero
     /// 当前拖动平台内的其他账号小卡片及其原始内容透明度。
     var draggingSiblingCardOpacities: [(card: HoverCard, opacity: Float)] = []
@@ -1758,6 +1755,8 @@ final class BalancePanelView: NSView {
     private(set) var valueScrollPreviewEnabled = false
     /// 长进度卡片开关状态（update 同步；卡片第二行结构随卡片重建切换）
     private(set) var longProgressCardEnabled = false
+    /// 原生滚动数字开关状态（update 同步；数值滚动是否交给 `NativeRollingEngine`）
+    private(set) var nativeRollingNumberEnabled = false
     /// 图标深浅互换开关状态（update 同步；品牌 icon 取深版还是浅版）
     private(set) var iconThemeSwapEnabled = false
     /// 无边框图标开关状态（update 同步；品牌 icon 用 SVG 原图还是 Icon Composer 的 PNG）
@@ -2001,6 +2000,10 @@ final class BalancePanelView: NSView {
             applyPlatformCardGaps()   // 组内平台卡间距随模式切换（列表态 4 / 长进度 2.5）
             contentSizeChanged = true
         }
+        // 原生滚动数字开关同步：只写数值视图的静态镜像，**不重建卡片** ——
+        // 视图在每次 setText 读它，屏上正在滚的数字不被打断（下一次数值变化走新引擎）
+        nativeRollingNumberEnabled = s.nativeRollingNumber
+        RollingNumberView.nativeEngineEnabled = s.nativeRollingNumber
         // 图标两开关同步：变化时按当前生效外观就地换图（不重建卡片；
         // 设置段先于卡片构建执行，后续新建卡直接读这两个开关取对图）
         let iconSwapChanged = s.iconThemeSwap != iconThemeSwapEnabled
@@ -3396,9 +3399,10 @@ final class BalancePanelView: NSView {
     var rootBottomCap: NSLayoutConstraint?
     /// 字符化开关（MonoCharSwitch）切换模糊→清晰过渡的出帧源（显示器刷新率）
     var charBlurTicker: DisplayTicker?
-    /// 进行中模糊过渡的目标图层（ticker 为多调用方共享：新调用接管时旧图层集
-    /// 中断在中间模糊半径——不清滤镜会永久停在模糊状态，见 playCharBlurTransition）
-    var charBlurLayers: [CALayer] = []
+    /// 模糊过渡的覆盖层（ticker 为多调用方共享：新调用接管时旧一层要先收干净，
+    /// 否则原视图会一直藏着 / 覆盖层留在屏上，见 playCharBlurTransition）。
+    /// 每项 = (盖在目标上的模糊位图视图, 被隐藏 alpha 的原视图, 原始快照)
+    var charBlurOverlays: [(overlay: NSImageView, target: NSView, snapshot: CGImage)] = []
 
     // MARK: - 控件回调（转发给 AppDelegate 接线）
 

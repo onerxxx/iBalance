@@ -1,5 +1,5 @@
 // ─── 本文件速查（只写「去哪找」，不写行号——行号必漂移）─────────────────────────
-// 目的      App 面板「操作」磁贴 → 玻璃弹窗里复刻 mintform-react 的 CSS 3D 硬币
+// 目的      3D 硬币：复刻 mintform-react 的 CSS 3D token（设置窗口「3D 硬币」pane + 面板 Token 内嵌小硬币）
 // 参考源    ../mintform-react-main/src：Mintform.tsx（几何/材质/交互算式）、
 //           MintformBase.css + Mintform.css（分层与渐变）、core/{geometry,material,
 //           motion,appearance}.ts、runtime/useMintformMotion.ts（弹簧与朝向光）
@@ -47,12 +47,16 @@
 //           / CoinFormRowView（一行一参数、等高）/ CoinSliderRowView（滑杆行）；
 //           Control 区 = CoinControlSectionView（排最前），Edge 区 = CoinEdgeSectionView，
 //           Motion 区 = CoinMotionSectionView —— 三块装进 CoinDemoPanelView 里的
-//           NSScrollView（设置窗口内嵌时视口 = 参数区自然高、整卡随页面滚动；
-//           弹窗壳内同参数区自然高），「保存 / 关闭」按钮固定在 GlassModalShell 的 footer
-// 入口      CoinDemoDialog.present()（GlassModalShell；面板侧接线见 PanelLayout/Panel/main）
+//           NSScrollView（视口 = 参数区自然高、整卡随设置窗口页面滚动）
+// 入口      CoinDemoPanelView（设置窗口「3D 硬币」pane 内嵌，唯一入口）
+//           ⚠️ 独立玻璃弹窗 CoinDemoDialog 2026-09-22 已整体删除：它原来的入口是面板
+//           「操作」磁贴，2026-09-13 随操作板块退场后就没有调用点了；弹窗里那套参数界面
+//           与设置窗口 pane 完全相同，属重复实现。面板 Token 板块的内嵌小硬币走 Coin3DView
 // ─────────────────────────────────────────────────────────────────────────────
 
 import Cocoa
+import Metal                // Phase 5：MTLCreateSystemDefaultDevice
+import QuartzCore           // Phase 5：CAMetalLayer
 import SettingsUI          // CoinVisualIdentity（「主题预设」图卡的硬币视觉身份四项）
 import UniformTypeIdentifiers
 
@@ -70,21 +74,21 @@ enum CoinMetrics {
     /// Coin Size 滑杆范围（上限同时决定弹窗内容区高度，见 `Coin3DView.contentHeight`）。
     /// 上限 192 → **170**（2026-09-13 用户要求「coin size 上限为 170」）；
     /// 落盘值超过上限的由 `CoinSettings.load` 的夹取自动收进 170。
-    /// ⚠️ 2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」：
-    /// 出厂默认由参考盒 160 改为当时 pane 的 **140**
-    static let defaultSize = 140.0
+    /// ⚠️ 2026-09-22 用户「固化现在便签黄的参数」：140 → **134**（按当天 pane 的取值）
+    static let defaultSize = 134.0
     static let sizeRange: ClosedRange<Double> = 96...170
     /// 「Panel coin size」默认值与滑杆范围（pt）：主面板 Token 板块里那枚内嵌硬币的直径。
     /// 与弹窗的 `size` 相互独立 —— 弹窗是「浮在舞台上的大币」，内嵌是「贴着数字的记号」
     /// （2026-09-12 用户指定可单独调）。厚度 / 浮雕深度仍按内嵌直径 ÷ 弹窗直径等比缩放。
-    /// ⚠️ 2026-09-17 同「出厂默认固化」：32 → **35**
-    static let defaultPanelSize = 35.0
+    /// ⚠️ 2026-09-17 同「出厂默认固化」：32 → 35；2026-09-22 再按当时取值 35 → **34**
+    static let defaultPanelSize = 34.0
     static let panelSizeRange: ClosedRange<Double> = 16...48
     /// 厚度默认值（Mintform.tsx 口径是 `thickness ?? size * 0.1` = 16；**已不沿用**）。
     /// 运行时可调，见 `Coin3DView.thickness`；滑杆范围见 `thicknessRange`。
-    /// ⚠️ 2026-09-17 同「出厂默认固化」：按当时 pane 的取值改为 **51**（≈ 140 币径的 36%，
-    /// 比参考实现的 10% 厚得多 —— 要回到薄币把这里改小即可，滑杆范围 10…70 涵盖）
-    static let defaultThickness = 51.0
+    /// ⚠️ 2026-09-17 同「出厂默认固化」：按当时 pane 的取值改为 51（≈ 140 币径的 36%，
+    /// 比参考实现的 10% 厚得多 —— 要回到薄币把这里改小即可，滑杆范围 10…70 涵盖）；
+    /// 2026-09-22 再按当时取值 51 → **53**
+    static let defaultThickness = 53.0
     /// Edge 面板的厚度滑杆范围（用户指定 10…70）
     static let thicknessRange: ClosedRange<Double> = 10...70
     /// 侧壁分段数（**固定值，不随 size 变化**；2026-09-12 用户指定）。
@@ -244,8 +248,8 @@ enum CoinMetrics {
     /// 默认静止朝向（yaw，度）：CoinSettings.restingRotation 的出厂默认。
     /// 用户 2026-09-11 指定 45（参考实现出生是 0 = 纯正面）；实际出生姿态走 Coin3DView 的
     /// restingRotation / restingTilt 属性，由弹窗与内嵌实例各自灌值。
-    /// ⚠️ 2026-09-17「出厂默认固化」：45 → **33**（按当时 pane 取值）
-    static let defaultRestingRotation = 33.0
+    /// ⚠️ 2026-09-17「出厂默认固化」：45 → 33；2026-09-22 再按当时取值 33 → **28**
+    static let defaultRestingRotation = 28.0
     /// Motion 区滑杆范围（用户 2026-09-11 指定）：静止俯仰 / 静止朝向 ±180（可翻到背面），
     /// 点按自旋档位。
     /// ⚠️ Turns 原为 **1…5**，2026-09-17 用户要求收到 **1…3**（「转太多圈看着晕」）；同日
@@ -256,9 +260,12 @@ enum CoinMetrics {
     static let restingRotationRange: ClosedRange<Double> = -180...180
     static let turnsRange: ClosedRange<Double> = 1...3
     /// Outline 线稿的内部结构层级（Style = Outline 时 Outline level 滑杆）。
-    /// 原为 1…5，2026-09-12 用户指定**去掉 L5**（mark 扫掠过程线）→ 上限收到 4。
-    /// 老值 5 由 `CoinSettings.load()` 夹回 4，不会把滑杆顶歪。
-    static let outlineLevelRange: ClosedRange<Double> = 1...4
+    /// 演进：1…5 →（2026-09-12 去掉 L5「mark 扫掠过程线」）1…4 →（2026-09-22 去掉原 L3
+    /// 「前后盖完整椭圆」）1…3。原 L3 在「只画可见盖」之后只剩贴外缘的那一圈，而 L2 的 rim 圆
+    /// 半径只差 `rimInset × sizeScale`（1px/160 盒，常见硬币尺寸下 0.2~0.6pt）⇒ 两档视觉不可分，
+    /// 该档整体删除，**原 L4 侧壁经线档前移为 L3**。
+    /// 老值由 `CoinSettings.load()` 按本范围夹回，不会把滑杆顶歪。
+    static let outlineLevelRange: ClosedRange<Double> = 1...3
     /// Outline 线稿的**基准线宽**（px/160 盒；各类线 = 基准 × 各自系数，全乘 sizeScale）
     static let outlineWidthRange: ClosedRange<Double> = 1...10
 }
@@ -927,7 +934,7 @@ final class Coin3DView: NSView {
         }
     }
 
-    /// Outline 线稿的内部结构层级（1…4，Style = Outline 时 Control 区「Outline level」可调）：
+    /// Outline 线稿的内部结构层级（1…3，Style = Outline 时 Control 区「Outline level」可调）：
     /// 级别越高内部线越多，见 `drawOutline` 的分层说明。只影响 outline 渲染 → 丢缓存
     var outlineLevel = 1 {
         didSet {
@@ -937,7 +944,7 @@ final class Coin3DView: NSView {
     }
 
     /// Outline 线稿的**基准线宽**（px/160 盒，1…10；各类线 = 基准 × 各自系数）：
-    /// hull 1.5×、innerRing/rim 1×、surface/L3 0.6×、裁剪圆 0.5×、经线 0.5×、扫掠线 0.4×
+    /// hull 1.5×、innerRing/rim 1×、surface 0.6×、裁剪圆 0.5×、经线 0.5×
     var outlineWidth = 1.0 {
         didSet {
             guard outlineWidth != oldValue else { return }
@@ -1118,6 +1125,8 @@ final class Coin3DView: NSView {
     private func invalidateRender() {
         cachedImage = nil
         cachedKey = []
+        markTexture = nil                 // mark 覆盖度纹理跟着 logo/尺寸/浮雕参数走
+        syncMetalLayer()                  // 开关/外观翻转时增删 GPU 子层
         needsDisplay = true
     }
 
@@ -1127,6 +1136,130 @@ final class Coin3DView: NSView {
                                 transparentAt: material.fieldTransparentAt,
                                 opaqueAt: material.fieldOpaqueAt)
         invalidateRender()
+    }
+
+    // MARK: Phase 5：GPU 渲染（Metal）
+    //
+    // **重绘驱动沿用同一条唯一漏斗**：ticker 每帧置 `needsDisplay`、拖拽自己置一次、
+    // `invalidateRender()` 置一次 —— 开着 GPU 时把 `wantsUpdateLayer` 打开，
+    // AppKit 每个显示周期就只调一次 `updateLayer()`（而不是 `draw(_:)`），
+    // 同一轮里的多次 invalidate 天然合并成一帧，不需要另起 displayLink。
+    //
+    // ⚠️ 用**子层**而不是 `makeBackingLayer`：子层能随参数开关即时增删（CG 档与今天逐像素同源），
+    //    换 backing layer 则要重建视图，而且 AppKit 仍会往 CAMetalLayer 上走 drawRect 那条路。
+    // ⚠️ 两条渲染路径的坐标系不同：layer 路径的落位用**视图 pt**（见 `render(into:frame:centerInView:)`）。
+
+    /// **Phase 5 总开关**（主面板内嵌 / 弹窗 / 设置预览同源）。
+    /// 默认 **false = 走 CG 自绘**：Phase 2（材质）/ Phase 3（mark）的离线判据都还没过，
+    /// 按 `plans/coin-metal.md` 的铁律就不该待在主路径上 —— GPU 那条是**接好了但默认关**的预览。
+    /// 想开：`defaults write com.local.ibalance coin_render_metal -bool true` 后重启（不用重编）。
+    /// `var` 而不是 `let`：离线复测要在同一个进程里切 A/B（App 侧不写它）。
+    static var metalRenderEnabled: Bool = {
+        let d = UserDefaults.standard
+        return d.object(forKey: UDKey.coinRenderMetal) == nil
+            ? false : d.bool(forKey: UDKey.coinRenderMetal)
+    }()
+
+    /// GPU 渲染子层（只在开关打开且外观支持时存在）
+    private var metalLayer: CAMetalLayer?
+    /// mark 覆盖度纹理缓存：烘焙一次，由 `invalidateRender()` 丢弃重烘
+    private var markTexture: CoinMetalRenderer.CoinMarkTexture?
+    private var loggedMetalFrame = false
+
+    /// 这一档能不能走 GPU。线稿外观（`.outline`）属 Phase 4、尚未实现 ⇒ 仍走 CG。
+    private var metalRenderActive: Bool {
+        Self.metalRenderEnabled && style != .outline
+    }
+
+    /// 子层跟随 bounds / backingScale；开关或外观翻转时增删子层（幂等）
+    private func syncMetalLayer() {
+        guard metalRenderActive, window != nil, bounds.width >= 1, bounds.height >= 1,
+              let device = MTLCreateSystemDefaultDevice() else {
+            metalLayer?.removeFromSuperlayer()
+            metalLayer = nil
+            return
+        }
+        let l: CAMetalLayer
+        if let existing = metalLayer {
+            l = existing
+        } else {
+            let created = CAMetalLayer()
+            created.device = device
+            created.pixelFormat = .bgra8Unorm
+            created.framebufferOnly = true
+            created.isOpaque = false            // 币周围留白要透出面板毛玻璃
+            created.allowsNextDrawableTimeout = true
+            layer?.addSublayer(created)         // 最后加 ⇒ 压在底色之上
+            metalLayer = created
+            l = created
+        }
+        let scale = window?.backingScaleFactor ?? 2
+        l.contentsScale = scale
+        l.frame = bounds
+        // ⚠️ 显式写 `drawableSize`：自建 CAMetalLayer 时它是**懒推导**的（首次 nextDrawable 之后
+        //    才有值），且不保证与当轮的 bounds×scale 同步 —— 两者不一致时 drawable 会被拉伸。
+        l.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+    }
+
+    override func layout() {
+        super.layout()
+        syncMetalLayer()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        markTexture = nil                       // 烘焙按倍率走（sigma 换算成纹素）
+        syncMetalLayer()
+        invalidateRender()
+    }
+
+    override var wantsUpdateLayer: Bool { metalRenderActive }
+
+    override func updateLayer() {
+        guard metalRenderActive else { return }
+        renderMetalFrame()
+    }
+
+    /// 一帧 GPU 渲染。参数口径与 CG 的 `renderCoin` / `drawMark` 同源：
+    /// 落位 = `coinCenter`（含惰性弹跳），mark 阴影的每遍 alpha 与遍数由滑杆反解。
+    private func renderMetalFrame() {
+        guard let l = metalLayer, let renderer = CoinMetalRenderer.shared,
+              bounds.width >= 1, bounds.height >= 1 else { return }
+        let pose = currentPose
+        let center = CGPoint(x: bounds.midX,
+                            y: restCenterY - CGFloat(bounceAmplitude * bounceOffset))
+        let shade = CoinMath.shading(for: CoinMath.projectedNormal(yaw: pose.rotation, pitch: pose.pitch))
+        let frame = CoinFrame(rotation: pose.rotation, pitch: pose.pitch, center: center,
+                              thickness: thickness)
+        let scale = l.contentsScale
+        // mark 边界阴影：口径逐条照 `drawMark`（详见 plans/coin-metal.md 的 Phase 3 一节）
+        let depthT = min(max(markDepth / CoinMetrics.markDepthRange.upperBound, 0), 1)
+        let peak = min(markShadowOpacity, CoinMetrics.markShadowOpacityCeiling)
+        let passes = CoinMetrics.markRimShadowPasses(forPeak: peak)
+        let perPass = 1 - pow(1 - peak, 1 / Double(passes))
+        let mark = CoinMarkParams(
+            enabled: !logoArt.isEmpty, depthPt: markDepth,
+            shadowAlpha: min(1, perPass * 2 * (1 + CoinMetrics.markShadowDepthAlphaGain * depthT)),
+            shadowPasses: passes)
+        if markTexture == nil {
+            // 模糊半径先按**设备像素**算（= spread × sizeScale × deviceScale × (1 + widthGain·t)），
+            // 再按实测标定的 `blur = 2σ` 换算（标定过程见 plans/coin-metal.md）
+            let sigmaPt = markShadowSpread * (size / Double(CoinMetrics.size))
+                * (1 + CoinMetrics.markShadowDepthWidthGain * depthT) * 0.5
+            markTexture = CoinMetalRenderer.bakeMarkTextures(
+                art: logoArt, logoScale: logoScale, logoExtraScale: logoExtraScale,
+                contentFit: logoContentFit, size: size, thickness: thickness,
+                inverted: logoInverted, pixelScale: scale, shadowSigmaPt: sigmaPt)
+        }
+        let ok = renderer.render(into: l, frame: frame, centerInView: center, size: size,
+                                 thickness: thickness, material: material, edgeFinish: edgeFinish,
+                                 shade: shade, mark: mark, markTexture: markTexture)
+        if !loggedMetalFrame {
+            loggedMetalFrame = true
+            Logger.log(.layout, "CoinMetal：首帧 GPU 渲染 size=\(size) thickness=\(thickness) "
+                       + "bounds=\(bounds.size) center=\(center) scale=\(scale) "
+                       + "drawable=\(l.drawableSize) mark=\(markTexture != nil) 成功=\(ok)")
+        }
     }
 
     // MARK: 布局与生命周期
@@ -1158,6 +1291,11 @@ final class Coin3DView: NSView {
             // 调 startTicker）才能拖动」。startTicker 自身幂等，直接无条件调。
             suspended = false
             startTicker()
+            syncMetalLayer()   // 入窗才有 backingScale ⇒ 子层尺寸在这一刻才有意义
+            // 落盘一次「这枚币走哪条渲染路径」—— 有它就不用猜（`/tmp/iBalance_layout.log`）
+            Logger.log(.layout, "Coin3DView：渲染路径 = \(metalRenderActive ? "Metal(GPU)" : "CG(自绘)")"
+                       + " size=\(size) thickness=\(thickness) bounds=\(bounds.size)"
+                       + " compact=\(compactInline)")
         } else {
             // 离开窗口即拆 displayLink：NSView.displayLink 强持有 target、本视图又持有 link，
             // 不主动 invalidate 会成环（与 RollingNumberView 同坑）
@@ -1336,6 +1474,10 @@ final class Coin3DView: NSView {
     // MARK: 绘制
 
     override func draw(_ dirtyRect: NSRect) {
+        // ⚠️ 走 GPU 时不画 CG：`wantsUpdateLayer` 已让 AppKit 改调 `updateLayer()`，
+        //    这里再兜一道 —— 万一有路径直接调 draw，画进去的 CG 币会从 Metal 子层的留白处
+        //    透出来（两层币叠在一起）。
+        guard !metalRenderActive else { return }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let pose = currentPose
         // 惰性弹跳：弹窗与内嵌都跑（相位口径不同，见 bounceOffset）；幅度按实例缩放
@@ -1418,20 +1560,21 @@ final class Coin3DView: NSView {
     // MARK: Outline 外观
 
     /// Outline 外观：整条材质管线不走，只画线稿（线与填充全用 `material.faceBase`，
-    /// 跟 Coin color 走）。`outlineLevel`（1…4，L5「mark 扫掠过程线」已于 2026-09-12
-    /// 按用户要求去掉）决定**内部结构线**画到哪一层，越高越多：
+    /// 跟 Coin color 走）。`outlineLevel`（1…3）决定**内部结构线**画到哪一层，越高越多：
     /// - L1：**外轮廓**（两盖圆投影的凸包，正交下圆柱剪影 = 两盖圆的 Minkowski 和；
     ///   并集在两圆相交处有凹角、描边出锯齿，所以用凸包）+ **边框**（可见盖面的
     ///   innerRing / surface 内缩圆）—— 基础档；
     /// - L2：+ rim 圆 + mark 裁剪圆；
-    /// - L3：+ 前后盖**完整椭圆**（厚度结构线，剪影内部的两圈）；
-    /// - L4：+ **侧壁经线**（可见面板沿厚度方向的棱线，剔除口径同 `drawSidewall`）—— 最高档。
-    /// 线宽全走基准 `outlineWidth`（1…10 px）：hull 1.5×、innerRing/rim 1×、surface/L3 0.6×、
+    /// - L3：+ **侧壁经线**（可见面板沿厚度方向的棱线，剔除口径同 `drawSidewall`）—— 最高档。
+    /// 档位沿革：L5「mark 扫掠过程线」2026-09-12 去掉；原 L3「前后盖完整椭圆」2026-09-22 去掉
+    /// ——改成只画可见盖之后，它只剩贴外缘那一圈，与 L2 的 rim 圆半径只差 `rimInset × sizeScale`，
+    /// 视觉不可分；原 L4 经线档因此前移为 L3。
+    /// 线宽全走基准 `outlineWidth`（1…10 px）：hull 1.5×、innerRing/rim 1×、surface 0.6×、
     /// 裁剪圆 0.5×、经线 0.5×，最后统一乘 sizeScale，并钳到
     /// `CoinMetrics.minOutlineWidth`（0.2pt，防小尺寸掉进亚像素不可见）。
     /// **色相全部同源**（都取 `material.faceBase`，随 Coin Color 走），层级靠 alpha 区分：
-    /// hull/边框/rim 1.0、L3 椭圆 0.8、L2 裁剪圆 0.7、**L4 经线 0.7、L5 扫掠线 0.7**
-    /// （末两者 2026-09-12 用户指定由 0.5/0.6 提到 0.7——细线叠加亚像素抗锯齿后
+    /// hull/边框/rim 1.0、裁剪圆 0.7、**经线 0.7**
+    /// （经线 2026-09-12 用户指定由 0.5 提到 0.7——细线叠加亚像素抗锯齿后
     /// 有效墨量 ≈ alpha × 像素覆盖率，0.5 会显得像另一个颜色）。
     /// mark 填充实色所有级别都画（**先填后描**：线压在填充上，裁剪圆描边才不会被
     /// 恰好落在其上的填充盖掉半边）。
@@ -1507,17 +1650,10 @@ final class Coin3DView: NSView {
                                        transform: cap), 0.5, alpha: 0.7)
         }
 
-        // L3+：前后盖完整椭圆（厚度结构线；剪影内部的两圈）
+        // L3+：侧壁经线 —— 每块可见面板沿厚度方向的那条棱（corners[0]→corners[3]）
+        // （原 L3「前后盖完整椭圆」档已删除：只画可见盖后只剩贴外缘那一圈，
+        //   与 L2 的 rim 圆半径只差 rimInset×sizeScale，视觉不可分）
         if level >= 3 {
-            for center in [c1, c2] {
-                let t = CGAffineTransform(a: front.a, b: front.b, c: front.c, d: front.d,
-                                          tx: center.x, ty: center.y)
-                stroke(CoinMath.circlePath(radius: half, transform: t), 0.6, alpha: 0.8)
-            }
-        }
-
-        // L4+：侧壁经线 —— 每块可见面板沿厚度方向的那条棱（corners[0]→corners[3]）
-        if level >= 4 {
             ctx.setLineWidth(max(0.5 * w * sizeScale, CoinMetrics.minOutlineWidth))
             ctx.setStrokeColor(material.faceBase.cgColor(alpha: 0.7))
             for index in 0..<geometry.segments {
@@ -2056,31 +2192,31 @@ struct CoinSettings {
     /// 上传的 SVG 文件名（Logo 行里显示）；空 = 内置 GHO 预设
     var logoName: String
 
-    /// 出厂默认。**2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」**：
-    /// 从原先「照抄参考实现 mintform 的 props 默认值」（sGHO + 绿/紫 + 薄币正立）整套改为
-    /// **按当时「3D 硬币」pane 的实际取值固化** —— 也就是"新装即是这枚币"。逐项对照见右侧注释。
+    /// 出厂默认。**2026-09-17 首次固化**（原「照抄 mintform props」→ 按当时 pane 取值）；
+    /// **2026-09-22 用户「固化现在便签黄的参数」再按当天取值重固一次**（线稿外观 + 黑币面 +
+    /// 紫色场 + reeded 边 + 反色 logo + 姿态/尺寸微调），右侧注释即本轮改动。
     /// ⚠️ 这套值是「出厂默认」的三处之一：本处（几何/工艺/运动）+ `CoinMetrics.default*` 常量
     ///（尺寸/厚度/浮雕/阴影/姿态）+ `SettingsUI.ThemePreset.defaultCoin*`（预设四项兜底，两处必须同步）。
     /// ⚠️ logo **不在其中**：`logoSVG` / `logoName` 保持空 = 新装用内置 GHO 预设。上传件是"内容"、
     /// 不是参数，而且是第三方品牌图，只属于本机配置（存量用户的 codex.svg 照样读得到，不受影响）。
-    static let initial = CoinSettings(preset: .gho,                    // 原 .sgho（色场开）→ GHO（色场关）
-                                      appearance: .default,
-                                      materialColor: CoinRGB(hex: "#FFC644")!,  // 原 sgho.faceBase 绿
-                                      fieldColor: CoinRGB(hex: "#FFE2A1")!,     // 原 sgho.field 紫
-                                      size: CoinMetrics.defaultSize,            // 140
-                                      panelSize: CoinMetrics.defaultPanelSize,  // 35
-                                      thickness: CoinMetrics.defaultThickness,  // 51
-                                      logoScalePercent: 70,                     // 原 100
+    static let initial = CoinSettings(preset: .gho,                    // GHO（无色场）
+                                      appearance: .outline,             // .default → 线稿（2026-09-22）
+                                      materialColor: CoinRGB(hex: "#000000")!,  // 黄 #FFC644 → 黑（2026-09-22）
+                                      fieldColor: CoinRGB(hex: "#9E91FF")!,     // 黄 #FFE2A1 → 紫（2026-09-22）
+                                      size: CoinMetrics.defaultSize,            // 134
+                                      panelSize: CoinMetrics.defaultPanelSize,  // 34
+                                      thickness: CoinMetrics.defaultThickness,  // 53
+                                      logoScalePercent: 78,                     // 70 → 78（2026-09-22）
                                       markDepth: CoinMetrics.defaultMarkDepth,  // 2
                                       markShadowOpacity: CoinMetrics.defaultMarkShadowOpacity,  // 68
                                       markShadowSpread: CoinMetrics.defaultMarkShadowSpread,    // 7
-                                      finish: .uniform,                         // 原 .reeded（齿纹交替）
-                                      restingTilt: 28,                          // 原 0（正立）
-                                      restingRotation: CoinMetrics.defaultRestingRotation,       // 33
-                                      turns: 3,                                 // 原 1
-                                      outlineLevel: 4,                          // 原 1（仅 Outline 外观用）
-                                      outlineWidth: 5,                          // 原 1（仅 Outline 外观用）
-                                      logoInverted: false,
+                                      finish: .reeded,                          // .uniform → 齿纹交替（2026-09-22）
+                                      restingTilt: 27,                          // 28 → 27（2026-09-22）
+                                      restingRotation: CoinMetrics.defaultRestingRotation,       // 28
+                                      turns: 3,
+                                      outlineLevel: 2,                          // 3 → 2（仅 Outline 外观用；档位 1…3）
+                                      outlineWidth: 7,                          // 5 → 7（仅 Outline 外观用）
+                                      logoInverted: true,                       // 反色（2026-09-22）
                                       logoSVG: "",
                                       logoName: "")
 
@@ -2168,8 +2304,8 @@ struct CoinSettings {
             logoName: defaults.string(forKey: UDKey.coinLogoSVGName) ?? "")
     }
 
-    /// 把当前内存快照整份写入磁盘（此后重启 / 重开弹窗都按这份还原）。
-    /// 自动保存（notifyLiveChange）与弹窗壳显式保存共用；persistDefaults 转发到此。
+    /// 把当前内存快照整份写入磁盘（此后重启 / 重开设置窗口都按这份还原）。
+    /// 自动保存的唯一出口（19 个 apply → notifyLiveChange → 此处）。
     /// ⚠️ 不发 coinSettingsDidChange —— 改动过程中的实时同步已由 apply() 发过，
     /// 落盘本身不改变任何值。
     func save() {
@@ -2993,7 +3129,7 @@ final class CoinMotionSectionView: CoinFormSectionView {
     }
 }
 
-// MARK: - 弹窗内容
+// MARK: - 设置窗口「3D 硬币」pane 内容（CoinDemoPanelView 及其分段宿主）
 
 /// 参数区滚动内容承载视图（翻转坐标，布局由 `CoinDemoPanelView` 统一排）。
 /// 三块参数区从上往下排在它里面，NSScrollView 按它的 frame 决定滚动范围。
@@ -3140,11 +3276,6 @@ final class CoinDemoPanelView: NSView {
         settings.save()
         NotificationCenter.default.post(name: .coinSettingsDidChange,
                                         object: CoinSettingsBox(settings))
-    }
-
-    /// 兼容弹窗壳的显式保存入口（入口已随操作磁贴退场）：快照整份落盘，与自动保存同函数
-    func persistDefaults() {
-        settings.save()
     }
 
     /// 外部改盘后整份回灌（「主题预设」应用硬币参数后由宿主调）。
@@ -3434,54 +3565,6 @@ final class CoinParamsHostView: NSView {
         for section in sections {
             section.frame = NSRect(x: 0, y: y, width: w, height: section.preferredHeight)
             y += section.preferredHeight + gap
-        }
-    }
-}
-
-// MARK: - 弹窗
-
-/// 面板「操作」磁贴入口：玻璃模态壳里放一枚可点按自旋 / 可拖动翻转的 3D 硬币，
-/// 下方 Control（预设 / 颜色 / 尺寸 / logo）、Edge（厚度 / 边纹）与 Motion
-/// （静止俯仰 / 静止朝向 / 自旋圈数）三个参数区装进**一个定高滚动容器**（用户
-/// 2026-09-11 指定），「保存 / 关闭」按钮固定在壳 footer。
-/// 调参实时上币并实时同步主面板内嵌小硬币；点「保存」把当前参数落盘为默认，
-/// 没保存就关（关闭 / Esc）则改动不保留。交互口径照 mintform demo：
-/// 点击自旋、横向拖动转向、纵向拖动俯仰、空格再转、Esc 关闭。
-@MainActor
-enum CoinDemoDialog {
-    /// 入口磁贴（PanelLayout 的「3D 硬币」）与弹窗 header 共用的 SF Symbol：
-    /// 面板磁贴画的是它，弹窗 header 就必须是同一个（用户 2026-09-11 指定），别各写各的字面量。
-    static let tileSymbol = "rotate.3d"
-
-    /// `onClose`：弹窗收起后回调（保存 / 关闭 / Esc 都走）——外部在此解除面板保活并复位
-    /// 内嵌小硬币；「保存」的落盘在本函数内部按按钮索引判断。
-    static func present(onClose: (() -> Void)? = nil) {
-        // 弹窗已在屏：焦点还给它，不叠第二个窗口、不重建面板视图
-        if GlassModalShell.hasActiveNonModalSession {
-            GlassModalShell.focusActiveNonModal()
-            return
-        }
-        let shell = GlassModalShell()
-        shell.setWindowTitle("3D 硬币")
-        shell.addHeader(title: "3D 硬币", info: NSAttributedString(
-            string: "复刻自 mintform 的 CSS 3D token。点击硬币播放旋转，按住拖动可自由翻转，"
-                + "参数区可滚动，「保存」把当前参数存为默认。",
-            attributes: [.font: NSFont.systemFont(ofSize: 11),
-                         .foregroundColor: NSColor.secondaryLabelColor]),
-            symbol: tileSymbol)
-        let panel = CoinDemoPanelView(frame: .zero)
-        shell.addContent(panel, height: panel.preferredHeight)
-        shell.firstResponder = panel.coin
-        // 按钮从右往左排：先加的在最右 → 关闭最右、保存在其左边（用户指定）；
-        // 回车 = 保存（主操作强调色），Esc = 关闭（绑在「关闭」上，不动盘）
-        shell.addButton("关闭", keyEquivalent: "\u{1b}")
-        shell.addButton("保存", keyEquivalent: "\r", primary: true)
-        // 非阻塞呈现：主面板保持可操作（用户 2026-09-11 指定）；「保存」在关闭回调里落盘
-        shell.presentNonModal { index in
-            if index == 1 {
-                panel.persistDefaults()
-            }
-            onClose?()
         }
     }
 }

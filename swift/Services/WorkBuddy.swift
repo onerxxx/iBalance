@@ -17,6 +17,8 @@ enum WorkBuddyService {
 
     /// 读取 WorkBuddy Desktop 当前登录账号：~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
     /// 该文件在账号切换或 token 刷新时由桌面端自动更新。
+    /// 凭据字段可能是明文，也可能是 `$wbEncrypted` 密文包裹（2026-09-22 桌面端更新后为密文），
+    /// 后者由 WBAtRestCrypto 用 native 静态钥解开（详见 WBAtRestCrypto.swift）。
     /// 返回的 refreshToken/expiresAt 用于把主账号持久化到 config（多号场景）。
     /// mtime 变化才重新解析；mtime 未变化但距上次读取 > 30s 也会重读（兜底，防止 mtime 精度丢失）。
     static func authInfo() -> (token: String, domain: String, uid: String, nickname: String, refreshToken: String, expiresAt: TimeInterval)? {
@@ -41,7 +43,7 @@ enum WorkBuddyService {
         }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
               let file = try? JSONDecoder().decode(AuthFile.self, from: data),
-              let token = file.auth?.accessToken, !token.isEmpty,
+              let token = file.auth?.accessToken?.resolved(), !token.isEmpty,
               let domain = file.auth?.domain, !domain.isEmpty,
               let uid = file.account?.uid, !uid.isEmpty else {
             cachedAuth = nil
@@ -49,8 +51,8 @@ enum WorkBuddyService {
             cachedAuthFetchedAt = now
             return nil
         }
-        let nickname = file.account?.nickname ?? uid
-        let refreshToken = file.auth?.refreshToken ?? ""
+        let nickname = file.account?.nickname?.resolved() ?? uid
+        let refreshToken = file.auth?.refreshToken?.resolved() ?? ""
         // auth 文件 expiresAt 单位为毫秒，转成秒级绝对时间戳
         var expiresAt: TimeInterval = 0
         if let ms = file.auth?.expiresAt, ms > 0 {
@@ -67,13 +69,18 @@ enum WorkBuddyService {
 
     private struct AuthFile: Decodable {
         struct Auth: Decodable {
-            let accessToken: String?
+            // 2026-09-22 起桌面端把凭据字段写成 `{"$wbEncrypted":1,"envelope":…}` 密文包裹，
+            // 故这里用 WBEncryptedField（明文/密文通吃），取值一律走 .resolved()
+            let accessToken: WBEncryptedField?
             let domain: String?
-            let refreshToken: String?
+            let refreshToken: WBEncryptedField?
             let expiresAt: Int64?      // 毫秒
             let expiresIn: Int64?      // 秒（fallback）
         }
-        struct Account: Decodable { let uid: String?; let nickname: String? }
+        struct Account: Decodable {
+            let uid: String?
+            let nickname: WBEncryptedField?
+        }
         let auth: Auth?
         let account: Account?
     }

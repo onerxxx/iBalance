@@ -63,6 +63,9 @@ Inter-4.1/
 # mintform 参考实现（3D 硬币复刻的第三方本地副本，不入库）
 /mintform-react-main/
 
+# nitro-rolling-number 参考实现（数值滚动引擎移植的第三方本地副本，不入库）
+/react-native-nitro-rolling-number/
+
 # .icon / actool 构建中间产物（可由 swift/icons 源包重新生成）
 /swift/.icon_build/
 

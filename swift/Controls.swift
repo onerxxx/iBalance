@@ -17,7 +17,6 @@
 //    改 hover 逻辑先确认是否需要滚动同步，否则滚动后会残留高亮。
 
 import Cocoa
-import CoreImage
 import CoreText
 
 /// 视觉缩放开关：在 .mini 基础上通过 affineTransform 缩至 0.81 倍，使整体更紧凑。
@@ -873,9 +872,22 @@ protocol HeaderTintAdjustable: NSView {
 final class HoverIconButton: NSButton, PanelScrollHoverSync, HeaderIconDraggable, HeaderTintAdjustable {
     /// 按钮容器尺寸（正方形）
     static let buttonSize: CGFloat = 22
-    /// hover 底色（极淡白圆底）：header 图标按钮 / 手动刷新按钮 / 刷新周期饼图按钮
-    /// 三处共用同一常量 —— 同组按钮的 hover 底不可能各写一份而走样
-    static let hoverBackgroundColor = NSColor.white.withAlphaComponent(0.12)
+    /// hover 底色（**与卡片 hover 材质同源 = 次背景色**）：header 图标按钮 / 手动刷新按钮 /
+    /// 刷新周期饼图按钮 / 拖动槽位指引的空位填充，四处共用同一常量 ——
+    /// 同组按钮的 hover 底不可能各写一份而走样
+    ///
+    /// 2026-09-22 用户「header 按钮的 hover 背景色使用卡片 hover 背景色」⇒ 原写死的
+    /// `NSColor.white.withAlphaComponent(0.12)`（极淡白圆底）改为 `Palette.hoverGradientBright`：
+    /// 它就是卡片 hover 材质块（`HoverMaterialHost.materialLayer`）颜色数组 `Palette.hoverGradient`
+    /// 里的那档，两档同值 ⇒ 即设置窗口「面板 → 次背景色」。
+    /// 材质块是 `CAGradientLayer`、按钮底是纯色正圆，故按钮取**单个色停**即可；
+    /// 改次背景色后按钮底在下次 hover 时当场解算跟随（无须 `refreshDotMatrixAndHoverMaterials()`
+    /// 那套材质宿主重解算）。
+    /// ⚠️ 该色是 `NSColor(name:)` 动态色（provider 忽略 appearance、只读运行镜像
+    /// `secondaryBackgroundActive`），落 `CALayer.backgroundColor` 走 `.cgColor` 安全；
+    /// 不走 `Palette.borderCGColor` 是因为它与外观无关，包一层 `performAsCurrentDrawingAppearance`
+    /// 结果完全一样
+    static let hoverBackgroundColor: NSColor = Palette.hoverGradientBright
     /// 非 hover 常态 tint；默认 = 副前景色（面板第二层灰，浅色外观下按面板底色加深），
     /// header 可按主题指定黑色动态色。
     var normalTintColor: NSColor = Palette.secondaryForeground {
@@ -1042,7 +1054,8 @@ final class HeaderSlotGuidesView: NSView {
 /// 手动刷新按钮：点击时图标顺时针旋转一圈。
 /// AppKit layer-backed 视图经 Auto Layout 同步会把 anchorPoint 重置为 (0,0)，
 /// 直接旋转会绕左下角转；需在 layout() 里恢复中心锚点 + 补偿 position（同 MiniSwitch 思路）。
-/// hover 自绘圆形白@8% 背景 + 图标 tint 提亮（同 footer HoverIconButton 样式）；
+/// hover 自绘圆形**次背景色**底 + 图标 tint 提亮（底色与卡片 hover 材质同源，
+/// 同 footer HoverIconButton 样式）；
 /// 仅按钮自身 hover 生效，行 hover 不驱动任何提亮。
 final class RefreshIconButton: NSButton, PanelScrollHoverSync {
     private var isSpinning = false
@@ -1207,7 +1220,7 @@ extension RefreshIconButton: CAAnimationDelegate {
 /// （时长 = 设置的刷新分钟数），每秒重算重绘；点击弹出间隔单选菜单（1/3/5 分钟）。
 /// 大小/配色对齐 header 左上角 HoverIconButton：22×22 容器、11pt 图形、
 /// 副前景色常态墨迹（= 系统灰基准 + 按面板底色对比度补偿，同 HoverIconButton）、
-/// hover 白@12% 正圆背景 + labelColor 提亮。
+/// hover **次背景色**正圆背景 + labelColor 提亮（底色同卡片 hover 材质）。
 /// 周期数据由 cycleProvider 直读 AppDelegate 的 repeating Timer（fireDate 恒为
 /// 下次自动刷新时刻，本轮起点 = fireDate − 间隔）：手动刷新不重建定时器、饼图
 /// 不跳变，改间隔重建定时器后自动跟随，面板侧零状态推送。
@@ -1375,7 +1388,7 @@ final class RefreshPieButton: NSView, PanelScrollHoverSync, HeaderIconDraggable,
         onSelectInterval?(TimeInterval(sender.tag))
     }
 
-    // MARK: - hover（同 HoverIconButton：白@12% 正圆背景 + 提亮，走事件级校验）
+    // MARK: - hover（同 HoverIconButton：次背景色正圆背景 + 提亮，走事件级校验）
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()

@@ -233,6 +233,13 @@ final class DigitWheelView: NSView {
     /// 墨迹护栏：窗口内可见两格的墨迹右沿（仅计入与核心可见带相交的格）− `slotAllowance`。
     /// 「核心可见带」= 窗口上下各扣掉边缘渐隐带（`attachEdgeFadeMask` 同口径）——
     /// 落在渐隐带里的字形已被柔化，不必再为它让出间隙。
+    ///
+    /// ⚠️ 要求按「墨迹还在核心带里剩多少」**线性放开**（松手窗 = 渐隐带高），不是二值判定：
+    /// 二值口径下离场字一出带护栏就整块掉下来 → 排布推进量整段几乎不动、**最后一帧"啪"地收一下**
+    ///（离线实测 8→1：前 90% 只动 0.9pt、最后一帧跳 1.65pt = 用户报的「滚动到最后才调整间距」）。
+    /// 线性放开后收窄变成连续滑动（尾段单帧 1.65 → 1.07pt），代价只是离场/入场字在**渐隐带内**的
+    /// 那一点墨迹允许压到右邻（带内已被 mask 柔化）。
+    /// **静止态权重恒 1** ⇒ 排版与旧口径逐点相同（离线逐数字核对 0…9 全部相等）。
     private func visibleInkGuard() -> CGFloat {
         var ownInk: CGFloat = 0
         let frac = pos - floor(pos)
@@ -241,7 +248,10 @@ final class DigitWheelView: NSView {
                              (Int(ceil(pos)).mod10, (1 - CGFloat(frac)) * cellH)] {
             let lo = max(digitInkTops[d] + cellTop, inkFade)
             let hi = min(digitInkBottoms[d] + cellTop, cellH - inkFade)
-            if hi > lo { ownInk = max(ownInk, digitInkRights[d]) }
+            guard hi > lo else { continue }
+            // 墨迹在核心带里还剩多少（离场格看它的底边、入场格看它的顶边）
+            let inside = min(hi - inkFade, (cellH - inkFade) - lo)
+            ownInk = max(ownInk, digitInkRights[d] * min(1, inside / max(1, inkFade)))
         }
         return ownInk - slotAllowance
     }
@@ -380,7 +390,10 @@ final class DigitWheelView: NSView {
 
     /// 设置目标数字。animated=false 直接落位（含槽宽）；true 从当前连续位置向
     /// 目标做一段独立 tween（时长由 rollDuration 按行进格数分配），到点精确停在目标位。
+    /// ⚠️ 本调用即**退出引擎模式**：自驱 tween 与引擎驱动互斥，谁最后接手谁说了算
+    ///（引擎接手走 `beginEngineRoll`）。
     func setDigit(_ d: Int, animated: Bool, rollDuration: CFTimeInterval = 0.9) {
+        engineRoll = false
         let best = nearestEquivalentTarget(d).target
         if animated {
             targetPos = best
@@ -497,6 +510,149 @@ final class DigitWheelView: NSView {
         return widthStartPos + (targetPos - widthStartPos) * eased
     }
 
+    // MARK: 原生引擎驱动（`RollingNumberView.nativeEngineEnabled`）
+    //
+    // 引擎模式下**本视图不跑自驱 tween**：位置由本视图自己的 `NativeRollingEngine` 逐帧给出
+    //（它算方向 / 环绕 / 曲线），本视图只负责「由位置推导槽宽、排布宽、位图落位」这三件事 ——
+    // 与自驱口径完全同一套渲染公式，换的只是**谁在推进时间**。
+    //
+    // ⚠️ **一个轮一个引擎**（引擎不整串共用）：原版是「整串一段共享时长」，而面板固化的节奏是
+    // 「每格一个时长」（`Motion.roll`/10 = 0.3s/格）。一段共享时长在行程长短不一时必然二选一崩
+    //（2026-09-20 离线实测，cellH=14、60fps，看「每帧走多少 pt」）：
+    //   · 按最长行程给 → 低行程轮爬行：1 格轮摊到 2.7s = **0.09pt/帧**，0.5pt 像素栅格上
+    //     「连着几帧屏幕不动」（用户第一次反馈的"帧数有点低"）；
+    //   · 按最短行程给 → 高行程轮频闪：9 格轮摊到 0.6s = **10.2pt/帧（0.73 格/帧）**，
+    //     一帧跳大半个数字，观感即"明显抖动"（第二次反馈）。
+    //   拆成每轮自己的引擎后，每轮都按自己的行程跑面板节奏 → 峰值 2.3pt/帧，与旧口径逐项相同。
+    // ⚠️ `engineRoll` 是**每段滚动**的标志而不是常驻开关：结构重建 / 单位换值等仍走自驱
+    // tween 的路径由 `setDigit` 复位（见那里）。
+
+    /// 本轮的引擎（惰性：不走引擎模式就不建）
+    private lazy var engine = NativeRollingEngine()
+    /// 本轮在引擎里的轮下标（= 该位的 10 的幂）
+    private var enginePower = 0
+    /// 本段滚动由引擎驱动：`tweenDuration` 恒 0（自驱 tween 不启动），`pos` 由引擎写入
+    private var engineRoll = false
+    /// 本段引擎滚动的起点位置：引擎的位置是 `from + (to − from) × 缓动进度` 的线性插值，
+    /// 故进度可由位置唯一反推（宽度插值的时间轴，口径与自驱的 `layoutStart → layoutEnd` 同）
+    private var engineFrom: Double = 0
+    /// 本段引擎滚动的终点位置（引擎给的**含环绕累积**值：9 → 0 走底缓冲时是 10 不是 0）
+    private var engineTo: Double = 0
+
+    /// 立刻结束在途自驱 tween 并落定（位置精确停在目标位、帧宽/排布宽归位）。
+    /// 引擎接管前必须调它：引擎按**自己记录的位置**驱动，而记录的位置恒等于「上一次下发给它的
+    /// 显示值」——自驱 tween 被打断时轮还停在半路，两者差一截，引擎第一帧会把轮拽回去
+    ///（数字瞬移）。落定后两者逐点相等，接管无痕。
+    func finishTween() {
+        guard tweenDuration > 0 else { return }
+        pos = targetPos
+        normalize()
+        tweenDuration = 0
+        currentWidth = widthForPosition(pos)
+        syncLayoutWidthToCurrentDigit()
+        applyStripOrigin()
+    }
+
+    /// 引擎前置（起滚与只询行程共用）：格式下发 + 首次用当前显示值起手；返回本位本轮行程（格）。
+    /// `shownMagnitude` = 当前屏上显示的幅值：引擎首次被使用时拿它起手，否则首段会被引擎
+    /// 当成"首值"直接落位（没有动画）。
+    private func prepareEngine(magnitude: UInt64, shownMagnitude: UInt64, fractionDigits: Int,
+                               minimumIntegerDigits: Int, power: Int) -> Double {
+        engine.setFormat(fractionDigits: fractionDigits, minimumIntegerDigits: minimumIntegerDigits)
+        if !engine.hasShownValue { engine.show(magnitude: shownMagnitude) }
+        let travels = engine.plannedTravels(to: magnitude)
+        return power < travels.count ? travels[power] : 0
+    }
+
+    /// 只询本位本轮行程（不落位、不起滚）：容器据此把「整段预算」折算成每格节奏（见
+    /// `RollingNumberView.beginNativeRoll`）
+    func engineTravel(magnitude: UInt64, shownMagnitude: UInt64, fractionDigits: Int,
+                      minimumIntegerDigits: Int, power: Int) -> Double {
+        prepareEngine(magnitude: magnitude, shownMagnitude: shownMagnitude,
+                      fractionDigits: fractionDigits, minimumIntegerDigits: minimumIntegerDigits,
+                      power: power)
+    }
+
+    /// 交给本轮的引擎起一段滚动：目标（幅值 / 小数位 / 整数位下限）与**本位幂次**下发，
+    /// 时长 = 本轮行程 × `secondsPerCell` × 实例相位（±6%，与自驱口径同一个反同步手法）。
+    /// **返回是否真有位移**：行程 0 的位直接落位不产生动画（调用方据此决定要不要开 ticker）。
+    @discardableResult
+    func beginEngineRoll(magnitude: UInt64, shownMagnitude: UInt64,
+                         fractionDigits: Int, minimumIntegerDigits: Int,
+                         power: Int, secondsPerCell: CFTimeInterval, at now: CFTimeInterval) -> Bool {
+        let travel = prepareEngine(magnitude: magnitude, shownMagnitude: shownMagnitude,
+                                   fractionDigits: fractionDigits,
+                                   minimumIntegerDigits: minimumIntegerDigits, power: power)
+        enginePower = power
+        guard travel > 0 else {
+            // 本位本轮不动：引擎落位到目标（幂等，方向/位置都不会漂），不起动画
+            engine.setTiming(duration: 0, easing: .easeOut, bounce: 0.15, stagger: 0, direction: .auto)
+            engine.animate(to: magnitude, at: now)
+            engineRoll = false
+            return false
+        }
+        let phase = 0.94 + 0.12 * tweenPhase      // 与自驱 `beginTween` 同一口径
+        engine.setTiming(duration: travel * secondsPerCell * phase,
+                         easing: .easeOut, bounce: 0.15, stagger: 0, direction: .auto)
+        engine.animate(to: magnitude, at: now)
+        let dest = engine.targetWheelPositions()
+        guard power < dest.count else { engineRoll = false; return false }
+        normalize()          // 起点归进 [0,10)：与引擎的 `wrap(当前位置)` 同口径
+        tweenDuration = 0    // 引擎驱动作废自驱 tween，两个驱动者不能同时推 pos
+        engineRoll = true
+        engineFrom = pos
+        engineTo = dest[power]
+        targetPos = dest[power]
+        layoutStart = layoutWidth
+        let td = ((Int(round(targetPos)) % 10) + 10) % 10
+        layoutEnd = digitWidths[td]
+        return true
+    }
+
+    /// 引擎逐帧落位：位置由本轮的引擎给（曲线 / 方向 / 环绕都是它的），本视图只做渲染推导。
+    /// 槽宽仍由位置推导（比例数字字体下右缘固定、左缘随之平移），排布宽走「理想宽单调推进 +
+    /// 墨迹护栏」那条既有口径（与自驱同一算式，只是进度改由位置反推）。
+    func driveEngine(now: CFTimeInterval) {
+        guard engineRoll else { return }
+        _ = engine.tick(now)
+        guard enginePower < engine.wheelCount else { return }
+        let p = engine.wheel(at: enginePower).position
+        pos = p
+        let span = engineTo - engineFrom
+        let t = span != 0 ? min(1, max(0, (p - engineFrom) / span)) : 1
+        layoutWidth = max(layoutStart + (layoutEnd - layoutStart) * CGFloat(t), visibleInkGuard())
+        currentWidth = widthForPosition(p)
+        applyStripOrigin()
+    }
+
+    /// 引擎还在动？（容器据此决定 ticker 是否继续 / 本段是否收尾）
+    func engineNeedsFrames() -> Bool { engineRoll && engine.needsFrames() }
+
+    /// 引擎立刻落定到本段终点（中止口径：面板隐藏 / 结构变化 / 单位换值前）
+    func finishEngineTransition() { engine.finishTransition() }
+
+    /// 引擎位置对齐到「当前显示的数字」（不由引擎接管的那些路径）：引擎只记位置不渲染，
+    /// 位置陈旧会让**下一次**引擎滚动的起点跳变（数字瞬移）
+    func alignEngine(magnitude: UInt64, fractionDigits: Int, minimumIntegerDigits: Int) {
+        engine.setFormat(fractionDigits: fractionDigits, minimumIntegerDigits: minimumIntegerDigits)
+        engine.show(magnitude: magnitude)
+    }
+
+    /// 清空引擎（当前文本没有数字，如占位「—」）
+    func resetEngine() { engine.reset() }
+
+    /// 引擎落定：位置归一进 [0,10)（多轮环绕后清掉缓冲），帧宽 / 排布宽收到精确落定值
+    /// —— 与自驱 `advance` 到点那一刻的三件事逐项对齐（无到位后回缩）。
+    func settleEngine() {
+        guard engineRoll else { return }
+        engineRoll = false
+        pos = targetPos
+        normalize()
+        currentWidth = widthForPosition(pos)
+        syncLayoutWidthToCurrentDigit()
+        applyStripOrigin()
+    }
+
     /// 根据连续位置计算当前槽宽。
     /// 例如 1→8 的中间态，宽度在 advance(1) 与 advance(8) 之间连续插值——
     /// 既保留垂直滚动，又保持比例数字字体的横向排版正确。
@@ -547,15 +703,25 @@ final class DigitWheelView: NSView {
         // 三处共同保证。分数残留会把整条数字带推出窗口：等宽数字字体下横位不变，
         // 视觉即「数值顶部平齐截断、底缘完好」（2026-09-13 用户偶发上报）。就地取整
         // 恢复不变量（可见数字 = round(pos)，不变）并打点取证，[RollDbg] 定位后移除
-        if tweenDuration == 0 {
+        // ⚠️ 引擎驱动期间**跳过**本守卫：那里 pos 由引擎给出、`tweenDuration` 恒 0，
+        //    取整会把整段滚动砸成一次跳变（见「原生引擎驱动」一节）
+        if !engineRoll, tweenDuration == 0 {
             let frac = pos - pos.rounded()
             if abs(frac) > 0.01 {
                 Logger.log(.layout, "[RollDbg] FRACTIONAL-POS pos=\(String(format: "%.3f", pos)) frac=\(String(format: "%.3f", frac)) cellH=\(String(format: "%.1f", cellH))")
                 pos = pos.rounded()
             }
         }
+        // 引擎的连续位置可越出 [0,10)（环绕累积：9 → 0 走底缓冲时到 10 再去 18），
+        // 落位按 10 环绕 —— 12 格 strip 的顶部 9 / 底部 0 缓冲正是为环绕准备的
+        //（原版同样在渲染时 `wrap`：`wheel.linear ? position : wrap10(position)`）
+        var p = pos
+        if engineRoll {
+            p = pos.truncatingRemainder(dividingBy: 10)
+            if p < 0 { p += 10 }
+        }
         // cell i 的顶边 = (i-1-pos)*cellH；strip 首行(cell 0)的顶边 = -(1+pos)*cellH
-        let y = -(1.0 + CGFloat(pos)) * cellH
+        let y = -(1.0 + CGFloat(p)) * cellH
         // 像素网格对齐（2x 屏 = 0.5pt 步进）：连续小数位置会让合成器把预渲染位图
         // 放在亚像素处重采样 → 字形边缘每帧微移（上下抖动/shimmer）。
         // 对齐后字形始终紧实，0.5pt 步进在 75Hz 下仍然顺滑。
@@ -721,6 +887,22 @@ final class TextSlotView: NSView {
 final class RollingNumberView: NSView {
 
     typealias FontProvider = (CGFloat, NSFont.Weight, Bool) -> NSFont
+
+    // MARK: - 原生引擎开关（设置窗口「主题外观 → 卡片」的 `native_rolling_number`）
+
+    /// true = 数值滚动交给 `NativeRollingEngine`（RN nitro-rolling-number 的 Swift 移植，
+    /// 见 NativeRollingEngine.swift）：整串数字**共享一段时长**同起同落、曲线走引擎自己的
+    /// 档位（`beginNativeRoll` 里给）。false = 本视图既有口径（每位车轮独立 tween、
+    /// 时长按行进格数分配、从快到慢）。
+    /// ⚠️ 静态镜像（与 `PanelFont.sharpGroteskActive` / `Palette.*` 同一条做法）：卡片构建时
+    /// 不逐个下发，由宿主 `Panel.update` 从快照写入，**切换不重建卡片** —— 已落位的数字不受
+    /// 影响，下一次数值变化走新口径（视图在每次 `setText` 读它）。
+    static var nativeEngineEnabled = false
+
+    /// 本轮滚动由引擎驱动（`onTick` 每帧让各轮自取位置，落定走 `finishNativeRoll`）。
+    /// ⚠️ 引擎实例**一个轮一个**、装在 `DigitWheelView` 自己身上（见那边「原生引擎驱动」一节的
+    /// 实测：整串一段共享时长在行程长短不一时必然二选一崩），本属性只标记"本段由引擎驱动"
+    private var nativeEngineActive = false
 
     // 自旋时长口径 / 时间曲线档位两处运行镜像（`slideTiming` / `curve`）2026-09-17 已随
     // 「动效的参数固化」整体移除：真值改由本文件的 `slideTime()` 与 `rollEase(_:)` 两个常量口径
@@ -1087,21 +1269,28 @@ final class RollingNumberView: NSView {
         let structureChanged: Bool
         let chars = Array(text)
         let isDigit = chars.map { $0.isASCII && $0.isNumber }
+        // 引擎输入先算一次（引擎模式起滚、以及「引擎没接管本轮」时的位置对齐都要它）
+        let engineTarget = Self.nativeEngineEnabled ? Self.engineTarget(from: chars) : nil
+        var engineTookRoll = false
         if chars.count == slots.count,
            zip(isDigit, slots).allSatisfy({ $0.0 == ($0.1.kind == .digit) }) {
-            var effectiveRoll = rollDuration
-            if animated, let total = totalDuration {
-                var maxCells = 0.0
-                for (i, ch) in chars.enumerated() where isDigit[i] {
-                    if let w = slots[i].view as? DigitWheelView, let d = ch.wholeNumberValue {
-                        maxCells = max(maxCells, w.plannedTravelCells(to: d))
-                    }
+            // 本轮最长行程（格）：总时长归一与引擎模式的共享时长都按它换算
+            var maxCells = 0.0
+            for (i, ch) in chars.enumerated() where isDigit[i] {
+                if let w = slots[i].view as? DigitWheelView, let d = ch.wholeNumberValue {
+                    maxCells = max(maxCells, w.plannedTravelCells(to: d))
                 }
-                if maxCells > 0 { effectiveRoll = total * 10 / maxCells }
+            }
+            // 引擎接管本轮的判据：开关开 + 要动画 + 有位移（各位目标与现值全同 = 没得滚）
+            let useEngine = engineTarget != nil && animated && maxCells > 0
+            var effectiveRoll = rollDuration
+            if animated, let total = totalDuration, !useEngine, maxCells > 0 {
+                effectiveRoll = total * 10 / maxCells
             }
             for (i, ch) in chars.enumerated() {
                 if isDigit[i], let w = slots[i].view as? DigitWheelView, let d = ch.wholeNumberValue {
-                    w.setDigit(d, animated: animated, rollDuration: effectiveRoll)
+                    // 引擎接管时数字位**不在这里起步**：整串由引擎一段共享时长驱动（beginNativeRoll）
+                    if !useEngine { w.setDigit(d, animated: animated, rollDuration: effectiveRoll) }
                 } else if let t = slots[i].view as? TextSlotView {
                     if t.text != String(ch) {
                         // 结构未变、仅静态字符换字（¥ ↔ $）：即时替换不走滚字
@@ -1112,6 +1301,11 @@ final class RollingNumberView: NSView {
                     }
                 }
             }
+            if useEngine, let target = engineTarget {
+                beginNativeRoll(target, isDigit: isDigit,
+                                rollDuration: rollDuration, totalDuration: totalDuration)
+                engineTookRoll = true
+            }
             if animated {
                 startTicker()
             } else {
@@ -1121,6 +1315,8 @@ final class RollingNumberView: NSView {
             }
             structureChanged = false
         } else {
+            // 结构变化：本轮不再由引擎驱动（下面整组重建/滑移直接落值）
+            endNativeRoll()
             rebuild(chars, slideOnRebuild: animated && slideOnRebuild, rollDuration: rollDuration)
             structureChanged = true
             // TODO(性能诊断): 每次结构重建打日志（滚动期间频繁重建 = 无动效根因），确认后移除
@@ -1135,8 +1331,134 @@ final class RollingNumberView: NSView {
             needsLayout = true
             invalidateIntrinsicContentSize()
         }
+        // 引擎没接管本轮（未开开关 / 未动画 / 无位移 / 结构变化）：把引擎位置对齐到当前显示值 ——
+        // 引擎只记位置不渲染，位置陈旧会让**下一次**引擎滚动的起点跳变（数字瞬移）
+        if Self.nativeEngineEnabled, !engineTookRoll { alignNativeEngine(engineTarget) }
     }
     private static var rebuildLogCount = 0
+
+    // MARK: 原生引擎驱动（见 NativeRollingEngine.swift 与 DigitWheelView 的「原生引擎驱动」）
+
+    /// 引擎输入：**显示口径**的数字 —— `magnitude` = 全部数字位拼成的整数、
+    /// `fractionDigits` = 小数点右侧位数、`integerDigits` = 左侧位数（补零下限）。
+    /// 三者一起决定引擎的位数与每轮的目标数字（`magnitude` 的 10^power 位 == 文本该位的数字）
+    private struct EngineTarget {
+        var magnitude: UInt64
+        var fractionDigits: Int
+        var integerDigits: Int
+    }
+
+    /// 数值文本 → 引擎输入。**不经 Double 往返**：主面板手上只有格式化后的字符串
+    ///（"1,234.56" / "¥0.0812" / "12.3M"），所以直接由字符串给出目标 —— 显示的是什么数字，
+    /// 引擎的目标就是什么（千分位、货币符号、单位字母这些静态字符不进引擎）。
+    /// 无数字（"—" 这类）返回 nil。
+    private static func engineTarget(from chars: [Character]) -> EngineTarget? {
+        var magnitude: UInt64 = 0
+        var digits = 0
+        var fractionDigits = 0
+        var integerDigits = 0
+        var seenDecimal = false
+        for ch in chars {
+            if ch == "." {
+                guard !seenDecimal else { continue }
+                seenDecimal = true
+                integerDigits = digits
+                continue
+            }
+            guard ch.isASCII, ch.isNumber, let d = ch.wholeNumberValue else { continue }
+            guard digits < kMaxEngineDigits else { return nil }   // 引擎幅值上限（10^17 量级）
+            magnitude = magnitude * 10 + UInt64(d)
+            digits += 1
+            if seenDecimal { fractionDigits += 1 }
+        }
+        guard digits > 0 else { return nil }
+        return EngineTarget(magnitude: magnitude, fractionDigits: fractionDigits,
+                            integerDigits: max(1, seenDecimal ? integerDigits : digits))
+    }
+    private static let kMaxEngineDigits = 18
+
+    /// 起一段引擎滚动：每个数字轮交给**它自己的引擎**，各按自己的行程跑面板节奏
+    ///（`secondsPerCell` = 面板预算/10 或整段预算/最长行程），位置逐帧取回（见 `onTick`）。
+    ///
+    /// **时长口径**（本方法里唯一的调参点，也是引擎模式与旧口径的主要差别）：
+    /// · `setText` 给了整段预算（开面板补发）→ 每轮时长 = `total × 本行程/最长行程`
+    ///   （最长那一位恰好占满 `total`，与自驱口径逐字相同）；
+    /// · 否则 → 每轮时长 = `rollDuration × 本行程/10`（面板固化节奏 0.3s/格，同样与自驱相同）。
+    /// ⚠️ 为什么**不是**「整串一段共享时长」（原版口径）：一段共享时长在行程长短不一时必然
+    /// 二选一崩 —— 按最长行程给，低行程轮爬到 0.09pt/帧（栅格上"帧不动"）；按最短行程给，
+    /// 高行程轮冲到 10.2pt/帧（一帧跳 0.73 格，频闪）。两个坑都实测过（见 DigitWheelView
+    /// 「原生引擎驱动」那节）。拆成每轮自己的引擎后，每轮都在面板节奏上跑。
+    /// **曲线恒 `.easeOut`**（= 面板固化曲线「从快到慢」，见 `rollEase(_:)`）：引擎自带的
+    /// 默认是 `.easeInOut`，起手段速度趋零 —— 实测「到位前静止帧」20~27%，换 `.easeOut` 后 0%。
+    private func beginNativeRoll(_ target: EngineTarget, isDigit: [Bool],
+                                 rollDuration: CFTimeInterval, totalDuration: CFTimeInterval?) {
+        // 槽 → 轮下标：幂次 = 该位**右侧**的数字位数（小数位一并计入，与引擎的
+        // 「轮下标 = 10 的幂」一一对应）
+        var powers = [Int](repeating: -1, count: slots.count)
+        var power = 0
+        for i in stride(from: slots.count - 1, through: 0, by: -1) where isDigit[i] {
+            powers[i] = power
+            power += 1
+        }
+        // 当前屏上显示的幅值：引擎首次被使用时拿它起手（否则首段没有动画）
+        let shownMagnitude: UInt64 = Self.engineTarget(from: Array(currentText))?.magnitude ?? 0
+        // 各轮行程先只询一遍（不落位）：整段预算要按「最长行程占满 total」折算成每格节奏 ——
+        // 口径与自驱的 `effectiveRoll = total × 10 / maxCells` 逐字同义
+        func travel(at i: Int) -> Double {
+            guard let w = slots[i].view as? DigitWheelView else { return 0 }
+            return w.engineTravel(magnitude: target.magnitude, shownMagnitude: shownMagnitude,
+                                  fractionDigits: target.fractionDigits,
+                                  minimumIntegerDigits: target.integerDigits, power: powers[i])
+        }
+        let travels = slots.indices.filter { powers[$0] >= 0 }.map { travel(at: $0) }
+        let longest = travels.max() ?? 0
+        let secondsPerCell = totalDuration.map { $0 / max(longest, 1) } ?? (rollDuration / 10)
+        // TODO(诊断): 每段引擎滚动的「秒/格 + 各轮行程」——节奏问题的判据（每格时长 × 行程
+        // = 该轮时长；cellH/时长 = 每帧走多少 pt）。确认稳定后移除
+        Logger.log(.layout, String(format: "[RollEng] '→%llu' 秒/格=%.3f 整段=%@ 各轮行程=%@",
+                                   target.magnitude, secondsPerCell,
+                                   totalDuration.map { String(format: "%.2f", $0) } ?? "nil",
+                                   travels.map { String(format: "%.0f", $0) }.joined(separator: ",")))
+        let now = CACurrentMediaTime()
+        var any = false
+        for (i, s) in slots.enumerated() where powers[i] >= 0 {
+            guard let w = s.view as? DigitWheelView else { continue }
+            // 先落在途自驱 tween（滑移 / 单位换值那一类的余量），再交给引擎 —— 见 finishTween
+            w.finishTween()
+            let moved = w.beginEngineRoll(magnitude: target.magnitude, shownMagnitude: shownMagnitude,
+                                          fractionDigits: target.fractionDigits,
+                                          minimumIntegerDigits: target.integerDigits,
+                                          power: powers[i], secondsPerCell: secondsPerCell, at: now)
+            any = any || moved
+        }
+        nativeEngineActive = any
+    }
+
+    /// 引擎落定：各轮收到精确落定值（位置归一进 [0,10)、帧宽/排布宽归位），引擎回 idle
+    private func finishNativeRoll() {
+        nativeEngineActive = false
+        for s in slots { (s.view as? DigitWheelView)?.settleEngine() }
+        relayoutSlots()
+        invalidateIntrinsicContentSize()
+    }
+
+    /// 中止在途引擎滚动：各实例的引擎立刻落定（轮位置 = 本段终点）+ 各轮收到精确落定值
+    private func endNativeRoll() {
+        guard nativeEngineActive else { return }
+        for s in slots { (s.view as? DigitWheelView)?.finishEngineTransition() }
+        finishNativeRoll()
+    }
+
+    /// 引擎位置对齐到「当前显示的数字」（不由引擎接管的那些路径）。目标不可解析时清空引擎
+    private func alignNativeEngine(_ target: EngineTarget?) {
+        endNativeRoll()
+        for s in slots {
+            guard let w = s.view as? DigitWheelView else { continue }
+            guard let target else { w.resetEngine(); continue }
+            w.alignEngine(magnitude: target.magnitude, fractionDigits: target.fractionDigits,
+                          minimumIntegerDigits: target.integerDigits)
+        }
+    }
 
     // MARK: 单位制切换换值（数字滚动 + 字符纵向换位）
 
@@ -1176,6 +1498,8 @@ final class RollingNumberView: NSView {
     func rollSwapText(_ text: String, rollDuration: CFTimeInterval = Motion.unitSwap.total) {
         endSwap()
         endSlide()
+        // 单位换值走自驱 tween（数字轮滚动 + 字符纵向换位），不由引擎驱动：先中止在途的引擎滚动
+        endNativeRoll()
         guard text != currentText else { return }
         // 占位「—」/ 离屏：没有可滚出的旧内容，直接落值（首次入场不做换位动效）
         guard window != nil, !isHidden, currentText != "—" else {
@@ -1190,6 +1514,8 @@ final class RollingNumberView: NSView {
         currentText = text
         needsLayout = true
         invalidateIntrinsicContentSize()
+        // 引擎位置对齐到新值（本轮不由它驱动，但下一次引擎滚动的起点必须是它）
+        if Self.nativeEngineEnabled { alignNativeEngine(Self.engineTarget(from: Array(text))) }
         // 滚入槽在滚出段就要先候场到行外下方（否则它们会先按终点现身、
         // 进滚入段又跳下去，凭空多一次闪动）
         swapRising = lastFreshViews
@@ -1743,6 +2069,12 @@ final class RollingNumberView: NSView {
         guard window != nil else {
             lastTS = 0
             tickerSuspended = true
+            // 引擎按**墙钟**推进（原版由 display link 驱动、隐藏时不停表），挂起后再补帧会
+            // "跳帧追赶"——故面板隐藏那一刻**直接落定**到目标：回窗口看到的是终点状态
+            if nativeEngineActive {
+                for s in slots { (s.view as? DigitWheelView)?.finishEngineTransition() }
+                finishNativeRoll()
+            }
             l.isPaused = true
             return
         }
@@ -1756,6 +2088,21 @@ final class RollingNumberView: NSView {
         let dt = max(0, now - lastTS)
         lastTS = now
         var moving = false
+        // 引擎口径：位置由各轮自己的引擎给（曲线 / 方向 / 环绕都是它的），本视图只分发 ——
+        // 推进按墙钟（原版 `engine.tick(CACurrentMediaTime())` 同款），不吃 dt
+        if nativeEngineActive {
+            var still = false
+            for s in slots {
+                guard let w = s.view as? DigitWheelView else { continue }
+                w.driveEngine(now: now)
+                if w.engineNeedsFrames() { still = true }
+            }
+            if still {
+                moving = true
+            } else {
+                finishNativeRoll()
+            }
+        }
         for s in slots {
             if let w = s.view as? DigitWheelView {
                 if w.advance(dt: dt) { moving = true }
@@ -1800,6 +2147,23 @@ final class RollingNumberView: NSView {
             invalidateIntrinsicContentSize()
         }
         Self.perfFrames += 1
+        // 本段滚动的**帧率实测**（2026-09-20 定位「原生引擎看着帧数低」用）：
+        // 段内帧数与墙钟时长一起给，直接分辨「真的掉帧」还是「位移太小、栅格上看着不动」
+        //（后者见 beginNativeRoll 的时长封顶注释）。确认后连同下面那块一起移除
+        if moving {
+            if rollFrames == 0 { rollSpanStart = now }
+            rollFrames += 1
+        } else if rollFrames > 0 {
+            let span = now - rollSpanStart
+            Logger.log(.layout, String(format: "[RollPerf] '%@' 本段 %d 帧 / %.2fs → %.0f fps（引擎=%d 回调avg=%.2fms）",
+                                       currentText, rollFrames, span,
+                                       rollFrames > 1 ? Double(rollFrames - 1) / max(span, 0.0001) : 0,
+                                       Self.nativeEngineEnabled ? 1 : 0,
+                                       rollFrameCost / Double(max(1, rollFrames)) * 1000))
+            rollFrames = 0
+            rollFrameCost = 0
+        }
+        if moving { rollFrameCost += CFAbsoluteTimeGetCurrent() - t0 }
         if Self.perfFrames <= 90 {
             Self.perfCosts.append(CFAbsoluteTimeGetCurrent() - t0)
             if Self.perfFrames == 90 {
@@ -1811,4 +2175,8 @@ final class RollingNumberView: NSView {
     }
     private static var perfFrames = 0
     private static var perfCosts: [CFTimeInterval] = []
+    /// 本段滚动的帧数 / 起点时刻 / 帧内回调总耗时（[RollPerf] 段内帧率实测用）
+    private var rollFrames = 0
+    private var rollSpanStart: CFTimeInterval = 0
+    private var rollFrameCost: CFTimeInterval = 0
 }

@@ -4,7 +4,6 @@
 // ⚠️ 跨 target 类型一律 public（internal 默认可见性对宿主不可见）。
 
 import AppKit
-import CoreImage
 import SwiftUI
 
 /// 主前景色（卡片文字色）的**唯一解算体**：宿主 `Palette.cardForeground`（动态色）与
@@ -84,9 +83,9 @@ public enum PanelThemeColor {
     /// 从原「峰值亮黄绿 (225, 254, 119) 的分解」改为**按当时面板参数固化**（灼橙黄）。
     /// 旧算式备查：hue=(2+(B−R)/Δ)/6、sat=Δ/max、V=max/255 ⇒ (0.2024691, 0.5314960, 0.9960784)；
     /// 反过来这三个新值对应的 RGB ≈ (255, 157, 0) 一族。
-    public static let defaultHue: CGFloat = 0.1330642513005204
-    public static let defaultSaturation: CGFloat = 0.4570954442024231
-    public static let defaultBrightness: CGFloat = 1
+    public static let defaultHue: CGFloat = 0.3427993785644959
+    public static let defaultSaturation: CGFloat = 0.201582739244505
+    public static let defaultBrightness: CGFloat = 0.7942168116569519
 }
 
 /// 用量色的**档位坡**（峰值色 × 压暗系数）：用量类可视化色阶的唯一实现。
@@ -150,19 +149,21 @@ public struct PanelBackgroundColor: Equatable, Codable {
     /// 旧配置的迁移值见 `Config` 解码（取与顶端同值）
     public static let defaultBottomAlpha: Double = 0.70
 
-    // ── 出厂默认（2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」）──
-    // 按当时的面板参数固化（= 「宝特蓝」那套深邃蓝底 + 蓝调次背景 + 85% 底端不透明度）。
+    // ── 出厂默认（2026-09-17 首次固化；2026-09-22 用户「固化现在便签黄的参数」按当天取值重固）──
+    // 按当时的面板参数固化（= 「便签黄」那套：黄底 hsv(0.141667, 0.483684, 1.0) + 中性灰次背景
+    // + 85% 底端不透明度 + 黄绿用量色）。⚠️ 内置主题预设**不随此变动**（用户 2026-09-22 明确要求
+    // 预设不动）：第 1 枚「宝特蓝」仍是老值，点它会把面板覆盖回蓝底。
     // ⚠️ **刻意不复用 `.default` / `.secondaryBackgroundDefault`**：那两个常量的语义是
     // 「老配置迁移到新键时的观感兜底」（近黑 @70% / 深灰 #292929），与「新装默认」不是一回事 ——
-    // 混用会让迁移口径跟着出厂默认一起漂移（旧配置一升级就变成蓝底）。
+    // 混用会让迁移口径跟着出厂默认一起漂移（旧配置一升级就变成黄底）。
     // 新装 / 清偏好后的初始外观 = 这三条；宿主 `AppConfig` 与 `AppSettingsSnapshot` 同源引用。
 
-    /// 出厂默认面板底色（蓝，不透明）
-    public static let factoryPanelBackground = PanelBackgroundColor(hue: 0.577778, saturation: 1.0,
-                                                                   brightness: 0.846221, alpha: 1.0)
-    /// 出厂默认次背景色（蓝调第二层背景，alpha 23.4%）
-    public static let factorySecondaryBackground = PanelBackgroundColor(hue: 0.577778, saturation: 0.232355,
-                                                                      brightness: 0.858658, alpha: 0.233976)
+    /// 出厂默认面板底色（便签黄，不透明）
+    public static let factoryPanelBackground = PanelBackgroundColor(hue: 0.141667, saturation: 0.483684,
+                                                                   brightness: 1.0, alpha: 1.0)
+    /// 出厂默认次背景色（中性灰第二层背景，alpha 15.3%）
+    public static let factorySecondaryBackground = PanelBackgroundColor(hue: 0.0, saturation: 0.0,
+                                                                      brightness: 0.433647, alpha: 0.153486)
     /// 出厂默认遮罩**底端**不透明度（顶端 = `factoryPanelBackground` 自身的 alpha = 1.0）
     public static let factoryPanelBottomAlpha: Double = 0.85
 
@@ -410,13 +411,12 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
 
     /// 硬币四项的出厂默认（= 宿主 `CoinSettings.initial`）。两个颜色常量在这里是**字面值**：
     /// 本 target 引不到 `CoinRGB` / `CoinMaterial`，所以宿主侧改了默认就得同步这里 —— 一处兜底。
-    /// ⚠️ 2026-09-17 用户「把现在主题外观和 3D 硬币的参数，设定为 app 初启动默认参数」：
-    /// 由原来的「sgho 绿 + 紫」（1 / #00DC00 / #9E91FF）改为**按当时硬币参数固化**
-    /// （GHO + 黄 `#FFC644` + 色场 `#FFE2A1`）。改宿主 `CoinSettings.initial` 时这两边一起改。
+    /// ⚠️ 2026-09-22 用户「固化现在便签黄的参数」：四项随宿主 `CoinSettings.initial` 一起重固
+    /// （GHO + **线稿外观** + 黑币面 `#000000` + 紫色场 `#9E91FF`）。改 `CoinSettings.initial` 时两边一起改。
     public static let defaultCoinPreset = 0                  // CoinPreset.gho
-    public static let defaultCoinAppearance = 0              // CoinAppearance.default
-    public static let defaultCoinMaterialColor = "#FFC644"   // 币面色（2026-09-17 固化）
-    public static let defaultCoinFieldColor = "#FFE2A1"      // 色场色（2026-09-17 固化）
+    public static let defaultCoinAppearance = 1              // CoinAppearance.outline（2026-09-22 固化）
+    public static let defaultCoinMaterialColor = "#000000"   // 币面色（2026-09-22 固化）
+    public static let defaultCoinFieldColor = "#9E91FF"      // 色场色（2026-09-22 固化）
 
     public init(id: String = UUID().uuidString, name: String,
                 heatHue: Double, heatSaturation: Double, heatBrightness: Double,
@@ -794,8 +794,6 @@ public enum MenuBarStatusDotStyle {
     /// 「进行中」蓝（宿主三态色表与设置预览共用，防止两处各写一份 RGB）
     public static let runningColor = NSColor(calibratedRed: 0.505, green: 0.824, blue: 1.0, alpha: 1)
 
-    private static let ciContext = CIContext()
-
     /// 呼吸当前透明度（0 → 峰值 → 0）。宿主与预览共用同一公式
     public static func breathOpacity(at t: Double) -> CGFloat {
         let phase = t.truncatingRemainder(dividingBy: breathPeriod) / breathPeriod
@@ -803,42 +801,99 @@ public enum MenuBarStatusDotStyle {
         return glowPeakOpacity * CGFloat(breath)
     }
 
-    /// 光晕位图烘焙（状态色圆点剪影 → 高斯模糊 → alpha 增益 → 裁回画布）。
+    /// 光晕位图烘焙（状态色圆点剪影 → 自绘高斯 → alpha 增益 → 落成预乘 RGBA 位图）。
     /// 1:1 菜单栏口径（原设置窗口预览用的 `visualScale` 放大倍数已随该页移除）。
+    ///
+    /// ⚠️ **2026-09-17 起改自绘，不再走 CoreImage**：原管线是 `CIGaussianBlur` + `CIColorMatrix`，
+    /// 而 `CIContext()` 一建就替进程加载 ~154 MB Metal 着色器库、且**加载后常驻、无 API 卸载**
+    /// （归因见 TRAPS「内存占用归因」）⇒ 换成超采样圆盘 + 可分离高斯 + 增益，数学上等价：
+    /// 离线 harness 对旧管线逐像素比对（σ = `blurSigmaPx` 时 maxΔ = 4/255、均值 0.44/255，
+    /// 且差异全落在半径 ≥15px 的光晕肩部），视觉无差。
+    /// ⚠️ 增益必须**同时乘在预乘 RGB 与 A 上**再各自钳 1（旧管线实测口径：肩部 R/A ≡ 状态色、
+    /// 圆点芯被推到纯白）——只乘 A 会让肩部暗一档。
     /// - Parameter dotDiameter: 圆点直径（pt，= 宿主静止帧边长）
     public static func glowBitmap(color: NSColor, dotDiameter: CGFloat) -> CGImage? {
-        let padding = glowPadding
-        let side = dotDiameter + padding * 2
+        let side = dotDiameter + glowPadding * 2
         let px = max(1, Int(side * bitmapScale))
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
-                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-                                         isPlanar: false, colorSpaceName: .deviceRGB,
-                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
-        rep.size = NSSize(width: side, height: side)
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        // 圆点剪影（实心圆）直接矢量绘制，无需图标形状
-        color.setFill()
-        NSBezierPath(ovalIn: NSRect(x: padding, y: padding,
-                                    width: dotDiameter, height: dotDiameter)).fill()
-        NSGraphicsContext.restoreGraphicsState()
-        guard let base = rep.cgImage else { return nil }
+        // Int 截断后的真实倍率：圆盘几何必须按它换算，否则与旧管线错位（旧管线靠 NSBitmapImageRep.size 同倍率）
+        let scale = CGFloat(px) / side
+        let center = Double((glowPadding + dotDiameter / 2) * scale)
+        let radius = Double(dotDiameter / 2 * scale)
 
-        // 高斯模糊 + alpha 增益（模糊拉低峰值）+ 裁回画布（模糊 extent 外扩，不裁会破坏 frame 对位）；
-        // σ = blurSigmaPx（菜单栏 σ=5px@3x ≈ 1.7pt 视觉值）
-        var ci = CIImage(cgImage: base)
-        if let blur = CIFilter(name: "CIGaussianBlur") {
-            blur.setValue(ci, forKey: kCIInputImageKey)
-            blur.setValue(blurSigmaPx, forKey: kCIInputRadiusKey)
-            ci = blur.outputImage ?? ci
+        // ① 圆盘覆盖度：4×4 超采样（边缘 1/16 精度，与 NSBezierPath 抗锯齿同量级）
+        var alpha = [Double](repeating: 0, count: px * px)
+        let sub = 4
+        let step = 1.0 / Double(sub)
+        for y in 0..<px {
+            for x in 0..<px {
+                var covered = 0
+                for sy in 0..<sub {
+                    for sx in 0..<sub {
+                        let fx = Double(x) + (Double(sx) + 0.5) * step
+                        let fy = Double(y) + (Double(sy) + 0.5) * step
+                        let dx = fx - center, dy = fy - center
+                        if dx * dx + dy * dy <= radius * radius { covered += 1 }
+                    }
+                }
+                alpha[y * px + x] = Double(covered) / Double(sub * sub)
+            }
         }
-        if let boost = CIFilter(name: "CIColorMatrix") {
-            boost.setValue(ci, forKey: kCIInputImageKey)
-            boost.setValue(CIVector(x: 0, y: 0, z: 0, w: alphaBoost), forKey: "inputAVector")
-            ci = boost.outputImage ?? ci
+
+        // ② 可分离高斯：σ = blurSigmaPx，3σ 截断 + 权重归一化（超界采样按透明处理，
+        // 与旧管线同口径 —— 画布留白 5.1pt = 15.3px ≥ 3σ，尾部落在边界时 alpha 已 <1%）
+        let sigma = Double(blurSigmaPx)
+        let tap = max(1, Int(ceil(3 * sigma)))
+        var kernel = (0...(tap * 2)).map { exp(-Double(($0 - tap) * ($0 - tap)) / (2 * sigma * sigma)) }
+        let kernelSum = kernel.reduce(0, +)
+        kernel = kernel.map { $0 / kernelSum }
+        var horizontal = [Double](repeating: 0, count: px * px)
+        var blurred = [Double](repeating: 0, count: px * px)
+        for y in 0..<px {
+            for x in 0..<px {
+                var acc = 0.0
+                for i in -tap...tap {
+                    let sx = x + i
+                    if sx >= 0, sx < px { acc += alpha[y * px + sx] * kernel[i + tap] }
+                }
+                horizontal[y * px + x] = acc
+            }
         }
-        ci = ci.cropped(to: CGRect(x: 0, y: 0, width: px, height: px))
-        return ciContext.createCGImage(ci, from: ci.extent)
+        for y in 0..<px {
+            for x in 0..<px {
+                var acc = 0.0
+                for i in -tap...tap {
+                    let sy = y + i
+                    if sy >= 0, sy < px { acc += horizontal[sy * px + x] * kernel[i + tap] }
+                }
+                blurred[y * px + x] = acc
+            }
+        }
+
+        // ③ 增益 + 出图（deviceRGB / 预乘 RGBA8，与旧管线同色域同内存布局）
+        let base = color.usingColorSpace(.deviceRGB) ?? color
+        let red = Double(base.redComponent)
+        let green = Double(base.greenComponent)
+        let blue = Double(base.blueComponent)
+        let boost = Double(alphaBoost)
+        var out = [UInt8](repeating: 0, count: px * px * 4)
+        for i in 0..<(px * px) {
+            let a = blurred[i] * boost
+            out[i * 4 + 0] = Self.byte(red * a)
+            out[i * 4 + 1] = Self.byte(green * a)
+            out[i * 4 + 2] = Self.byte(blue * a)
+            out[i * 4 + 3] = Self.byte(a)
+        }
+        guard let provider = CGDataProvider(data: Data(out) as CFData) else { return nil }
+        return CGImage(width: px, height: px, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: px * 4, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
+    /// 0…1 → 8bit（钳制）
+    private static func byte(_ value: Double) -> UInt8 {
+        UInt8(max(0, min(255, (value * 255).rounded())))
     }
 }
 
@@ -907,7 +962,8 @@ public struct AppSettingsSnapshot: Equatable {
     /// 取代原「alpha × 0.65」自动递减）
     public var panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha
     /// 浅色主题开关（强制浅色外观，即使系统是深色主题）
-    public var lightThemeEnabled = false
+    /// ⚠️ 2026-09-22 随「便签黄」出厂默认固化为 **true**（按当时那台机器的实际取值）
+    public var lightThemeEnabled = true
     /// 品牌 icon 深浅版互换
     public var iconThemeSwap = false
     /// 无边框图标（卡片品牌 icon 直接用 SVG 原图，不套 Icon Composer 底板）
@@ -918,6 +974,12 @@ public struct AppSettingsSnapshot: Equatable {
     public var cardTitleFontSize: Double = 13.5
     /// 卡片主标题 Sharp Grotesk（本机安装的商业字体；未装该字重回落系统字体）
     public var cardTitleSharpGrotesk = true
+    /// 原生滚动数字（2026-09-20 用户要求）：「主题外观 → 卡片」的开关 —— true = 数值滚动交给
+    /// 原生引擎（`NativeRollingEngine`，RN nitro-rolling-number 的 Swift 移植），整串数字
+    /// **共享一段时长**同起同落；false = 既有口径（每位车轮独立 tween、时长按行进格数分配）。
+    /// ⚠️ **刻意不进「主题预设」**：它是引擎/行为开关而不是外观参数（与「数值滚动预览」同类，
+    /// 与硬币的几何 / 运动参数同一判定 —— 换主题不该动它）
+    public var nativeRollingNumber = false
     // 数值滚动的「滑移时长口径」与「时间曲线档位」2026-09-17 用户「动效的参数固化，移除参数开放」：
     // 快照字段、两个选项枚举、动作与 setter、设置窗口「动效」整段一并移除 ——
     // 定稿值（跟随位移 / 从快到慢）写死在 `RollingNumberView.slideTime()` 与 `rollEase(_:)`
@@ -939,7 +1001,11 @@ public struct AppSettingsSnapshot: Equatable {
     /// nil = 用内置两档（深色 #EBEBEB / 浅色 0.13 黑 —— 即参数开放前的老行为），
     /// 有值 = 用户自选，**两档共用同一个值**（用户挑的就是这一支色，不再按外观分档）。
     /// 色盘显示的当前色 = `self ?? PanelForegroundColor.builtIn(dark: !lightThemeEnabled)`（视图里的 Binding）
-    public var panelForegroundColor: PanelBackgroundColor?
+    /// ⚠️ 2026-09-22 随「便签黄」出厂默认固化：默认**不再**是 nil，而是当时那支深灰
+    /// hsv(0, 0, 0.173407)（浅色主题下的正文色）。**副作用**：有值时两档共用 —— 切到深色主题
+    /// 正文仍是这支深灰。要让深色档回到内置 #EBEBEB，把这里与 `AppConfig` 的同名字段一起改回 nil。
+    public var panelForegroundColor: PanelBackgroundColor? = PanelBackgroundColor(hue: 0, saturation: 0,
+                                                                                brightness: 0.173407, alpha: 1)
     /// ── 3D 硬币的**视觉身份**四项（2026-09-16）：本页没有对应控件，纯为「主题预设」代读 ——
     /// 宿主装配快照时从 `CoinSettings.load()` 取，`ThemePreset(name:snapshot:)` 再固化进预设，
     /// 应用预设时宿主写回 UserDefaults 并回灌硬币 pane / 主面板内嵌小硬币。
@@ -952,6 +1018,11 @@ public struct AppSettingsSnapshot: Equatable {
     /// + 用户自建（宿主 `ThemePresetStore.load()`，UserDefaults）**，宿主装配快照时拼起来，
     /// 内置恒排在前；新增 / 应用 / 改名 / 删除都先交宿主动作落盘再回读本条
     public var themePresets: [ThemePreset] = []
+    /// 最后一次「应用」的预设 id（宿主从 `UDKey.appliedThemePresetID` 读）。
+    /// 与 `themePresets` 里某项的 `matches(self)` **联合**判定「这枚预设被改过」：
+    /// 命中 id 但已不再匹配 = 脏（卡片显示「已修改」+ 更新/重置入口）。
+    /// nil（从未应用过 / 清过偏好）= 没有任何卡显示已修改
+    public var appliedPresetID: String?
     /// DeepSeek API Key（真实值来自钥匙串；空 = 未配置）
     public var apiKey: String = ""
     /// DeepSeek 常用充值额度（0 = 未设置 → 面板不画点阵；>0 = 点阵分母）
@@ -970,21 +1041,25 @@ public struct AppSettingsSnapshot: Equatable {
                 savedAccountGroups: [SavedAccountGroup] = [],
                 panelBackgroundColor: PanelBackgroundColor = .factoryPanelBackground,
                 panelBackgroundBottomAlpha: Double = PanelBackgroundColor.factoryPanelBottomAlpha,
-                lightThemeEnabled: Bool = false,
+                lightThemeEnabled: Bool = true,   // 2026-09-22 随「便签黄」出厂默认固化（原 false）
                 iconThemeSwap: Bool = false,
                 iconNoBorder: Bool = true,
                 longProgressCard: Bool = false,
                 cardTitleFontSize: Double = 13.5, cardTitleSharpGrotesk: Bool = true,
+                nativeRollingNumber: Bool = false,
                 heatHue: Double = Double(PanelThemeColor.defaultHue),
                 heatSaturation: Double = Double(PanelThemeColor.defaultSaturation),
                 heatBrightness: Double = Double(PanelThemeColor.defaultBrightness),
                 secondaryBackgroundColor: PanelBackgroundColor = .factorySecondaryBackground,
-                panelForegroundColor: PanelBackgroundColor? = nil,
+                // 2026-09-22 随「便签黄」出厂默认固化：默认不再是 nil（副作用见属性声明处的注释）
+                panelForegroundColor: PanelBackgroundColor? = PanelBackgroundColor(hue: 0, saturation: 0,
+                                                                                  brightness: 0.173407, alpha: 1),
                 coinPreset: Int = ThemePreset.defaultCoinPreset,
                 coinAppearance: Int = ThemePreset.defaultCoinAppearance,
                 coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor,
                 coinFieldColor: String = ThemePreset.defaultCoinFieldColor,
-                themePresets: [ThemePreset] = []) {
+                themePresets: [ThemePreset] = [],
+                appliedPresetID: String? = nil) {
         self.refreshInterval = refreshInterval
         self.autoCheckin = autoCheckin
         self.autoCheckinSub = autoCheckinSub
@@ -1002,6 +1077,7 @@ public struct AppSettingsSnapshot: Equatable {
         self.longProgressCard = longProgressCard
         self.cardTitleFontSize = cardTitleFontSize
         self.cardTitleSharpGrotesk = cardTitleSharpGrotesk
+        self.nativeRollingNumber = nativeRollingNumber
         self.heatHue = heatHue
         self.heatSaturation = heatSaturation
         self.heatBrightness = heatBrightness
@@ -1012,6 +1088,7 @@ public struct AppSettingsSnapshot: Equatable {
         self.coinMaterialColor = coinMaterialColor
         self.coinFieldColor = coinFieldColor
         self.themePresets = themePresets
+        self.appliedPresetID = appliedPresetID
     }
 }
 
@@ -1042,6 +1119,9 @@ public struct AppSettingsActions {
     /// 无边框图标（宿主：落盘 + 就地换卡片 icon，不重建卡片）
     public var setIconNoBorder: (Bool) -> Void = { _ in }
     public var setLongProgressCard: (Bool) -> Void = { _ in }
+    /// 原生滚动数字（宿主：写 config + 落盘 + 运行镜像给 `RollingNumberView.nativeEngineEnabled`，
+    /// **不重建卡片** —— 下一次数值变化就走新引擎）
+    public var setNativeRollingNumber: (Bool) -> Void = { _ in }
     /// 「主题外观」pane 用量色（HSB 三参 0…1，**一把写**；2026-09-14 由三根滑杆改为
     /// 系统色盘拾色 —— 色盘给的是一个颜色，分解回 HSB 后一次落值、只重绘一次）。
     /// 宿主：落 UserDefaults + 就地重绘点阵与卡片边框
@@ -1065,6 +1145,10 @@ public struct AppSettingsActions {
     /// 改名（点图卡下方的名字就地改）：按 id 找到用户自建的那枚、换名字后落盘。
     /// 内置六枚没有改名入口，宿主也不需要额外挡 —— 存储里根本不含它们的 id
     public var renameThemePreset: (String, String) -> Void = { _, _ in }
+    /// 「更新预设」（2026-09-22）：把**当前外观逐项写回**该 id 的预设（覆盖它的值）。
+    /// 只对用户自建的那些开放 —— 内置六枚写死在代码里、`ThemePresetStore` 里没有它们的条目，
+    /// 宿主按 id 命中不到，所以视图对内置只给「重置」不给「更新」
+    public var updateThemePreset: (String) -> Void = { _ in }
     public var manualCheckin: () -> Void = {}
     public var showCheckinHistory: () -> Void = {}
     public var shareWbHistory: () -> Void = {}
@@ -1339,6 +1423,11 @@ public final class AppSettingsModel {
         actions.setLongProgressCard(on)
         sync()
     }
+    /// 原生滚动数字开关（2026-09-20）：即时生效，切换不重建卡片（下一次数值变化走新引擎）
+    public func setNativeRollingNumber(_ on: Bool) {
+        actions.setNativeRollingNumber(on)
+        sync()
+    }
     /// 用量色拾取（色盘）：先交宿主动作（落 UserDefaults + 就地重绘），随后回读快照
     public func setThemeColor(hue: Double, saturation: Double, brightness: Double) {
         actions.setHeatColor(hue, saturation, brightness)
@@ -1380,6 +1469,13 @@ public final class AppSettingsModel {
     /// 应用一组预设（宿主逐项原样落值），随后回读快照 —— 该页所有控件随之显示新值
     public func applyThemePreset(_ preset: ThemePreset) {
         actions.applyThemePreset(preset)
+        sync()
+    }
+
+    /// 「更新预设」（2026-09-22）：把当前外观写回该预设（按 id 命中用户自建那枚，覆盖其值），
+    /// 随后回读快照 —— 覆盖后当前外观与该预设重新逐项相等，「已修改」标记随之消失
+    public func updateThemePreset(id: String) {
+        actions.updateThemePreset(id)
         sync()
     }
 

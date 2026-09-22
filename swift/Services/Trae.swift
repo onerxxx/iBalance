@@ -60,7 +60,31 @@ enum TraeService {
 
     /// 读取 storage.json 并解密 iCubeAuthInfo，返回完整账号信息
     /// 用于采集当前登录账号 + 多账号余额查询
+    ///
+    /// 带内存缓存：菜单栏标题渲染、面板快照构造每轮都会问一次当前登录账号（且一轮内多次），
+    /// 而每次调用都要读盘 + JSON 解析 + base64 + SHA-512 派生 + AES-CBC 解密 + HMAC 校验。
+    /// 口径对齐 WorkBuddyService.authInfo()：mtime 变化才重解密，mtime 未变但距上次 > 30s 也重读
+    /// （兜底，防 mtime 精度丢失；TRAE 切号会改 storage.json，mtime 必然变化）。
     static func readAuthInfo(storagePath: String) -> TraeAccountInfo? {
+        authCacheLock.lock()
+        defer { authCacheLock.unlock() }
+        let mtime = (try? FileManager.default.attributesOfItem(atPath: storagePath))?[.modificationDate] as? Date
+            ?? .distantPast
+        let now = Date()
+        if let cached = cachedAuth, cached.path == storagePath, cached.mtime == mtime,
+           now.timeIntervalSince(cached.fetchedAt) < 30 {
+            return cached.info
+        }
+        let info = decodeAuthInfo(storagePath: storagePath)
+        cachedAuth = (path: storagePath, mtime: mtime, info: info, fetchedAt: now)
+        return info
+    }
+
+    private static var cachedAuth: (path: String, mtime: Date, info: TraeAccountInfo?, fetchedAt: Date)?
+    private static let authCacheLock = NSLock()
+
+    /// 实际读盘 + 解密（无缓存），由 readAuthInfo 调用
+    private static func decodeAuthInfo(storagePath: String) -> TraeAccountInfo? {
         guard FileManager.default.fileExists(atPath: storagePath),
               let data = try? Data(contentsOf: URL(fileURLWithPath: storagePath)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

@@ -4,7 +4,6 @@
 // (2026-08-24 自 main.swift/Panel.swift 拆出,纯代码搬移)
 
 import Cocoa
-import CoreImage
 
 extension BalancePanelView {
 
@@ -112,11 +111,12 @@ extension BalancePanelView {
         for ring in draggingHiddenStatusRings { ring.isHidden = true }
         var ghostReady = false
         // 两段式幽灵（2026-09-06 用户指定「只背景加模糊，边框和卡片内容不加」）：
-        // ① 背景段 = 幽灵容器 layer 开 backgroundFilters 高斯模糊——只模糊身后的面板
-        //    内容（GPU 合成、区域限于幽灵 frame），叠 hover 强背景色定调，边框清晰；
+        // ① 背景段 = 拖起时**烘一次整面板模糊底**（叠卡片 hover 底色），幽灵移动只反向平移
+        //    这张大图 ⇒ 取到的永远是「幽灵当前所在位置」下那一块，边框与卡片内容保持清晰；
+        //    原实现走 layer.backgroundFilters 实时高斯模糊——那条路会拉起 179 MB 的图层 CI
+        //    着色器库且常驻卸载不掉（见 TRAPS「内存占用归因」）⇒ 2026-09-17 改自绘；
         // ② 内容段 = 卡片子树的清晰内容位图（透明底）：hover 材质已不在卡片里
         //    （容器共享、且画在卡片之下），截图天然只含内容像素，无需再临时隐藏。
-        // 滤镜实例只在拖起时创建一次（勿移入 movePlatformGhost 逐帧重建）
         let contentImage = makeDragSnapshot(of: ghostSourceView)
         if let contentImage {
             let ghost = NSView(frame: ghostFrame)
@@ -125,17 +125,29 @@ extension BalancePanelView {
                 // 幽灵圆角跟随卡片层圆角（2026-09-13 起 9pt，与 hover 描边同源）
                 l.cornerRadius = Palette.hoverCardCornerRadius
                 l.cornerCurve = .continuous
-                if let blur = CIFilter(name: "CIGaussianBlur") {
-                    blur.setValue(6, forKey: kCIInputRadiusKey)
-                    l.backgroundFilters = [blur]
-                }
-                l.backgroundColor = Palette.borderCGColor(Palette.cardHoverStrongBright, in: self)
                 l.borderColor = Palette.borderCGColor(Palette.hoverBorderBright, in: self)
                 l.borderWidth = Palette.cardBorderWidth
                 l.shadowColor = NSColor.black.cgColor
                 l.shadowOffset = CGSize(width: 0, height: -3)
                 l.shadowRadius = 10
                 l.shadowOpacity = shouldReduceMotion ? 0.35 : 0.48
+            }
+            // 背景段：整面板模糊底（拖起时烘一次，此后只平移；形状由圆角裁切层给）
+            if let backdropImage = bakedGhostBackdrop() {
+                let clip = CALayer()
+                clip.frame = CGRect(origin: .zero, size: ghostFrame.size)
+                clip.cornerRadius = Palette.hoverCardCornerRadius
+                clip.cornerCurve = .continuous
+                clip.masksToBounds = true
+                let backdrop = CALayer()
+                backdrop.frame = CGRect(x: -ghostFrame.minX, y: -ghostFrame.minY,
+                                        width: bounds.width, height: bounds.height)
+                backdrop.contentsScale = 1          // 底图按 1px/pt 烘，1:1 铺在面板坐标系上
+                backdrop.contentsGravity = .resize
+                backdrop.contents = backdropImage
+                clip.addSublayer(backdrop)
+                ghost.layer?.addSublayer(clip)
+                draggingGhostBackdrop = backdrop
             }
             let contentView = NSImageView(frame: NSRect(origin: .zero, size: ghostFrame.size))
             contentView.image = contentImage
@@ -165,11 +177,52 @@ extension BalancePanelView {
         }
     }
 
+    /// 拖起时烘一次「整面板的模糊底 + 卡片 hover 底色」（替代 `layer.backgroundFilters` 的实时模糊）。
+    /// 纯 CPU 路径：`cacheDisplay` 渲染面板 → 缩到 1px/pt → 三遍盒式模糊（σ = 6 设备像素 ÷ backingScale
+    /// 的视觉值，见 SoftBlur 头注）→ 叠卡片 hover 底色（次背景色，与 hover 渐变同源）。
+    /// 幽灵移动时只平移这张图（见 movePlatformGhost），所以背景取的始终是「当前位置」下那一块。
+    private func bakedGhostBackdrop() -> CGImage? {
+        guard bounds.width > 1, bounds.height > 1,
+              let rep = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        layoutSubtreeIfNeeded()
+        cacheDisplay(in: bounds, to: rep)
+        guard let raw = rep.cgImage else { return nil }
+        // 缩到 1px/pt 再糊：整画布成本降到 1/scale²，而「糊」本来就不需要锐度
+        let w = max(1, Int(bounds.width.rounded()))
+        let h = max(1, Int(bounds.height.rounded()))
+        let space = CGColorSpaceCreateDeviceRGB()
+        let info = CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: info) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(raw, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let small = ctx.makeImage() else { return nil }
+        let scale = window?.backingScaleFactor ?? 2
+        let sigmaPt = SoftBlur.sigmaPt(fromCIRadius: 6, scale: scale)
+        guard let blurred = SoftBlur.boxBlur(small, sigmaPx: sigmaPt),
+              let tinted = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                     bytesPerRow: 0, space: space, bitmapInfo: info) else { return nil }
+        tinted.draw(blurred, in: CGRect(x: 0, y: 0, width: w, height: h))
+        // 定调色 = **卡片 hover 的底色**（次背景色 `hoverGradientBright`，与卡片 hover 渐变同源）——
+        // 2026-09-17 用户「拖动卡片时沿用卡片 hover 的背景色」；原先那档单独的「hover 强背景色」
+        // （cardHoverStrongBright + 固定 30%/90% 两档）已随之删除，别再各写一份
+        tinted.setFillColor(Palette.borderCGColor(Palette.hoverGradientBright, in: self))
+        tinted.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        return tinted.makeImage()
+    }
+
     private func movePlatformGhost(to locationInWindow: NSPoint) {
         guard let ghost = draggingGhostView else { return }
         let pointer = convert(locationInWindow, from: nil)
         ghost.frame.origin = NSPoint(x: pointer.x - draggingGhostOffset.x,
                                      y: pointer.y - draggingGhostOffset.y)
+        // 底图反向平移：让整面板模糊底「钉」在面板坐标系里，幽灵取到的是当前位置下那一块
+        if let backdrop = draggingGhostBackdrop {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            backdrop.frame.origin = NSPoint(x: -ghost.frame.minX, y: -ghost.frame.minY)
+            CATransaction.commit()
+        }
     }
 
     func updatePlatformDrag(_ id: String, locationInWindow: NSPoint) {

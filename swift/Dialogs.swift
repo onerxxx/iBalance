@@ -192,7 +192,7 @@ func makeWbBrandIcon() -> NSImage? {
 }
 
 /// App 图标快照（App-Icon-Default-1024@1x.png，ictool 按 design-generation 27 导出的
-/// Default rendition，随 icons/*.png 打包）。操作磁贴类弹窗（手动签到/签到历史/检查更新/关于）
+/// Default rendition，随 icons/*.png 打包）。面板工具类弹窗（手动签到/签到历史/检查更新/关于）
 /// 统一用它，不走 NSApp.applicationIconImage（后者受系统图标缓存影响）
 func makeAppIconSnapshot() -> NSImage? {
     guard let url = Bundle.main.url(forResource: "App-Icon-Default-1024@1x", withExtension: "png"),

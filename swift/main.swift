@@ -307,6 +307,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 菜单栏 status item（标题整体渲染为位图 template，见 updateTitle）
         statusItem = statusBar.statusItem(withLength: NSStatusItem.variableLength)
 
+        // WorkBuddy 桌面端凭据为 at-rest 加密（详见 WBAtRestCrypto.swift）：后台预热静态钥，
+        // 取钥要走一次 native 探针（拉起 WorkBuddy 自带 Electron，~1s），别等到读 auth 文件时才同步等
+        WBAtRestCrypto.warmUp()
+
         // 启动缓存回灌（cache-then-refresh）：立即显示上次会话的数值，
         // 网络刷新返回后照常覆盖；无缓存文件时维持占位符行为不变
         restoreBalanceCache()
@@ -470,7 +474,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 只有 button.image 的 template 走系统状态栏自适应管线：
     // 深浅模式（按屏幕）、聚焦变淡、透明菜单栏、菜单打开高亮反色，全部由系统处理；
     // attributedTitle 里的 NSTextAttachment 原样绘制、不进 template 管线（无论是否设 isTemplate），
-    // 因此把「主图标 + 平台图标 + 文字」整体画进一张黑形位图再交给系统，是唯一能全状态自适应的做法
+    // 因此把「平台图标 + 文字」整体画进一张黑形位图再交给系统，是唯一能全状态自适应的做法
+    //（原先开头还挂一颗卡片主图标 `credit-card-filled`，后来菜单栏只剩平台条目，该图标与其 SVG 已移除）
 
     /// 图标形状缓存（iconName → 黑形位图）
     private var menuBarIconShapes: [String: NSImage] = [:]
@@ -874,12 +879,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         if popoverController == nil { buildPanelOnce() }   // 兜底：未预构建时按需构建一次
         guard let popover = popoverController, let panel = panelView else { return }
-        // 面板行为按当前态归位：3D 硬币非阻塞弹窗 / SwiftUI 设置窗口在屏期间保持
-        // applicationDefined（点弹窗不算「面板外」，面板保持可交互）；平时恢复 transient。
-        // 覆盖「弹窗开着时面板曾被关掉再重开」的窗口期——弹窗关闭回调里的
+        // 面板行为按当前态归位：SwiftUI 设置窗口在屏期间保持 applicationDefined
+        //（点设置窗口不算「面板外」，面板保持可交互）；平时恢复 transient。
+        // 覆盖「设置窗口开着时面板曾被关掉再重开」的窗口期——窗口关闭回调里的
         // endKeepPanelAlive 只对在屏面板生效。
-        popover.behavior = (GlassModalShell.hasActiveNonModalSession
-                            || SettingsWindowController.shared.isSessionActive)
+        popover.behavior = SettingsWindowController.shared.isSessionActive
             ? .applicationDefined : .transient
         // 先展示缓存数据（即时响应），再触发自动刷新拿最新
         panel.update(makePanelSnapshot())
@@ -962,23 +966,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - NSPopoverDelegate
 
     /// 面板保活（begin）：临时把 popover 行为切为 applicationDefined，防 .transient 把
-    /// 「与弹窗交互」误判为「点击面板外」而关闭面板，导致点「操作」区的 API Key /
-    /// 关于 等选项时面板先消失。
-    /// 同步模态用 keepPanelAliveDuring 包裹；跨异步的生命周期（3D 硬币非阻塞弹窗）
-    /// 用 begin/end 手动配对——begin 后必须在弹窗关闭回调里 end。
+    /// 「与弹窗交互」误判为「点击面板外」而关闭面板，导致同步模态里点按钮时面板先消失。
+    /// 同步模态用 keepPanelAliveDuring 包裹；跨异步的生命周期用 begin/end 手动配对 ——
+    /// begin 后必须在流程收口处 end。
     func beginKeepPanelAlive() {
         guard let popover = popoverController, popover.isShown else { return }
         popover.behavior = .applicationDefined
     }
 
     /// 面板保活收口（end）：恢复「点击面板外自动关闭」。尊重 pin 置顶态（置顶期间本就
-    /// 是 applicationDefined，不能被重置回 transient）；3D 硬币非阻塞弹窗、SwiftUI 设置
-    /// 窗口在屏期间同样保持 applicationDefined——其他模态（调色气泡、系统弹窗）的收口
-    /// 不得提前解除其保活。
+    /// 是 applicationDefined，不能被重置回 transient）；SwiftUI 设置窗口在屏期间同样保持
+    /// applicationDefined——其他模态（调色气泡、系统弹窗）的收口不得提前解除其保活。
     func endKeepPanelAlive() {
         guard let popover = popoverController, popover.isShown else { return }
         popover.behavior = (popover.contentViewController?.view.window?.level == .floating
-                            || GlassModalShell.hasActiveNonModalSession
                             || SettingsWindowController.shared.isSessionActive)
             ? .applicationDefined : .transient
     }
@@ -1225,6 +1226,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         snap.expireSegments = ["套餐已到期"]
                     }
                 }
+            } else {
+                // 兜底（2026-09-22 用户指定）：取不到套餐与余额/积分（无缓存，或查询无有效套餐 /
+                // 账号级失效且从未成功过一次）→ 余额固定 0%，当前账号副标题显示「当前无可用套餐」，
+                // 不留「—」空白态。已有旧缓存的账号不受影响（上面分支按旧数据展示，本轮继续保留）。
+                snap.value = "0%"
+                snap.usedRatio = 1
+                if isCurrent {
+                    snap.expireSegments = ["无可用套餐"]
+                }
             }
             snap.pulsing = zcodePulsingTracker.isPulsing(ac.uid)
             // 任务状态光环（仅当前账号）：进行中=蓝 / 完成=绿 / 中断=橙红（完成与中断最多显示 5 分钟）
@@ -1408,6 +1418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         s.cardTitleFontSize = config.cardTitleFontSize
         s.cardTitleSharpGrotesk = config.cardTitleSharpGrotesk
         s.longProgressCard = config.longProgressCard
+        s.nativeRollingNumber = config.nativeRollingNumber
         s.iconThemeSwap = config.iconThemeSwap
         s.iconNoBorder = config.iconNoBorder
         // 数值滚动的滑移时长 / 时间曲线（2026-09-16 新增）2026-09-17 已固化：不再进快照
@@ -1490,9 +1501,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - SwiftUI 设置窗口（header 设置按钮）
 
-    /// 装配设置窗口模型：动作全部转发既有 AppDelegate 回调（与面板磁贴/设置行同一条链路），
+    /// 装配设置窗口模型：动作全部转发既有 AppDelegate 回调（与设置行/状态栏菜单项同一条链路），
     /// 状态快照复用面板快照的设置段（单一事实源），然后打开窗口。
-    /// `pane` 指定落点：面板「Key / 额度」磁贴、右键「Key / 额度设置…」直接定位到该 pane。
+    /// `pane` 指定落点：右键「Key / 额度设置…」直接定位到该 pane（面板无对应入口）。
     private func openSettingsWindow(pane: SettingsSidebarItem = .appearance) {
         var actions = AppSettingsActions()
         actions.setRefreshInterval = { [weak self] in self?.applyRefreshInterval(TimeInterval($0)) }
@@ -1566,6 +1577,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self, want != config.longProgressCard else { return }
             onToggleLongProgressCard()
         }
+        // 原生滚动数字（2026-09-20）：写 config + 落盘 + 镜像给数值视图；**不重建卡片** ——
+        // 下一次数值变化就走新引擎（切换那一刻屏上的数字不动，语义与「无感换挡」一致）
+        actions.setNativeRollingNumber = { [weak self] want in
+            guard let self, want != config.nativeRollingNumber else { return }
+            config.nativeRollingNumber = want
+            ConfigStore.save(config)
+            syncPanel()
+        }
         // 数值滚动的滑移时长口径（`roll_slide_timing`）与时间曲线档位（`roll_curve`）
         // 2026-09-17 用户「动效的参数固化，移除参数开放」：两个 config 键、设置窗口「动效」整段、
         // 两个 setter 与静态镜像一并移除 —— 定稿值（跟随位移 / 从快到慢）写进
@@ -1585,6 +1604,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 用户自建的走 UserDefaults（ThemePresetStore）；应用见 applyThemePreset 的逐项落值说明
         actions.saveThemePreset = { [weak self] preset in self?.saveThemePreset(preset) }
         actions.applyThemePreset = { [weak self] preset in self?.applyThemePreset(preset) }
+        // 「更新预设」（2026-09-22）：把当前外观写回该 id 的用户自建预设
+        actions.updateThemePreset = { [weak self] id in self?.updateThemePreset(id: id) }
         actions.deleteThemePreset = { [weak self] id in self?.deleteThemePreset(id: id) }
         actions.renameThemePreset = { [weak self] id, name in
             self?.renameThemePreset(id: id, name: name)
@@ -1683,6 +1704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             longProgressCard: config.longProgressCard,
             cardTitleFontSize: config.cardTitleFontSize,
             cardTitleSharpGrotesk: config.cardTitleSharpGrotesk,
+            nativeRollingNumber: config.nativeRollingNumber,
             heatHue: Double(Palette.heatPeakHue),
             heatSaturation: Double(Palette.heatPeakSaturation),
             heatBrightness: Double(Palette.heatPeakBrightness),
@@ -1694,7 +1716,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             coinFieldColor: coin.fieldColor.hex,
             // 预设列表 = **内置（代码里，只读）+ 用户自建（UserDefaults）**，内置恒在前面
             //（`ThemePresetStore.load()` 已把老数据里的内置条目过滤掉，见该处迁移注释）
-            themePresets: ThemePreset.builtIns + ThemePresetStore.load())
+            themePresets: ThemePreset.builtIns + ThemePresetStore.load(),
+            // 「已修改」判定用：最后一次应用过的预设 id（UserDefaults，见 UDKey.appliedThemePresetID）
+            appliedPresetID: UserDefaults.standard.string(forKey: UDKey.appliedThemePresetID))
     }
 
     /// 面板「面板背景色」（设置窗口色盘拾色 / 顶部不透明度滑杆）：写配置并经快照同步重绘遮罩
@@ -1758,6 +1782,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ThemePresetStore.save(list)
     }
 
+    /// 「更新预设」（2026-09-22）：把**当前外观**逐项写回该 id 的用户自建预设 ——
+    /// 走与「新增预设」同一条映射（`ThemePreset(name:snapshot:)`），只有 id / name 沿用原条目。
+    /// 内置六枚不在 `ThemePresetStore` 里 ⇒ 按 id 命中不到时静默返回（视图本来也不给它们「更新」入口）
+    private func updateThemePreset(id: String) {
+        var list = ThemePresetStore.load()
+        guard let index = list.firstIndex(where: { $0.id == id }) else { return }
+        var updated = ThemePreset(name: list[index].name, snapshot: makeSettingsSnapshot())
+        updated.id = id      // 沿用原 id（视图命中 / 去重都靠它）
+        list[index] = updated
+        ThemePresetStore.save(list)
+        // 覆盖后当前外观与该预设重新逐项相等 ⇒ 记为「已应用这枚」，卡片上的「已修改」随之消失
+        recordAppliedThemePreset(id)
+    }
+
+    /// 记下「最近应用（或更新）的预设 id」——卡片「已修改」判定的那一半状态。
+    /// 另一半是 `ThemePreset.matches(快照)`：命中 id 且不再相等 = 脏
+    private func recordAppliedThemePreset(_ id: String) {
+        UserDefaults.standard.set(id, forKey: UDKey.appliedThemePresetID)
+    }
+
     /// 删除一组主题预设（按 id 命中；不存在时什么都不做）
     private func deleteThemePreset(id: String) {
         let list = ThemePresetStore.load()
@@ -1789,6 +1833,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         config.cardTitleFontSize = preset.cardTitleFontSize
         config.cardTitleSharpGrotesk = preset.cardTitleSharpGrotesk
         ConfigStore.save(config)
+        // 记下「刚应用的是这枚」——预设卡片「已修改」判定的一半状态（另一半是 matches 比对）；
+        // 点图卡 = 干净态，此后改任何一项参数都会让这枚卡变成「已修改」
+        recordAppliedThemePreset(preset.id)
         // 运行镜像：与 `onToggleLightTheme` 同一组（自建顶层窗口外观、副前景色按底色解算、
         // 遮罩两端不透明度、次背景色都读它们），漏一个就会出现「面板换了、弹窗还是旧色」
         Palette.lightThemeActive = config.lightThemeEnabled
@@ -1816,7 +1863,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// ⚠️ 只写这 4 个键，**不能**走 `CoinSettings.save()` —— 那是整份快照落盘，会把预设里
     /// 根本没有的几何 / 工艺 / 运动 / logo 项一起盖掉（那些不属于主题，见 `ThemePreset` 注释）。
     /// 写盘后两个消费点各自回灌：设置窗口「3D 硬币」pane 的参数区 + 主面板内嵌小硬币。
-    /// 玻璃弹窗（CoinDemoDialog）每次 present 都新建面板并从磁盘初始化，不必处理。
     private func applyCoinIdentity(from preset: ThemePreset) {
         let defaults = UserDefaults.standard
         defaults.set(preset.coinPreset, forKey: UDKey.coinPreset)
@@ -1928,7 +1974,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func onAbout() {
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         let shell = DialogShell()
-        // 操作磁贴类弹窗统一用 App 图标快照（见 Dialogs.makeAppIconSnapshot 注释）
+        // 面板工具类弹窗统一用 App 图标快照（见 Dialogs.makeAppIconSnapshot 注释）
         shell.addIcon(makeAppIconSnapshot())
         shell.addTitle("关于 iBalance")
         // 长文阅读类弹窗：内容宽 +8 抵消 sidePadding 增量，再 +20 加宽正文行宽
@@ -1939,22 +1985,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
         _ = keepPanelAliveDuring { shell.present() }
-    }
-
-    // MARK: - 3D 硬币演示
-
-    /// 操作磁贴「3D 硬币」：玻璃壳里放一版 native 复刻的 mintform CSS 3D token。
-    /// 非阻塞呈现（用户 2026-09-11 指定弹窗与主面板两边都可操作）：弹窗可见期间手动
-    /// 保活面板（begin/end 跨异步配对），关闭回调里解除保活并复位内嵌小硬币。
-    @objc private func onShowCoinDemo() {
-        beginKeepPanelAlive()
-        CoinDemoDialog.present { [weak self] in
-            self?.endKeepPanelAlive()
-            // 弹窗调参中的实时同步走 .coinSettingsDidChange（通知带内存快照）；落盘只由弹窗
-            // 「保存」按钮负责。弹窗关闭后按磁盘值再灌一次：保存过 = 无害复位，
-            // 没保存 = 撤掉本次未保存的实时同步（主面板回到已存默认）。
-            self?.panelView?.reloadInlineCoinSettings()
-        }
     }
 
     // MARK: - App 自更新（GitHub Releases）
@@ -1993,7 +2023,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         updateProgressWinRef = created
         return created
     }
-    /// 更新流程进行中标志：防止连点磁贴/自动检查与手动检查并发跑两条流程
+    /// 更新流程进行中标志：防止连点 / 自动检查与手动检查并发跑两条流程
     private var updateFlowRunning = false
 
     /// 检查 → 确认 → 下载替换完整流程。检查阶段（网络连通 + 版本比对）一律在后台
@@ -2075,7 +2105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         floatingPanel?.orderOut(nil)
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        // 检查更新终态提示也走 App 图标快照（与其他操作磁贴弹窗同口径）
+        // 检查更新终态提示也走 App 图标快照（与其他面板工具弹窗同口径）
         alert.icon = makeAppIconSnapshot()
         alert.alertStyle = warning ? .warning : .informational
         alert.messageText = title
@@ -2352,6 +2382,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             entries.append((id: MenuBarPrefix.qwen, symbol: "", value: pct, isCurrent: true, icon: "qwen"))
         }
 
+        // 探活分段计时（前置 DS/ZhiPu/Qwen 只读内存缓存，不单独计时）
+        let tPre = Date()
+
         // 2. ZCode（仅当前账号）
         let zcodeMainUid = ZcodeService.currentUid() ?? ""
         if let main = config.zcodeAccounts.first(where: { $0.uid == zcodeMainUid }),
@@ -2359,6 +2392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let pct = fmtAmountCommas(c.remain / c.total * 100, decimals: 1) + "%"
             entries.append((id: MenuBarPrefix.zcode + main.uid, symbol: "", value: pct, isCurrent: true, icon: "zhipu"))
         }
+        let tZcode = Date()
 
         // 3. Codex（仅当前账号）
         let codexMainUid = CodexService.currentUid() ?? ""
@@ -2367,6 +2401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let pct = fmtAmountCommas(100 - c.usedPercent, decimals: 0) + "%"
             entries.append((id: MenuBarPrefix.codex + main.uid, symbol: "", value: pct, isCurrent: true, icon: "codex"))
         }
+        let tCodex = Date()
 
         // 4. TRAE（仅当前账号）
         let traeMainUid = TraeService.readAuthInfo(storagePath: config.traeStoragePath)?.uid ?? ""
@@ -2375,6 +2410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let remaining = c.limit - c.used
             entries.append((id: MenuBarPrefix.trae + main.uid, symbol: "", value: fmtAmountCommas(remaining, decimals: 0), isCurrent: true, icon: "trae-color"))
         }
+        let tTrae = Date()
 
         // 5. WorkBuddy（仅当前账号）
         let wbMainUid = WorkBuddyService.authInfo()?.uid ?? ""
@@ -2382,9 +2418,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
            let c = cacheWbAccounts[main.uid] {
             entries.append((id: MenuBarPrefix.wb + main.uid, symbol: "", value: fmtAmountCommas(c.remain, decimals: 0), isCurrent: true, icon: "workbuddy"))
         }
+        let tWb = Date()
 
         // 余额面板拖拽只改变平台组顺序；这里按平台前缀重排，保持每组内部账号顺序不变。
-        return balancePlatformOrder().flatMap { platformID in
+        let ordered = balancePlatformOrder().flatMap { platformID in
             switch platformID {
             case "ds":
                 return entries.filter { $0.id == MenuBarPrefix.ds }
@@ -2404,6 +2441,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return []
             }
         }
+        let tOrder = Date()
+        // 分段计时只在慢时打（日常 1~3ms，不值得刷屏）：首次调用、切号后新账号首次判定
+        // 会因各处缓存全 miss 明显变慢，这里直接指到是哪个平台
+        func ms(_ from: Date, _ to: Date) -> Int { Int(to.timeIntervalSince(from) * 1000) }
+        let totalMs = ms(tPre, tOrder)
+        if totalMs >= 5 {
+            Logger.log(.refresh, "[MenuBarEntries] \(totalMs)ms [zcode=\(ms(tPre, tZcode)) codex=\(ms(tZcode, tCodex)) trae=\(ms(tCodex, tTrae)) wb=\(ms(tTrae, tWb)) order=\(ms(tWb, tOrder))]")
+        }
+        return ordered
     }
 
     // MARK: - 统一格式化标题（用缓存 + 当前小数位）
@@ -2440,13 +2486,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func updateTitleImpl(tag: String) {
         let t0 = Date()
         updateTitleRenderCount &+= 1
-        let fingerprint = (isOffline ? "offline" : orderedMenuBarEntries()
-            .filter { isMenuBarVisible(id: $0.id, isCurrent: $0.isCurrent) }
+        // 条目表一次算到位：fingerprint 与下面的渲染循环共用同一份。原来一次渲染要跑两遍
+        // orderedMenuBarEntries()，每次都要做平台探活（TRAE/WB 读登录态、账号表拼接），纯浪费主线程
+        let entries = isOffline ? [] : orderedMenuBarEntries()
+        let visibleEntries = entries.filter { isMenuBarVisible(id: $0.id, isCurrent: $0.isCurrent) }
+        let tEntries = Date()
+        let fingerprint = (isOffline ? "offline" : visibleEntries
             .map { "\($0.id):\($0.value):dot=\(menuBarGlowState(for: $0.id) != nil)" }
             .joined(separator: "|"))
             + "|size:\(NSFont.menuBarFont(ofSize: 0).pointSize)"
         if fingerprint == lastTitleFingerprint, statusItem.button?.image != nil {
-            Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): unchanged, skip")
+            // 条目探活耗时也打出来：unchanged 分支不做烘焙，它的耗时≈平台探活 + 判活成本
+            let entriesMs = Int(Date().timeIntervalSince(t0) * 1000)
+            Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): unchanged, skip [entries=\(entriesMs)ms]")
             // 面板照常同步（面板内容比菜单栏多，不能因标题未变而漏同步）
             syncPanel()
             return
@@ -2501,8 +2553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         var renderedIds: [String] = []
         // 光晕层用：本次实际渲染的条目（id/icon，顺序与标题位图内附件一致）
         var renderedEntries: [(id: String, icon: String)] = []
-        for entry in orderedMenuBarEntries() {
-            guard isMenuBarVisible(id: entry.id, isCurrent: entry.isCurrent) else { continue }
+        for entry in visibleEntries {
             renderedIds.append(entry.id)
             renderedEntries.append((entry.id, entry.icon))
             if hasContent { append("  \u{2009}") }
@@ -2548,6 +2599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         statusItem.button?.attributedTitle = NSAttributedString(string: "")
+        let tAttr = Date()
 
         // 光晕层同步：附件（平台图标）在标题位图内的精确 frame 用 NSLayoutManager 解出，
         // 与 NSString.draw 同一套排版引擎，坐标可直接对位
@@ -2560,6 +2612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 各条目整段横向区间（图标起 → 下一条目内容起），供排序滑动动画裁快照
         let spansByID = entrySpans(attr: attr, iconInfos: iconInfos, entries: renderedEntries)
         let newImage = renderTemplateTitleImage(attr) ?? NSImage()  // 烘焙失败 = 空图（原 nil 赋值同样清空）
+        let tBake = Date()
         let newIDs = renderedEntries.map(\.id)
         var animated = false
         if !isOffline, !lastMenuBarIDs.isEmpty, newIDs != lastMenuBarIDs,
@@ -2577,13 +2630,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastMenuBarIDs = newIDs
         lastMenuBarSpans = spansByID
         menuBarGlow.setEntries(glowEntries, imageHeight: ceil(titleH))
-
-        let ms = Int(Date().timeIntervalSince(t0) * 1000)
-        let slow = ms >= 10 ? " SLOW!" : ""
-        Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): call-render=\(updateTitleCallCount)/\(updateTitleRenderCount), ids=[\(renderedIds.joined(separator: ","))], attrLen=\(attr.length), \(ms)ms\(slow)")
+        let tGlow = Date()
 
         // 面板打开时同步重绘
         syncPanel()
+        let tEnd = Date()
+
+        // 阶段计时：常态渲染 4~5ms，切号这类「全条目换 id」会明显变慢 ——
+        // 拆开看是条目探活贵、烘焙贵、还是赋值/重排（含系统 replicant）贵，别靠猜
+        func stage(_ from: Date, _ to: Date) -> Int { Int(to.timeIntervalSince(from) * 1000) }
+        let ms = stage(t0, tEnd)
+        let slow = ms >= 10 ? " SLOW!" : ""
+        Logger.log(.refresh, "updateTitleImpl[\(updateTitleRenderCount)] \(tag): call-render=\(updateTitleCallCount)/\(updateTitleRenderCount), ids=[\(renderedIds.joined(separator: ","))], attrLen=\(attr.length), \(ms)ms\(slow) [entries=\(stage(t0, tEntries)) attr=\(stage(tEntries, tAttr)) bake=\(stage(tAttr, tBake)) glow=\(stage(tBake, tGlow)) sync=\(stage(tGlow, tEnd))]")
         // 面板位置锁定由 startPanelOriginLock 的 KVO 接管：origin 偏离时立即无动画拉回
     }
 
@@ -2879,6 +2937,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         // 主账号（当前登录）：用 authInfo 直接查询
+        // 顺手把主账号补进 config 并落盘（钥匙串 + config）——写操作只在刷新流程做，
+        // 不进 wbCheckinAccounts()（那个跑在菜单栏渲染 / 面板快照的高频只读路径上）
+        persistCurrentWbAccountIfNeeded()
         var wbFailed = false
         let mainStart = Date()
         let mainWb: (remain: Double, total: Double)? = await Logger.measure("[\(seq)] WB.main.fetchSummary") {
@@ -3461,7 +3522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     /// Agent 卡副标题 meta 文案：最近 10 次会话均速 →「x tok/s」。
-    /// <100 保留 1 位小数、≥100 取整（面板宽 264，控制 meta 列宽）；nil = 无会话数据，meta 隐藏
+    /// <100 保留 1 位小数、≥100 取整（面板宽 254，控制 meta 列宽）；nil = 无会话数据，meta 隐藏
     private static func tokSpeedText(_ speed: Double?) -> String? {
         guard let speed else { return nil }
         let v = speed < 100 ? String(format: "%.1f", speed) : String(format: "%.0f", speed)

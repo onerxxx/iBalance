@@ -611,12 +611,12 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     }
     /// 总计词元大数字（逐位垂直滚动；左对齐贴版心，位次与原 drawText 排版一致）
     private let totalRollView = RollingNumberView()
-    /// 大数字左边那枚**小尺寸 3D 硬币**（用户 2026-09-11 指定）：参数与「3D 硬币」弹窗同源
+    /// 大数字左边那枚**小尺寸 3D 硬币**（用户 2026-09-11 指定）：参数与「3D 硬币」pane 同源
     /// （材质 / Logo / 边纹 / 厚度 / 浮雕深度按 `CoinSettings` 等比缩到 `inlineCoinDiameter`），
     /// 只在主面板内嵌实例上显示（`showsInlineCoin`；hover 子面板保持原排版）。
     private let inlineCoin = Coin3DView(frame: .zero)
-    /// 内嵌硬币直径（pt）：由「3D 硬币」弹窗的 **Panel coin size** 驱动（默认 32，
-    /// 2026-09-12 用户指定可单独调；与弹窗的 Coin size 相互独立）。
+    /// 内嵌硬币直径（pt）：由「3D 硬币」pane 的 **Panel coin size** 驱动（默认 32，
+    /// 2026-09-12 用户指定可单独调；与 pane 里的 Coin size 相互独立）。
     /// 在 `reloadInlineCoinSettings` 里按设置刷新。
     private var inlineCoinDiameter: CGFloat = CGFloat(CoinMetrics.defaultPanelSize)
     /// 硬币与大数字之间的间距 = 直径 × 0.25（2026-09-14 用户指定间距随硬币尺寸增减；
@@ -850,10 +850,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         inlineCoin.interactive = true
         inlineCoin.isHidden = true
         addSubview(inlineCoin)
-        // 「3D 硬币」弹窗实时同步：弹窗每改一个参数 apply 就发 .coinSettingsDidChange
-        // （主线程同步，object = 弹窗的**内存快照** CoinSettingsBox——落盘是「保存」按钮的
-        // 显式行为，磁盘上还是旧值，这里不能读盘）。弹窗关闭后 main.swift 会再灌一次
-        // 磁盘值：保存过 = 无害复位，没保存 = 撤掉本次未保存的实时同步。
+        // 「3D 硬币」pane 实时同步：改一个参数 apply 就发 .coinSettingsDidChange
+        // （主线程同步，object = 那份**内存快照** CoinSettingsBox——参数改一次即自动落盘，
+        // 通知带的仍是内存值）。「主题预设」应用后 main.swift 会按磁盘值再灌一次。
         settingsChangeObserver = NotificationCenter.default.addObserver(
             forName: .coinSettingsDidChange, object: nil, queue: .main
         ) { [weak self] note in
@@ -2279,7 +2278,8 @@ extension BalancePanelView {
 
     /// 创建唯一的内嵌内容视图并启动低频刷新。与卡片 hover 子面板共用 TokensPanelView
     /// 与数据仓缓存；显示平台由 refreshInlineTokens 按 Agent 组顶部平台动态解析。
-    /// 3D 硬币弹窗关闭后调用：内嵌小硬币按同一份 CoinSettings 重灌（参数同源，见 TokensPanelView）
+    /// 「主题预设」应用（`applyCoinIdentity`）后调用：内嵌小硬币按同一份 CoinSettings 重灌
+    /// （参数同源，见 TokensPanelView）
     func reloadInlineCoinSettings() {
         inlineTokenView?.reloadInlineCoinSettings()
     }
@@ -2298,7 +2298,7 @@ extension BalancePanelView {
         view.horizontalInset = 8
         view.topInset = 4
         view.bottomInset = 3
-        // 大数字左边的内嵌小 3D 硬币：参数取自「3D 硬币」弹窗落盘的那份 CoinSettings
+        // 大数字左边的内嵌小 3D 硬币：参数取自「3D 硬币」pane 落盘的那份 CoinSettings
         view.showsInlineCoin = true
         // 大数值行（硬币 + 大数字）整体左缩进 +3（2026-09-15 用户指定；hover 子面板不受影响）
         view.numberRowLeadingInset = 3

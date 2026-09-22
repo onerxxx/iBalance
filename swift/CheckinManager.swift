@@ -34,18 +34,33 @@ extension AppDelegate {
     // MARK: - WorkBuddy 自动签到
 
     /// 收集待签到账号：config 预存的其他账号 + 当前登录账号（token 自动刷新，uid 去重）
-    /// 主账号不在 config 时自动持久化（含 refreshToken/expiresAt），下次主账号切换后原账号仍可续期签到。
+    ///
+    /// ⚠️ 本函数是**只读**的。菜单栏标题渲染、面板快照构造等高频路径都会调它，
+    /// 主账号缺失时只补进本次返回的数组，不落盘 —— 持久化由刷新流程显式负责
+    /// （`persistCurrentWbAccountIfNeeded()`）。原来这里就地 `ConfigStore.save`：
+    /// 那是「写钥匙串 + 写 config」的同步写操作，一旦主账号不在数组里（切号后新账号
+    /// 首次判定就是这样），每次标题渲染都会写一次，几百 ms 全卡在主线程。
     func wbCheckinAccounts() -> [WBAccount] {
         var accounts = config.workbuddyAccounts
         if let auth = WorkBuddyService.authInfo(),
            !accounts.contains(where: { $0.uid == auth.uid }) {
-            let main = WBAccount(token: auth.token, uid: auth.uid, domain: auth.domain,
-                                 nickname: auth.nickname, refreshToken: auth.refreshToken, expiresAt: auth.expiresAt)
-            accounts.append(main)
-            config.workbuddyAccounts.append(main)
-            ConfigStore.save(config)
+            accounts.append(WBAccount(token: auth.token, uid: auth.uid, domain: auth.domain,
+                                      nickname: auth.nickname, refreshToken: auth.refreshToken,
+                                      expiresAt: auth.expiresAt))
         }
         return accounts
+    }
+
+    /// 把当前登录账号补进 config 并落盘（原 `wbCheckinAccounts` 的副作用，挪出只读路径）。
+    /// 目的不变：主账号不在 config 时持久化（含 refreshToken/expiresAt），
+    /// 下次主账号切换后原账号仍可续期签到。只在刷新流程调用一次。
+    func persistCurrentWbAccountIfNeeded() {
+        guard let auth = WorkBuddyService.authInfo(),
+              !config.workbuddyAccounts.contains(where: { $0.uid == auth.uid }) else { return }
+        config.workbuddyAccounts.append(WBAccount(token: auth.token, uid: auth.uid, domain: auth.domain,
+                                                  nickname: auth.nickname, refreshToken: auth.refreshToken,
+                                                  expiresAt: auth.expiresAt))
+        ConfigStore.save(config)
     }
 
     /// 补全 WorkBuddy 多账号签到 streak/reward：遍历所有账号，streak 或 reward 为 0 时查状态 API 填充。
@@ -270,7 +285,7 @@ extension AppDelegate {
     @objc func onManualCheckin() {
         guard !manualCheckinInProgress else { return }
         manualCheckinInProgress = true
-        syncPanel()  // 立即刷新面板：签到磁贴开始脉冲 + 禁点
+        syncPanel()  // 立即刷新面板（签到进行中态；面板侧的脉冲/禁点随操作磁贴 2026-09-13 退场）
 
         let today = Self.todayString()
         // 签到前快照：区分「本次刚签到」vs「今日早已签到」
@@ -342,7 +357,7 @@ extension AppDelegate {
             }
 
             manualCheckinInProgress = false
-            syncPanel()  // 停掉签到磁贴的进行中脉冲（面板已关闭时无害，下次打开即常态）
+            syncPanel()  // 签到收尾刷新面板（面板已关闭时无害，下次打开即常态）
 
             // 结果弹窗（DialogShell 原生模板）；签到期间主面板已被关闭时不打扰
             // （数据已写入，下次打开卡片可见）

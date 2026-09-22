@@ -15,7 +15,6 @@
 //    改图表字体或配色，要确认这条转发链还在，别指望动态色自动生效。
 
 import Cocoa
-import CoreImage
 import SettingsUI
 
 /// 单个周浏览页的数据：图表 7 天数值/文本 + 表头标签与周累计。
@@ -111,7 +110,7 @@ final class UsageHistoryChartView: NSView, PanelScrollHoverSync {
         updateArrowCursor(point: convert(event.locationInWindow, from: nil))
     }
 
-    /// 命中箭头区域时切换手指光标（与余额卡片/磁贴同一交互语言）
+    /// 命中箭头区域时切换手指光标（与余额卡片同一交互语言）
     private func updateArrowCursor(point: NSPoint) {
         let inArrows = (row?.historyWeeks.count ?? 0) > 1
             && (arrowHitArea(leftArrowRect).contains(point) || arrowHitArea(rightArrowRect).contains(point))
@@ -899,7 +898,7 @@ extension BalancePanelView {
         rowStack.translatesAutoresizingMaskIntoConstraints = false
         // 位移动画需要 layer-backed
         rowStack.wantsLayer = true
-        // 用量条目 hover：整行渐变背景 + 发丝边框（与余额卡片/磁贴/折叠标题条同一套 Palette）；
+        // 用量条目 hover：整行渐变背景 + 发丝边框（与余额卡片/折叠标题条同一套 Palette）；
         // 行内容常态副前景灰，hover 时文字/icon 一起提亮到 Palette.hoverForeground（不透明纯白）。
         // ⚠️ 别改成系统 labelColor：vibrant 外观下它是白 @85%，叠在深色玻璃上偏灰，
         // 观感即「先亮后有变暗」（2026-09-12 实测 txt alpha=0.85）；两个色路同源这一个值，
