@@ -1,3 +1,5 @@
+<div align="center">
+
 <img src="swift/icons/App-Icon-Default-1024@1x.png" width="96" alt="iBalance">
 
 # iBalance
@@ -5,6 +7,8 @@
 macOS 菜单栏应用，在本机聚合多个 AI 服务的余额与额度。
 
 macOS 26 及以上 · Apple Silicon · Swift + AppKit
+
+</div>
 
 ## 特性
 
