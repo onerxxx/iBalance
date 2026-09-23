@@ -7,6 +7,8 @@
 #   • tag 格式 v<CFBundleVersion>（如 v2026.8.27.3），App 数值逐段比较
 #   • asset 只放一个 .zip；App 校验顺序 = asset.digest 优先 → 正文 "SHA256: <hex>" 兜底
 #   • 仓库需公开（Releases 匿名可拉），否则 App 端 HTTP 404
+#   ⚠️ tag 由 GitHub 从**远端默认分支 HEAD** 创建，不是取本地 HEAD ⇒ 本地提交必须先 push，
+#      否则 tag 落在旧提交上、release 的源码与发布出去的二进制对不上（开头闸门会拦）
 # ============================================================
 set -euo pipefail
 
@@ -14,6 +16,47 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="onerxxx/iBalance"
 
 NOTES="${1:-}"
+
+# ── 发布前置闸门：HEAD 必须已在远端默认分支上（2026-09-23 加）──────────────
+# 为什么必须有：`gh release create <tag> <zip>` 的 tag 是 GitHub 从**远端默认分支 HEAD**
+# 建出来的，与本地 HEAD 无关。本地提交没 push 就发版 ⇒ tag 指向旧提交、release 页的源码
+# 与发布出去的二进制对不上（v2026.9.23.4 踩过一次，事后靠 git tag -f 重指才补齐）。
+#
+# 位置刻意放在**编译之前**：闸门失败时版本号计数器还没被消费，`git push` 后原样重跑即可，
+# 不会跳号（放编译之后就必然白烧一个版本号）。
+#
+# 逃生开关：IBALANCE_SKIP_PUSH_GATE=1（会大声提示，只在远端确实不可达又必须出包时用）。
+if [[ "${IBALANCE_SKIP_PUSH_GATE:-}" == "1" ]]; then
+    echo "!! 已跳过发布前置闸门（IBALANCE_SKIP_PUSH_GATE=1）：tag 可能指向非本次提交" >&2
+else
+    echo "==> 发布前置闸门：HEAD 必须已在远端默认分支上"
+    DEFAULT_BRANCH="$(gh api "repos/$REPO" --jq '.default_branch' 2>/dev/null || true)"
+    if [[ -z "$DEFAULT_BRANCH" ]]; then
+        # 取不到默认分支 = gh 未登录 / 网络不可达 —— 后面的上传同样做不了，直接中止
+        echo "!! 取不到远端默认分支（gh 未登录或网络不可达）。发布流程本身也需要它，先修好再发。" >&2
+        exit 1
+    fi
+    REMOTE_SHA="$(gh api "repos/$REPO/commits/$DEFAULT_BRANCH" --jq '.sha' 2>/dev/null || true)"
+    LOCAL_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+    if [[ "$LOCAL_SHA" != "$REMOTE_SHA" ]]; then
+        # ⚠️ 变量一律写 ${VAR} 花括号形式：本机 /bin/bash 是 3.2.57 + LANG=C.UTF-8，
+        #    变量名后面紧跟多字节字符（全角括号、中文标点）时，首字节会被并进变量名
+        #    ⇒ 展开成垃圾、`set -u` 下直接 "unbound variable" 中止。加空格或花括号都能免疫
+        echo "!! 中止：HEAD 不在远端 ${DEFAULT_BRANCH} 上，tag 会指向 ${REMOTE_SHA}（不是你的 HEAD）" >&2
+        echo "    本地 HEAD  : ${LOCAL_SHA}" >&2
+        echo "    远端 ${DEFAULT_BRANCH} : ${REMOTE_SHA}" >&2
+        echo "    先 push（或先与远端对齐）再发版：git push origin ${DEFAULT_BRANCH}" >&2
+        exit 1
+    fi
+    echo "    HEAD == origin/${DEFAULT_BRANCH} (${LOCAL_SHA:0:7})"
+    # 工作区脏 = 二进制含 tag 源码里没有的改动（同一类不一致）。只警告不拦：
+    # 日常工作区本来就可能带着在改的东西，拦下来会挡住正常发版
+    DIRTY="$(git -C "$ROOT" status --porcelain)"
+    if [[ -n "$DIRTY" ]]; then
+        echo "⚠️  工作区有未提交改动 —— 二进制会比 tag 源码多出下列内容：" >&2
+        printf '%s\n' "$DIRTY" >&2
+    fi
+fi
 
 echo "==> 编译 release 构建（-O + 固定自签）"
 bash "$ROOT/swift/build.sh" --release
