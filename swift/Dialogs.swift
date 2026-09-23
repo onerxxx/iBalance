@@ -250,7 +250,7 @@ private func makeCheckbox(label: String, isOn: Bool) -> NSButton {
 /// 迁入设置窗口后的口径变化：
 /// - 不再自己开窗，改为**定高内容视图**（`contentHeight`）由宿主内嵌；
 /// - **勾选即生效**（2026-09-12 用户去掉页脚「保存」按钮）：任一处勾选变化 → `onCommit` →
-///   宿主 `makeConfig()` 合并落盘 + 同步菜单 / 签到定时器 / 面板。所以没有「未保存改动」，
+///   宿主 `makeConfig(basingOn:)` 合并落盘 + 同步菜单 / 签到定时器 / 面板。所以没有「未保存改动」，
 ///   也没有「取消」语义 —— `reload(config:)` 退化成「每次开窗回读真实配置、归一勾选态」。
 ///
 /// 2026-09-12 排版整备（对齐设置窗口其余 pane 的 macOS 口径）：
@@ -348,19 +348,23 @@ final class PlatformTogglesPanelView: NSView {
     private var controls: [RowControls] = []
     /// 行首「全选」checkbox 的控制器；action 目标需存活至视图销毁，由本视图持有
     private var rowAllHandlers: [RowAllHandler] = []
-    /// 上一次回读的配置：保存时以它为基，未在表里的平台 / 字段原样保留
-    private var originalConfig: AppConfig
+    /// 建表那一刻的配置，**只用来喂勾选框初值**（`buildGrid()` 读它）。
+    /// ⚠️ **禁止**拿它当保存时的合并基 —— 它可能已经很旧：视图是保活复用的，建表之后
+    /// 发生的配置变化（右键切换菜单栏显隐、账号导入、主题色改动…）都不在里面，
+    /// 以它为基整份写回会把那些改动**打回旧值**（合并基见 `makeConfig(basingOn:)`，
+    /// 由宿主传入此刻的真实配置）
+    private var initialConfig: AppConfig
     /// 表格本体（`layout()` 里按卡片可用宽度重算名字列宽）
     private var gridView: NSGridView?
     /// 上一次布局时的卡宽（分隔线重绘的去重依据，见 `layout()`）
     private var lastLaidOutWidth: CGFloat = 0
-    /// 任一处勾选变化后的落盘回调（宿主编排：`makeConfig()` → 落盘 + 同步菜单 / 定时器 / 面板）
+    /// 任一处勾选变化后的落盘回调（宿主编排：`makeConfig(basingOn:)` → 落盘 + 同步菜单 / 定时器 / 面板）
     var onCommit: (() -> Void)?
 
     // MARK: - 构建
 
     init(config: AppConfig) {
-        originalConfig = config
+        initialConfig = config
         super.init(frame: .zero)
         let grid = buildGrid()
         gridView = grid
@@ -454,14 +458,14 @@ final class PlatformTogglesPanelView: NSView {
             let rowAll = makeCheckbox(label: "\(platform.name) 全选", isOn: false)
             let row = RowControls(
                 refresh: makeCheckbox(label: "\(platform.name) 刷新",
-                                      isOn: originalConfig[keyPath: platform.refresh]),
+                                      isOn: initialConfig[keyPath: platform.refresh]),
                 checkin: platform.checkin.map {
-                    makeCheckbox(label: "\(platform.name) 自动签到", isOn: originalConfig[keyPath: $0])
+                    makeCheckbox(label: "\(platform.name) 自动签到", isOn: initialConfig[keyPath: $0])
                 },
                 card: makeCheckbox(label: "\(platform.name) 卡片显示",
-                                   isOn: originalConfig.panelCardVisible[platform.id] ?? true),
+                                   isOn: initialConfig.panelCardVisible[platform.id] ?? true),
                 usage: makeCheckbox(label: "\(platform.name) 用量显示",
-                                    isOn: originalConfig.panelUsageVisible[platform.id] ?? true))
+                                    isOn: initialConfig.panelUsageVisible[platform.id] ?? true))
             controls.append(row)
             let handler = RowAllHandler(
                 all: rowAll,
@@ -503,8 +507,8 @@ final class PlatformTogglesPanelView: NSView {
 
     /// 回读真实配置：按配置重置全部勾选（含行首全选框）。
     /// 勾选即生效，本视图不会有「未保存编辑」，所以这里只是每次开窗的归一（幂等）。
+    /// ⚠️ 只刷勾选态、**不记这份配置**：合并基由 `makeConfig(basingOn:)` 的调用方现取（见 `initialConfig`）
     func reload(config: AppConfig) {
-        originalConfig = config
         for (index, platform) in Self.platforms.enumerated() {
             let row = controls[index]
             row.refresh.state = config[keyPath: platform.refresh] ? .on : .off
@@ -517,9 +521,15 @@ final class PlatformTogglesPanelView: NSView {
         rowAllHandlers.forEach { $0.sync() }
     }
 
-    /// 勾选结果合并回配置：以 `reload` 时的配置为基，未出现在表里的平台 / 字段原样保留
-    func makeConfig() -> AppConfig {
-        var updated = originalConfig
+    /// 勾选结果合并回配置：**以调用方传入的当前配置为基**，本表只管它这四列的 13 个键，
+    /// 其余字段（菜单栏显隐 `menubar_visible`、账号列表、外观参数…）原样保留。
+    ///
+    /// ⚠️ 基**必须**是宿主的实时配置，不能是建表时的快照：视图保活复用，建表之后用户还能
+    /// 右键卡片切菜单栏显隐、导入账号、改主题，那些改动都不在建表快照里 —— 以快照为基就
+    /// 会把它们整份打回旧值（2026-09-23 修：右键隐藏的 ZhiPu 被平台表的一次勾选写回默认
+    /// 「可见」，于是它每轮刷新都重新出现在菜单栏）
+    func makeConfig(basingOn base: AppConfig) -> AppConfig {
+        var updated = base
         for (index, platform) in Self.platforms.enumerated() {
             let row = controls[index]
             updated[keyPath: platform.refresh] = (row.refresh.state == .on)

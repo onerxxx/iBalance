@@ -12,31 +12,97 @@ import SettingsUI
 /// UserDefaults（`heat_dot_*`），放同域读写一次到位；② 备份（BackupService）导出的
 /// 是「config + UserDefaults 持久域整包」，放这里预设自动跟着备份走，config 不用加字段。
 ///
-/// ⚠️ **这里只存用户自建的那些**（2026-09-17 起）：出厂那几枚（`ThemePreset.builtIns`）
-/// 写死在代码里随包发布，不进存储 —— 视图显示的是「内置 + 本 store」两份拼起来
-///（拼接点在 `BalancePanelView` 装配快照那一行）。
+/// 存两种东西（2026-09-22 起）：① **用户自建**那些；② 出厂那六枚（`ThemePreset.builtIns`）
+/// 被改过之后的**覆盖条目**（同一个 id，存的是改后的值）。
+/// ⚠️ 覆盖条目是「改动的自动保存」落到内置那几枚上时的唯一去处 —— 内置常量写死在代码里，
+/// 不改常量就只能另存一份；视图显示的列表 = 「内置（覆盖条目优先）+ 用户自建」
+///（拼接点在 `main.swift` 装配快照那一行）。
 ///
 /// 只存一份列表（不限条数）：整表紧凑 JSON，几十条也就几 KB。
 enum ThemePresetStore {
     /// 读：缺键 / 结构异常一律返回空列表（不静默留半份）；单条结构异常由
     /// `ThemePreset.init(from:)` 的逐项兜底吸收，不会连坐整份列表。
     ///
-    /// **顺带做一次迁移**：老版本把内置那几枚也存在这里（升级前就是这个状态），
-    /// 按 `builtInIDs` 过滤掉后若与盘上的内容不等，直接写回 —— 于是「内置」这个身份
-    /// 从「存储里的一条」变成「代码里的一条」，不会出现同 id 的两份。
+    /// **顺带做一次归一**：与内置常量**逐字段完全相同**的条目没有信息量（老版本把内置那几枚
+    /// 整份抄在存储里留下的副本、或「重置」后本该删掉的覆盖条目），丢掉并写回 ——
+    /// 于是「同 id 的两份」不会一直留着，常量也不会被一份陈旧副本挡住。
+    /// ⚠️ 判定用**精确相等**（`==`，无容差）：有差异的才真是「改过的内置」，必须留着。
     static func load() -> [ThemePreset] {
         guard let raw = UserDefaults.standard.string(forKey: UDKey.themePresets),
               let data = raw.data(using: .utf8),
               let list = try? JSONDecoder().decode([ThemePreset].self, from: data) else { return [] }
-        let userOnly = list.filter { !ThemePreset.builtInIDs.contains($0.id) }
-        if userOnly.count != list.count { save(userOnly) }
-        return userOnly
+        let normalized = list.filter { stored in
+            guard let builtin = ThemePreset.builtIns.first(where: { $0.id == stored.id }) else {
+                return true
+            }
+            return stored != builtin
+        }
+        if normalized.count != list.count { save(normalized) }
+        return normalized
     }
 
     static func save(_ presets: [ThemePreset]) {
         guard let data = try? JSONEncoder().encode(presets),
               let raw = String(data: data, encoding: .utf8) else { return }
         UserDefaults.standard.set(raw, forKey: UDKey.themePresets)
+    }
+}
+
+/// 「主题预设」的**编辑状态**（2026-09-22 起）：① 哪几枚处于「已修改」；② 每枚的**本值**。
+///
+/// 为什么需要它：外观参数改动会**自动写回**当前那枚自建预设（不用再点「更新」），于是
+/// `theme_presets` 里那枚的值 = 你改后的值 ——「重置」要恢复成「改之前」，那份值只能另存一份，
+/// 就是这里的 `origins`。标记本身也落盘：改完关窗 / 重启回来仍亮着，只有点「重置」才摘
+///（改回原值、点别的预设卡都不摘），与「已修改状态要自动保存」这条要求一一对应。
+///
+/// 单键 JSON（键名 `UDKey.themePresetEditState`）；条目随预设删除一并清（宿主 `deleteThemePreset`）。
+enum ThemePresetEditStore {
+    struct State: Codable {
+        /// 处于「已修改」的预设 id（**粘性**：只由「重置」或「恢复初始」摘）
+        var modified: Set<String> = []
+        /// 每枚预设的**本值** = 应用 / 新建它那一刻的值（「重置」恢复的目标）。
+        /// ⚠️ 它会随「认下」**前移**（认下 = 把这枚预设的当前值认作新本值）⇒ 光靠它拿不到出厂那套
+        var origins: [String: ThemePreset] = [:]
+        /// 每枚预设的**初始值**（2026-09-22 新增，「恢复初始」的目标）：新建那一刻的快照，
+        /// **只在新建时记一次、「认下」动不了它** —— 用户要求「把参数保存为默认值之后，
+        /// 依然可以重置为 app 的初始默认参数」。
+        /// ⚠️ 只记**自建**那些：内置六枚的初始值就是代码里那枚常量（`ThemePreset.builtIns`），
+        /// 再在存储里存一份只会与常量漂移
+        var initials: [String: ThemePreset] = [:]
+
+        init() {}
+
+        /// 逐项兜底：缺键 / 某条坏值都不该让整份状态崩掉（与 `ThemePreset.init(from:)` 同口径）
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            modified = try c.decodeIfPresent(Set<String>.self, forKey: .modified) ?? []
+            origins = try c.decodeIfPresent([String: ThemePreset].self, forKey: .origins) ?? [:]
+            initials = try c.decodeIfPresent([String: ThemePreset].self, forKey: .initials) ?? [:]
+        }
+
+        enum CodingKeys: String, CodingKey { case modified, origins, initials }
+    }
+
+    static func load() -> State {
+        guard let raw = UserDefaults.standard.string(forKey: UDKey.themePresetEditState),
+              let data = raw.data(using: .utf8),
+              let state = try? JSONDecoder().decode(State.self, from: data) else { return State() }
+        return state
+    }
+
+    static func save(_ state: State) {
+        guard let data = try? JSONEncoder().encode(state),
+              let raw = String(data: data, encoding: .utf8) else { return }
+        UserDefaults.standard.set(raw, forKey: UDKey.themePresetEditState)
+    }
+
+    /// 忘掉一枚（删预设时一并清）：标记、本值、初始值都摘掉，别在存储里留孤儿条目
+    static func forget(id: String) {
+        var state = load()
+        state.modified.remove(id)
+        state.origins[id] = nil
+        state.initials[id] = nil
+        save(state)
     }
 }
 
@@ -696,10 +762,13 @@ enum UDKey {
     /// 「主题预设」列表（String = [ThemePreset] 的 JSON 串，设置窗口「主题外观」页顶部
     /// 「保存」写入；读写见 ThemePresetStore）
     static var themePresets: String { "theme_presets" }
-    /// 最后一次「应用」的主题预设 id（2026-09-22 新增）：判断「当前这枚预设被改过没有」——
-    /// 当前外观仍与该预设逐项相等 = 干净；不再相等 = 卡片显示「已修改」并给更新/重置入口。
+    /// 最后一次「应用」的主题预设 id（2026-09-22 新增）：**自动保存**写回的目标 ——
+    /// 改任何外观参数都会把当前外观写进这枚自建预设（内置六枚写不进，只记「已修改」）。
     /// 只记 id（值以 `theme_presets` / 内置常量为准），切号 / 换机不影响它
     static var appliedThemePresetID: String { "applied_theme_preset_id" }
+    /// 「主题预设」的编辑状态（String = `ThemePresetEditStore.State` 的 JSON 串）：
+    /// 「已修改」标记集合 + 每枚预设的本值，读写见 ThemePresetEditStore
+    static var themePresetEditState: String { "theme_preset_edit_state" }
 
     // 3D 硬币（CoinDemo）：设置窗口「3D 硬币」pane 整页参数自动保存，下次打开还原（读写见 CoinSettings）
     /// Preset（Int = CoinPreset.rawValue：0 = GHO 无色场 / 1 = sGHO 启用色场）

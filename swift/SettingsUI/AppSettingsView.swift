@@ -327,7 +327,7 @@ private struct ThemePane: View {
                 // ⚠️ 页脚文案控在**两行以内**（2026-09-17 用户「主题外观页面的所有 forms 下的介绍描述，
                 // 简化到两行以内」）—— 默认窗口下页脚一行 ≈39 个汉字，超过 ~75 字就会溢成三行。
                 // 改这几段时先数字数，别再堆细节（细节看代码注释，这里只留「一眼看懂」）
-                Text("点图卡即应用，蓝框那枚是当前生效的一组；内置预设只读，点列表末尾「新增主题」把当前参数存成一枚自己的预设（可改名、可删）。")
+                Text("点图卡即应用；外观改动自动保存进当前预设，卡片右侧可认下或重置。内置六枚不可删改名，点末尾「新增主题」存一枚自己的。")
             }
             Section {
                 // 面板底色（2026-09-14 用户要求：原「高对比背景」强度滑杆改制）——
@@ -442,10 +442,24 @@ private struct ThemePane: View {
     ///   「贴左、右边空一大片」（.19 那一版就是这么错的）。外层 `frame(maxWidth: .infinity)`
     ///   负责让网格拿到整行宽度（否则它只按内容宽量），两者缺一不可。
     private static let presetColumnCount = 3
+    /// **卡片外**右侧那栏「状态 + 动作」的宽度与它到图卡的间距（2026-09-22 新增）。
+    /// ⚠️ 网格列宽必须把它算进去（`cellWidth`），否则图卡会被挤窄 —— 面板基准宽 100 是定死的
+    ///（`presetThumb` 里那一串定尺寸都按 100 推出来的）
+    private static let railWidth: CGFloat = 18
+    private static let railGap: CGFloat = 3
+    /// 一格的总宽 = 图卡那部分（含两侧选中框占位）+ 动作栏 + 两者之间的间距。
+    /// 传进来的 base = **图卡部分**的宽度（96…110：110 = 面板基准 100 + 外扩选中框占位 2×5）
+    private static func cellWidth(_ cardBase: CGFloat) -> CGFloat {
+        s(cardBase) + s(railWidth) + s(railGap)
+    }
     private var presetGrid: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: Self.s(96),
-                                                              maximum: Self.s(110)),
-                                                     spacing: Self.s(12)),
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: Self.cellWidth(96),
+                                                              maximum: Self.cellWidth(110)),
+                                                     // 列间距 12 → **4**（2026-09-22）：一格现在自带
+                                                     // 右侧 18pt 动作栏 + 3pt 间隙（恒占位），列间距再留
+                                                     // 12 会把图卡之间撑到 ~41pt；4 之后面板之间 ≈35pt
+                                                     //（动作栏右缘 → 邻卡选中框外缘还留 4pt，不打架）
+                                                     spacing: Self.s(4)),
                                  count: Self.presetColumnCount),
                   alignment: .center, spacing: Self.s(16)) {
             ForEach(model.snapshot.themePresets) { preset in
@@ -463,7 +477,10 @@ private struct ThemePane: View {
     /// 命名与交互照 macOS 系统设置「外观」那套：图缩略图即选项、名字居中在图下、
     /// 当前生效那枚加一圈系统蓝描边（见 `presetThumb` 的 isActive）。
     ///
-    /// 2026-09-17 用户改版 —— **出厂内置那几枚只读、用户自建的可删可改名**：
+    /// 2026-09-17 用户改版 —— **出厂内置那几枚不可删、名字不可点改**，用户自建的可删可改名：
+    /// ⚠️ 2026-09-22 起「内置」只是**身份**不可动（不能删 / 不能改名），**值照样能改** ——
+    /// 改过的内置预设以一份同 id 的**覆盖条目**落在 `ThemePresetStore` 里（见宿主
+    /// `autoSaveAppearanceToAppliedPreset` / `resetThemePreset`）
     /// - 内置：名字行不给垃圾桶、名字点不动（`ThemePreset.builtInIDs` 判断），右侧照样留同宽占位保居中
     /// - 自建：点名字 → 就地变成输入框（Enter 提交 / Esc 放弃，都走模型 `commitPresetRename`
     ///   / `cancelPresetRename`）；行尾垃圾桶 = 删除
@@ -472,86 +489,157 @@ private struct ThemePane: View {
     ///   （卡是「应用」语义，上面再挂一个「新增」确实两件事混在一起）
     ///
     /// ⚠️ 垃圾桶不能压在缩略图上做 overlay —— 外层是 Button，overlay 里再放 Button 命中判定不可靠；
-    /// 放在名字行里，并用同宽占位保持名字居中
+    /// 放在名字行里，并用同宽占位保持名字居中。
+    ///
+    /// 2026-09-22 用户：「按钮和状态放卡片外的右上角（红框处），都使用 icon」——
+    /// 「已修改」胶囊 + 两枚动作按钮从缩略图顶部的 `ZStack` 浮层挪进卡片**外**右侧的
+    /// `presetActionRail`。于是缩略图又是一枚干净的 `Button`（浮层那两年是为「同 Button 里再嵌
+    /// Button」才拆的 ZStack，现在没这回事了），卡上不再盖任何东西
     private func presetCard(_ preset: ThemePreset) -> some View {
         let isActive = preset.matches(model.snapshot)
         let isBuiltIn = ThemePreset.builtInIDs.contains(preset.id)
-        // 「已修改」（2026-09-22）= 这枚就是**最后应用过**的那枚，但当前外观已经跟它对不上。
-        // ⚠️ 不能只用 `!isActive` 判：那样每枚"当前值恰好不等于它"的卡都会亮已修改 ——
-        // 必须同时命中 `appliedPresetID`（宿主记的、跨窗口/重启保持）
-        let isModified = !isActive && preset.id == model.snapshot.appliedPresetID
+        // 「已修改」（2026-09-22）= 宿主记在 `ThemePresetEditStore` 里的**粘性标记**（落盘、跨重启）。
+        // ⚠️ 不能用「当前外观 ≠ 预设值」判：外观一改就**自动写回**这枚预设（改动不丢），
+        // 那种比对照不出「改过没有」；标记只有点「重置 / 恢复初始」才摘（改回原值、点别的卡都不摘）。
+        // 于是它独立于 isActive —— 当前生效的那枚照样可以亮着「已修改」（这枚是你改过的）
+        let isModified = model.snapshot.modifiedPresetIDs.contains(preset.id)
+        // 动作栏露不露（2026-09-22）= 标记 ∪「现在 ≠ 它的**初始值**」。
+        // ⚠️ 只看标记会踩坑：「认下」会摘标记 ⇒ 整栏跟着消失 —— 「把参数保存为默认值之后，
+        // 依然可以重置为 app 的初始默认参数」就没入口了（用户当天那条要求）。
+        // 后面这个集合是宿主**现算**的（`differingFromInitialPresetIDs`）：手动改回初始值它就自动不亮，
+        // 与粘性标记是两件事，两个都要
+        let showsRail = isModified
+            || model.snapshot.differingPresetIDs.contains(preset.id)
         // 图卡前景色 = **这枚预设自己记的主前景色**（nil = 内置两档，2026-09-17 随参数开放接入预设）。
         // 提到 presetCard 算好再往下传（而不是让 presetThumb 自己读全局）：参数变化 →
         // 这里的值跟着变 → SwiftUI 重渲染子树，图卡上的文字色才能实时跟上色盘
         let appearanceDark = !preset.lightThemeEnabled
         let fg = Color(nsColor: PanelForegroundColor.resolved(dark: appearanceDark,
                                                               override: preset.panelForegroundColor))
-        return VStack(spacing: Self.s(6)) {
-            // 图卡本体仍是「点 = 应用」，但外层不再直接是 Button —— 右上方的图标按钮要**叠在缩略图上**，
-            // 而「同一 Button 里再嵌 Button」的命中判定不可靠（垃圾桶当年就是为这个挪进名字行的）。
-            // 这里改成 ZStack 里两个平级 Button：上层的图标按钮天然先拿到点击，其余区域落回应用按钮
-            ZStack(alignment: .top) {
+        return HStack(alignment: .top, spacing: Self.s(Self.railGap)) {
+            VStack(spacing: Self.s(6)) {
                 Button { model.applyThemePreset(preset) } label: {
                     presetThumb(preset, isActive: isActive, appearanceDark: appearanceDark, fg: fg)
                 }
                 .buttonStyle(.plain)
-                .help(isModified ? "应用这组预设（会丢弃当前修改）" : "应用这组预设")
-                if isModified {
-                    HStack(spacing: Self.s(4)) {
-                        Text("已修改")
-                            .font(.system(size: Self.s(9), weight: .medium))
-                            .foregroundStyle(fg)
-                            .padding(.horizontal, Self.s(5))
-                            .padding(.vertical, Self.s(2))
-                            .background(Capsule().fill(Color(nsColor: .controlBackgroundColor).opacity(0.75)))
-                        Spacer(minLength: 0)
-                        // 更新：只有用户自建的能写回（内置六枚写死在代码里，存储里没有它们的条目）
-                        if !isBuiltIn {
-                            presetIconButton("square.and.arrow.down", fg: fg,
-                                             help: "把当前外观更新到这组预设") {
-                                model.updateThemePreset(id: preset.id)
-                            }
-                        }
-                        presetIconButton("arrow.counterclockwise", fg: fg,
-                                         help: "重置为这组预设的值（丢弃当前修改）") {
-                            model.applyThemePreset(preset)
-                        }
-                    }
-                    .padding(.horizontal, Self.s(6))
-                    .padding(.top, Self.s(6))
-                }
-            }
-            HStack(spacing: Self.s(4)) {
-                Color.clear.frame(width: Self.s(16), height: 1)
-                presetNameText(preset, isBuiltIn: isBuiltIn)
-                if isBuiltIn {
+                .help("应用这组预设")
+                HStack(spacing: Self.s(4)) {
                     Color.clear.frame(width: Self.s(16), height: 1)
-                } else {
-                    Button(role: .destructive) { model.deleteThemePreset(id: preset.id) } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: Self.s(11)))
-                            .foregroundStyle(Color.red)
+                    presetNameText(preset, isBuiltIn: isBuiltIn)
+                    if isBuiltIn {
+                        Color.clear.frame(width: Self.s(16), height: 1)
+                    } else {
+                        // 与右侧动作栏**同一套悬停高亮**（2026-09-22 用户「预设卡片的按钮需要有
+                        // hover 背景色」），只是底走红色系（图标本来就是红的）。
+                        // ⚠️ 从 `.borderless` 换成 `.plain`：要自己画悬停底，就不能让系统样式掺进来。
+                        // ⚠️ 圆的边长写在 `background` 里：`.background` 不参与布局 ⇒ 名字行那点高度
+                        // 不会被这枚底撑起来（`presetAddTile` 的占位名字行要与它逐行对齐）
+                        let hovered = model.presetControlHovered(preset.id, .delete)
+                        Button(role: .destructive) { model.deleteThemePreset(id: preset.id) } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: Self.s(11)))
+                                .foregroundStyle(Color.red.opacity(hovered ? 1.0 : 0.72))
+                                .background(Circle().fill(Color.red.opacity(hovered ? 0.16 : 0))
+                                                .frame(width: Self.s(15), height: Self.s(15)))
+                        }
+                        .buttonStyle(.plain)
+                        .frame(width: Self.s(16))
+                        .onHover { model.hoverPresetControl(preset.id, .delete, $0) }
+                        .help("删除这组预设")
                     }
-                    .buttonStyle(.borderless)
-                    .frame(width: Self.s(16))
-                    .help("删除这组预设")
                 }
             }
+            // 状态 + 动作**在卡片外**（2026-09-22 用户：「按钮和状态放卡片外的右上角（红框处），
+            // 都使用 icon」）—— 以前是压在缩略图顶部的「已修改」胶囊 + 两枚按钮，盖住了面板内容
+            presetActionRail(preset, isModified: isModified, showsRail: showsRail)
         }
     }
 
-    /// 图卡右上方的小图标按钮（2026-09-22「更新预设 / 重置预设」）：
-    /// 圆形半透明底 + 预设自己的前景色 —— 跟着图卡的深浅档走，不用系统强调色（图卡是自绘面板缩影）
-    private func presetIconButton(_ icon: String, fg: Color, help: String,
-                                  action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    /// 卡片**外**右上角那一栏：三枚动作（认下 / 重置 / 恢复初始）+ 状态（已修改），竖排、全部用图标。
+    /// 内置六枚与自建那几枚**一律都有这三枚**（2026-09-22：内置的改动也落存储为「覆盖条目」，
+    /// 所以「认下 / 重置 / 恢复初始」对它们同样成立）
+    ///
+    /// ⚠️ **顺序 = 动作在前、状态在后**（2026-09-22 用户「按钮的顶部与卡片的顶部同高」）：
+    /// 第一格是谁决定按钮落在哪 —— 状态占第一格的话按钮整体被压低一格。
+    /// 栏首再补一层 `s(5)` 垫料（= `presetThumb` 的选中框占位），第一枚按钮的顶才落在卡片**可见**顶边上。
+    ///
+    /// ⚠️ **2026-09-22 悬停版起，这一栏改用设置窗口自己的前景色，不再跟预设的
+    /// `panelForegroundColor`**：这几枚住在图卡**外面**、是设置窗口的 chrome；跟随预设那套前景色的话，
+    /// 「浅色档预设 × 浅色系统外观」就是浅图标压浅底（内置六枚里必有一半读不出来）。图卡本身才是
+    /// 预设的缩影 —— 那份前景色继续只服务 `presetThumb` 里的文字与图形。
+    ///
+    /// ⚠️ **恒定占位**（没亮「已修改」的卡也占这一栏宽度，只是里面空着）：网格列宽固定、
+    /// 内容在列内居中，这一栏时有时无的话，同一行里「改过的卡」会把图卡往左顶、没改的往右挪
+    /// —— 行与行之间图卡左右错位（`presetAddTile` 也要占同样的位，见它那处）
+    /// - Parameters:
+    ///   - showsRail: 这一栏露不露 = 粘性标记 ∪「现值 ≠ 初始值」（见 `presetCard`）——
+    ///     认下之后标记摘了但值仍不是初始的 ⇒ 照样露，不然「恢复初始」没入口
+    ///   - isModified: 只控制**最下面那枚状态标记**（`applepencil.and.scribble`）露不露 ——
+    ///     它的语义是「你动过手、还没认下 / 还原」，比整栏的判据窄一档
+    private func presetActionRail(_ preset: ThemePreset, isModified: Bool,
+                                  showsRail: Bool) -> some View {
+        VStack(spacing: Self.s(4)) {
+            if showsRail {
+                // 认下：改动本来就自动写回这枚预设，这个按钮只剩「把图卡现在的样子认作本值」
+                //（内置六枚也一样 —— 它们的改动副本就存在存储里）
+                presetIconButton("square.and.arrow.down", presetID: preset.id, control: .adopt,
+                                 help: "把图卡现在的样子认作本值（摘掉「已修改」）") {
+                    model.updateThemePreset(id: preset.id)
+                }
+                // 重置：回到**本值**（= 最近一次「认下」那一刻；没认下过就是应用 / 新建那一刻）
+                presetIconButton("arrow.counterclockwise", presetID: preset.id, control: .reset,
+                                 help: "重置为这组预设的本值（改动的部分一并撤销）") {
+                    model.resetThemePreset(id: preset.id)
+                }
+                // 恢复初始（2026-09-22 用户「把参数保存为默认值之后，依然可以重置为 app 的初始默认参数」）：
+                // 回到**初始值** —— 内置六枚 = 代码里出厂那套常量、自建 = 新建那一刻的快照。
+                // ⚠️ 与「重置」只差目标：本值会随「认下」前移，初始值不会 —— 认下过之后就只有这一枚能回出厂
+                presetIconButton("clock.arrow.circlepath", presetID: preset.id, control: .initial,
+                                 help: "恢复为 App 初始默认参数（内置回到出厂那套，自建回到新建那一刻）") {
+                    model.restoreInitialThemePreset(id: preset.id)
+                }
+                // 状态排在三枚动作**下面**（2026-09-22 用户「按钮的顶部与卡片的顶部同高」）：
+                // 它占着第一格的话会把按钮整体压低一格 —— 三枚动作才是这一栏的主角，
+                // 恒定紧贴卡片顶边；标记是补充信息，往下排。
+                // **不是按钮**（故不带底、不参与悬停，与上面三枚区分开）：这枚预设被改过。
+                // ⚠️ 只认**粘性标记**（比上面整栏那个判据窄一档）：认下之后值虽然不是初始的了，
+                // 但你已经「认下」过、「已修改」就该灭 —— 「恢复初始」则是回到初始态，两个都灭
+                if isModified {
+                    Image(systemName: "applepencil.and.scribble")
+                        .font(.system(size: Self.s(13), weight: .regular))
+                        .foregroundStyle(Color.secondary)
+                        .frame(width: Self.s(Self.railWidth), height: Self.s(Self.railWidth))
+                        .help("已修改：改动已自动保存进这组预设")
+                }
+            }
+        }
+        // 补回选中框那层垫料：`HStack(alignment: .top)` 的顶对齐落在 `presetThumb` 末尾
+        // `.padding(Self.s(5))`（给选中蓝框留的外扩位）的**外缘**上，而卡片的**可见**顶边在里面
+        // 5pt —— 不补这一下，第一枚按钮的顶会比卡片顶边高出 5pt
+        .padding(.top, Self.s(5))
+        .frame(width: Self.s(Self.railWidth), alignment: .top)
+    }
+
+    /// 卡片**外**右侧动作栏里的小图标按钮（2026-09-22「认下 / 重置」）：
+    /// 圆形底 + **设置窗口自己的前景色**（`Color.primary` 两档透明度 —— 理由见 `presetActionRail` 那段：
+    /// 这两枚在卡外，是设置窗口的 chrome，得在任何系统外观 × 任何预设下都读得出来）。
+    ///
+    /// **悬停高亮**（2026-09-22 用户「预设卡片的按钮需要有 hover 背景色和 Tooltip」）：
+    /// 常态 = 极淡的圆底（按钮有形状、又不抢眼），指针进来底与图标各深一档；`.help` 出 Tooltip。
+    /// 悬停态住模型（`hoveredPresetID` / `hoveredPresetControl`）—— 本 target 没有 `@State`，见文件头注。
+    /// 宽度 = `railWidth`（rail 那栏就按它定宽，加宽按钮要连 `railWidth` 一起改）
+    private func presetIconButton(_ icon: String, presetID: String, control: PresetCardControl,
+                                  help: String, action: @escaping () -> Void) -> some View {
+        let hovered = model.presetControlHovered(presetID, control)
+        return Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: Self.s(10), weight: .semibold))
-                .foregroundStyle(fg)
-                .frame(width: Self.s(18), height: Self.s(18))
-                .background(Circle().fill(Color(nsColor: .controlBackgroundColor).opacity(0.75)))
+                .foregroundStyle(Color.primary.opacity(hovered ? 0.95 : 0.58))
+                .frame(width: Self.s(Self.railWidth), height: Self.s(Self.railWidth))
+                .background(Circle().fill(Color.primary.opacity(hovered ? 0.18 : 0.07)))
         }
         .buttonStyle(.plain)
+        .onHover { model.hoverPresetControl(presetID, control, $0) }
         .help(help)
     }
 
@@ -562,34 +650,39 @@ private struct ThemePane: View {
     /// ⚠️ 尺寸全部走 `Self.s(...)`（同 `presetThumb`）：图卡放大缩小时它跟着走，不会掉队。
     /// ⚠️ 曾试过放进 Section 的 footer（`.buttonStyle(.link)`），**整个不渲染** —— 见 MEMORY 那条坑
     private var presetAddTile: some View {
-        VStack(spacing: Self.s(6)) {
-            Button { model.addThemePresetFromCurrent() } label: {
-                VStack(spacing: Self.s(8)) {
-                    Image(systemName: "plus")
-                        .font(.system(size: Self.s(18), weight: .light))
-                    Text("新增主题")
-                        .font(.body)
+        // 右侧同样留一栏（`presetActionRail` 那 18pt）的空占位：不占的话这一格比预设卡窄
+        // 18pt，而内容在列内居中 ⇒ 它会比左右邻卡**右移**半格，网格里一眼看得出错位
+        HStack(alignment: .top, spacing: Self.s(Self.railGap)) {
+            VStack(spacing: Self.s(6)) {
+                Button { model.addThemePresetFromCurrent() } label: {
+                    VStack(spacing: Self.s(8)) {
+                        Image(systemName: "plus")
+                            .font(.system(size: Self.s(18), weight: .light))
+                        Text("新增主题")
+                            .font(.body)
+                    }
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: Self.s(138))    // 与 mini 面板同高（同日「缩小容器高度」152 → 140 → 138）
+                    .background {
+                        RoundedRectangle(cornerRadius: Self.s(10))
+                            .fill(Color.primary.opacity(0.04))
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.s(10))
+                            .strokeBorder(style: StrokeStyle(lineWidth: Self.s(1),
+                                                             dash: [Self.s(5), Self.s(4)]))
+                            .foregroundStyle(Color.secondary.opacity(0.45))
+                    }
+                    // 与图卡那圈选中框占位同宽 ⇒ 虚线框的实际宽度 = mini 面板宽度（逐列对齐）
+                    .padding(Self.s(5))
                 }
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity)
-                .frame(height: Self.s(138))        // 与 mini 面板同高（同日「缩小容器高度」152 → 140 → 138）
-                .background {
-                    RoundedRectangle(cornerRadius: Self.s(10))
-                        .fill(Color.primary.opacity(0.04))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: Self.s(10))
-                        .strokeBorder(style: StrokeStyle(lineWidth: Self.s(1),
-                                                         dash: [Self.s(5), Self.s(4)]))
-                        .foregroundStyle(Color.secondary.opacity(0.45))
-                }
-                // 与图卡那圈选中框占位同宽 ⇒ 虚线框的实际宽度 = mini 面板宽度（逐列对齐）
-                .padding(Self.s(5))
+                .buttonStyle(.plain)
+                .help("按当前参数新增一组预设")
+                // 名字行占位：与预设卡那行同字号同高（透明），保证整块高度也一致
+                Text("新增主题").font(.body).opacity(0)
             }
-            .buttonStyle(.plain)
-            .help("按当前参数新增一组预设")
-            // 名字行占位：与预设卡那行同字号同高（透明），保证整块高度也一致
-            Text("新增主题").font(.body).opacity(0)
+            Color.clear.frame(width: Self.s(Self.railWidth), height: 1)
         }
     }
 

@@ -491,10 +491,13 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
     /// ── 出厂内置预设（2026-09-17 用户要求：把现有六枚「固定为默认提供的预设」）──
     /// 随包发布：**写死在代码里**，新装机器 / 清空 UserDefaults 也照样有这六枚；
     /// 用户用图卡右上角「+」新增的那些仍存 UserDefaults（宿主 `ThemePresetStore`）。
-    /// 分工：视图显示的是 `builtIns + ThemePresetStore.load()`（宿主装配快照时拼）。
-    /// - `id` 沿用当初存进 UserDefaults 的那六个 UUID ⇒ 宿主 `load()` 按 `builtInIDs` 过滤时，
-    ///   老数据里的同 id 条目**自然被去重**（升级后不会出现两份同名卡）
-    /// - 这六枚**只读**：图卡上不给删除按钮、名字也不可点改（视图按 `builtInIDs` 判断）
+    /// 分工：视图显示的是「内置（有覆盖条目就用覆盖那份）+ 存储里用户自建的那些」
+    ///（拼接点在宿主 `themePresetList`）。
+    /// - `id` 沿用当初存进 UserDefaults 的那六个 UUID ⇒ 同 id 的**覆盖条目**能对上号，
+    ///   升级后不会出现两份同名卡（列表按 id 合并，见宿主 `themePresetList`）
+    /// - 这六枚的**身份**不可动：图卡上不给删除按钮、名字也不可点改（视图按 `builtInIDs` 判断）；
+    ///   ⚠️ 但**值可以改**（2026-09-22 起）—— 改过之后以存储里的覆盖条目为准，
+    ///   「重置」把覆盖条目删掉即回到这里的常量
     /// - 参数 = 2026-09-17 定稿那刻存储里的原值（脚本从 `defaults read` 直出，未手抄）
     public static let builtIns: [ThemePreset] = [
         ThemePreset(id: "4186C421-8893-4B04-BD01-061EB177FD2D", name: "宝特蓝",
@@ -622,6 +625,15 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
     /// 浮点带 1e-4 容差：值经「config 落盘 → 快照 → 预设 JSON」几趟，逐位相等本就成立，
     /// 容差只为挡住量化口径不一致的意外。
     public func matches(_ s: AppSettingsSnapshot) -> Bool {
+        // 「把快照当一枚预设」再比 —— 比对的 16 项两边字段名逐一对得上（见 `init(name:snapshot:)`），
+        // 于是这一份口径只有一处实现：同 id / 名字都不参与比对
+        matches(ThemePreset(name: name, snapshot: s))
+    }
+
+    /// 两枚预设**逐项相等**？口径与 `matches(_ snapshot:)` 完全同一份（后者转调这里）——
+    /// 容差 1e-4、主前景色走「nil ↔ 显式内置档」的分组等价，名字 / id 不参与。
+    /// `id` 不参与是有意的：内置预设的**覆盖条目**与它那位出厂常量同 id 但值可能早已不同
+    public func matches(_ other: ThemePreset) -> Bool {
         func eq(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-4 }
         func eqColor(_ a: PanelBackgroundColor, _ b: PanelBackgroundColor) -> Bool {
             eq(a.hue, b.hue) && eq(a.saturation, b.saturation)
@@ -651,22 +663,22 @@ public struct ThemePreset: Codable, Equatable, Identifiable {
             case let (nil, y?): return isBuiltInTone(y)
             }
         }
-        return eq(heatHue, s.heatHue) && eq(heatSaturation, s.heatSaturation)
-            && eq(heatBrightness, s.heatBrightness)
-            && eqColor(panelBackgroundColor, s.panelBackgroundColor)
-            && eq(panelBackgroundBottomAlpha, s.panelBackgroundBottomAlpha)
-            && eqColor(secondaryBackgroundColor, s.secondaryBackgroundColor)
-            && eqFg(panelForegroundColor, s.panelForegroundColor)
-            && lightThemeEnabled == s.lightThemeEnabled
-            && iconThemeSwap == s.iconThemeSwap
-            && iconNoBorder == s.iconNoBorder
-            && longProgressCard == s.longProgressCard
-            && eq(cardTitleFontSize, s.cardTitleFontSize)
-            && cardTitleSharpGrotesk == s.cardTitleSharpGrotesk
-            && coinPreset == s.coinPreset
-            && coinAppearance == s.coinAppearance
-            && coinMaterialColor == s.coinMaterialColor
-            && coinFieldColor == s.coinFieldColor
+        return eq(heatHue, other.heatHue) && eq(heatSaturation, other.heatSaturation)
+            && eq(heatBrightness, other.heatBrightness)
+            && eqColor(panelBackgroundColor, other.panelBackgroundColor)
+            && eq(panelBackgroundBottomAlpha, other.panelBackgroundBottomAlpha)
+            && eqColor(secondaryBackgroundColor, other.secondaryBackgroundColor)
+            && eqFg(panelForegroundColor, other.panelForegroundColor)
+            && lightThemeEnabled == other.lightThemeEnabled
+            && iconThemeSwap == other.iconThemeSwap
+            && iconNoBorder == other.iconNoBorder
+            && longProgressCard == other.longProgressCard
+            && eq(cardTitleFontSize, other.cardTitleFontSize)
+            && cardTitleSharpGrotesk == other.cardTitleSharpGrotesk
+            && coinPreset == other.coinPreset
+            && coinAppearance == other.coinAppearance
+            && coinMaterialColor == other.coinMaterialColor
+            && coinFieldColor == other.coinFieldColor
     }
 
     /// 解码：**逐项 `decodeIfPresent` + 缺省兜底**，不用合成的「整份必须齐全」实现 ——
@@ -1014,15 +1026,27 @@ public struct AppSettingsSnapshot: Equatable {
     public var coinAppearance: Int = ThemePreset.defaultCoinAppearance
     public var coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor
     public var coinFieldColor: String = ThemePreset.defaultCoinFieldColor
-    /// 「主题预设」列表（该页顶部）= **内置（`ThemePreset.builtIns`，代码里，只读）
+    /// 「主题预设」列表（该页顶部）= **内置（`ThemePreset.builtIns`，代码里）
     /// + 用户自建（宿主 `ThemePresetStore.load()`，UserDefaults）**，宿主装配快照时拼起来，
-    /// 内置恒排在前；新增 / 应用 / 改名 / 删除都先交宿主动作落盘再回读本条
+    /// 内置恒排在前。⚠️ 内置六枚**有覆盖条目就用覆盖那份**（改动自动保存落在存储里，
+    /// 见宿主 `themePresetList`）—— 列表里的值才是「这枚预设现在的样子」
     public var themePresets: [ThemePreset] = []
-    /// 最后一次「应用」的预设 id（宿主从 `UDKey.appliedThemePresetID` 读）。
-    /// 与 `themePresets` 里某项的 `matches(self)` **联合**判定「这枚预设被改过」：
-    /// 命中 id 但已不再匹配 = 脏（卡片显示「已修改」+ 更新/重置入口）。
-    /// nil（从未应用过 / 清过偏好）= 没有任何卡显示已修改
+    /// 最后一次「应用」的预设 id（宿主从 `UDKey.appliedThemePresetID` 读）——
+    /// **自动保存**写回的目标：改任何外观参数都会把当前外观写进这枚自建预设
+    ///（内置六枚写不进，只记「已修改」）。nil（从未应用过 / 清过偏好）= 不做自动保存
     public var appliedPresetID: String?
+    /// 处于「已修改」的预设 id（宿主从 `ThemePresetEditStore` 读，**落盘、跨重启**）。
+    /// ⚠️ 判定**不再**是「当前外观 ≠ 预设值」那种派生比对：外观改动会自动写回预设，
+    /// 那种比对照不出「改过没有」。这里是宿主维护的粘性标记 —— 改回原值、点别的卡都不摘，
+    /// 只有点「重置」「恢复初始」摘（见宿主 `autoSaveAppearanceToAppliedPreset` / `resetThemePreset`）
+    public var modifiedPresetIDs: Set<String> = []
+    /// 当前值与**初始值**（App 初始默认参数：内置 = 代码里出厂常量，自建 = 新建那一刻）**不同的**预设 id
+    /// —— 宿主**现算**，只用来决定图卡右侧那栏动作露不露（∪ 上面的粘性标记）。
+    /// ⚠️ 与「已修改」标记**不是一回事**，别合并：标记是「你动过手」（粘性、只有重置 / 恢复初始摘），
+    /// 这个是**当下**是否还在初始态（自己改回初始就自动不亮）。两个都要，是因为「认下」会摘标记 ——
+    /// 只看标记的话，**认下之后就再也够不到「重置 / 恢复初始」**了（用户当天要求：
+    /// 「把参数保存为默认值之后，依然可以重置为 app 的初始默认参数」）
+    public var differingPresetIDs: Set<String> = []
     /// DeepSeek API Key（真实值来自钥匙串；空 = 未配置）
     public var apiKey: String = ""
     /// DeepSeek 常用充值额度（0 = 未设置 → 面板不画点阵；>0 = 点阵分母）
@@ -1059,7 +1083,9 @@ public struct AppSettingsSnapshot: Equatable {
                 coinMaterialColor: String = ThemePreset.defaultCoinMaterialColor,
                 coinFieldColor: String = ThemePreset.defaultCoinFieldColor,
                 themePresets: [ThemePreset] = [],
-                appliedPresetID: String? = nil) {
+                appliedPresetID: String? = nil,
+                modifiedPresetIDs: Set<String> = [],
+                differingPresetIDs: Set<String> = []) {
         self.refreshInterval = refreshInterval
         self.autoCheckin = autoCheckin
         self.autoCheckinSub = autoCheckinSub
@@ -1089,6 +1115,8 @@ public struct AppSettingsSnapshot: Equatable {
         self.coinFieldColor = coinFieldColor
         self.themePresets = themePresets
         self.appliedPresetID = appliedPresetID
+        self.modifiedPresetIDs = modifiedPresetIDs
+        self.differingPresetIDs = differingPresetIDs
     }
 }
 
@@ -1136,19 +1164,27 @@ public struct AppSettingsActions {
     /// 「主题外观」pane **顶部「主题预设」**（2026-09-15 用户要求）：该页顶部一组预设，
     /// 「应用」原样写回、「删除」移除一枚；新增走**图卡右上角的「+」**（2026-09-17 用户要求，
     /// 取代原「名称 + 保存」那一行）。
-    /// 宿主：用户预设存 UserDefaults（`ThemePresetStore`，JSON 串单键）+ 应用时逐项落值重绘。
-    /// ⚠️ 出厂那六枚（`ThemePreset.builtIns`）**不在这里**：它们只读，宿主也不往存储里写
+    /// 宿主：预设存 UserDefaults（`ThemePresetStore`，JSON 串单键）+ 应用时逐项落值重绘。
+    /// ⚠️ 出厂那六枚（`ThemePreset.builtIns`）**不走这里** —— 它们是代码里的常量，
+    /// 改过之后由宿主的自动保存写成一份同 id 的**覆盖条目**（见 `ThemePresetStore` 注释）
     public var saveThemePreset: (ThemePreset) -> Void = { _ in }
     public var applyThemePreset: (ThemePreset) -> Void = { _ in }
     /// 删除一枚预设（按 id 命中；移除后其余顺序不变）—— 只对用户自建的那些开放
     public var deleteThemePreset: (String) -> Void = { _ in }
     /// 改名（点图卡下方的名字就地改）：按 id 找到用户自建的那枚、换名字后落盘。
-    /// 内置六枚没有改名入口，宿主也不需要额外挡 —— 存储里根本不含它们的 id
+    /// 内置六枚没有改名入口（名字是身份的一部分），宿主也不用额外挡 —— 视图不给入口
     public var renameThemePreset: (String, String) -> Void = { _, _ in }
-    /// 「更新预设」（2026-09-22）：把**当前外观逐项写回**该 id 的预设（覆盖它的值）。
-    /// 只对用户自建的那些开放 —— 内置六枚写死在代码里、`ThemePresetStore` 里没有它们的条目，
-    /// 宿主按 id 命中不到，所以视图对内置只给「重置」不给「更新」
+    /// 「认下改动」（2026-09-22 起语义收窄）：外观改动本来就**自动写回**预设，这个按钮只剩
+    /// 一件事 —— 把这枚预设的**当前值**认作它的**本值**（「重置」回到这一点），顺带摘掉「已修改」。
+    /// 内置六枚与自建那几枚一律都能认（内置的改动副本就存在存储里）
     public var updateThemePreset: (String) -> Void = { _ in }
+    /// 「重置」（2026-09-22）：把这枚预设**连同当前外观**恢复成它的**本值**（= 最近一次「认下」那一刻，
+    /// 没认下过就是应用 / 新建那一刻），并摘掉「已修改」。
+    public var resetThemePreset: (String) -> Void = { _ in }
+    /// 「恢复初始」（2026-09-22 用户「把参数保存为默认值之后，依然可以重置为 app 的初始默认参数」）：
+    /// 把这枚预设恢复成它的**初始值** —— 内置六枚 = 代码里出厂那套常量；自建 = **新建那一刻**的快照。
+    /// ⚠️ 与「重置」的分工：重置回**本值**（会随认下前移），恢复初始回**初始**（认下动不了它）
+    public var restoreInitialThemePreset: (String) -> Void = { _ in }
     public var manualCheckin: () -> Void = {}
     public var showCheckinHistory: () -> Void = {}
     public var shareWbHistory: () -> Void = {}
@@ -1275,6 +1311,20 @@ public struct SettingsHostedContent {
     }
 }
 
+/// 预设卡上**可悬停的控件**（图卡右侧动作栏那几枚 + 名字行尾那枚垃圾桶）——
+/// 只用来给 `.onHover` 记一个「现在指着谁」，不参与任何落盘语义。
+/// 缩略图（点 = 应用）**不在其中**：它就是卡片本身、恒亮着，没有「悬停才出现」的底可加。
+public enum PresetCardControl: String, Sendable {
+    /// 认下（把这枚预设的当前值认作本值）
+    case adopt
+    /// 重置（回本值）
+    case reset
+    /// 恢复初始（回 App 初始默认参数：内置 = 出厂常量，自建 = 新建那一刻）
+    case initial
+    /// 删除（名字行尾）
+    case delete
+}
+
 @MainActor
 @Observable
 public final class AppSettingsModel {
@@ -1288,6 +1338,10 @@ public final class AppSettingsModel {
             // 起 Key/额度并入账号 pane，原独立 keyQuota pane 删除；提交时机：
             // 回车 / 离开账号 pane / 关窗）
             if oldValue == .accounts { commitKeyQuotaIfDirty() }
+            // 切页即回读真实状态：内嵌 AppKit 的 pane（3D 硬币 / 平台开关）改一次直接落盘、
+            // 不经过本模型的 setter，不回读的话切回「主题外观」看到的是上一刻的快照
+            //（预设卡的「已修改」与图卡值都靠它跟上）
+            sync()
             history.removeSubrange((historyIndex + 1)...)
             history.append(selection)
             historyIndex += 1
@@ -1316,13 +1370,19 @@ public final class AppSettingsModel {
     public var coinThumbnailProvider: ((CoinVisualIdentity, CGFloat) -> NSImage?)?
     /// Key/额度表单的编辑草稿（窗口打开时按真实配置重置，见 `beginSession`）
     public var keyQuotaDraft = KeyQuotaDraft()
-    /// ── 「主题预设」的三处**界面状态**，都刻意住模型而不是视图 ──
+    /// ── 「主题预设」的几处**界面状态**，都刻意住模型而不是视图 ──
     /// 本 target 只有属性包装器可用（`@State` 在新 SDK 里是宏，CLT 工具链报
     /// "StateMacro could not be found"，见文件头注），模型是 `@Observable` 类，照样驱动刷新。
     /// 1) 正在改名的预设 id（nil = 没在改名）：点图卡下方的名字进入，Enter 提交、Esc 放弃
     public var renamingPresetID: String?
     /// 2) 改名草稿（进入改名时填入原名）
     public var renameDraft = ""
+    /// 3) 预设卡按钮的**悬停高亮**（2026-09-22 用户「预设卡片的按钮需要有 hover 背景色」）：
+    ///    指针只有一个 ⇒ 同一时刻至多一个目标，两个字段就够（指着哪枚卡的哪个控件）。
+    ///    ⚠️ 住模型是**没办法**（本 target 没有 `@State`，`.onHover` 的进出总得有个地方落），
+    ///    不是「界面状态就该进模型」—— 别拿它当范例去扩
+    public var hoveredPresetID: String?
+    public var hoveredPresetControl: PresetCardControl?
 
     /// pane 导航历史（系统设置同款后退/前进）；初始 = [初始 pane]，两侧按钮初始均禁用
     private var history: [SettingsSidebarItem] = [.appearance]
@@ -1472,10 +1532,30 @@ public final class AppSettingsModel {
         sync()
     }
 
-    /// 「更新预设」（2026-09-22）：把当前外观写回该预设（按 id 命中用户自建那枚，覆盖其值），
-    /// 随后回读快照 —— 覆盖后当前外观与该预设重新逐项相等，「已修改」标记随之消失
+    /// 「认下改动」（2026-09-22 起语义收窄）：外观改动本来就自动写回预设（见宿主
+    /// `autoSaveAppearanceToAppliedPreset`），这里只剩「把这枚预设的当前值认作它的本值」
+    /// —— 摘掉「已修改」，此后「重置」回到这一刻。随后回读快照，卡片上的标记随之消失
     public func updateThemePreset(id: String) {
         actions.updateThemePreset(id)
+        clearPresetHover()
+        sync()
+    }
+
+    /// 「重置」（2026-09-22）：把这枚预设连同当前外观恢复成它的**本值**（应用 / 新建那一刻的值，
+    /// 或最近一次「认下」），并摘掉「已修改」（改回原值、点别的卡都不摘）。
+    /// 随后回读快照 —— 该页所有控件 + 预设图卡都回到本值
+    public func resetThemePreset(id: String) {
+        actions.resetThemePreset(id)
+        clearPresetHover()
+        sync()
+    }
+
+    /// 「恢复初始」（2026-09-22）：恢复成 **App 初始默认参数** —— 内置六枚回到代码里出厂那套，
+    /// 自建那几枚回到**新建那一刻**（本值会随「认下」前移，初始值不会，所以这两件事得分开）。
+    /// 随后回读快照
+    public func restoreInitialThemePreset(id: String) {
+        actions.restoreInitialThemePreset(id)
+        clearPresetHover()
         sync()
     }
 
@@ -1483,6 +1563,7 @@ public final class AppSettingsModel {
     public func deleteThemePreset(id: String) {
         if renamingPresetID == id { renamingPresetID = nil; renameDraft = "" }
         actions.deleteThemePreset(id)
+        clearPresetHover()
         sync()
     }
 
@@ -1511,6 +1592,33 @@ public final class AppSettingsModel {
     public func cancelPresetRename() {
         renamingPresetID = nil
         renameDraft = ""
+    }
+
+    // MARK: 预设卡按钮的悬停（`.onHover` 的落点）
+
+    /// 这个控件的底要不要按「悬停态」画
+    public func presetControlHovered(_ presetID: String, _ control: PresetCardControl) -> Bool {
+        hoveredPresetID == presetID && hoveredPresetControl == control
+    }
+
+    /// `.onHover` 的两个事件都到这里：进来就点亮；出去时**只在自己还指着时才熄灭** ——
+    /// 两个相邻按钮的 `false` 可能晚于另一个的 `true`（移出 A 进 B 时事件顺序不保证），
+    /// 不加这个判据会出现「已经 hover 在 B 上但 B 不亮」
+    public func hoverPresetControl(_ presetID: String, _ control: PresetCardControl, _ on: Bool) {
+        if on {
+            hoveredPresetID = presetID
+            hoveredPresetControl = control
+        } else if presetControlHovered(presetID, control) {
+            clearPresetHover()
+        }
+    }
+
+    /// 摘掉悬停态。**动作执行后必须清一次**：点「认下」/「重置」会把「已修改」摘掉 ⇒ 整栏收起，
+    /// 点垃圾桶 ⇒ 整张卡消失 —— 视图已经不在树上，`.onHover(false)` 不一定会来，
+    /// 不主动清就留下一个「指针早就不在上面了还亮着」的假悬停（同一枚卡再被改出来时它一亮就是错的）
+    private func clearPresetHover() {
+        hoveredPresetID = nil
+        hoveredPresetControl = nil
     }
     /// 草稿是否有未落盘的改动（提交点的守卫：脏才写，避免空提交反复刷网络）
     public var keyQuotaDirty: Bool {

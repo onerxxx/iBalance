@@ -114,11 +114,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     /// 取走表格当前勾选并落盘（宿主 `applyPlatformConfig` 负责后续整串同步）
     private func applyPlatformConfigNow() {
-        guard let panel = platformPanel, let apply = applyPlatformConfig else { return }
-        apply(panel.makeConfig())
+        // ⚠️ 合并基 = **此刻**从宿主回读的配置，不是建表时那一份：表格保活复用，建表之后
+        //    发生的改动（右键卡片切菜单栏显隐、导入账号、改主题色…）只有在实时读的这份里。
+        //    拿旧快照当基会让那些改动被整份写回旧值（2026-09-23 修的那条：
+        //    右键隐藏的 ZhiPu 被平台表一次勾选写回「默认可见」，之后每轮刷新都重新出现在菜单栏）
+        guard let panel = platformPanel, let apply = applyPlatformConfig,
+              let base = platformConfig?() else { return }
+        apply(panel.makeConfig(basingOn: base))
         // ⚠️ reload 必须用**写回之后**回读的那份：`applyPlatformConfig` 是 `config = updated`，
         //    若沿用 apply 之前捕获的旧值，勾选会被打回旧态（点了又弹回去）。
-        //    顺带让面板的 `originalConfig` 基保持在最新，下次合并不会以旧配置为基。
         if let saved = platformConfig?() { panel.reload(config: saved) }
     }
     /// 窗口会话进行中（open → willClose）：popover 保活 / 防 hide 判定用它而非 isVisible——

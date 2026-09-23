@@ -655,6 +655,9 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     func refreshFontStyle() {
         totalRollView.refreshFont()
         metricsDirty = true   // 字体变了 → 所有文本度量缓存作废
+        // SG 档还有一条**几何**差异：大数字层要按 `numberRowLift` 上下微调，
+        // 而偏移量在 `layout()` 里落地 ⇒ 这里必须显式重排（只改字体不会带出 layout）
+        needsLayout = true
         invalidateIntrinsicContentSize()
         needsDisplay = true
     }
@@ -938,6 +941,19 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         activityTitleTop(rows: rows) + titleInkHeight + 6
     }
 
+    /// SG 字体档下大数字的**垂直微调量**（2026-09-22 用户「使用SG字体时, token大数值上移3pt」）。
+    ///
+    /// 为什么是字体档专属：滚动数字按**行盒顶**排版（`DigitWheelView` 的
+    /// `baselinePad + ascender − 墨迹高`），而 SG（Book20）的 ascender 相对字面明显偏大 ⇒
+    /// 同样的行盒下墨迹被推低，与系统档不在一条视觉基准线上。
+    ///
+    /// ⚠️ 只挪**数字**这一层：硬币与 spinner 仍以 `numberRowCenterY` 居中（`inlineCoin` 是独立
+    /// 3D 视图，按中线对齐与字体无关），命中区 `numberRowRect` 也不动 —— 别去改 `numberRowY`，
+    /// 那是「数字 + 硬币 + spinner」三者的共同基准。
+    private static let sgNumberLift: CGFloat = 3
+    /// 数字行的 y 偏移（flipped 坐标：负 = 上移）
+    private var numberRowLift: CGFloat { PanelFont.sharpGroteskActive ? -Self.sgNumberLift : 0 }
+
     /// 大数字行框：与原 draw 排版同位（行带高 32）
     override func layout() {
         super.layout()
@@ -954,7 +970,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         // 版心左缘，2026-09-14 用户指定；主面板内嵌实例 +3，2026-09-15 用户指定），
         // 其余行（标题/列表/热力图）仍按 insets.left
         let rowX = numberRowLeadingInset
-        totalRollView.frame = NSRect(x: rowX + inlineCoinWidth, y: numberRowY,
+        totalRollView.frame = NSRect(x: rowX + inlineCoinWidth, y: numberRowY + numberRowLift,
                                      width: max(0, bounds.width - insets.right - rowX - inlineCoinWidth),
                                      height: Self.numberRowBaseHeight)
         // 内嵌小硬币：以**数字行中线**垂直居中（不随硬币尺寸漂移，

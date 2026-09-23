@@ -666,6 +666,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                        name: NSWorkspace.didActivateApplicationNotification, object: nil)
         ws.addObserver(self, selector: #selector(refreshStatusItemAppearance),
                        name: NSWorkspace.didDeactivateApplicationNotification, object: nil)
+        // 主题预设的自动保存还有一条入口：硬币 pane 改的是内嵌 AppKit 面板（改一次落一次盘，
+        // 不经过设置窗口模型的 setter），它的通知单独挂这里（见 onCoinSettingsLiveChange）
+        nc.addObserver(self, selector: #selector(onCoinSettingsLiveChange),
+                       name: .coinSettingsDidChange, object: nil)
     }
 
     /// 强制 status item 重绘。通知可能在非主线程投递，统一回主线程更新 UI。
@@ -1600,12 +1604,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             self?.applySecondaryBackgroundColor(color)
         }
         // 「主题预设」（2026-09-15 用户要求，「主题外观」页顶部）：新增 / 应用 / 改名 / 删除 ——
-        // **内置那几枚在代码里**（`ThemePreset.builtIns`，只读、不落盘），
-        // 用户自建的走 UserDefaults（ThemePresetStore）；应用见 applyThemePreset 的逐项落值说明
+        // **内置那几枚的常量在代码里**（`ThemePreset.builtIns`，身份不可删不可改名），
+        // 但**值可改**：改动会以「同 id 覆盖条目」落进 UserDefaults（ThemePresetStore），
+        // 列表装配时用它盖掉常量（见 `themePresetList()`）；用户自建的也走 ThemePresetStore。
+        // 「已修改」标记与本值另存 `ThemePresetEditStore`；应用见 applyThemePreset 的逐项落值说明
         actions.saveThemePreset = { [weak self] preset in self?.saveThemePreset(preset) }
         actions.applyThemePreset = { [weak self] preset in self?.applyThemePreset(preset) }
-        // 「更新预设」（2026-09-22）：把当前外观写回该 id 的用户自建预设
+        // 「认下改动」（2026-09-22 起：改动本来就自动写回预设，这个按钮只剩「把当前外观
+        // 认作本值」这一件事）
         actions.updateThemePreset = { [weak self] id in self?.updateThemePreset(id: id) }
+        // 「重置」（2026-09-22）：把这枚预设连同当前外观恢复成它的本值 + 摘掉「已修改」
+        actions.resetThemePreset = { [weak self] id in self?.resetThemePreset(id: id) }
+        // 「恢复初始」（2026-09-22）：同样恢复 + 摘标记，但目标是 **App 初始默认参数**
+        //（内置 = 出厂那套常量 / 自建 = 新建那一刻）—— 「认下」会把本值前移，认下过之后
+        // 只有这一枚能回出厂，这正是用户要的「保存为默认值之后依然能重置为初始默认」
+        actions.restoreInitialThemePreset = { [weak self] id in
+            self?.restoreInitialThemePreset(id: id)
+        }
         actions.deleteThemePreset = { [weak self] id in self?.deleteThemePreset(id: id) }
         actions.renameThemePreset = { [weak self] id, name in
             self?.renameThemePreset(id: id, name: name)
@@ -1625,7 +1640,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         SettingsWindowController.shared.configure(
             actions: actions,
-            snapshot: { [weak self] in self?.makeSettingsSnapshot() ?? AppSettingsSnapshot() },
+            snapshot: { [weak self] in
+                guard let self else { return AppSettingsSnapshot() }
+                // 「外观改动自动保存」的**唯一挂钩点**：设置窗口每次回读快照（= 每次改完某项
+                // 参数后的 `sync()`）都在这里过一道 —— 命中「最后应用的那枚自建预设」且当前
+                // 外观已与它不同，就把当前外观写回它 + 打上「已修改」标记（见该方法注释）。
+                // 挂钩点选在回读而不是逐个 setter：外观落值路径有十来条（色盘 / 滑杆 / 开关 /
+                // 硬币 pane），它们全都汇到这一次回读上
+                // ⚠️ 顺序不能反：先写盘再建快照 —— 否则返回的这份里预设值 / 已修改集合还是
+                // 上一刻的，图卡会慢一拍（写盘只在真有差异时发生，没差异就是白读一次）
+                let live = self.makeSettingsSnapshot()
+                if self.autoSaveAppearanceToAppliedPreset(live) {
+                    return self.makeSettingsSnapshot()
+                }
+                return live
+            },
             // 平台品牌图标：复用面板查表（<平台>.png = macOS27 ClearDark / ClearLight / 同名 SVG）。
             // 请求里带深浅档与「无边框」标志 —— 账号行固定 dark + 带边框，
             // 「主题预设」图卡按预设外观 + 两个图标开关解档
@@ -1714,11 +1743,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             coinAppearance: coin.appearance.rawValue,
             coinMaterialColor: coin.materialColor.hex,
             coinFieldColor: coin.fieldColor.hex,
-            // 预设列表 = **内置（代码里，只读）+ 用户自建（UserDefaults）**，内置恒在前面
-            //（`ThemePresetStore.load()` 已把老数据里的内置条目过滤掉，见该处迁移注释）
-            themePresets: ThemePreset.builtIns + ThemePresetStore.load(),
-            // 「已修改」判定用：最后一次应用过的预设 id（UserDefaults，见 UDKey.appliedThemePresetID）
-            appliedPresetID: UserDefaults.standard.string(forKey: UDKey.appliedThemePresetID))
+            // 预设列表 = **内置（代码里）+ 用户自建（UserDefaults）**，内置恒在前面。
+            // ⚠️ 内置那几枚**改过之后以存储里的覆盖条目为准**（见 themePresetList）
+            themePresets: themePresetList(),
+            // 「已修改」标记（粘性）+ 自动保存的目标（UserDefaults，见 `ThemePresetEditStore`）
+            appliedPresetID: UserDefaults.standard.string(forKey: UDKey.appliedThemePresetID),
+            modifiedPresetIDs: ThemePresetEditStore.load().modified,
+            // 图卡动作栏的可见性：标记 ∪「现在 ≠ 初始值」—— 「认下」摘标记之后动作栏不能跟着消失
+            //（否则「保存为默认值之后依然能恢复初始默认」这条就没入口了），见 `differingFromInitialPresetIDs`
+            differingPresetIDs: differingFromInitialPresetIDs())
     }
 
     /// 面板「面板背景色」（设置窗口色盘拾色 / 顶部不透明度滑杆）：写配置并经快照同步重绘遮罩
@@ -1769,8 +1802,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 新增一组主题预设（图卡右上角「+」）：把「主题外观」页当前的全部参数固化成一枚，**追加**到列表末尾。
     /// 2026-09-17 用户改版后不再有「名称输入框」，名字由模型自动给「预设 N」，**也就不再做重名检查** ——
     /// 同名只是显示重了（id 才是身份），旧那套「覆盖确认」弹窗随输入框一起删除。
+    ///
+    /// 2026-09-22：新增即**认作当前生效的那枚**（`recordAppliedThemePreset`）—— 这枚预设就是
+    /// 「当前外观」的照片，此后改外观自动写回它（本值 = 它自己，见 `ThemePresetEditStore`）
     private func saveThemePreset(_ preset: ThemePreset) {
         ThemePresetStore.save(ThemePresetStore.load() + [preset])
+        recordAppliedThemePreset(preset.id)
     }
 
     /// 改名一枚主题预设（点图卡下方的名字就地改，模型侧 Enter 才调到这里）：
@@ -1782,24 +1819,186 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ThemePresetStore.save(list)
     }
 
-    /// 「更新预设」（2026-09-22）：把**当前外观**逐项写回该 id 的用户自建预设 ——
-    /// 走与「新增预设」同一条映射（`ThemePreset(name:snapshot:)`），只有 id / name 沿用原条目。
-    /// 内置六枚不在 `ThemePresetStore` 里 ⇒ 按 id 命中不到时静默返回（视图本来也不给它们「更新」入口）
+    /// 「认下改动」（2026-09-22 起语义收窄）：外观改动本来就**自动写回**预设，这个按钮只剩一件事 ——
+    /// 把这枚预设的**当前值认作它的本值** + 摘掉「已修改」，此后「重置」回到这一刻。
+    ///
+    /// ⚠️ 刻意**不写「当前外观」**：这枚卡不一定是当前生效的那枚（点了别的预设后它照样亮着
+    /// 「已修改」），那种时候「当前外观」是**别人**的值，写进去等于拿别人的外观砸掉这枚预设
+    /// （自动保存只写「最后应用的那枚」，所以两边的值本来就是分开的）。
+    /// 内置六枚没有「更新」入口（改不了代码里那枚常量，`ThemePresetStore` 里也没有它们的条目）
     private func updateThemePreset(id: String) {
-        var list = ThemePresetStore.load()
-        guard let index = list.firstIndex(where: { $0.id == id }) else { return }
-        var updated = ThemePreset(name: list[index].name, snapshot: makeSettingsSnapshot())
-        updated.id = id      // 沿用原 id（视图命中 / 去重都靠它）
-        list[index] = updated
-        ThemePresetStore.save(list)
-        // 覆盖后当前外观与该预设重新逐项相等 ⇒ 记为「已应用这枚」，卡片上的「已修改」随之消失
-        recordAppliedThemePreset(id)
+        guard let current = themePresetValues(id: id) else { return }
+        var state = ThemePresetEditStore.load()
+        state.origins[id] = current
+        state.modified.remove(id)
+        ThemePresetEditStore.save(state)
     }
 
-    /// 记下「最近应用（或更新）的预设 id」——卡片「已修改」判定的那一半状态。
-    /// 另一半是 `ThemePreset.matches(快照)`：命中 id 且不再相等 = 脏
+    /// 「重置」（2026-09-22）：把这枚预设**连同当前外观**恢复成它的本值 + 摘掉「已修改」——
+    /// 唯一能摘掉标记的入口（改回原值、点别的预设卡都不摘）。
+    ///
+    /// 本值缺（这枚从没被应用过 / 编辑状态被清了）时什么都不做：没有「原本的值」可回。
+    /// 落盘分两种：自建那枚把本值写回存储；**内置六枚**的本值就是出厂常量 ⇒ 把它在存储里的
+    /// **覆盖条目删掉**（不留一份与常量逐字段相同的副本，与 `ThemePresetStore.load()` 的归一同一口径），
+    /// 列表随即从常量取值
+    private func resetThemePreset(id: String) {
+        let state = ThemePresetEditStore.load()
+        guard var restored = state.origins[id] else { return }
+        restored.id = id
+        var list = ThemePresetStore.load()
+        if let index = list.firstIndex(where: { $0.id == id }) {
+            restored.name = list[index].name     // 名字以当前为准：改名不该被回滚
+            if ThemePreset.builtIns.contains(restored) {
+                list.remove(at: index)           // 本值 = 出厂常量 → 覆盖条目直接删
+            } else {
+                list[index] = restored
+            }
+            ThemePresetStore.save(list)
+        }
+        applyThemePreset(restored)               // 逐项落值 + 记 appliedID（本值已存在，不会被覆盖）
+        var after = ThemePresetEditStore.load()
+        after.modified.remove(id)
+        ThemePresetEditStore.save(after)
+    }
+
+    /// 「恢复初始」（2026-09-22 用户「把参数保存为默认值之后，依然可以重置为 app 的初始默认参数」）：
+    /// 把这枚预设**连同当前外观**恢复成它的**初始值** —— 内置六枚 = 代码里出厂那套常量；
+    /// 自建 = **新建那一刻**的快照（`ThemePresetEditStore.initials`，「认下」动不了它）。
+    ///
+    /// 与「重置」的唯一差别是目标：重置回**本值**（会随「认下」前移），这一枚回**初始**。
+    /// 落盘口径同 `resetThemePreset`：内置写回的是出厂常量 ⇒ 把存储里的覆盖条目删掉；自建把那枚改回初始值。
+    /// 顺手把**本值也归位**成初始值 —— 恢复初始之后这枚预设的状态与「刚建出来、没动过」逐项一致，
+    /// 不留「当前值 = 初始值、本值却在别处」的悬挂状态
+    private func restoreInitialThemePreset(id: String) {
+        let state = ThemePresetEditStore.load()
+        guard var restored = initialThemePreset(id: id, state: state) else { return }
+        restored.id = id
+        var list = ThemePresetStore.load()
+        if let index = list.firstIndex(where: { $0.id == id }) {
+            restored.name = list[index].name     // 名字以当前为准：改名不该被回滚
+            if ThemePreset.builtIns.contains(restored) {
+                list.remove(at: index)           // 初始值 = 出厂常量 → 覆盖条目直接删
+            } else {
+                list[index] = restored
+            }
+            ThemePresetStore.save(list)
+        }
+        applyThemePreset(restored)               // 逐项落值 + 记 appliedID（本值已存在，不会被覆盖）
+        var after = ThemePresetEditStore.load()
+        after.origins[id] = restored             // 本值归位（见方法注释）
+        after.modified.remove(id)
+        ThemePresetEditStore.save(after)
+    }
+
+    /// 记下「最后应用（/ 新建）的预设 id」，并给还没记过本值 / 初始值的预设补一份。
+    ///
+    /// **本值**（`origins`）= 应用它那一刻的样子，「重置」恢复的目标。
+    /// **初始值**（`initials`）= 新建它那一刻的样子，「恢复初始」恢复的目标 —— 只管**自建**那几枚：
+    /// 内置六枚的初始值就是代码里那枚常量（`ThemePreset.builtIns`），在存储里再记一份只会与常量漂移。
+    /// ⚠️ 两者都**已记过就不改写**：外观改动会自动写回预设，若每次都拿「当前值」当本值，
+    /// 「重置」就永远回到改完的样子 = 形同虚设
     private func recordAppliedThemePreset(_ id: String) {
         UserDefaults.standard.set(id, forKey: UDKey.appliedThemePresetID)
+        var state = ThemePresetEditStore.load()
+        let current = themePresetValues(id: id)
+        var dirty = false
+        if state.origins[id] == nil, let current {
+            state.origins[id] = current
+            dirty = true
+        }
+        if !ThemePreset.builtInIDs.contains(id), state.initials[id] == nil, let current {
+            state.initials[id] = current
+            dirty = true
+        }
+        if dirty { ThemePresetEditStore.save(state) }
+    }
+
+    /// 按 id 取一枚预设的**当前值**：先查存储（自建那枚 / 内置的**覆盖条目**），再落到代码里的
+    /// 内置常量。都查不到 = nil（例如预设已被删）。
+    /// ⚠️ 顺序不能反：内置被改过之后，存储里那份才是权威值
+    private func themePresetValues(id: String) -> ThemePreset? {
+        ThemePresetStore.load().first { $0.id == id } ?? ThemePreset.builtIns.first { $0.id == id }
+    }
+
+    /// 按 id 取一枚预设的**初始值**（= App 初始默认参数）：既是「恢复初始」的目标，也是「动作栏露不露」的基准。
+    /// - 内置六枚：**代码里出厂那套常量**（故意不看存储 —— 存储里那份是被改过的覆盖条目）
+    /// - 自建那几枚：`ThemePresetEditStore.initials`（新建那一刻的快照，认下动不了它）
+    /// ⚠️ `state.origins[id]` 那一段是**老状态的迁移口**（本版之前建的预设没记初始值，只能拿本值顶一次），
+    /// 不是常驻兜底 —— 记上 `initials` 之后就不会再被走到
+    private func initialThemePreset(id: String, state: ThemePresetEditStore.State) -> ThemePreset? {
+        ThemePreset.builtIns.first { $0.id == id } ?? state.initials[id] ?? state.origins[id]
+    }
+
+    /// **与初始值不同**的预设 id 集合（图卡动作栏的可见性判据，见 `AppSettingsSnapshot.differingPresetIDs`）。
+    /// **现算不落盘**：初始值本身不会动，但「当前值」随自动保存一直在变 —— 存一份立刻就会过期
+    private func differingFromInitialPresetIDs() -> Set<String> {
+        let state = ThemePresetEditStore.load()
+        var ids: Set<String> = []
+        for preset in themePresetList() {
+            guard let initial = initialThemePreset(id: preset.id, state: state) else { continue }
+            if !preset.matches(initial) { ids.insert(preset.id) }
+        }
+        return ids
+    }
+
+    /// 「主题预设」列表（设置窗口「主题外观」页顶部）：内置六枚在前（保持出厂顺序）、用户自建在后。
+    ///
+    /// ⚠️ 内置那几枚**有覆盖条目就用覆盖那份** —— 改过内置预设之后值存在 `ThemePresetStore`
+    /// 里（同 id），这里不换过来的话图卡画的还是出厂常量，用户看到的就是「改了没保存」
+    ///（同 id 两条也不能一起丢进列表：`ForEach` 的 id 会撞）。
+    private func themePresetList() -> [ThemePreset] {
+        let stored = ThemePresetStore.load()
+        let overrides = stored.filter { ThemePreset.builtInIDs.contains($0.id) }
+        let userMade = stored.filter { !ThemePreset.builtInIDs.contains($0.id) }
+        return ThemePreset.builtIns.map { builtin in
+            overrides.first { $0.id == builtin.id } ?? builtin
+        } + userMade
+    }
+
+    /// **外观改动的自动保存**（2026-09-22 用户要求「已修改状态需要自动保存，直到点击重置」）：
+    /// 把当前外观写回**最后应用的那枚预设**，并给它打上「已修改」标记。返回是否动了盘。
+    ///
+    /// - 写回一律落到 `ThemePresetStore`：自建那枚直接覆盖；**内置六枚在存储里建一份同 id 的
+    ///   覆盖条目**（常量写死在代码里改不得）—— 覆盖条目从此刻起就是这枚预设的权威值
+    ///  （`themePresetValues` / `themePresetList` 都先查存储）。⚠️ 早先的版本对内置「只打标记
+    ///   不写值」，结果内置预设改了跟没改一样（用户当天反馈「默认的六个主题，修改后数据没有正常保存」）
+    /// - **标记是粘性的**：任何一次差异打上，之后改回原值 / 切到别的预设都不摘 ——
+    ///   只在这里加，只在 `resetThemePreset` 摘
+    /// - 本值（`origins`）只在**首次应用**那一刻记一次：自动保存会把改动写进预设，
+    ///   不另存一份的话「重置」就无处可回
+    /// - 调用点见设置窗口的 snapshot 闭包（每次回读快照过一道）与 `.coinSettingsDidChange`
+    ///  （硬币 pane 是内嵌 AppKit，不走模型 sync）
+    @discardableResult
+    private func autoSaveAppearanceToAppliedPreset(_ live: AppSettingsSnapshot) -> Bool {
+        guard let id = UserDefaults.standard.string(forKey: UDKey.appliedThemePresetID),
+              let stored = themePresetValues(id: id),
+              !stored.matches(live) else { return false }
+        var state = ThemePresetEditStore.load()
+        // 本值缺（老状态 / 手工清过）→ 以它此刻的值兜一份，别让「重置」无处可回
+        if state.origins[id] == nil { state.origins[id] = stored }
+        state.modified.insert(id)
+        ThemePresetEditStore.save(state)
+        // 写回：名字沿用当前那份（自建的可能被改过名；内置六枚没有改名入口）
+        var list = ThemePresetStore.load()
+        var updated = ThemePreset(name: stored.name, snapshot: live)
+        updated.id = id
+        if let index = list.firstIndex(where: { $0.id == id }) {
+            list[index] = updated
+        } else {
+            list.append(updated)     // 内置六枚第一次被改：这里建覆盖条目
+        }
+        ThemePresetStore.save(list)
+        return true
+    }
+
+    /// 「3D 硬币」pane 的实时改动（`CoinSettingsBox` 那条通知，19 个参数一个出口）：硬币的
+    /// **视觉身份四项**（Preset / Style 档 + 币面色 + 色场色）属于预设内容，在硬币 pane 改它们
+    /// 等于在改当前那枚预设。那条 pane 改一次直接落盘、不经过模型 setter，所以单独挂一次。
+    /// 几何 / 工艺 / 运动那几项不在预设里 —— `matches` 比对不过，什么都不写
+    /// ⚠️ 「应用预设」写那 4 个键时不发这条通知（见 `applyCoinIdentity`），成不了回头环
+    @objc private func onCoinSettingsLiveChange() {
+        guard SettingsWindowController.shared.isSessionActive else { return }
+        autoSaveAppearanceToAppliedPreset(makeSettingsSnapshot())
     }
 
     /// 删除一组主题预设（按 id 命中；不存在时什么都不做）
@@ -1807,6 +2006,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let list = ThemePresetStore.load()
         guard list.contains(where: { $0.id == id }) else { return }
         ThemePresetStore.save(list.filter { $0.id != id })
+        // 编辑状态一并忘掉（本值 + 已修改），别在存储里留孤儿条目；
+        // 删的正是「最后应用的那枚」时把指针也清掉 —— 否则下次改外观会去写一枚不存在的预设
+        ThemePresetEditStore.forget(id: id)
+        if UserDefaults.standard.string(forKey: UDKey.appliedThemePresetID) == id {
+            UserDefaults.standard.removeObject(forKey: UDKey.appliedThemePresetID)
+        }
     }
 
     /// 应用一组主题预设：**逐项按预设里的值原样落值，不走任何派生 / 翻转逻辑** ——
@@ -1833,8 +2038,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         config.cardTitleFontSize = preset.cardTitleFontSize
         config.cardTitleSharpGrotesk = preset.cardTitleSharpGrotesk
         ConfigStore.save(config)
-        // 记下「刚应用的是这枚」——预设卡片「已修改」判定的一半状态（另一半是 matches 比对）；
-        // 点图卡 = 干净态，此后改任何一项参数都会让这枚卡变成「已修改」
+        // 记下「刚应用的是这枚」= 此后**自动保存**的目标（改任何外观参数都写回它）；
+        // 同时给它补一份本值（首次应用那一刻的样子，「重置」回到这里）。
+        // 点图卡 = 干净态：值本来就是这枚的，不会因此亮「已修改」
         recordAppliedThemePreset(preset.id)
         // 运行镜像：与 `onToggleLightTheme` 同一组（自建顶层窗口外观、副前景色按底色解算、
         // 遮罩两端不透明度、次背景色都读它们），漏一个就会出现「面板换了、弹窗还是旧色」
@@ -1947,6 +2153,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 平台开关落盘（设置窗口「平台」pane 每次勾选变化即调，已无「保存」按钮）：落盘后同步右键菜单、
     /// 自动签到定时器和面板状态。2026-09-12 由玻璃弹窗迁入设置窗口，先「保存按钮」后改「勾选即生效」。
+    /// ⚠️ 这里是**整份替换**（`config = updated`），安全的前提是 `updated` 的合并基为宿主此刻的配置 ——
+    /// 由 `SettingsWindow.applyPlatformConfigNow()` 现取传入（`makeConfig(basingOn:)`）。一旦谁把基换回
+    /// 「建表时的快照」，本函数就会把表格之外的改动整份打回旧值（菜单栏显隐 / 账号列表 / 外观参数）
     private func applyPlatformConfig(_ updated: AppConfig) {
         let oldConfig = config
         config = updated
