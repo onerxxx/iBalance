@@ -29,7 +29,7 @@ struct PanelSnapshot: Equatable {
     var dsAccounts: [AccountCardSnapshot] = []
     /// ZhiPu（智谱 BigModel）卡片数据（单元素；uid 恒 "zhipu"）
     var zhipuAccounts: [AccountCardSnapshot] = []
-    /// Qwen（千问 Token Plan）卡片数据（单元素；uid 恒 "qwen"，值为周剩余百分比）
+    /// Qwen（千问 Token Plan）卡片数据（单元素；uid 恒 "qwen"，值为周期剩余百分比）
     var qwenAccounts: [AccountCardSnapshot] = []
     /// 面板余额卡片可见性：key = 平台 ID（"ds" / "zcode" / "codex" / "trae" / "wb"），
     /// value=true 显示、false 隐藏；未记录的平台默认 true。
@@ -1531,8 +1531,8 @@ final class BalancePanelView: NSView {
         static let ds    = CardStyle(icon: "deepseek", name: "DeepSeek", platformID: "ds", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
         // ZhiPu：与 ds 同构的单账号卡（uid 恒 "zhipu" 无前缀，右键菜单 id 恰为 MenuBarPrefix.zhipu）；副标题带 external-link 图标
         static let zhipu = CardStyle(icon: "zhipu", name: "ZhiPu", platformID: "zhipu", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "external-link", menuBarIdPrefix: "")
-        // Qwen（千问 Token Plan）：单账号卡，值为周剩余百分比；副标题为 7 天限额重置倒计时（clock-stop-w 图标）
-        static let qwen = CardStyle(icon: "qwen", name: "Qwen", platformID: "qwen", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop-w", menuBarIdPrefix: "")
+        // Qwen（千问 Token Plan）：单账号卡，值为周期剩余百分比；副标题为周期限额重置倒计时（月口径 → clock-stop-m 图标）
+        static let qwen = CardStyle(icon: "qwen", name: "Qwen", platformID: "qwen", iconSize: 27.75, checkin: false, showsExpire: true, expireIconSymbol: "clock-stop-m", menuBarIdPrefix: "")
     }
 
     // TRAE 多账号卡片容器（动态重建，账号列表变化时刷新）
@@ -2345,7 +2345,7 @@ final class BalancePanelView: NSView {
             let info: NSStackView?
             if isCurrent && style.showsExpire {
                 var rowViews: [NSView] = []
-                // 第二行图标可选：重置倒计时按周期用 clock-stop-w（Qwen 7 天）/ clock-stop-m（WB/TRAE/Codex 月），
+                // 第二行图标可选：重置倒计时按周期用 clock-stop-m（WB/TRAE/Codex/Qwen 月），
                 // 周期不确定（ZCode 套餐到期）用 clock-stop，DS/ZhiPu 用 external-link 打开页面图标
                 if let symbol = style.expireIconSymbol {
                     // TRAE 已停止维护：用原生 xmark（icons 里没有 xmark.svg）。

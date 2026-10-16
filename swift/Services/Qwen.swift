@@ -1,20 +1,24 @@
-// Qwen.swift — 千问 Token Plan（platform.qianwenai.com）周额度查询
+// Qwen.swift — 千问 Token Plan（platform.qianwenai.com）周期额度查询
 // 登录态采集与落盘缓存走 BrowserCookieStore 通用管线（与 ZhiPu 同款）：
 // Edge/Chrome Cookies 的 login_qianwenai_ticket（v10 解密）→ 缓存 qwen_ticket.json，
 // 后续刷新不碰钥匙串；接口报登录态失效时清缓存重采一轮自愈。
 // 拿到 ticket 后调千问控制台网关 api.json（BroadScopeAspnGateway，实现取回自
 // git 67eeb0e~1 Services/Qianwen.swift）：先从计费页 HTML 抓 SEC_TOKEN，
-// 再查 subscription / quota-config / usage，按周用量百分比推算本周剩余额度。
+// 再查 subscription / quota-config / usage，按周期用量百分比推算剩余额度。
 import Foundation
 
 enum QwenService {
-    /// 周额度快照（套餐口径）
+    /// 周期额度快照（套餐口径）。
+    /// ⚠️ 字段名 `week*` 是历史命名：2026-09-24 千问把计费口径从「周」改成「月」
+    /// （quota-config 的 weekly → five_hour + monthly，usage 的 per1Week* → per1Month*），
+    /// 这里沿用旧字段名以免动 Config.QwenAmount 的落盘键（改键会打回旧缓存配置），
+    /// 但取值口径已是月度：weekRem/weekLimit = 本月剩余/月上限，weekResetAt = 月度重置时刻。
     struct Quota {
-        let weekRem: Double         // 本周剩余（额度单位）
-        let weekLimit: Double       // 周额度上限
+        let weekRem: Double         // 本周期剩余（额度单位）
+        let weekLimit: Double       // 周期额度上限
         let remainingDays: Int      // API 回传的剩余自然日（>0=还剩几天，0=今天，负数=已过期）
         let expireAt: TimeInterval  // 套餐到期时间戳（秒），0 = 未知
-        let weekResetAt: TimeInterval  // 7 天限额重置时间戳（秒，usage.per1WeekResetTime），0 = 未知
+        let weekResetAt: TimeInterval  // 周期限额重置时间戳（秒，usage.per1MonthResetTime），0 = 未知
     }
 
     /// 登录态 Cookie 名与站点（与浏览器站内一致）
@@ -82,17 +86,23 @@ enum QwenService {
         case bad
     }
 
-    /// 调千问控制台网关 api.json（BroadScopeAspnGateway），返回 data.DataV2.data.data 载荷
+    /// 调千问控制台网关 api.json（BroadScopeAspnGateway），返回 data.DataV2.data.data 载荷。
+    /// ⚠️ 该网关响应抖动极大（2026-10-14 实测：中位 ~3.2s、尾部 22.7s，偶发
+    /// `SSL: UNEXPECTED_EOF_WHILE_READING` 与 `-1005 连接丢失`，单发失败率 8~12%），
+    /// 且**只有 Qwen 走这个网关**（其余平台零失败）⇒ 必须带重试，否则每轮刷新都有
+    /// 一成概率落到「刷新失败」分支，footer 与系统通知会频繁报错。
+    /// 注意：timeout 仍取 15s（网关 P99 超出也无更好办法——单个接口拉长会顶穿
+    /// performRefresh 的 45s totalBudget，见 TRAPS「Qwen 网关抖动」）。
     private static func gateway(api: String, dataJson: String, secToken: String, ticket: String) async -> GatewayResult {
         let params = "{\"Api\":\"\(api)\",\"Data\":\(dataJson),\"V\":\"1.0\"}"
         let body = "product=sfm_bailian&action=BroadScopeAspnGateway&sec_token=\(formEncode(secToken))&region=cn-beijing&params=\(formEncode(params))"
         guard let url = URL(string: "https://cs-data.qianwenai.com/data/api.json?product=sfm_bailian&action=BroadScopeAspnGateway&api=\(formEncode(api))") else { return .bad }
-        let (data, status) = await HTTP.request(url: url, method: "POST", headers: [
+        let (data, status) = await HTTP.requestWithRetry(url: url, method: "POST", headers: [
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "Cookie": "\(cookieName)=\(ticket)",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        ], body: Data(body.utf8), timeout: 15)
+        ], body: Data(body.utf8), timeout: 15, retries: 1, backoff: 1.2)
         // status=0：超时/断网等传输层失败——非登录态问题，调用方直接报网络错误，
         // 不进入「清缓存重采」路径（曾导致超时后再跑一轮 15s，面板「刷新中」卡 30s+）
         guard status != 0 else { return .network }
@@ -107,7 +117,7 @@ enum QwenService {
 
     // MARK: - 配额查询
 
-    /// 查询千问 Token Plan 周额度剩余。ticket 为空静默跳过；
+    /// 查询千问 Token Plan 周期额度剩余。ticket 为空静默跳过；
     /// authFailed=true 表示登录态可能失效（调用方清缓存重采），error 供通知/footer 展示。
     static func fetch(ticket: String) async -> (quota: Quota?, authFailed: Bool, error: String) {
         guard !ticket.isEmpty else { return (nil, false, "") }
@@ -151,18 +161,20 @@ enum QwenService {
         guard let specQuota = quota[specCode] as? [String: Any] else {
             return (nil, false, "接口缺少套餐规格 \(specCode)")
         }
-        let weekly = jsonNum(specQuota["weekly"])
-        let weekPct = (usage["per1WeekPercentage"] as? Double) ?? 0
+        // 2026-09-24 起千问口径为月：quota-config 的该档位给 monthly（另有 five_hour 滚动窗口，无用量接口取不到），
+        // usage 给 per1MonthPercentage / per1MonthResetTime
+        let limit = jsonNum(specQuota["monthly"])
+        let usedPct = (usage["per1MonthPercentage"] as? Double) ?? 0
         // 套餐到期时间：endTime 单位为毫秒，转秒级时间戳
         let expireAt = jsonNum(sub["endTime"]) / 1000.0
         // 直接用 API 返回的 remainingDays（官网同值），避免本地计算偏差
         let remainingDays = (sub["remainingDays"] as? Int) ?? Int(jsonNum(sub["remainingDays"]))
-        guard weekly > 0 else {
-            return (nil, false, "周额度为 0（套餐不含周额度）")
+        guard limit > 0 else {
+            return (nil, false, "月额度为 0（套餐不含月额度）")
         }
-        // 7 天限额重置时间：usage.per1WeekResetTime 毫秒 → 秒
-        let weekResetAt = jsonNum(usage["per1WeekResetTime"]) / 1000.0
-        return (Quota(weekRem: weekly * (1 - weekPct), weekLimit: weekly,
+        // 周期限额重置时间：usage.per1MonthResetTime 毫秒 → 秒
+        let weekResetAt = jsonNum(usage["per1MonthResetTime"]) / 1000.0
+        return (Quota(weekRem: limit * (1 - usedPct), weekLimit: limit,
                       remainingDays: remainingDays, expireAt: expireAt,
                       weekResetAt: weekResetAt), false, "")
     }

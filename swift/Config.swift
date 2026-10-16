@@ -248,7 +248,7 @@ struct AppConfig: Codable {
     /// ZhiPu（智谱 BigModel）余额：各平台独立刷新开关 + 手填 token 覆盖（空 = 自动从浏览器 Cookies 解密）
     var bigmodelRefreshEnabled: Bool = true
     var bigmodelTokenOverride: String = ""
-    /// Qwen（千问 Token Plan）周额度：独立刷新开关 + 手填 ticket 覆盖（空 = 自动从浏览器 Cookies 解密）
+    /// Qwen（千问 Token Plan）周期额度：独立刷新开关 + 手填 ticket 覆盖（空 = 自动从浏览器 Cookies 解密）
     var qwenRefreshEnabled: Bool = true
     var qwenTicketOverride: String = ""
     var traeRefreshEnabled: Bool = true
@@ -869,8 +869,9 @@ struct BalanceCache: Codable {
     var bigmodelInflow: Double?
     var bigmodelCycleStartInflow: Double?
     var bigmodelCycleStartBalance: Double?
-    /// Qwen（千问 Token Plan）周额度快照（重启后秒显，随下一轮刷新覆盖）
-    /// weekResetAt = 7 天限额重置时间戳（秒）；可选兼容旧缓存（缺字段解码为 nil）
+    /// Qwen（千问 Token Plan）周期额度快照（重启后秒显，随下一轮刷新覆盖）
+    /// weekResetAt = 周期限额重置时间戳（秒）；可选兼容旧缓存（缺字段解码为 nil）
+    /// ⚠️ week* 字段名是历史命名，2026-09-24 起口径为月（详见 Services/Qwen.swift 顶部）
     struct QwenAmount: Codable { let weekRem: Double; let weekLimit: Double; let remainingDays: Int; let expireAt: Double; let weekResetAt: Double? }
     var qwen: QwenAmount?
     var wbAccounts: [String: WbAmount] = [:]

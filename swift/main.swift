@@ -144,7 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var cacheBigModelCycleStartBalance: Double?
     /// 点阵已用比（-1 = 无数据）
     private var cacheBigModelUsedRatio: Double = -1
-    /// Qwen（千问 Token Plan）周额度快照缓存（卡片值=周剩余百分比，副标题=到期倒计时）
+    /// Qwen（千问 Token Plan）周期额度快照缓存（卡片值=周期剩余百分比，副标题=到期倒计时）
     private var cacheQwen: QwenService.Quota?
     var cacheWb: (remain: Double, total: Double)?
     /// WorkBuddy 多账号额度缓存：uid → (remain, total)，用于面板显示每号余额卡片
@@ -176,6 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var zhipuPulsingTracker = PulsingTracker()
     private var qwenPulsingTracker = PulsingTracker()
     private var codexPulsingTracker = PulsingTracker()
+    /// Qwen 网关连败计数（去抖用）：该网关单发失败率实测 8~12%（抖动型，非登录态问题），
+    /// 单轮失败不立刻进 failedServices / 弹通知，**连续 2 轮**都失败才报，避免 footer 与
+    /// 系统通知被偶发抖动刷屏；任一轮成功即归零。持续故障仍会在 2 轮后照常报出。
+    private var qwenConsecutiveFailures = 0
 
     /// 点阵脉冲状态机（全平台共用）：跟踪 usedRatio 的上次值，上升 → pulsing=true（被消耗），
     /// 稳定或回升 → pulsing=false；首轮（无 prev 记录）不触发。每平台一个实例，多号平台按 uid 分键。
@@ -1101,8 +1105,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             zpSnap.dayDeltaDirection = d.direction
         }
         s.zhipuAccounts = [zpSnap]
-        // Qwen 卡片：千问 Token Plan 周剩余百分比（同多号管线单元素，uid 恒 "qwen"，
-        // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.qwen）；副标题为 7 天限额重置倒计时
+        // Qwen 卡片：千问 Token Plan 周期剩余百分比（同多号管线单元素，uid 恒 "qwen"，
+        // 无前缀 menuBarId → 右键菜单 id 恰为 MenuBarPrefix.qwen）；副标题为周期限额重置倒计时
         var qwSnap = AccountCardSnapshot(uid: "qwen", nickname: "", isCurrent: true)
         if let q = cacheQwen, q.weekLimit > 0 {
             let pct = q.weekRem / q.weekLimit * 100
@@ -1110,7 +1114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             qwSnap.usedRatio = min(1, max(0, 1 - pct / 100))
             qwSnap.pulsing = qwenPulsingTracker.isPulsing("main")
             qwSnap.inMenuBar = isMenuBarVisible(id: MenuBarPrefix.qwen, isCurrent: true)
-            // 副标题优先 = 7 天限额重置倒计时（同 WB/TRAE resetAt 口径）；
+            // 副标题优先 = 周期限额重置倒计时（同 WB/TRAE resetAt 口径）；
             // 旧缓存无该字段或重置时刻已过 → 回落原套餐到期倒计时
             if q.weekResetAt > 0, let text = Self.expireCountdownText(endsAt: q.weekResetAt) {
                 qwSnap.expireSegments = text
@@ -1123,7 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
             }
         }
-        // Qwen 点阵恒显示：usedRatio=0 表示「本周一点没用」（满格全绿），有展示意义——
+        // Qwen 点阵恒显示：usedRatio=0 表示「本周期一点没用」（满格全绿），有展示意义——
         // 与 DS 的「0=没配置额度」语义不同，不套用 DS 的未消耗隐藏口径
         if let q = cacheQwen, q.weekLimit > 0 {
             let d = dayDeltaText(platform: "qwen",
@@ -1355,7 +1359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                               decimals: 2, percent: false, prefix: "¥") {
             s.usageRows.append(row)
         }
-        // Qwen 用量行：周剩余额度百分比的消耗（百分点，同 ZCode 行口径）
+        // Qwen 用量行：周期剩余额度百分比的消耗（百分点，同 ZCode 行口径）
         if let q = cacheQwen, q.weekLimit > 0,
            let row = usageRow(icon: "qwen", name: "Qwen", platform: "qwen",
                               accounts: [(uid: "qwen", current: q.weekRem / q.weekLimit * 100)],
@@ -2189,7 +2193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 长文阅读类弹窗：内容宽 +8 抵消 sidePadding 增量，再 +20 加宽正文行宽
         shell.contentWidth = DialogMetrics.width + 8 + 20
         shell.addInfo("菜单栏常驻小工具，实时聚合多个 AI 服务的余额与额度。\n\n"
-            + "• DeepSeek 余额（官方 API 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• Qwen Token Plan 周额度（浏览器登录态自动采集）\n• WorkBuddy 积分（导入本机登录账号，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（本机 JWT + JSON 导入，一键切号）\n• Codex 额度（auth.json 导入，一键切号）\n\n"
+            + "• DeepSeek 余额（官方 API 查询）\n• ZhiPu 余额（浏览器登录态自动采集）\n• Qwen Token Plan 额度（浏览器登录态自动采集）\n• WorkBuddy 积分（导入本机登录账号，自动签到）\n• TRAE 积分（本地解密，自动签到）\n• ZCode 额度（本机 JWT + JSON 导入，一键切号）\n• Codex 额度（auth.json 导入，一键切号）\n\n"
             + "多账号管理 · 自动签到 · 日/周用量统计 · 应用内自更新\n\n"
             + "配置存于 ~/Library/Application Support/com.local.ibalance\n版本 v\(build)")
         shell.addButton("知道了", keyEquivalent: "\r")
@@ -2585,7 +2589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             entries.append((id: MenuBarPrefix.zhipu, symbol: "¥", value: fmtAmountCommas(bal, decimals: 2), isCurrent: true, icon: "zhipu"))
         }
 
-        // 1c. Qwen（千问 Token Plan；周额度剩余百分比，同 ZCode 行口径）
+        // 1c. Qwen（千问 Token Plan；周期额度剩余百分比，同 ZCode 行口径）
         if let q = cacheQwen, q.weekLimit > 0 {
             let pct = fmtAmountCommas(q.weekRem / q.weekLimit * 100, decimals: 1) + "%"
             entries.append((id: MenuBarPrefix.qwen, symbol: "", value: pct, isCurrent: true, icon: "qwen"))
@@ -3088,12 +3092,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    /// Qwen（千问 Token Plan）周额度刷新：手填覆盖 ticket 优先，否则扫浏览器 Cookies 解密登录态，
-    /// 调控制台网关取周配额。无凭据静默跳过（对齐 ZhiPu 行为）。
+    /// Qwen（千问 Token Plan）周期额度刷新：手填覆盖 ticket 优先，否则扫浏览器 Cookies 解密登录态，
+    /// 调控制台网关取周期配额。无凭据静默跳过（对齐 ZhiPu 行为）。
     private func refreshOneQwen(_ cfg: AppConfig, seq: Int64) async {
         let t0 = Date()
         guard cfg.qwenRefreshEnabled else {
             Logger.log(.refresh, "[\(seq)] Qwen: disabled, skipped")
+            qwenConsecutiveFailures = 0
             if ownsRefresh(seq) { failedServices.remove("Qwen") }
             return
         }
@@ -3110,18 +3115,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         if let q = result.quota {
             cacheQwen = q
-            // 用量记录：口径 = 周剩余额度百分比（同 ZCode 行的百分点口径；
-            // fetch 已保证 weekLimit > 0）。周重置跳涨由 UsageStore 基线平移承接，用量不清零。
+            // 用量记录：口径 = 周期剩余额度百分比（同 ZCode 行的百分点口径；
+            // fetch 已保证 weekLimit > 0）。周期重置跳涨由 UsageStore 基线平移承接，用量不清零。
             UsageStore.observe(platform: "qwen", uid: "qwen", value: q.weekRem / q.weekLimit * 100, increasing: false)
             let ratio = q.weekLimit > 0 ? min(1, max(0, (q.weekLimit - q.weekRem) / q.weekLimit)) : 0
             _ = qwenPulsingTracker.observe("main", ratio: ratio)
+            qwenConsecutiveFailures = 0
             failedServices.remove("Qwen")
             Logger.log(.refresh, "[\(seq)] Qwen: OK weekRem=\(q.weekRem)/\(q.weekLimit) used=\(Int(ratio*100))% days=\(q.remainingDays) (elapsed=\(Int(Date().timeIntervalSince(t0)*1000))ms)")
         }
         if !result.error.isEmpty {
-            notify("Qwen 配额查询", result.error)
-            failedServices.insert("Qwen")
-            Logger.log(.refresh, "[\(seq)] Qwen: ERROR \(result.error)")
+            // 去抖：单轮失败多为网关抖动（retry 后仍可能中招），连败 2 轮才报错
+            qwenConsecutiveFailures += 1
+            if qwenConsecutiveFailures >= 2 {
+                notify("Qwen 配额查询", result.error)
+                failedServices.insert("Qwen")
+            } else {
+                failedServices.remove("Qwen")
+            }
+            Logger.log(.refresh, "[\(seq)] Qwen: ERROR (连败 \(qwenConsecutiveFailures) 轮) \(result.error)")
         }
         updateTitle(tag: "qwen-\(seq)")
     }
@@ -3130,6 +3142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func qwenFetch(cfg: AppConfig, seq: Int64) async -> (quota: QwenService.Quota?, authFailed: Bool, error: String) {
         guard let ticket = QwenService.resolveTicket(override: cfg.qwenTicketOverride), !ticket.isEmpty else {
             Logger.log(.refresh, "[\(seq)] Qwen: no login cookie found, skipped")
+            qwenConsecutiveFailures = 0
             if ownsRefresh(seq) { failedServices.remove("Qwen") }
             return (nil, false, "")
         }
