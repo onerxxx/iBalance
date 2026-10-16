@@ -28,10 +28,12 @@ enum ZcodeService {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return json["deviceMid"] as? String
     }()
-    /// 本机已安装 ZCode 客户端版本（app_version 取真实客户端口径，随客户端更新）
-    private static let zcodeAppVersion: String? =
-        Bundle(url: URL(fileURLWithPath: "/Applications/ZCode.app"))?
-            .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    /// 本机已安装 ZCode 客户端版本（app_version 取真实客户端口径，随客户端更新）。
+    /// 经 LaunchServices 按 bundle id 定位（ZCode 可装在任意卷/目录，勿写死 /Applications）
+    private static let zcodeAppVersion: String? = {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "dev.zcode.app") else { return nil }
+        return Bundle(url: url)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    }()
     /// bigmodel 渠道付费 Coding Plan（Lite 等档位）的 API Key 用量端点；
     /// 返回 data.level（套餐档）+ data.limits[]（usage=总额度 currentValue=已用 remaining=剩余，
     /// nextResetTime=窗口重置毫秒戳；同一套餐有 5 小时窗口与月度窗口两条，额度数值相同）
@@ -51,8 +53,8 @@ enum ZcodeService {
     /// 从 ~/.zcode/v2/config.json 读取当前登录的 Coding Plan 账号。
     /// 凭据为 provider 键下 options.apiKey：付费档 API Key（bigmodel）或 JWT（其余），
     /// JWT 解 payload（不验签）取 user_id 作为账号标识；API Key 无法自解析 uid，
-    /// 取同文件 start-plan JWT 的 user_id（同一 bigmodel 账号两个键并存），
-    /// 均无 JWT 时退回 credentials.json 当前登录账号的 uid。
+    /// 取当前登录会话 JWT 的 user_id（credentials.json zcodejwttoken 优先，
+    /// config.json start-plan 键回落），均无 JWT 时退回 credentials.json 当前登录账号的 uid。
     static func importCurrentAccount() -> ZcodeImportResult {
         guard FileManager.default.fileExists(atPath: configPath) else {
             return .failure("未找到 ~/.zcode/v2/config.json，请先安装并登录 ZCode")
@@ -70,15 +72,11 @@ enum ZcodeService {
         guard let (_, apiKey) = keyPairs.first else {
             return .failure("ZCode 配置中未找到 Coding Plan 登录信息，请先在 ZCode 中登录")
         }
-        // JWT 自解析 uid；API Key（bigmodel 付费档）取同文件 start-plan JWT 的 user_id
-        //（同一 bigmodel 账号两个键并存），均无 JWT 时退回 credentials.json 当前登录账号 uid
+        // JWT 自解析 uid；API Key 无法自解析，取当前登录会话 JWT 的 user_id
+        //（credentials.json zcodejwttoken 优先，config.json start-plan 键回落），
+        // 均无 JWT 时退回 credentials.json 当前登录账号 uid
         let uid = jwtUserId(from: apiKey)
-            ?? providerKeys.filter { $0.hasSuffix("start-plan") }
-                .compactMap { key -> String? in
-                    guard let opts = (provider[key] as? [String: Any])?["options"] as? [String: Any],
-                          let ak = opts["apiKey"] as? String, !ak.isEmpty else { return nil }
-                    return jwtUserId(from: ak)
-                }.first
+            ?? currentLoginJWT()?.uid
             ?? currentUserInfo()?.uid
         guard let uid, !uid.isEmpty else {
             return .failure("无法解析 ZCode 登录令牌")
@@ -94,9 +92,16 @@ enum ZcodeService {
         return account.uid
     }
 
-    /// 当前登录号的体验套餐（start-plan）JWT：config.json start-plan 键的 apiKey（均为 JWT）。
-    /// 体验套餐余额（billing/balance）只认 JWT，付费档 API Key 查询为 401；仅当前登录号持有。
-    static func currentStartPlanJWT() -> (uid: String, token: String)? {
+    /// 当前登录号的会话 JWT：credentials.json zcodejwttoken（客户端 restoreCachedSession
+    /// 的活跃令牌，登录/切号后即时更新）优先；读不到或非 JWT 再回落 config.json
+    /// start-plan 键（均为 JWT；ZCode 3.14.4 起重新登录后该键可能滞留上一登录号的旧 JWT）。
+    private static func currentLoginJWT() -> (uid: String, token: String)? {
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: credentialsPath)),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+           let tok = json["zcodejwttoken"].flatMap(decryptCredential), isJWT(tok),
+           let uid = jwtUserId(from: tok) {
+            return (uid, tok)
+        }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let provider = json["provider"] as? [String: Any] else { return nil }
@@ -107,6 +112,12 @@ enum ZcodeService {
             return (uid, ak)
         }
         return nil
+    }
+
+    /// 当前登录号的体验套餐（start-plan）JWT（来源见 currentLoginJWT）。
+    /// 体验套餐余额（billing/balance）只认 JWT，付费档 API Key 查询为 401；仅当前登录号持有。
+    static func currentStartPlanJWT() -> (uid: String, token: String)? {
+        currentLoginJWT()
     }
     /// 解 JWT payload 的 user_id（JWT 为 HS256 签名，客户端不验签，仅取 payload）
     private static func jwtUserId(from jwt: String) -> String? {
