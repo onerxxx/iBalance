@@ -1,7 +1,11 @@
 // WbTokens.swift — WorkBuddy Token 用量数据源（与 ZCode 共用 Token 统计子面板视图）
-// 数据源 = ~/.workbuddy/traces/<pid>/trace_*.json：WB 每次 agent 运行落一个 trace 文件，
-// trace.modelInfo 记录该次运行的模型列表与 token 累计（totalInputTokens/totalOutputTokens/
-// totalCachedTokens/callCount），trace.startedAt 为运行起点（ISO8601，各 trace 互相独立、
+// 数据源 = ~/.workbuddy/traces/<pid>/trace_*.json|*.jsonl：WB 每次 agent 运行落一个 trace 文件。
+// ⚠️ **两种格式都要认**（2026-10-11 起 WB 改用 .jsonl 逐行事件流，旧代码只认 .json，统计因此归零）：
+//   - `.json`：整份一个 JSON 对象，`trace.modelInfo` 直接可读；
+//   - `.jsonl`：每行一个事件，`modelInfo` 只在部分行（trace_update / trace_end）出现且为**累计快照**，
+//     取最后一行为终值（见 `parseJSONL`）。
+// `trace.modelInfo` 记录该次运行的模型列表与 token 累计（totalInputTokens/totalOutputTokens/
+// totalCachedTokens/callCount），`trace.startedAt` 为运行起点（ISO8601，各 trace 互相独立、
 // 数值为该次运行的增量，跨文件直接求和）。
 // 项目归属 = trace.sessionId → workbuddy.db sessions 表的 cwd（含已删除会话，保留历史归属），
 // 项目名取 cwd 末段；映射不到的归入「(未知项目)」。
@@ -113,7 +117,10 @@ enum WBTokenStore {
         var fresh: [String: FileContribution] = [:]
         var pending: [(path: String, mtime: Date, size: Int)] = []
         for case let url as URL in walker {
-            guard url.lastPathComponent.hasPrefix("trace_"), url.pathExtension == "json" else { continue }
+            // ⚠️ 扩展名**两种都要收**：WB 自 2026-10-11 起把 trace 从「单个 .json（整份 JSON 对象）」
+            // 改成「.jsonl（逐行事件流）」，只认 "json" 会让新会话全部漏掉（面板 10-11 起归零的根因）
+            let ext = url.pathExtension
+            guard url.lastPathComponent.hasPrefix("trace_"), ext == "json" || ext == "jsonl" else { continue }
             let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
             guard let mtime = vals?.contentModificationDate, let size = vals?.fileSize else { continue }
             let path = url.path
@@ -335,6 +342,9 @@ enum WBTokenStore {
         let empty = FileContribution(mtime: mtime, size: size, model: "", sessionId: "",
                                      tokens: 0, outputTokens: 0, calls: 0,
                                      startedAt: nil, dayStart: nil)
+        if (path as NSString).pathExtension == "jsonl" {
+            return parseJSONL(data, mtime: mtime, size: size) ?? empty
+        }
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let trace = root["trace"] as? [String: Any],
               let mi = trace["modelInfo"] as? [String: Any] else { return empty }
@@ -350,6 +360,47 @@ enum WBTokenStore {
         return FileContribution(mtime: mtime, size: size, model: model, sessionId: sid,
                                 tokens: tokens, outputTokens: output, calls: calls,
                                 startedAt: startedAt, dayStart: dayStart)
+    }
+
+    /// `.jsonl` 逐行事件流（WB ≥ 2026-10-11）的解析。
+    ///
+    /// 结构：每行一个事件 `{type:"trace_start"|"span_start"|"span_end"|"trace_update"|"trace_end", ...}`，
+    /// `trace` / `modelInfo` **只在部分行出现**，且 `modelInfo` 是**累计快照**（同一 trace 会多次
+    /// `trace_update` 递增 callCount/总 token）⇒ 取**最后一个**含 `modelInfo` 的 trace 对象即终值。
+    /// 纯工具调用类 trace（如只有 Bash）压根不带 modelInfo ⇒ 返回 nil，由调用方落成空贡献。
+    ///
+    /// 性能：文件可能数 MB、上千行，逐行 `JSONSerialization` 太贵 ⇒ 先做字节级 needle 命中
+    /// （`"modelInfo"` 只出现在极少数行），未命中的行直接跳过。
+    private static let modelInfoNeedle = Data("\"modelInfo\"".utf8)
+
+    private static func parseJSONL(_ data: Data, mtime: Date, size: Int) -> FileContribution? {
+        var model = "unknown"
+        var tokens: Int64 = 0
+        var output: Int64 = 0
+        var calls: Int64 = 0
+        var sid = ""
+        var started: TimeInterval?
+        var found = false
+        for line in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
+            guard line.range(of: modelInfoNeedle) != nil else { continue }
+            guard let root = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+                  let trace = root["trace"] as? [String: Any],
+                  let mi = trace["modelInfo"] as? [String: Any] else { continue }
+            found = true
+            let input = (mi["totalInputTokens"] as? NSNumber)?.int64Value ?? 0
+            output = (mi["totalOutputTokens"] as? NSNumber)?.int64Value ?? 0
+            tokens = input + output
+            calls = (mi["callCount"] as? NSNumber)?.int64Value ?? 0
+            if let m = (mi["models"] as? [Any])?.compactMap({ $0 as? String }).first { model = m }
+            if let s = trace["sessionId"] as? String, !s.isEmpty { sid = s }
+            if let st = (trace["startedAt"] as? String).flatMap({ isoTimestamp(iso: $0) }) { started = st }
+        }
+        guard found else { return nil }
+        let dayStart = started
+            .map { Calendar.current.startOfDay(for: Date(timeIntervalSince1970: $0)).timeIntervalSince1970 }
+        return FileContribution(mtime: mtime, size: size, model: model, sessionId: sid,
+                                tokens: tokens, outputTokens: output, calls: calls,
+                                startedAt: started, dayStart: dayStart)
     }
 
     /// ISO8601 → 原始时间戳（秒）。容忍毫秒位有无：截前 19 位补 Z 再解析。
