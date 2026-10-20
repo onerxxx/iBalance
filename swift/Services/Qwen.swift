@@ -2,8 +2,9 @@
 // 登录态采集与落盘缓存走 BrowserCookieStore 通用管线（与 ZhiPu 同款）：
 // Edge/Chrome Cookies 的 login_qianwenai_ticket（v10 解密）→ 缓存 qwen_ticket.json，
 // 后续刷新不碰钥匙串；接口报登录态失效时清缓存重采一轮自愈。
-// 拿到 ticket 后调千问控制台网关 api.json（BroadScopeAspnGateway，实现取回自
-// git 67eeb0e~1 Services/Qianwen.swift）：先从计费页 HTML 抓 SEC_TOKEN，
+// 拿到 ticket 后调千问控制台网关（BroadScopeAspnGateway，实现取回自
+// git 67eeb0e~1 Services/Qwen.swift）：先取 sec_token（2026-10-18 起由
+// platform-home 的 /tool/user/info.json 下发，不再内联在计费页 HTML 里），
 // 再查 subscription / quota-config / usage，按周期用量百分比推算剩余额度。
 import Foundation
 
@@ -24,13 +25,14 @@ enum QwenService {
     /// 登录态 Cookie 名与站点（与浏览器站内一致）
     private static let cookieName = "login_qianwenai_ticket"
     private static let cacheFilename = "qwen_ticket.json"
-    private static let billingURL = "https://platform.qianwenai.com/home/billing/subscription/token-plan-individual"
+    /// sec_token 下发接口（等同前端 shared.js 的 bP()：cn 站固定 platform-home 域名）
+    private static let secTokenURL = URL(string: "https://platform-home.qianwenai.com/tool/user/info.json")
 
     // MARK: - 凭据解析（手填覆盖 > 本地缓存 > 浏览器采集）
 
-    static func resolveTicket(override: String) -> String? {
-        BrowserCookieStore.resolve(override: override, cookieName: cookieName,
-                                   hostLike: "%qianwenai.com%", cacheFilename: cacheFilename, logTag: "[Qwen]") { row, password in
+    static func resolveTicket(override: String) -> BrowserCookieStore.Resolution {
+        BrowserCookieStore.resolveDetailed(override: override, cookieName: cookieName,
+                                           hostLike: "%qianwenai.com%", cacheFilename: cacheFilename, logTag: "[Qwen]") { row, password in
             // 老版本浏览器：value 列即明文 ticket
             let trimmed = row.plain.trimmingCharacters(in: .whitespacesAndNewlines)
             if looksLikeTicket(trimmed) { return trimmed }
@@ -69,13 +71,45 @@ enum QwenService {
         return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
     }
 
-    /// 正则提取首个捕获组
-    private static func regexFirstGroup(_ pattern: String, in text: String) -> String? {
-        guard let re = try? NSRegularExpression(pattern: pattern),
-              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-              m.numberOfRanges > 1,
-              let r = Range(m.range(at: 1), in: text) else { return nil }
-        return String(text[r])
+    // MARK: - sec_token
+
+    /// sec_token 取值结果：token 成功；notLoggedIn = 服务端明确要求登录（Cookie 失效）；
+    /// network = 传输层失败；bad = 其它异常
+    private enum SecTokenResult {
+        case token(String)
+        case notLoggedIn
+        case network
+        case bad(String)
+    }
+
+    /// 取控制台 sec_token（调网关必带）。对齐前端 shared.js：GET /tool/user/info.json
+    /// → `{ code: "200", data: { secToken } }`；未登录返回 `code: "ConsoleNeedLogin"`。
+    /// ⚠️ 2026-10-18 前该值内联在计费页 HTML（`SEC_TOKEN: "..."`），平台改版后 HTML 里
+    /// 已彻底没有（页面退化成 11KB 的空壳 SPA），旧正则必然取不到 —— 那会把「取不到
+    /// sec_token」误判成登录态失效，进而每轮都在「清缓存重采 → 又失败」里空转。
+    private static func fetchSecToken(ticket: String, ua: String) async -> SecTokenResult {
+        guard let url = secTokenURL else { return .bad("URL错误") }
+        let (data, status) = await HTTP.requestWithRetry(url: url, headers: [
+            "Accept": "application/json",
+            "Cookie": "\(cookieName)=\(ticket)",
+            "User-Agent": ua
+        ], timeout: 15, retries: 1, backoff: 1.2)
+        if status == 0 { return .network }
+        guard status == 200, let data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .bad("HTTP \(status)（登录态可能已失效）")
+        }
+        let code = (json["code"] as? String) ?? (json["code"] as? Int).map(String.init) ?? ""
+        if code == "ConsoleNeedLogin" { return .notLoggedIn }
+        guard code == "200",
+              let inner = json["data"] as? [String: Any],
+              let sec = inner["secToken"] as? String,
+              !sec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let msg = (json["message"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? "code=\(code.isEmpty ? "?" : code)"
+            return .bad("未取到 sec_token（\(msg)）")
+        }
+        return .token(sec)
     }
 
     /// 网关调用结果：payload 成功；network 网络层失败（超时/断网，status=0，
@@ -122,18 +156,16 @@ enum QwenService {
     static func fetch(ticket: String) async -> (quota: Quota?, authFailed: Bool, error: String) {
         guard !ticket.isEmpty else { return (nil, false, "") }
         let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        guard let pageURL = URL(string: billingURL) else { return (nil, false, "URL错误") }
-        let (htmlData, status) = await HTTP.requestWithRetry(url: pageURL, headers: [
-            "Cookie": "\(cookieName)=\(ticket)",
-            "User-Agent": ua
-        ], timeout: 15)
-        if status == 0 { return (nil, false, "网络错误") }
-        guard status == 200, let htmlData,
-              let html = String(data: htmlData, encoding: .utf8) else {
-            return (nil, true, "HTTP \(status)（登录态可能已失效）")
-        }
-        guard let secToken = regexFirstGroup("SEC_TOKEN:\\s*\"([^\"]+)\"", in: html) else {
-            return (nil, true, "未取到 SEC_TOKEN（登录态可能已失效）")
+        let secToken: String
+        switch await fetchSecToken(ticket: ticket, ua: ua) {
+        case .token(let t):
+            secToken = t
+        case .notLoggedIn:
+            return (nil, true, "登录态已失效（请在浏览器重新登录千问）")
+        case .network:
+            return (nil, false, "网络错误")
+        case .bad(let msg):
+            return (nil, true, msg)
         }
         let cornerstone = "{\"domain\":\"platform.qianwenai.com\",\"consoleSite\":\"QIANWENAI\",\"console\":\"ONE_CONSOLE\",\"xsp_lang\":\"zh-CN\",\"protocol\":\"V2\",\"productCode\":\"p_efm\"}"
         let apis: [(name: String, api: String, dataJson: String)] = [

@@ -35,23 +35,40 @@ enum BrowserCookieStore {
         let enc: Data          // encrypted_value 列（v10 密文或空）
         let plain: String      // value 列（老版本明文）
         let lastAccess: Int64
+        let expiresUTC: Int64  // Chrome 纪元（1601-01-01）微秒；0 = 会话 Cookie（无过期时间）
         let profile: String    // 日志定位用：Profile 目录名
+    }
+
+    /// 登录态解析结果。token 为空且 loginExpired=true ⇒ 浏览器里**有该 Cookie 行但已全部过期**
+    /// （区别于从未登录过）：必须在浏览器重新登录才能恢复，重采/清缓存都救不回来。
+    struct Resolution {
+        let token: String?
+        let loginExpired: Bool
+    }
+
+    static func resolve(override: String, cookieName: String, hostLike: String,
+                        cacheFilename: String, logTag: String,
+                        decode: (CookieRow, Data) -> String?) -> String? {
+        resolveDetailed(override: override, cookieName: cookieName, hostLike: hostLike,
+                        cacheFilename: cacheFilename, logTag: logTag, decode: decode).token
     }
 
     /// 通用采集管线：手填覆盖值非空时直接使用；其次读本地缓存（零权限开销）；
     /// 否则扫描各浏览器 Profile 的 Cookies 库（确认存在目标行才取主密钥）。
     /// decode：行 → 登录态字符串（各平台自带校验，nil = 该行不可用）。
-    static func resolve(override: String, cookieName: String, hostLike: String,
-                        cacheFilename: String, logTag: String,
-                        decode: (CookieRow, Data) -> String?) -> String? {
-        if !override.isEmpty { return override }
-        if let cached = cachedToken(filename: cacheFilename) { return cached }
+    static func resolveDetailed(override: String, cookieName: String, hostLike: String,
+                                cacheFilename: String, logTag: String,
+                                decode: (CookieRow, Data) -> String?) -> Resolution {
+        if !override.isEmpty { return Resolution(token: override, loginExpired: false) }
+        if let cached = cachedToken(filename: cacheFilename) { return Resolution(token: cached, loginExpired: false) }
 
         struct Hit { let token: String; let lastAccess: Int64 }
         var hits: [Hit] = []
+        var sawExpired = false
         for spec in browserSpecs() where FileManager.default.fileExists(atPath: spec.userDataDir) {
             // 第一步：纯文件读——各 Profile 的 Cookies 库里是否存在目标行（不动钥匙串）
-            let rows = collectRows(spec: spec, cookieName: cookieName, hostLike: hostLike, logTag: logTag)
+            let rows = collectRows(spec: spec, cookieName: cookieName, hostLike: hostLike,
+                                   logTag: logTag, sawExpired: &sawExpired)
             guard !rows.isEmpty else {
                 Logger.log(.refresh, "\(logTag) \(spec.label): 各 Profile 无登录行（\(cookieName)）")
                 continue
@@ -81,14 +98,17 @@ enum BrowserCookieStore {
             }
         }
         // 多 Profile / 多浏览器命中时取 last_access_utc 最大者（最近一次使用会话）
-        guard let best = hits.max(by: { $0.lastAccess < $1.lastAccess }) else { return nil }
+        guard let best = hits.max(by: { $0.lastAccess < $1.lastAccess }) else {
+            return Resolution(token: nil, loginExpired: sawExpired)
+        }
         storeToken(best.token, filename: cacheFilename, source: "浏览器登录态采集", logTag: logTag)
-        return best.token
+        return Resolution(token: best.token, loginExpired: false)
     }
 
     // MARK: Cookie 库读取（纯文件操作，不涉及钥匙串）
 
-    private static func collectRows(spec: BrowserSpec, cookieName: String, hostLike: String, logTag: String) -> [CookieRow] {
+    private static func collectRows(spec: BrowserSpec, cookieName: String, hostLike: String,
+                                    logTag: String, sawExpired: inout Bool) -> [CookieRow] {
         guard let subdirs = try? FileManager.default.contentsOfDirectory(atPath: spec.userDataDir) else {
             Logger.log(.refresh, "\(logTag) \(spec.label): 用户数据目录不可读（TCC/权限）")
             return []
@@ -100,15 +120,20 @@ enum BrowserCookieStore {
                 let dbPath = spec.userDataDir + "/" + sub + "/" + rel
                 guard FileManager.default.fileExists(atPath: dbPath) else { continue }
                 rows.append(contentsOf: cookieRows(dbPath: dbPath, profile: sub,
-                                                   cookieName: cookieName, hostLike: hostLike, logTag: logTag))
+                                                   cookieName: cookieName, hostLike: hostLike,
+                                                   logTag: logTag, sawExpired: &sawExpired))
             }
         }
         return rows
     }
 
     /// 拷贝出 Cookies 库后只读查询目标行的原始数据（不解密）；库不可读返回空数组。
+    /// ⚠️ 过期行（expires_utc 已过）直接丢弃：浏览器的过期 Cookie 根本不会发出，
+    /// 拿它去请求只会稳定拿到「未登录」。曾有 bug 把过期行当有效行采集并落盘缓存，
+    /// 导致每轮刷新都在「鉴权失败 → 清缓存 → 重采到同一条过期行」里死循环。
     private static func cookieRows(dbPath: String, profile: String, cookieName: String,
-                                   hostLike: String, logTag: String) -> [CookieRow] {
+                                   hostLike: String, logTag: String,
+                                   sawExpired: inout Bool) -> [CookieRow] {
         let fm = FileManager.default
         // 浏览器运行中会锁库，复制到临时文件只读访问
         let tmp = NSTemporaryDirectory() + "ibalance-cookies-" + UUID().uuidString
@@ -132,7 +157,7 @@ enum BrowserCookieStore {
 
         var stmt: OpaquePointer?
         // 加密数据在 encrypted_value（v10 密文），旧版明文在 value 列；两列都兼容
-        guard sqlite3_prepare_v2(db, "SELECT encrypted_value, value, last_access_utc FROM cookies WHERE name = ? AND host_key LIKE ?", -1, &stmt, nil) == SQLITE_OK else {
+        guard sqlite3_prepare_v2(db, "SELECT encrypted_value, value, last_access_utc, expires_utc FROM cookies WHERE name = ? AND host_key LIKE ?", -1, &stmt, nil) == SQLITE_OK else {
             return []
         }
         defer { sqlite3_finalize(stmt) }
@@ -140,15 +165,30 @@ enum BrowserCookieStore {
         bindText(stmt, index: 2, hostLike)
 
         var rows: [CookieRow] = []
+        var expired = 0
         while sqlite3_step(stmt) == SQLITE_ROW {
+            let expiresUTC = sqlite3_column_int64(stmt, 3)
+            if isExpired(expiresUTC) { expired += 1; continue }
             let enc = sqlite3_column_blob(stmt, 0).map { p in
                 Data(bytes: p, count: Int(sqlite3_column_bytes(stmt, 0)))
             } ?? Data()
             let plain = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
             rows.append(CookieRow(enc: enc, plain: plain,
-                                  lastAccess: sqlite3_column_int64(stmt, 2), profile: profile))
+                                  lastAccess: sqlite3_column_int64(stmt, 2),
+                                  expiresUTC: expiresUTC, profile: profile))
+        }
+        if expired > 0 {
+            sawExpired = true
+            Logger.log(.refresh, "\(logTag) \(profile): \(expired) 条登录行已过期（\(cookieName)），需在该浏览器重新登录")
         }
         return rows
+    }
+
+    /// expires_utc 是「1601-01-01 起的微秒数」；0 = 会话 Cookie（浏览器关闭即失效，此处视为有效）
+    private static func isExpired(_ expiresUTC: Int64) -> Bool {
+        guard expiresUTC > 0 else { return false }
+        let now = Int64((Date().timeIntervalSince1970 + 11_644_473_600) * 1_000_000)
+        return expiresUTC <= now
     }
 
     // MARK: - v10 解密

@@ -180,6 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 单轮失败不立刻进 failedServices / 弹通知，**连续 2 轮**都失败才报，避免 footer 与
     /// 系统通知被偶发抖动刷屏；任一轮成功即归零。持续故障仍会在 2 轮后照常报出。
     private var qwenConsecutiveFailures = 0
+    /// Qwen 报错通知去重（同一条错误 30 分钟内只弹一次）：刷新间隔 ~2.5min，持续故障
+    /// （例如登录态过期）不去重会整夜刷系统通知；错误文案变化时立即重弹。
+    private var qwenLastNotified: (message: String, at: Date)?
 
     /// 点阵脉冲状态机（全平台共用）：跟踪 usedRatio 的上次值，上升 → pulsing=true（被消耗），
     /// 稳定或回升 → pulsing=false；首轮（无 prev 记录）不触发。每平台一个实例，多号平台按 uid 分键。
@@ -3121,6 +3124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let ratio = q.weekLimit > 0 ? min(1, max(0, (q.weekLimit - q.weekRem) / q.weekLimit)) : 0
             _ = qwenPulsingTracker.observe("main", ratio: ratio)
             qwenConsecutiveFailures = 0
+            qwenLastNotified = nil
             failedServices.remove("Qwen")
             Logger.log(.refresh, "[\(seq)] Qwen: OK weekRem=\(q.weekRem)/\(q.weekLimit) used=\(Int(ratio*100))% days=\(q.remainingDays) (elapsed=\(Int(Date().timeIntervalSince(t0)*1000))ms)")
         }
@@ -3128,7 +3132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // 去抖：单轮失败多为网关抖动（retry 后仍可能中招），连败 2 轮才报错
             qwenConsecutiveFailures += 1
             if qwenConsecutiveFailures >= 2 {
-                notify("Qwen 配额查询", result.error)
+                let changed = qwenLastNotified?.message != result.error
+                let stale = qwenLastNotified.map { Date().timeIntervalSince($0.at) > 1800 } ?? true
+                if changed || stale {
+                    notify("Qwen 配额查询", result.error)
+                    qwenLastNotified = (result.error, Date())
+                }
                 failedServices.insert("Qwen")
             } else {
                 failedServices.remove("Qwen")
@@ -3140,7 +3149,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     /// 单轮 Qwen 查询：解析 ticket（手填 > 缓存 > 浏览器采集）后请求控制台网关
     private func qwenFetch(cfg: AppConfig, seq: Int64) async -> (quota: QwenService.Quota?, authFailed: Bool, error: String) {
-        guard let ticket = QwenService.resolveTicket(override: cfg.qwenTicketOverride), !ticket.isEmpty else {
+        let state = QwenService.resolveTicket(override: cfg.qwenTicketOverride)
+        guard let ticket = state.token, !ticket.isEmpty else {
+            // 浏览器里有该 Cookie 行但已过期：重采/清缓存都没用，只能去浏览器重新登录。
+            // 报错（走连败去抖），否则用户只会看到数值一直停在上次，不知道要重登。
+            if state.loginExpired {
+                Logger.log(.refresh, "[\(seq)] Qwen: 登录 Cookie 已过期，需在浏览器重新登录")
+                return (nil, false, "登录态已过期，请在浏览器重新登录千问（platform.qianwenai.com）")
+            }
             Logger.log(.refresh, "[\(seq)] Qwen: no login cookie found, skipped")
             qwenConsecutiveFailures = 0
             if ownsRefresh(seq) { failedServices.remove("Qwen") }
