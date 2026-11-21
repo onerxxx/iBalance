@@ -1,8 +1,10 @@
 // CodexTokens.swift — Codex Agent Token 用量数据源
-// 数据源 = ~/.codex/sessions/**/rollout-*.jsonl。
+// 数据源 = ~/.codex/sessions/**/rollout-*.jsonl（进行中）与 *.jsonl.zst（已结束会话，
+// 被 Codex 的 rollout 压缩任务归档；macOS 无系统 zstd 解码，走 Vendor/zstd）。
 // 每个 token_count 事件的 last_token_usage 是本轮增量，避免把 total_token_usage
 //（session 内累计值）重复相加；cwd 作为项目归属，turn_context.model 作为模型归属。
 import Cocoa
+import CZstd
 
 enum CodexTokenStore {
     private static let cache = TokenStoreCache(label: "ibalance.codexTokens") { Self.query() }
@@ -36,8 +38,12 @@ enum CodexTokenStore {
         var fresh: [String: FileContribution] = [:]
         var changed = false
         for case let fileURL as URL in walker {
-            guard fileURL.lastPathComponent.hasPrefix("rollout-"),
-                  fileURL.pathExtension == "jsonl",
+            // rollout-*.jsonl = 进行中的会话；rollout-*.jsonl.zst = 已结束会话被
+            // Codex 压缩任务归档（内容同为 JSONL 事件流）。只认 .jsonl 会让压缩后
+            // 的文件全部漏掉 → 无项目 → 整个 Codex 卡片（含 tok/s）消失
+            let name = fileURL.lastPathComponent
+            guard name.hasPrefix("rollout-"),
+                  name.hasSuffix(".jsonl") || name.hasSuffix(".jsonl.zst"),
                   let vals = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
                   let mtime = vals.contentModificationDate, let size = vals.fileSize else { continue }
             let path = fileURL.path
@@ -189,11 +195,18 @@ enum CodexTokenStore {
         try? data.write(to: diskCacheURL, options: .atomic)
     }
 
-    /// 解析单个 rollout 文件；读取失败返回 nil（不进缓存，下轮重试），空用量正常进缓存
+    /// 解析单个 rollout 文件；读取/解压失败返回 nil（不进缓存，下轮重试），空用量正常进缓存
     private static func parseFile(_ url: URL, mtime: Date, size: Int,
                                   isoWithFraction: ISO8601DateFormatter,
                                   isoWithoutFraction: ISO8601DateFormatter) -> FileContribution? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let raw = try? Data(contentsOf: url) else { return nil }
+        let data: Data
+        if url.pathExtension == "zst" {
+            guard let inflated = inflateZstd(raw) else { return nil }
+            data = inflated
+        } else {
+            data = raw
+        }
 
         var cwd: String?
         var currentModel = "Codex"
@@ -227,5 +240,39 @@ enum CodexTokenStore {
                                       tokens: input + output, outputTokens: output))
         }
         return FileContribution(mtime: mtime, size: size, cwd: cwd, usages: usages)
+    }
+
+    /// zstd 解压（流式，天然支持连续多帧）：Codex 压缩产物目前是单帧，
+    /// 但归档实现可能改为追加帧，按帧边界逐段解压更稳。
+    /// 失败返回 nil —— 调用方据此不进缓存、下轮重试；绝不能把「解压失败」
+    /// 当成「这份会话没有用量」，否则一次坏读会让该会话永久缺失。
+    private static func inflateZstd(_ data: Data) -> Data? {
+        guard !data.isEmpty, let stream = ZSTD_createDCtx() else { return nil }
+        defer { _ = ZSTD_freeDCtx(stream) }
+        let chunkSize = 1 << 20
+        var out = Data()
+        var chunk = [UInt8](repeating: 0, count: chunkSize)
+        var frameClosed = false
+        let ok = data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return false }
+            var input = ZSTD_inBuffer(src: base, size: raw.count, pos: 0)
+            while input.pos < input.size {
+                let consumedBefore = input.pos
+                let produced = chunk.withUnsafeMutableBytes { dst -> Int in
+                    var output = ZSTD_outBuffer(dst: dst.baseAddress, size: dst.count, pos: 0)
+                    let ret = ZSTD_decompressStream(stream, &output, &input)
+                    if ZSTD_isError(ret) != 0 { return -1 }
+                    // ret == 0 = 当前帧完整结束；输入同时耗尽即整份文件解完
+                    frameClosed = ret == 0 && input.pos >= input.size
+                    return output.pos
+                }
+                if produced < 0 { return false }
+                if produced > 0 { out.append(contentsOf: chunk[0..<produced]) }
+                // 既没吃进输入也没吐出数据 = 数据被截断，跳出防死循环
+                if input.pos == consumedBefore && produced == 0 { return false }
+            }
+            return frameClosed
+        }
+        return ok ? out : nil
     }
 }

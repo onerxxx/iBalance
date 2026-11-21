@@ -1,34 +1,40 @@
 // WbTokens.swift — WorkBuddy Token 用量数据源（与 ZCode 共用 Token 统计子面板视图）
-// 数据源 = ~/.workbuddy/traces/<pid>/trace_*.json|*.jsonl：WB 每次 agent 运行落一个 trace 文件。
-// ⚠️ **两种格式都要认**（2026-10-11 起 WB 改用 .jsonl 逐行事件流，旧代码只认 .json，统计因此归零）：
-//   - `.json`：整份一个 JSON 对象，`trace.modelInfo` 直接可读；
-//   - `.jsonl`：每行一个事件，`modelInfo` 只在部分行（trace_update / trace_end）出现且为**累计快照**，
-//     取最后一行为终值（见 `parseJSONL`）。
-// `trace.modelInfo` 记录该次运行的模型列表与 token 累计（totalInputTokens/totalOutputTokens/
-// totalCachedTokens/callCount），`trace.startedAt` 为运行起点（ISO8601，各 trace 互相独立、
-// 数值为该次运行的增量，跨文件直接求和）。
-// 项目归属 = trace.sessionId → workbuddy.db sessions 表的 cwd（含已删除会话，保留历史归属），
-// 项目名取 cwd 末段；映射不到的归入「(未知项目)」。
-// 口径与 ZCode 一致：总计 = input + output（cache 是 input 子集不另加）。
-// 文件总量上千个（数百 MB），全量重解析需数秒——按 (mtime,size) 做按文件增量缓存，
-// 未变文件直接复用单文件贡献，只解析新增/变化的文件。
+// 数据源 = ~/.workbuddy/projects/<cwd-slug>/<sessionId>.jsonl：WB 把每次会话的完整事件流
+// 落在这里，**带 usage 的条目 = 一次真实 LLM 请求**（providerData.rawUsage 的
+// prompt_tokens / completion_tokens + providerData.model + timestamp + cwd）。
+//
+// ⚠️ 为什么不再读 traces/（2026-10-29 的根因）：WB CLI 2.165 起 trace 里的 `modelInfo`
+// 与 `trace.totalTokens` 已恒为缺失/0（10-28 之后所有 trace 都是 `totalTokens:0`，
+// 连 1.4 MB 的大会话也一样），token 统计因此归零。会话记录不受影响 —— 每次请求的 usage
+// 都在，且比 trace 全（trace 只覆盖 23 个会话 / 2.59 亿，会话记录覆盖 416 个 / 58.9 亿）。
+// trace 那套 modelInfo 的解析已整段删除，别按老路子加回去。
+//
+// 口径：总计 = prompt_tokens + completion_tokens（cache_read 是 prompt 的子集，不另加；
+// 与 ZCode / 旧 trace 口径一致）。同一条 JSONL 内每次请求的 (prompt, completion) 唯一且
+// prompt 单调递增，实测无重复条目（2026-10-29 核过 88 条 / 650 条两种规模的会话）。
+// 项目归属 = 条目自带的 cwd 末段（无需再查 workbuddy.db sessions 表，DB 只留着做账号那摊事）。
+//
+// 文件量 400+ / 523 MB，全量重解析要几秒 —— 按 (mtime,size) 做**按文件增量缓存**，
+// 未变文件直接复用缓存内的调用列表（无 usage 的会话也缓存空列表，免得每轮重读）。
 import Cocoa
-import SQLite3
 
 enum WBTokenStore {
 
-    /// 单文件解析结果（增量缓存的值）；整体持久化到 App Support，
-    /// App 重启后首次构建免全量重解析（~1700 文件数秒 → 只解析新增文件）
+    /// 一次 LLM 请求的用量（会话记录里一条带 usage 的条目）
+    private struct Call: Codable {
+        let t: TimeInterval   // 请求时间（秒）
+        let model: String     // providerData.model（缺失时回落 requestModelId）
+        let tokens: Int64     // prompt + completion
+        let output: Int64     // 仅 completion（卡片副标题 tok/s 用，2026-09-14 用户指定）
+    }
+
+    /// 单文件（= 单会话）解析结果；整体持久化到 App Support，
+    /// App 重启后首次构建免全量重解析（~420 文件 / 523 MB → 只解析新增/变化的文件）
     private struct FileContribution: Codable {
         let mtime: Date
         let size: Int
-        let model: String    // 首要模型（极少数多模型 trace 归属第一个，无法按模型拆分）
-        let sessionId: String
-        let tokens: Int64    // input + output
-        let outputTokens: Int64  // 仅 output（卡片副标题 tok/s 用，2026-09-14 用户指定）
-        let calls: Int64
-        let startedAt: TimeInterval?   // trace 原始起点（秒）；缺失/不可解析为 nil（不计入周期总计）
-        let dayStart: TimeInterval?   // 本地时区当日零点；startedAt 缺失/不可解析为 nil
+        let cwd: String
+        let calls: [Call]     // 空 = 该会话没有任何 model 调用（照样进缓存，签名命中即可跳过）
     }
 
     /// 模型聚合行（大小写归并后的展示名 = 优先带大写的原始写法，同档取用量最大的）
@@ -40,12 +46,12 @@ enum WBTokenStore {
     }
 
     private static let cache = TokenStoreCache(label: "ibalance.wbTokens") { Self.query() }
-    /// 单文件贡献增量缓存（(mtime,size) 未变直接复用；磁盘持久化见 loadDiskCache/saveDiskCache）
+    /// 单文件贡献增量缓存（(mtime,size) 未变直接复用）
     private static var fileCache: [String: FileContribution] = [:]
     private static var diskCacheLoaded = false
 
     /// 并发解析的收集器：`DispatchQueue.concurrentPerform` 要跨线程写同一份结果，
-    /// 而 Swift 6 不允许并发闭包捕获可变局部量 ⇒ 用带锁的引用类型（每次 parse 后取一次锁，开销可忽略）
+    /// 而 Swift 6 不允许并发闭包捕获可变局部量 ⇒ 用带锁的引用类型（每次 parse 后取一次锁）
     private final class ParseBox: @unchecked Sendable {
         private let lock = NSLock()
         private var items: [String: FileContribution] = [:]
@@ -60,34 +66,23 @@ enum WBTokenStore {
         }
     }
 
-    /// 增量缓存落盘位置（App Support/wb-tokens-filecache-v4.json）；
-    /// v3 = FileContribution 增加 outputTokens 字段后换名；**v4 = 无 token 的 trace 也缓存**
-    ///（见 `parse` 的注释：那批文件此前每轮都被重读重解析，是 2026-09-17 那次「卡片 tok/s 出得慢」的根因）。
-    /// 换名 → 老缓存解码失败 → 自动全量重建一次（并发解析，见 query）
+    /// 增量缓存落盘位置。**v5 = 数据源从 traces/ 换成 projects/ 会话记录**（结构从
+    /// 「单文件单模型汇总」变成「单文件调用列表」）；换名 → 老缓存解码失败 → 自动全量重建一次。
     private static var diskCacheURL: URL {
-        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v4.json")
-    }
-
-    /// v3 缓存路径：**只读回退**。v4 与 v3 的 `FileContribution` 结构逐字相同，v4 只是多缓存了
-    /// "无 token 的空贡献" ⇒ 升级时先吃掉老缓存，免得为了换名白读一遍 1.9 GB
-    private static var legacyDiskCacheURL: URL {
-        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v3.json")
+        AppDataStore.applicationSupportURL.appendingPathComponent("wb-tokens-filecache-v5.json")
     }
 
     /// 首次查询前把持久化的单文件贡献装回内存（进程生命周期内只装一次）
     private static func loadDiskCacheIfNeeded() {
         guard !diskCacheLoaded else { return }
         diskCacheLoaded = true
-        for url in [diskCacheURL, legacyDiskCacheURL] {
-            guard let data = try? Data(contentsOf: url),
-                  let decoded = try? JSONDecoder().decode([String: FileContribution].self, from: data)
-            else { continue }
-            fileCache = decoded
-            return
-        }
+        guard let data = try? Data(contentsOf: diskCacheURL),
+              let decoded = try? JSONDecoder().decode([String: FileContribution].self, from: data)
+        else { return }
+        fileCache = decoded
     }
 
-    /// 缓存有变化时写盘（JSONDecoder/Encoder 对 ~1700 条为毫秒级，仅在增量扫描后触发）
+    /// 缓存有变化时写盘（JSONEncoder 对几万条为毫秒级，仅在增量扫描后触发）
     private static func saveDiskCacheIfNeeded(_ changed: Bool) {
         guard changed else { return }
         guard let data = try? JSONEncoder().encode(fileCache) else { return }
@@ -106,21 +101,18 @@ enum WBTokenStore {
     private static func query() -> TokenSummary? {
         let t0 = CACurrentMediaTime()
         loadDiskCacheIfNeeded()
-        let dir = NSHomeDirectory() + "/.workbuddy/traces"
+        let dir = NSHomeDirectory() + "/.workbuddy/projects"
         guard let walker = FileManager.default.enumerator(
             at: URL(fileURLWithPath: dir),
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { return nil }
 
-        // 第一遍（串行、只 stat）：签名命中的直接沿用缓存贡献；**空贡献同样命中** ——
-        // 那是本轮修复的关键：无 token 的 trace 过去永远进不了缓存，每轮都被重读重解析。
+        // 第一遍（串行、只 stat）：签名命中的直接沿用缓存贡献；**空贡献同样命中**。
         // 未命中的攒进 pending，第二遍并发解析。
         var fresh: [String: FileContribution] = [:]
         var pending: [(path: String, mtime: Date, size: Int)] = []
         for case let url as URL in walker {
-            // ⚠️ 扩展名**两种都要收**：WB 自 2026-10-11 起把 trace 从「单个 .json（整份 JSON 对象）」
-            // 改成「.jsonl（逐行事件流）」，只认 "json" 会让新会话全部漏掉（面板 10-11 起归零的根因）
-            let ext = url.pathExtension
-            guard url.lastPathComponent.hasPrefix("trace_"), ext == "json" || ext == "jsonl" else { continue }
+            // 只收 <sessionId>.jsonl（项目目录 = cwd slug，再下一层才是会话文件）
+            guard url.pathExtension == "jsonl" else { continue }
             let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
             guard let mtime = vals?.contentModificationDate, let size = vals?.fileSize else { continue }
             let path = url.path
@@ -130,8 +122,8 @@ enum WBTokenStore {
             }
             pending.append((path, mtime, size))
         }
-        // 第二遍：**并发解析**。IO 与 JSON 解析都能并行，首轮全量（首次安装 / 换缓存版本）
-        // 时收益最大（本机 2820 文件 / 1.9 GB）；64KB 以下的碎文件占大头，并行度按核数自动分。
+        // 第二遍：**并发解析**（IO 与 JSON 解析都能并行，首轮全量收益最大）；
+        // parse 返回 nil = 读盘失败（文件正在写）→ 本轮不入缓存，下轮签名仍未命中 → 自动重试
         let box = ParseBox()
         if !pending.isEmpty {
             DispatchQueue.concurrentPerform(iterations: pending.count) { i in
@@ -139,7 +131,6 @@ enum WBTokenStore {
                 if let c = parse(path: item.path, mtime: item.mtime, size: item.size) {
                     box.add(item.path, c)
                 }
-                // parse 返回 nil = 读盘失败（文件正在写）：本轮不入缓存，下轮签名仍未命中 → 自动重试
             }
         }
         let parsedCount = box.parsed
@@ -148,96 +139,96 @@ enum WBTokenStore {
         fileCache = fresh
         saveDiskCacheIfNeeded(changed)
 
-        // 项目映射（sessionId → cwd 末段），每次查询现读 sessions 表（量小、可含新增会话）
-        let sessionMap = sessionProjects()
-
-        // 按模型/项目聚合（模型大小写归并）+ 按天聚合（词元活动热力图）
+        // 聚合：模型（大小写归并）/ 项目 / 按天 / 各滚动窗口
         var models: [String: ModelAgg] = [:]
         var projects: [String: Int64] = [:]
-        /// 项目完整目录（basename 键 → 首个命中的 cwd 末段），供行点击打开
+        /// 项目完整目录（basename 键 → 首个命中的 cwd），供行点击打开
         var projectPaths: [String: String] = [:]
         var dailyMap: [TimeInterval: Int64] = [:]
         var requests: Int64 = 0
-        // 周期总计 + 各窗口项目/模型小计（5h/1d/7d/30d 滚动窗口）：startedAt 落在
-        // 各窗口起点之后即计入（All 补全量；startedAt 缺失的贡献不计入任何窗口）
         let periodStarts = TokenPeriodWindows.starts()
         var periodTotals: [TokenPeriod: Int64] = [:]
         var periodProjectTokens: [TokenPeriod: [String: Int64]] = [:]
         var periodModelTokens: [TokenPeriod: [String: Int64]] = [:]
+        /// 会话均速原料：每文件（= 会话）首末请求时间 + output 合计
+        var sessions: [(start: TimeInterval, tokens: Double, seconds: Double)] = []
+        /// 本地时区当日零点缓存（键 = UTC 日序号，同一天的 startOfDay 恒定，避免每条调用都算一遍）
+        var dayStartCache: [Int: TimeInterval] = [:]
+
         for c in fresh.values {
-            // 空贡献（无 token 的 trace）**不进任何聚合**：它们入缓存只是为了"签名命中、别再重读"。
-            // 少了这一句会白建一堆 `models[""]` / `projects["(未知项目)"]` 的零值键（后面虽被 filter 掉）
-            guard c.tokens > 0 else { continue }
-            let key = c.model.lowercased()
-            var agg = models[key] ?? ModelAgg()
-            agg.tokens += c.tokens
-            agg.calls += c.calls
-            // 展示名优先带大写的写法（与 ZCode 数据源同口径），同档取用量大的，全小写回落小写
-            let curUpper = c.model != key
-            let dispUpper = !agg.name.isEmpty && agg.name != agg.name.lowercased()
-            let replace: Bool
-            if agg.name.isEmpty { replace = true }
-            else if curUpper != dispUpper { replace = curUpper }
-            else { replace = c.tokens > agg.nameTokens }
-            if replace {
-                agg.name = c.model
-                agg.nameTokens = c.tokens
-            }
-            models[key] = agg
-            let full = sessionMap[c.sessionId]
+            let full = c.cwd.isEmpty ? nil : c.cwd
             let proj = full.map { ($0 as NSString).lastPathComponent } ?? "(未知项目)"
-            projects[proj, default: 0] += c.tokens
             if let full, projectPaths[proj] == nil { projectPaths[proj] = full }
-            requests += c.calls
-            if let d = c.dayStart { dailyMap[d, default: 0] += c.tokens }
-            if let s = c.startedAt {
-                for p in TokenPeriod.windowed where s >= (periodStarts[p] ?? .infinity) {
-                    periodTotals[p, default: 0] += c.tokens
-                    periodProjectTokens[p, default: [:]][proj, default: 0] += c.tokens
-                    periodModelTokens[p, default: [:]][key, default: 0] += c.tokens
+            var first: TimeInterval = .infinity
+            var last: TimeInterval = -.infinity
+            var sessionOutput: Int64 = 0
+            for call in c.calls {
+                guard call.tokens > 0 else { continue }
+                // 模型
+                let key = call.model.lowercased()
+                var agg = models[key] ?? ModelAgg()
+                agg.tokens += call.tokens
+                agg.calls += 1
+                // 展示名优先带大写的写法（与 ZCode 数据源同口径），同档取用量大的，全小写回落小写
+                let curUpper = call.model != key
+                let dispUpper = !agg.name.isEmpty && agg.name != agg.name.lowercased()
+                let replace: Bool
+                if agg.name.isEmpty { replace = true }
+                else if curUpper != dispUpper { replace = curUpper }
+                else { replace = call.tokens > agg.nameTokens }
+                if replace {
+                    agg.name = call.model.isEmpty ? "unknown" : call.model
+                    agg.nameTokens = call.tokens
                 }
+                models[key] = agg
+                // 项目 / 总量 / 请求数
+                projects[proj, default: 0] += call.tokens
+                requests += 1
+                // 按天（本地时区零点）
+                let dayKey = Int(call.t / 86400)
+                let day: TimeInterval
+                if let d = dayStartCache[dayKey] {
+                    day = d
+                } else {
+                    day = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: call.t))
+                        .timeIntervalSince1970
+                    dayStartCache[dayKey] = day
+                }
+                dailyMap[day, default: 0] += call.tokens
+                // 滚动窗口
+                for p in TokenPeriod.windowed where call.t >= (periodStarts[p] ?? .infinity) {
+                    periodTotals[p, default: 0] += call.tokens
+                    periodProjectTokens[p, default: [:]][proj, default: 0] += call.tokens
+                    periodModelTokens[p, default: [:]][key, default: 0] += call.tokens
+                }
+                first = min(first, call.t)
+                last = max(last, call.t)
+                sessionOutput += call.output
+            }
+            if last > first, sessionOutput > 0 {
+                sessions.append((start: first, tokens: Double(sessionOutput), seconds: last - first))
             }
         }
 
         let projectRows = projects
             .filter { $0.value > 0 }
             .map { TokenSummary.ProjectUsage(name: $0.key, tokens: $0.value,
-                                                  path: projectPaths[$0.key]) }
+                                             path: projectPaths[$0.key]) }
             .sorted { $0.tokens > $1.tokens }
-        // 构建耗时落日志（这类"数据仓慢"的问题不好复现，留一条常驻记录；本机 2820 文件基准：
-        // 缓存全命中 ≈ 200ms，全量首建（并发）≈ 1.5～3s）
+        // 构建耗时落日志（这类"数据仓慢"的问题不好复现，留一条常驻记录；本机 416 文件 / 523 MB：
+        // 缓存全命中 ≈ 100ms，全量首建（并发）≈ 2～4s）
         Logger.log(.refresh, String(format: "[WBToken] build %.0fms 文件 %d（本轮解析 %d）模型 %d 项目 %d 总计 %lld",
                                     (CACurrentMediaTime() - t0) * 1000, fresh.count, parsedCount,
                                     models.count, projectRows.count,
                                     projectRows.reduce(Int64(0)) { $0 + $1.tokens }))
         guard !projectRows.isEmpty else { return nil }
-        // 最近 10 次会话均速（tok/s，卡片副标题 meta）：**一次对话 = 同一 sessionId 的全部
-        // trace**（trace 只是一次 agent 运行，一次对话含多次运行；按 trace 切会把分母缩成
-        // 纯运行时间、数值虚高数倍）。tokens 只算 output（2026-09-14 用户指定）；
-        // 时长 = 会话首 trace 起点 → 末 trace mtime（含对话中的空闲，口径对齐 ZCode
-        // session.time_created→time_updated）；sessionId 缺失的 trace 各自成会话，均值口径归 recentSessionSpeed
-        var bySession: [String: (start: TimeInterval, end: TimeInterval, output: Int64)] = [:]
-        for (path, c) in fresh where c.outputTokens > 0 || c.startedAt != nil {
-            guard let started = c.startedAt else { continue }
-            let key = c.sessionId.isEmpty ? path : c.sessionId
-            let end = c.mtime.timeIntervalSince1970
-            var s = bySession[key] ?? (started, started, 0)
-            s.start = min(s.start, started)
-            s.end = max(s.end, end)
-            s.output += c.outputTokens
-            bySession[key] = s
-        }
-        let sessions = bySession.values.map {
-            (start: $0.start, tokens: Double($0.output), seconds: $0.end - $0.start)
-        }
         let modelRows = models.values
             .filter { $0.tokens > 0 }
             .map { TokenSummary.ProjectUsage(name: $0.name, tokens: $0.tokens) }
             .sorted { $0.tokens > $1.tokens }
         let total = projectRows.reduce(Int64(0)) { $0 + $1.tokens }
         periodTotals[.all] = total   // All = 全量总计，无窗口
-        // 各窗口列表：项目键沿用 basename（path 回查全量映射）；模型展示名取全量
-        // 聚合结果（窗口 ⊆ 全量，键必已存在）
+        // 各窗口列表：项目键沿用 basename（path 回查全量映射）；模型展示名取全量聚合结果
         var periodProjects: [TokenPeriod: [TokenSummary.ProjectUsage]] = [:]
         for (p, dict) in periodProjectTokens {
             periodProjects[p] = dict
@@ -251,171 +242,62 @@ enum WBTokenStore {
                 .map { TokenSummary.ProjectUsage(name: models[$0.key]!.name, tokens: $0.value) }
                 .sorted { $0.tokens > $1.tokens }
         }
-        Logger.log(.refresh, "[WbTokDbg] 项目行=\(projectRows.count) 名=\(projectRows.prefix(3).map { $0.name }) 未知=\(projectRows.filter { $0.name == "(未知项目)" }.count)")
         let daily = dailyMap
             .map { TokenDayUsage(dayStart: $0.key, tokens: $0.value) }
             .sorted { $0.dayStart < $1.dayStart }
         var summary = TokenSummary(totalTokens: total, projects: projectRows, models: modelRows,
-                                 requestCount: requests, daily: daily, periodTotals: periodTotals,
-                                 periodProjects: periodProjects, periodModels: periodModels)
+                                   requestCount: requests, daily: daily, periodTotals: periodTotals,
+                                   periodProjects: periodProjects, periodModels: periodModels)
         summary.recentSessionSpeed = recentSessionSpeed(sessions)
         return summary
     }
 
-    /// workbuddy.db sessions 表 sessionId → cwd（含已删除会话，保留历史用量归属）。
-    /// WAL 库同 ZCode 打开链：先只读直开（WB 运行中含 -wal 增量），失败再 immutable 直读主文件。
-    /// workbuddy.db sessions 表 sessionId → cwd（含已删除会话，保留历史用量归属）。
-    /// WAL 库同 ZCode 打开链：先只读直开（WB 运行中含 -wal 增量），失败再 immutable 直读主文件。
-    /// ⚠️ open 是惰性的：WB 未启动（无 -shm）时只读 open 也返回 OK，失败（CANTOPEN）
-    /// 浮现在 prepare——所以打开与查询必须视为同一次尝试，prepare 失败同样回落 immutable
-    private static func sessionProjects() -> [String: String] {
-        let path = NSHomeDirectory() + "/.workbuddy/workbuddy.db"
-        guard FileManager.default.fileExists(atPath: path) else {
-            Logger.log(.refresh, "[WbTokDbg] workbuddy.db 不存在")
-            return [:]
-        }
-        // ⚠️ 2026-09-17：这张表**每轮 query 都要读一遍**（本机 sessions 上万行，实测是 1s 里的大头），
-        // 而会话映射几乎不变 ⇒ 按库文件签名缓存。签名必须**把 -wal 也算上**：WB 运行时新会话先落
-        // WAL 增量，只看主库 mtime 会让新会话的归属一直读旧映射
-        var parts: [String] = []
-        for p in [path, path + "-wal"] {
-            guard let a = try? FileManager.default.attributesOfItem(atPath: p),
-                  let m = a[.modificationDate] as? Date, let s = a[.size] as? Int else { continue }
-            parts.append("\(p):\(Int(m.timeIntervalSince1970)):\(s)")
-        }
-        let stamp = parts.joined(separator: "|")
-        if let c = sessionMapCache, c.stamp == stamp { return c.map }
-        let map = querySessionMap(path: path, immutable: false)
-            ?? querySessionMap(path: path, immutable: true) ?? [:]
-        sessionMapCache = (stamp, map)
-        return map
-    }
-
-    /// sessionId → cwd 的缓存（按 workbuddy.db + -wal 的 (mtime,size) 失效）。
-    /// ⚠️ 只在 `WbTokens` 自己的串行队列上读写（每仓一个 `TokenStoreCache` queue）⇒ 无需加锁
-    private static var sessionMapCache: (stamp: String, map: [String: String])?
-
-    /// 单次「打开 + 查询」尝试；打开或 prepare 任一失败返回 nil（供外层回落 immutable）
-    private static func querySessionMap(path: String, immutable: Bool) -> [String: String]? {
-        var db: OpaquePointer?
-        let rc: Int32
-        if immutable {
-            let escaped = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
-            rc = sqlite3_open_v2("file:\(escaped)?immutable=1", &db,
-                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
-        } else {
-            rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil)
-        }
-        let mode = immutable ? "immutable" : "ro"
-        guard rc == SQLITE_OK else {
-            Logger.log(.refresh, "[WbTokDbg] \(mode) 打开失败 rc=\(rc)")
-            sqlite3_close(db)
-            return nil
-        }
-        defer { sqlite3_close(db) }
-        var out: [String: String] = [:]
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT id, cwd FROM sessions", -1, &stmt, nil) == SQLITE_OK else {
-            Logger.log(.refresh, "[WbTokDbg] \(mode) prepare 失败 msg=\(sqlite3_errmsg(db).map { String(cString: $0) } ?? "")")
-            return nil
-        }
-        defer { sqlite3_finalize(stmt) }
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let id = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
-            let cwd = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
-            if !id.isEmpty, !cwd.isEmpty { out[id] = cwd }
-        }
-        Logger.log(.refresh, "[WbTokDbg] \(mode) sessionMap=\(out.count)")
-        return out
-    }
-
-    /// 解析单个 trace 文件。
+    /// 解析单个会话记录文件（`~/.workbuddy/projects/<slug>/<sessionId>.jsonl`）。
     ///
-    /// ⚠️ **无用量也返回"空贡献"（tokens 0）并进缓存** —— 这是 2026-09-17 的性能修复：
-    /// 此前 `tokens > 0` 不成立就 `return nil`，那批文件（结构不符 / 只有工具调用没有 token）
-    /// **永远进不了缓存**，于是每轮 60s 刷新都拿不到签名命中、把它们的整份内容重读重解析一遍
-    ///（本机实测：2820 个 trace / 1.9 GB，其中 ~1900 个是这类无 token 文件 ⇒ **每轮白读 1.4 GB**、
-    /// 十几秒），卡片副标题的 tok/s 因此迟迟不出来。
-    /// 现在只有**读盘失败**才返回 nil（本轮不入缓存、下轮重试；文件正在写时可能命中这条）。
+    /// 每行一个事件（message / reasoning / function_call / function_call_result / …），
+    /// **只有真正调过模型的条目带 `providerData.rawUsage`** —— 一次请求一条，且实测
+    /// (prompt, completion) 唯一、prompt 随上下文增长单调不减，直接累加即可，无需去重。
+    /// 无 usage 的会话返回空 calls（**不吃 nil**：nil 表示读盘失败、下轮重试；
+    /// 空贡献要进缓存，否则这类文件每轮 60s 都被重读重解析 —— 2026-09-17 踩过）。
+    ///
+    /// 性能：文件可达 11 MB、上万行且大量是工具输出/快照 ⇒ 先做字节级 needle 命中，
+    /// 未命中的行直接跳过不解析（`"usage"` 是 `"rawUsage"` 的补集写法，两种都收）。
+    private static let rawUsageNeedle = Data("\"rawUsage\"".utf8)
+    private static let usageNeedle = Data("\"usage\"".utf8)
+
     private static func parse(path: String, mtime: Date, size: Int) -> FileContribution? {
         guard let data = FileManager.default.contents(atPath: path) else { return nil }
-        let empty = FileContribution(mtime: mtime, size: size, model: "", sessionId: "",
-                                     tokens: 0, outputTokens: 0, calls: 0,
-                                     startedAt: nil, dayStart: nil)
-        if (path as NSString).pathExtension == "jsonl" {
-            return parseJSONL(data, mtime: mtime, size: size) ?? empty
-        }
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let trace = root["trace"] as? [String: Any],
-              let mi = trace["modelInfo"] as? [String: Any] else { return empty }
-        let input = (mi["totalInputTokens"] as? NSNumber)?.int64Value ?? 0
-        let output = (mi["totalOutputTokens"] as? NSNumber)?.int64Value ?? 0
-        let tokens = input + output
-        let model = (mi["models"] as? [Any])?.compactMap { $0 as? String }.first ?? "unknown"
-        let sid = trace["sessionId"] as? String ?? ""
-        let calls = (mi["callCount"] as? NSNumber)?.int64Value ?? 0
-        let startedAt = (trace["startedAt"] as? String).flatMap { isoTimestamp(iso: $0) }
-        let dayStart = startedAt
-            .map { Calendar.current.startOfDay(for: Date(timeIntervalSince1970: $0)).timeIntervalSince1970 }
-        return FileContribution(mtime: mtime, size: size, model: model, sessionId: sid,
-                                tokens: tokens, outputTokens: output, calls: calls,
-                                startedAt: startedAt, dayStart: dayStart)
-    }
-
-    /// `.jsonl` 逐行事件流（WB ≥ 2026-10-11）的解析。
-    ///
-    /// 结构：每行一个事件 `{type:"trace_start"|"span_start"|"span_end"|"trace_update"|"trace_end", ...}`，
-    /// `trace` / `modelInfo` **只在部分行出现**，且 `modelInfo` 是**累计快照**（同一 trace 会多次
-    /// `trace_update` 递增 callCount/总 token）⇒ 取**最后一个**含 `modelInfo` 的 trace 对象即终值。
-    /// 纯工具调用类 trace（如只有 Bash）压根不带 modelInfo ⇒ 返回 nil，由调用方落成空贡献。
-    ///
-    /// 性能：文件可能数 MB、上千行，逐行 `JSONSerialization` 太贵 ⇒ 先做字节级 needle 命中
-    /// （`"modelInfo"` 只出现在极少数行），未命中的行直接跳过。
-    private static let modelInfoNeedle = Data("\"modelInfo\"".utf8)
-
-    private static func parseJSONL(_ data: Data, mtime: Date, size: Int) -> FileContribution? {
-        var model = "unknown"
-        var tokens: Int64 = 0
-        var output: Int64 = 0
-        var calls: Int64 = 0
-        var sid = ""
-        var started: TimeInterval?
-        var found = false
+        var cwd = ""
+        var calls: [Call] = []
         for line in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
-            guard line.range(of: modelInfoNeedle) != nil else { continue }
+            guard line.range(of: rawUsageNeedle) != nil || line.range(of: usageNeedle) != nil else { continue }
             guard let root = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
-                  let trace = root["trace"] as? [String: Any],
-                  let mi = trace["modelInfo"] as? [String: Any] else { continue }
-            found = true
-            let input = (mi["totalInputTokens"] as? NSNumber)?.int64Value ?? 0
-            output = (mi["totalOutputTokens"] as? NSNumber)?.int64Value ?? 0
-            tokens = input + output
-            calls = (mi["callCount"] as? NSNumber)?.int64Value ?? 0
-            if let m = (mi["models"] as? [Any])?.compactMap({ $0 as? String }).first { model = m }
-            if let s = trace["sessionId"] as? String, !s.isEmpty { sid = s }
-            if let st = (trace["startedAt"] as? String).flatMap({ isoTimestamp(iso: $0) }) { started = st }
+                  let pd = root["providerData"] as? [String: Any],
+                  let u = (pd["rawUsage"] as? [String: Any]) ?? (pd["usage"] as? [String: Any])
+            else { continue }
+            let input = num(u, "prompt_tokens", "inputTokens", "input_tokens", "promptTokens")
+            let output = num(u, "completion_tokens", "outputTokens", "output_tokens", "completionTokens")
+            guard input > 0 || output > 0 else { continue }
+            if cwd.isEmpty, let c = root["cwd"] as? String { cwd = c }
+            let model = (pd["model"] as? String) ?? (pd["requestModelId"] as? String) ?? ""
+            // timestamp 是毫秒（1793177026095）；> 1e11 判为毫秒，缺失时用文件 mtime 兜底，
+            // 免得整条丢出「按天 / 窗口」统计
+            var t = (root["timestamp"] as? NSNumber)?.doubleValue ?? 0
+            t = t > 1e11 ? t / 1000 : t
+            if t <= 0 { t = mtime.timeIntervalSince1970 }
+            calls.append(Call(t: t, model: model, tokens: input + output, output: output))
         }
-        guard found else { return nil }
-        let dayStart = started
-            .map { Calendar.current.startOfDay(for: Date(timeIntervalSince1970: $0)).timeIntervalSince1970 }
-        return FileContribution(mtime: mtime, size: size, model: model, sessionId: sid,
-                                tokens: tokens, outputTokens: output, calls: calls,
-                                startedAt: started, dayStart: dayStart)
+        return FileContribution(mtime: mtime, size: size, cwd: cwd, calls: calls)
     }
 
-    /// ISO8601 → 原始时间戳（秒）。容忍毫秒位有无：截前 19 位补 Z 再解析。
-    /// ⚠️ `DateFormatter` **不是线程安全的**，而 `query()` 现在并发解析（见那里）⇒ 这里必须加锁。
-    private static let isoLock = NSLock()
-    private static func isoTimestamp(iso: String) -> TimeInterval? {
-        guard iso.count >= 19 else { return nil }
-        isoLock.lock(); defer { isoLock.unlock() }
-        return Self.isoParser.date(from: String(iso.prefix(19)) + "Z")?.timeIntervalSince1970
+    /// usage 里的整数字段（各家字段名不一致：WB 用 prompt_tokens/completion_tokens，
+    /// 老格式可能是 camelCase）—— 取第一个存在的键
+    private static func num(_ dict: [String: Any], _ keys: String...) -> Int64 {
+        for k in keys {
+            if let n = dict[k] as? NSNumber { return n.int64Value }
+            if let d = dict[k] as? Double { return Int64(d) }
+            if let i = dict[k] as? Int { return Int64(i) }
+        }
+        return 0
     }
-
-    private static let isoParser: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-        f.locale = Locale(identifier: "en_US_POSIX")
-        return f
-    }()
 }

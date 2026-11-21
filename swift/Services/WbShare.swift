@@ -370,7 +370,7 @@ extension AppDelegate {
                     var msg = "已按最近一次同步前的备份还原：\(rb.restoredSessions) 条会话回到原账号归属，"
                     msg += "\(rb.restoredMemories) 份记忆/个性化文件恢复原内容。\n"
                     msg += wasRunning ? "WorkBuddy 正在重启。" : "WorkBuddy 未在运行，下次启动即生效。"
-                    msg += "\n注意：之后用 iBalance 切号时仍会自动执行同步。"
+                    msg += "\n注意：用 iBalance 切号时会自动重新执行同步；但在 WB 桌面端里手动切号不会搬移。"
                     done.addInfo(msg)
                 }
                 done.addButton("好")

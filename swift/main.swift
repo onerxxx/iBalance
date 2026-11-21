@@ -1697,7 +1697,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func makeSettingsSnapshot() -> AppSettingsSnapshot {
         let s = makePanelSnapshot()
         let interval = s.refreshIntervalSeconds
-        // 「已保存账号」逐平台分组（2026-09-13 用户要求）：空平台不出现。
+        // 「已保存账号」逐平台分组（2026-09-13 用户要求；2026-11-20 账号页合并后**空平台也下发**：
+        // 视图每平台一段，段内 = 账号列表 + 末尾「添加账号」行，空平台只显添加行 = 首账号入口）。
         // name 取各平台展示名（ZCode 走 displayName = 昵称/uid 尾号，Codex 邮箱优先），
         // detail 统一给 uid 便于区分同名账号；iconKey 与面板卡片图标名同源
         let accountGroups = [
@@ -1717,7 +1718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                                   .init(id: $0.uid,
                                         name: $0.email.isEmpty ? $0.uid : $0.email,
                                         detail: $0.email.isEmpty ? "" : $0.uid) }),
-        ].filter { !$0.accounts.isEmpty }
+        ]
         // 3D 硬币的视觉身份四项（本页没有控件，只为「主题预设」代读，见 ThemePreset 注释）：
         // 取盘值而不是某处的内存副本 —— 弹窗 / 设置窗口两个调参入口都是「改一次落一次盘」，
         // 磁盘才是权威

@@ -101,8 +101,13 @@ enum WorkBuddyService {
             restartWorkBuddy()
             return false
         }
-        // 3. 同步共享：此时 WorkBuddy 已死、auth 已指向新账号，时机天然安全。
-        //    把全部会话归属转移到新账号 + 记忆广播（详见 WbShare.swift），静默执行，只记日志。
+        // 3. 同步共享：把全部会话归属搬给新账号 + 记忆广播（详见 WbShare.swift）。
+        //    ⚠️ 这是「多账号共享全部对话历史」的唯一实现：WB 客户端按 sessions.user_id
+        //    过滤会话列表，闭源改不了查询 ⇒ 想让每个账号都看到全部对话，只能每次切号
+        //    把归属搬到当前账号。2026-10-25 曾一度移除此步（用户反馈切号后「历史丢失」），
+        //    随后用户明确要求三账号都要看到全部对话 ⇒ 恢复自动搬移。
+        //    前提：**切号必须走 iBalance**；在 WB 桌面端里手动切号只改 auth 不搬会话，
+        //    而且搬走的会话在原账号就看不到了 —— 那是 10-20「338 条历史丢失」的根因。
         let share = WbShareSync.perform(targetUid: account.uid, nicknameByUid: [:])
         Logger.log(.switchAccount, "[wb-share] on-switch: uid=\(account.uid) moved=\(share.movedSessions) memorySynced=\(share.memorySynced) err=\(share.error ?? "none")")
         // 4. 重启 WorkBuddy Desktop

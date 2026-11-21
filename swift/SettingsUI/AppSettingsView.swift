@@ -115,6 +115,9 @@ public struct AppSettingsView: View {
 // MARK: - 账号 pane（原「操作→账号」栏目；2026-09-13 并入原「Key / 额度」pane）
 
 /// Key/额度草稿提交时机不变（回车 / 离开本 pane / 关窗，见模型 `commitKeyQuotaIfDirty`）。
+/// 2026-11-20 简化：原「添加账号」四行与「已保存账号」逐平台段**合并为每平台一段** ——
+/// 段内 = 已保存账号（行内删除）+ 末尾一行「添加账号」（空平台只显这行，即首账号入口）；
+/// 平台不再在「添加」「已保存」两处各出现一次。添加行沿用 2026-09-12 口径：无小字 + 统一按钮文案。
 private struct AccountsPane: View {
     // 官方口径：需要给注入的 @Observable 属性生成 Binding 时用 @Bindable（属性包装器形态），
     // 直接 `$model.keyQuotaDraft.apiKey`；不必再手写 Binding(get:set:) 桥。
@@ -131,24 +134,10 @@ private struct AccountsPane: View {
             } header: {
                 Text("同步")
             }
-            Section {
-                // 平台品牌 PNG（dark 版，键与面板卡片图标名同源）
-                // 四行统一：无小字副标题 + 同一个按钮文案（2026-09-12 用户指定；各平台取账号的
-                // 具体方式由按钮文案统一承载，不再逐行区分）
-                OperationRow(model: model, icon: .platform("workbuddy"), title: "WorkBuddy",
-                             subtitle: nil, actionTitle: "本机JSON导入") { model.actions.addWbAccount() }
-                OperationRow(model: model, icon: .platform("trae-color"), title: "TRAE",
-                             subtitle: nil, actionTitle: "本机JSON导入") { model.actions.addTraeAccount() }
-                OperationRow(model: model, icon: .platform("zhipu"), title: "ZCode",
-                             subtitle: nil, actionTitle: "本机JSON导入") { model.actions.addZcodeAccount() }
-                OperationRow(model: model, icon: .platform("codex"), title: "Codex",
-                             subtitle: nil, actionTitle: "本机JSON导入") { model.actions.addCodexAccount() }
-            } header: {
-                Text("添加账号")
-            }
-            // 「已保存账号」（2026-09-13 用户要求）：逐平台列出已保存账号，行内「删除」移除单个账号。
-            // 删除转交宿主（二次确认 + 落盘 + 面板/菜单栏刷新），model.deleteAccount 里的 sync() 回读刷新本列表；
-            // 空平台不出现，全空时整段不渲染
+            // 每平台一段（2026-11-20 合并原「添加账号」+「已保存账号」两处）：
+            // 段内 = 已保存账号（行内「删除」）+ 末尾「添加账号」行；空平台只显添加行。
+            // 删除转交宿主（二次确认 + 落盘 + 面板/菜单栏刷新），model.deleteAccount 里的 sync() 回读刷新本列表。
+            // 添加行沿用 2026-09-12 口径：无小字副标题 + 统一按钮文案「本机JSON导入」
             ForEach(model.snapshot.savedAccountGroups) { group in
                 Section {
                     ForEach(group.accounts) { acc in
@@ -157,6 +146,10 @@ private struct AccountsPane: View {
                                      actionTitle: "删除", destructive: true) {
                             model.deleteAccount(platform: group.id, uid: acc.id)
                         }
+                    }
+                    OperationRow(model: model, icon: .platform(group.iconKey), title: "添加账号",
+                                 subtitle: nil, actionTitle: "本机JSON导入") {
+                        addAccount(group.id)
                     }
                 } header: {
                     Text(group.platform)
@@ -188,18 +181,29 @@ private struct AccountsPane: View {
             } header: {
                 Text("DeepSeek")
             } footer: {
-                Text("API Key 只存本机钥匙串，不落明文。日常额度是点阵的分母（0 = 不画点阵）。\n获取 Key：[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)")
+                Text("Key 存本机钥匙串；额度为点阵分母（0 = 不画）。[获取 Key](https://platform.deepseek.com/api_keys)")
             }
             Section {
-                TextField("ZhiPu Token", text: $model.keyQuotaDraft.zhipuToken, prompt: Text("留空 = 自动读取浏览器登录态"))
+                TextField("ZhiPu Token", text: $model.keyQuotaDraft.zhipuToken, prompt: Text("留空 = 自动读取"))
                     .onSubmit { model.commitKeyQuotaIfDirty() }
-                TextField("Qwen Ticket", text: $model.keyQuotaDraft.qwenTicket, prompt: Text("留空 = 自动读取浏览器登录态"))
+                TextField("Qwen Ticket", text: $model.keyQuotaDraft.qwenTicket, prompt: Text("留空 = 自动读取"))
                     .onSubmit { model.commitKeyQuotaIfDirty() }
             } header: {
                 Text("浏览器登录态覆盖")
             } footer: {
-                Text("留空则解密浏览器 Cookies 取登录态，填了以手填值为准（浏览器登出后仍可用）。回车 / 换页 / 关窗即保存。")
+                Text("留空自动解密浏览器 Cookies 取登录态；手填值优先（浏览器登出后仍可用）。回车 / 换页 / 关窗即保存。")
             }
+        }
+    }
+
+    /// 平台键 → 既有添加动作（与状态栏菜单同一条链路）；键集合由宿主快照固定（四个平台）
+    private func addAccount(_ platform: String) {
+        switch platform {
+        case "workbuddy": model.actions.addWbAccount()
+        case "trae": model.actions.addTraeAccount()
+        case "zcode": model.actions.addZcodeAccount()
+        case "codex": model.actions.addCodexAccount()
+        default: break
         }
     }
 }

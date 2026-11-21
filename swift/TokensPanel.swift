@@ -677,6 +677,18 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     // MARK: 总计周期切换（5H/1D/1W/1M）
 
+    /// 周期槽位加宽量：每槽在文案宽基础上 +0.8pt，5 槽总宽 +4pt
+    ///（2026-11-20 试参 +2/槽 = 总宽 +10；11-21 用户「-6pt」→ +0.8/槽）。
+    /// 文案在槽内水平居中。槽宽按选中态（最粗）字体测，切换不跳。
+    /// ⚠️ SG 档每侧余量 0.4pt > 字形描边外扩 ~0.18pt，容得下；再减就会压描边
+    private static let periodSlotExtra: CGFloat = 0.8
+    /// 选中态字形描边加粗量（2026-11-21 用户「圆角外框改为字体加粗、字重最大」）：
+    /// SG 档只有 Book20 单一字重（无 fvar 可变轴，weight 参数只挑中文兜底档），
+    /// 真实字重不可调 ⇒ 用**字形描边**（NSAttributedString.Key.strokeWidth 负值 = 填充+描边）
+    /// 把笔画向外扩出加粗效果，两档字体都生效。数值 = 字号百分比，0.35pt @9pt。
+    /// ⚠️ 描边向外扩 ~0.17pt：槽宽 +2pt（每侧 1pt 余量）容得下，不压相邻文案
+    private static let periodSelectedStrokePercent: CGFloat = 4
+
     /// 大数字当前周期口径（默认 7d，2026-09-02 用户指定；打开面板即 7 天滚动窗总计）
     var period: TokenPeriod = .d7 {
         didSet {
@@ -885,10 +897,13 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     private func makeLabelFont() -> NSFont {
         PanelFont.font(size: 9, weight: .regular, monoDigits: true)
     }
-    /// 选中周期字体：字重加一档（regular → medium，2026-09-08 用户指定；未选中仍 regular）。
+    /// 选中周期字体：**字重取最大档 .black**（2026-11-21 用户「加粗的字重最大」，
+    /// 取代 2026-09-08 的 medium 档；未选中仍 regular）。系统档真实生效；
+    /// SG 档拉丁只有 Book20 单字重，weight 只挑中文兜底档，拉丁的加粗由
+    /// draw 处字形描边（periodSelectedStrokePercent）补上。
     /// 宽度度量（cachedPeriodWidths）按此字体测——槽位取较宽态，选中切换不跳动。
     private func makePeriodSelectedFont() -> NSFont {
-        PanelFont.font(size: 9, weight: .medium, monoDigits: true)
+        PanelFont.font(size: 9, weight: .black, monoDigits: true)
     }
     /// 标签墨迹高度（9pt 小注释）
     private var labelInkHeight: CGFloat { ceil(makeLabelFont().boundingRectForFont.height) }
@@ -1301,7 +1316,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
 
     /// mouseUp 各交互判定的并集（命中口径与 mouseUp 一致）
     private func hitInteractive(_ p: NSPoint) -> Bool {
-        if periodToggleRects.contains(where: { $0.insetBy(dx: -3, dy: -3).contains(p) }) { return true }
+        // periodToggleRects 存的就是外扩 3 后的命中区（draw 处），这里不再二次外扩
+        if periodToggleRects.contains(where: { $0.contains(p) }) { return true }
         for r in [modelToggleRect, projectToggleRect, dailyToggleRect, weeklyToggleRect]
         where r.insetBy(dx: -3, dy: -3).contains(p) { return true }
         if let row = listRowRects.firstIndex(where: { $0.contains(p) }),
@@ -1316,7 +1332,7 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
         let p = convert(event.locationInWindow, from: nil)
-        if let hit = periodToggleRects.firstIndex(where: { $0.insetBy(dx: -3, dy: -3).contains(p) }),
+        if let hit = periodToggleRects.firstIndex(where: { $0.contains(p) }),
            let next = TokenPeriod(rawValue: hit), next != period {
             period = next
         } else if modelToggleRect.insetBy(dx: -3, dy: -3).contains(p) {
@@ -1381,7 +1397,8 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         drawText("总计", at: NSPoint(x: insets.left + ceil(cachedNameWidth) + 4, y: totalLabelTop),
                  font: titleFont, color: titleColor)
 
-        // ── 首行右侧：周期切换（5H/1D/1W/1M；选中 = 主前景 + 字重加一档 medium，
+        // ── 首行右侧：周期切换（5H/1D/1W/1M；选中 = 主前景 + 最大字重加粗
+        //（.black + SG 档字形描边，2026-11-21 取代前一日圆角外框方案），
         // 未选 = 次级灰 regular；槽位宽按选中态字体测量，切换不跳）──
         // 大数值整行命中区：与 layout() 的数字行同一几何（numberRowY 共用推导）
         numberRowRect = NSRect(x: 0, y: numberRowY, width: bounds.width,
@@ -1390,13 +1407,30 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         let pWidths = cachedPeriodWidths
         let periodSelectedFont = makePeriodSelectedFont()
         var px = bounds.width - insets.right - cachedPeriodTotal
-        let pY = totalLabelTop + (titleInkHeight - labelFont.boundingRectForFont.height) / 2
+        let labelH = labelFont.boundingRectForFont.height
+        let pY = totalLabelTop + (titleInkHeight - labelH) / 2
         for (i, p) in TokenPeriod.allCases.enumerated() {
-            drawText(p.label, at: NSPoint(x: px, y: pY),
-                     font: period == p ? periodSelectedFont : labelFont,
-                     color: period == p ? Palette.cardForeground : labelColor)
-            periodToggleRects.append(NSRect(x: px, y: totalLabelTop,
-                                            width: pWidths[i], height: titleInkHeight))
+            let slot = NSRect(x: px, y: totalLabelTop, width: pWidths[i], height: titleInkHeight)
+            // 文案在加宽槽内水平居中（槽宽 = 选中态字宽 + periodSlotExtra，切换不跳）
+            let textW = (p.label as NSString).size(withAttributes: [.font: periodSelectedFont]).width
+            let textX = px + (pWidths[i] - textW) / 2
+            // 选中态 = 最大字重加粗（2026-11-21 用户要求，取代圆角外框）：
+            // 字体走 .black 档；SG 档拉丁只有 Book20 单字重（无 fvar 轴），真实字重不可调，
+            // 用字形描边把笔画向外扩出加粗效果 —— strokeWidth 负值 = 填充+描边同色，
+            // 数值为字号百分比（periodSelectedStrokePercent）。系统档 .black 本身够粗，
+            // 描边同样叠加保持两档观感一致。未选中态不描边
+            let selected = period == p
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: selected ? periodSelectedFont : labelFont,
+                .foregroundColor: selected ? Palette.cardForeground : labelColor,
+            ]
+            if selected {
+                attrs[.strokeWidth] = -Self.periodSelectedStrokePercent
+                attrs[.strokeColor] = Palette.cardForeground
+            }
+            (p.label as NSString).draw(at: NSPoint(x: textX, y: pY), withAttributes: attrs)
+            // 命中区 = 槽位外扩 3（与其余切换文案 -3 口径一致）
+            periodToggleRects.append(slot.insetBy(dx: -3, dy: -3))
             px += pWidths[i] + 6
         }
 
@@ -2044,9 +2078,11 @@ final class TokensPanelView: NSView, PanelScrollHoverSync {
         let titleFont = makeHeaderTitleFont()
         cachedNameWidth = (source.platformName as NSString)
             .size(withAttributes: [.font: titleFont]).width
-        // 周期槽宽按选中态字体（medium）测：选中切换时槽位/整块宽度不跳
+        // 周期槽宽按选中态字体（最大字重 .black）测 + periodSlotExtra 加宽
+        //（每槽 +0.8、总宽 +4，见常量注释）：选中切换时槽位/整块宽度不跳
         cachedPeriodWidths = TokenPeriod.allCases.map {
             ($0.label as NSString).size(withAttributes: [.font: makePeriodSelectedFont()]).width
+                + Self.periodSlotExtra
         }
         let pGap: CGFloat = 6
         cachedPeriodTotal = cachedPeriodWidths.reduce(0, +)

@@ -925,6 +925,8 @@ public enum SettingsWindowMetrics {
 }
 
 /// 「已保存账号」分组（2026-09-13 用户要求）：账号页逐平台列出已保存账号并支持逐个删除。
+/// 2026-11-20 起分组恒含四个平台（空平台 = 空账号数组）：视图每平台一段，段尾「添加账号」行
+/// 对空平台即首账号入口（原「添加账号」独立段并入，见 AccountsPane）。
 public struct SavedAccountGroup: Equatable, Identifiable {
     /// 平台键（workbuddy / trae / zcode / codex）：删除动作回传宿主，用于定位账号数组与菜单栏前缀
     public let id: String
